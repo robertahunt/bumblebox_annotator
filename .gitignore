@@ -1,0 +1,28 @@
+# Projects directory - user data
+projects/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model checkpoints (large files)
+checkpoints/*.pt
+checkpoints/*.pth
+!checkpoints/.gitkeep
