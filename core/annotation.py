@@ -7,6 +7,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 import pickle
+from collections import OrderedDict
 
 
 def mask_to_rle(mask):
@@ -114,11 +115,12 @@ def mask_to_polygon(mask):
     return polygons
 
 class AnnotationManager:
-    """Manage annotations for a project"""
+    """Manage annotations for a project with LRU cache"""
     
-    def __init__(self):
+    def __init__(self, max_cache_size=20):
         self.project_info = {}
-        self.frame_annotations = {}  # frame_idx -> list of annotations
+        self.frame_annotations = OrderedDict()  # LRU cache: frame_idx -> list of annotations
+        self.max_cache_size = max_cache_size  # Maximum frames to keep in memory
         self.class_names = ['bee']  # Default class
         self.unsaved_changes = False
         self.image_width = 0
@@ -133,7 +135,7 @@ class AnnotationManager:
             'classes': self.class_names,
             'version': '1.0'
         }
-        self.frame_annotations = {}
+        self.frame_annotations = OrderedDict()
         self.unsaved_changes = True
         
     def load_project(self, project_path):
@@ -150,8 +152,8 @@ class AnnotationManager:
         self.project_info = data.get('project_info', {})
         self.class_names = data.get('classes', ['bee'])
         
-        # Load frame annotations
-        self.frame_annotations = {}
+        # Load frame annotations into LRU cache (only recent frames)
+        self.frame_annotations = OrderedDict()
         annotations_dir = project_path / 'annotations' / 'frames'
         
         if annotations_dir.exists():
@@ -291,17 +293,92 @@ class AnnotationManager:
         return annotations
         
     def get_frame_annotations(self, frame_idx):
-        """Get annotations for a frame"""
-        return self.frame_annotations.get(frame_idx, [])
+        """Get annotations for a frame (LRU access)"""
+        if frame_idx in self.frame_annotations:
+            # Move to end (most recently used)
+            self.frame_annotations.move_to_end(frame_idx)
+            return self.frame_annotations[frame_idx]
+        return []
         
     def set_frame_annotations(self, frame_idx, annotations):
-        """Set annotations for a frame"""
-        self.frame_annotations[frame_idx] = annotations
-        self.unsaved_changes = True
+        """Set annotations for a frame with LRU cache management"""
+        import copy
+        import numpy as np
+        import gc
+        
+        prev = self.frame_annotations.get(frame_idx, None)
+        
+        def deep_equal(a, b):
+            if type(a) != type(b):
+                return False
+            if isinstance(a, dict):
+                if set(a.keys()) != set(b.keys()):
+                    return False
+                for k in a:
+                    if not deep_equal(a[k], b[k]):
+                        return False
+                return True
+            elif isinstance(a, (list, tuple)):
+                if len(a) != len(b):
+                    return False
+                return all(deep_equal(x, y) for x, y in zip(a, b))
+            elif isinstance(a, np.ndarray):
+                return np.array_equal(a, b)
+            else:
+                return a == b
+
+        if prev is None or not deep_equal(prev, annotations):
+            self.unsaved_changes = True
+        
+        # Update existing entry
+        if frame_idx in self.frame_annotations:
+            self.frame_annotations.move_to_end(frame_idx)
+            # Delete old annotations before replacing
+            old_anns = self.frame_annotations[frame_idx]
+            del old_anns
+            self.frame_annotations[frame_idx] = copy.deepcopy(annotations)
+            # print(f"Annotation cache: updated frame {frame_idx}")
+        else:
+            # Evict oldest if over capacity BEFORE adding new one
+            if len(self.frame_annotations) >= self.max_cache_size:
+                oldest_key = next(iter(self.frame_annotations))
+                old_anns = self.frame_annotations[oldest_key]
+                del self.frame_annotations[oldest_key]
+                # Explicitly delete annotation data (includes large mask arrays)
+                del old_anns
+                gc.collect()
+                print(f"Annotation cache: evicted frame {oldest_key} to make room for frame {frame_idx}")
+            
+            # Store annotations (deep copy to avoid external modifications)
+            self.frame_annotations[frame_idx] = copy.deepcopy(annotations)
+            print(f"Annotation cache: cached frame {frame_idx}, cache size={len(self.frame_annotations)}/{self.max_cache_size}")
+    
+    def clear_annotation_cache(self, keep_recent=10):
+        """
+        Clear annotation cache to free memory, keeping only recent frames.
+        
+        Args:
+            keep_recent: Number of recent frame annotations to keep in memory
+        """
+        if len(self.frame_annotations) <= keep_recent:
+            return
+        
+        # Sort by frame index and keep only the most recent ones
+        sorted_indices = sorted(self.frame_annotations.keys())
+        frames_to_remove = sorted_indices[:-keep_recent]
+        
+        for frame_idx in frames_to_remove:
+            del self.frame_annotations[frame_idx]
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        print(f"Cleared annotation cache: removed {len(frames_to_remove)} frames, kept {len(self.frame_annotations)}")
     
     def clear_cache(self):
         """Clear the in-memory annotation cache"""
-        self.frame_annotations = {}
+        self.frame_annotations = OrderedDict()
         self.unsaved_changes = False
         
     def add_annotation(self, frame_idx, annotation):

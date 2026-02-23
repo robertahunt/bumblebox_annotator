@@ -12,6 +12,7 @@ class YOLOToolbar(QWidget):
     """Toolbar for YOLO model inference"""
     
     inference_requested = pyqtSignal()  # Signal to request inference on current frame
+    track_from_last_requested = pyqtSignal()  # Signal to request tracking from last annotated frame
     
     def __init__(self, parent=None, checkpoint_path=None):
         super().__init__(parent)
@@ -54,6 +55,16 @@ class YOLOToolbar(QWidget):
         self.inference_btn.setEnabled(False)  # Disabled until model is loaded
         self.inference_btn.clicked.connect(self.on_inference_requested)
         layout.addWidget(self.inference_btn)
+        
+        # Separator
+        layout.addWidget(self.create_separator())
+        
+        # Track from last frame button
+        self.track_btn = QPushButton("Track from Last Frame")
+        self.track_btn.setToolTip("Match YOLO detections on current frame to annotations from the last annotated frame")
+        self.track_btn.setEnabled(False)  # Disabled until model is loaded
+        self.track_btn.clicked.connect(self.on_track_requested)
+        layout.addWidget(self.track_btn)
         
         layout.addStretch()
         
@@ -101,6 +112,8 @@ class YOLOToolbar(QWidget):
             self.model_status_label.setText(f"✓ {model_name}")
             self.model_status_label.setStyleSheet("color: green;")
             self.inference_btn.setEnabled(True)
+            self.track_btn.setEnabled(True)
+            self.box_inference_btn.setEnabled(True)
             
             if show_dialogs:
                 QMessageBox.information(
@@ -130,6 +143,7 @@ class YOLOToolbar(QWidget):
             self.model_status_label.setText("Failed to load model")
             self.model_status_label.setStyleSheet("color: red;")
             self.inference_btn.setEnabled(False)
+            self.track_btn.setEnabled(False)
     
     def on_inference_requested(self):
         """Handle inference button click"""
@@ -142,6 +156,18 @@ class YOLOToolbar(QWidget):
             return
             
         self.inference_requested.emit()
+    
+    def on_track_requested(self):
+        """Handle track from last frame button click"""
+        if self.model is None:
+            QMessageBox.warning(
+                self,
+                "No Model",
+                "Please load a YOLO checkpoint first."
+            )
+            return
+            
+        self.track_from_last_requested.emit()
     
     def get_model(self):
         """Get the loaded YOLO model"""

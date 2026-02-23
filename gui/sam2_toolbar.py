@@ -14,6 +14,9 @@ class SAM2Toolbar(QWidget):
     tool_changed = pyqtSignal(str)  # Signal when SAM2 tool is selected
     clear_prompts_requested = pyqtSignal()
     propagate_requested = pyqtSignal()
+    propagate_to_selected_requested = pyqtSignal()
+    unload_requested = pyqtSignal()  # Signal to unload SAM2 checkpoint
+    sam2_loaded = pyqtSignal(object)  # Signal when SAM2 is loaded (emits SAM2Integrator)
     
     def __init__(self, parent=None, checkpoint_path=None):
         super().__init__(parent)
@@ -41,6 +44,13 @@ class SAM2Toolbar(QWidget):
         self.load_checkpoint_btn.setToolTip("Load SAM2 checkpoint file (.pt)")
         self.load_checkpoint_btn.clicked.connect(self.load_checkpoint)
         layout.addWidget(self.load_checkpoint_btn)
+        
+        # Unload checkpoint button
+        self.unload_checkpoint_btn = QPushButton("Unload")
+        self.unload_checkpoint_btn.setToolTip("Unload SAM2 checkpoint to free memory")
+        self.unload_checkpoint_btn.clicked.connect(self.unload_checkpoint)
+        self.unload_checkpoint_btn.setEnabled(False)
+        layout.addWidget(self.unload_checkpoint_btn)
         
         # Checkpoint status label
         self.checkpoint_status_label = QLabel("No model loaded")
@@ -85,6 +95,13 @@ class SAM2Toolbar(QWidget):
         self.propagate_btn.setEnabled(False)
         self.propagate_btn.clicked.connect(self.on_propagate)
         layout.addWidget(self.propagate_btn)
+        
+        self.propagate_to_selected_btn = QToolButton()
+        self.propagate_to_selected_btn.setText("Propagate to Selected →→")
+        self.propagate_to_selected_btn.setToolTip("Propagate through all frames until next training/validation frame")
+        self.propagate_to_selected_btn.setEnabled(False)
+        self.propagate_to_selected_btn.clicked.connect(self.on_propagate_to_selected)
+        layout.addWidget(self.propagate_to_selected_btn)
         
         layout.addStretch()
         
@@ -158,16 +175,17 @@ class SAM2Toolbar(QWidget):
             self.checkpoint_status_label.setText(f"✓ {checkpoint_name}")
             self.checkpoint_status_label.setStyleSheet("color: green;")
             
-            # Enable tool buttons
+            # Enable tool buttons and unload button
             self.point_btn.setEnabled(True)
             self.box_btn.setEnabled(True)
             self.clear_prompts_btn.setEnabled(True)
             self.propagate_btn.setEnabled(True)
+            self.propagate_to_selected_btn.setEnabled(True)
+            self.unload_checkpoint_btn.setEnabled(True)
             
-            # Notify parent that SAM2 is loaded
-            parent = self.parent()
-            if parent and hasattr(parent, 'on_sam2_loaded'):
-                parent.on_sam2_loaded(sam2)
+            # Emit signal that SAM2 is loaded
+            print(f"SAM2Toolbar: Emitting sam2_loaded signal with sam2={sam2}")
+            self.sam2_loaded.emit(sam2)
             
             if show_dialogs:
                 QMessageBox.information(
@@ -205,11 +223,56 @@ class SAM2Toolbar(QWidget):
         """Handle propagate button"""
         self.propagate_requested.emit()
     
+    def on_propagate_to_selected(self):
+        """Handle propagate to selected button"""
+        self.propagate_to_selected_requested.emit()
+    
     def is_checkpoint_loaded(self):
         """Check if a checkpoint is loaded"""
         return self.checkpoint_path is not None
     
     def uncheck_tools(self):
-        """Uncheck all SAM2 tool buttons"""
+        """Uncheck all SAM2 tool buttons without emitting signals"""
         for btn in self.button_group.buttons():
+            btn.blockSignals(True)
             btn.setChecked(False)
+            btn.blockSignals(False)
+    
+    def unload_checkpoint(self):
+        """Unload the SAM2 checkpoint to free memory"""
+        # Confirm with user
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self,
+            "Unload SAM2 Checkpoint",
+            "This will unload the SAM2 model from memory to free up resources.\n\n"
+            "You can reload it later if needed.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # Uncheck all tools
+            self.uncheck_tools()
+            
+            # Emit signal to parent to clear SAM2 instance
+            self.unload_requested.emit()
+            
+            # Reset UI state
+            self.checkpoint_path = None
+            self.checkpoint_status_label.setText("No model loaded")
+            self.checkpoint_status_label.setStyleSheet("color: gray; font-style: italic;")
+            
+            # Disable tool buttons
+            self.point_btn.setEnabled(False)
+            self.box_btn.setEnabled(False)
+            self.clear_prompts_btn.setEnabled(False)
+            self.propagate_btn.setEnabled(False)
+            self.propagate_to_selected_btn.setEnabled(False)
+            self.unload_checkpoint_btn.setEnabled(False)
+            
+            QMessageBox.information(
+                self,
+                "SAM2 Unloaded",
+                "SAM2 checkpoint has been unloaded from memory."
+            )

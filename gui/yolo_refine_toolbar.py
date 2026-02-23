@@ -3,8 +3,10 @@ YOLO refinement toolbar for refining instance masks using a trained model
 """
 
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QPushButton,
-                             QLabel, QFileDialog, QMessageBox, QSpinBox)
+                             QLabel, QFileDialog, QMessageBox, QSpinBox,
+                             QToolButton, QMenu)
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QAction
 from pathlib import Path
 
 
@@ -41,6 +43,24 @@ class YOLORefinementToolbar(QWidget):
         self.load_model_btn.setToolTip("Load a trained YOLO segmentation model checkpoint (.pt file)")
         self.load_model_btn.clicked.connect(self.load_checkpoint)
         layout.addWidget(self.load_model_btn)
+        
+        # Train menu button
+        self.train_menu_btn = QToolButton()
+        self.train_menu_btn.setText("Train...")
+        self.train_menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.train_menu_btn.setToolTip("Train a refinement model")
+        
+        # Create menu
+        train_menu = QMenu(self)
+        
+        # Add train action
+        train_action = QAction("Train Refinement Model", self)
+        train_action.setToolTip("Train a new fine-grained YOLO model on cropped bee regions")
+        train_action.triggered.connect(self.on_train_model)
+        train_menu.addAction(train_action)
+        
+        self.train_menu_btn.setMenu(train_menu)
+        layout.addWidget(self.train_menu_btn)
         
         # Model status label
         self.model_status_label = QLabel("No model loaded")
@@ -97,6 +117,22 @@ class YOLORefinementToolbar(QWidget):
     def on_padding_changed(self, value):
         """Handle padding change"""
         self.padding = value
+    
+    def on_train_model(self):
+        """Handle train model button click"""
+        # Notify parent window to initiate training
+        parent_window = self.parent()
+        while parent_window and not hasattr(parent_window, 'train_yolo_model_stage2'):
+            parent_window = parent_window.parent()
+        
+        if parent_window and hasattr(parent_window, 'train_yolo_model_stage2'):
+            parent_window.train_yolo_model_stage2()
+        else:
+            QMessageBox.warning(
+                self,
+                "Training Not Available",
+                "Training functionality is not available in the current context."
+            )
         
     def load_checkpoint(self):
         """Load a YOLO checkpoint file via file dialog"""

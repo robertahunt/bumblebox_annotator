@@ -350,5 +350,247 @@ class SAM2Integrator:
                 propagated_masks.append(None)
                 
         return propagated_masks
-
-
+    
+    def _propagate_mask_chunk_video(self, temp_dir, mask_indices_and_masks, start_obj_id):
+        """
+        Helper method to propagate a chunk of masks using video predictor.
+        
+        Args:
+            temp_dir: Directory containing frame files (0.jpg, 1.jpg)
+            mask_indices_and_masks: List of (original_index, mask) tuples to process
+            start_obj_id: Starting object ID for this chunk
+            
+        Returns:
+            Dictionary mapping original_index to propagated mask (or None for failures)
+        """
+        import torch
+        
+        results = {}
+        
+        try:
+            # Initialize video state with temporary directory
+            inference_state = self.video_predictor.init_state(
+                video_path=temp_dir,
+                offload_video_to_cpu=True,
+                offload_state_to_cpu=True
+            )
+            
+            # Add each mask from current frame as an object to track
+            object_ids = []
+            next_obj_id = start_obj_id
+            
+            for original_idx, mask in mask_indices_and_masks:
+                try:
+                    # Check if mask is empty
+                    if not np.any(mask > 0):
+                        print(f"Mask {original_idx} is empty, skipping")
+                        results[original_idx] = None
+                        continue
+                    
+                    # Convert mask to binary (0 or 1)
+                    binary_mask = (mask > 0).astype(np.uint8)
+                    
+                    # Add mask to first frame (frame_idx=0) with unique obj_id
+                    frame_idx, out_obj_ids, out_mask_logits = self.video_predictor.add_new_mask(
+                        inference_state=inference_state,
+                        frame_idx=0,  # Current frame is index 0
+                        obj_id=next_obj_id,  # Use unique sequential ID
+                        mask=binary_mask
+                    )
+                    
+                    object_ids.append((original_idx, next_obj_id))
+                    next_obj_id += 1
+                    
+                except Exception as e:
+                    print(f"Error adding mask {original_idx} to video predictor: {e}")
+                    results[original_idx] = None
+                    continue
+            
+            if not object_ids:
+                print("No valid masks to propagate in this chunk")
+                for original_idx, _ in mask_indices_and_masks:
+                    results[original_idx] = None
+                return results
+            
+            print(f"Processing chunk: {len(object_ids)} masks with obj_ids {[obj_id for _, obj_id in object_ids]}")
+            
+            # Propagate masks to all frames (just frame 1 in our case)
+            video_segments = {}
+            for frame_idx, obj_ids, mask_logits in self.video_predictor.propagate_in_video(
+                inference_state,
+                start_frame_idx=0
+            ):
+                # Handle obj_ids that might be arrays/lists
+                processed_masks = {}
+                for i, obj_id_raw in enumerate(obj_ids):
+                    # Convert obj_id to int (might be array/list)
+                    if isinstance(obj_id_raw, (list, np.ndarray)):
+                        obj_id = int(obj_id_raw[0]) if len(obj_id_raw) > 0 else i
+                    else:
+                        obj_id = int(obj_id_raw)
+                    
+                    # Move to CPU and convert to numpy immediately to free GPU memory
+                    processed_masks[obj_id] = (mask_logits[i] > 0.0).cpu().numpy()
+                
+                video_segments[frame_idx] = processed_masks
+                
+                # Clear CUDA cache after processing each frame
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Extract masks for next frame (frame_idx=1)
+            next_frame_masks = video_segments.get(1, {})
+            
+            # Build result dictionary maintaining original indices
+            for original_idx, obj_id in object_ids:
+                if obj_id in next_frame_masks:
+                    # Get propagated mask
+                    propagated_mask = next_frame_masks[obj_id].squeeze()
+                    
+                    # Convert to uint8 (0 or 255)
+                    propagated_mask = (propagated_mask > 0).astype(np.uint8) * 255
+                    
+                    # Check if mask is valid
+                    if np.any(propagated_mask > 0):
+                        results[original_idx] = propagated_mask
+                    else:
+                        print(f"Mask {original_idx} propagation resulted in empty mask")
+                        results[original_idx] = None
+                else:
+                    print(f"Mask {original_idx} not found in propagation results")
+                    results[original_idx] = None
+            
+            # Clean up video state to free memory
+            try:
+                self.video_predictor.reset_state(inference_state)
+            except Exception as e:
+                print(f"Warning: Failed to reset video predictor state: {e}")
+            
+            # Delete inference state explicitly
+            try:
+                del inference_state
+            except:
+                pass
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            # Clear CUDA cache after cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                print(f"Chunk cleanup complete. Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        
+        except Exception as e:
+            print(f"Error in chunk propagation: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return None for all masks in this chunk on error
+            for original_idx, _ in mask_indices_and_masks:
+                results[original_idx] = None
+        
+        return results
+    
+    def propagate_masks_to_frame_video(self, current_frame, current_masks, next_frame):
+        """
+        Propagate masks from current frame to next frame using SAM2's video propagation.
+        This uses the official propagate_in_video API which is more accurate but memory intensive.
+        For more than 10 masks, processes them in chunks to manage memory.
+        
+        Args:
+            current_frame: Current frame image (H, W, 3) in RGB format
+            current_masks: List of masks from current frame (each mask is H x W, values 0 or 255)
+            next_frame: Next frame image (H, W, 3) in RGB format
+            
+        Returns:
+            List of propagated masks for next frame (or None for failed propagations)
+        """
+        import tempfile
+        import os
+        import torch
+        
+        # Clear CUDA cache before starting to free up memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"Cleared CUDA cache. Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        
+        try:
+            # Create temporary directory for frames
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Save frames as temporary files (SAM2 expects numeric names: 0.jpg, 1.jpg, etc.)
+                frame0_path = os.path.join(temp_dir, "0.jpg")
+                frame1_path = os.path.join(temp_dir, "1.jpg")
+                
+                import cv2
+                # Convert RGB to BGR for cv2.imwrite
+                cv2.imwrite(frame0_path, cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(frame1_path, cv2.cvtColor(next_frame, cv2.COLOR_RGB2BGR))
+                
+                # Process masks in chunks if there are more than 10
+                chunk_size = 10
+                num_masks = len(current_masks)
+                
+                if num_masks > chunk_size:
+                    print(f"Processing {num_masks} masks in chunks of {chunk_size}")
+                    
+                    # Process in chunks
+                    all_results = {}
+                    for chunk_start in range(0, num_masks, chunk_size):
+                        chunk_end = min(chunk_start + chunk_size, num_masks)
+                        chunk_num = chunk_start // chunk_size + 1
+                        total_chunks = (num_masks + chunk_size - 1) // chunk_size
+                        
+                        print(f"\nProcessing chunk {chunk_num}/{total_chunks} (masks {chunk_start}-{chunk_end-1})")
+                        
+                        # Prepare chunk data: (original_index, mask) tuples
+                        chunk_data = [(i, current_masks[i]) for i in range(chunk_start, chunk_end)]
+                        
+                        # Process this chunk
+                        chunk_results = self._propagate_mask_chunk_video(
+                            temp_dir, 
+                            chunk_data, 
+                            start_obj_id=0  # Reset obj_id for each chunk
+                        )
+                        
+                        # Merge into all results
+                        all_results.update(chunk_results)
+                        
+                        print(f"Chunk {chunk_num} complete. Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                    
+                    # Build final result list in original order
+                    propagated_masks = [all_results.get(i) for i in range(num_masks)]
+                    
+                else:
+                    # Process all masks at once if there are 10 or fewer
+                    print(f"Processing {num_masks} masks in a single batch")
+                    chunk_data = [(i, mask) for i, mask in enumerate(current_masks)]
+                    all_results = self._propagate_mask_chunk_video(
+                        temp_dir,
+                        chunk_data,
+                        start_obj_id=0
+                    )
+                    propagated_masks = [all_results.get(i) for i in range(num_masks)]
+                
+                # Final cleanup
+                import gc
+                gc.collect()
+                
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    print(f"Final cleanup. Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+            
+            # Temp directory and files are automatically cleaned up here
+            
+        except Exception as e:
+            print(f"Error in video propagation: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return None for all masks on error
+            propagated_masks = [None] * len(current_masks)
+        
+        finally:
+            # Ensure garbage collection happens even if exception occurs
+            import gc
+            gc.collect()
+        
+        return propagated_masks

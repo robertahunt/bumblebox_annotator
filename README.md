@@ -1,4 +1,4 @@
-# Bee Annotator
+# Bumblebox Annotator
 
 A GUI-based annotation tool for video instance segmentation with human-in-the-loop training.
 
