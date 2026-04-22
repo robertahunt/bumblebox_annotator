@@ -266,7 +266,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
         
         self.cent_max_dist_spin = QSpinBox()
         self.cent_max_dist_spin.setRange(10, 2000)
-        self.cent_max_dist_spin.setValue(600)
+        self.cent_max_dist_spin.setValue(200)
         self.cent_max_dist_spin.setSingleStep(50)
         cent_layout.addRow("  Max distance (pixels):", self.cent_max_dist_spin)
         

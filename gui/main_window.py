@@ -495,7 +495,7 @@ class MainWindow(QMainWindow):
         
         self.bbox_mode_action = QAction("Show &Bounding Boxes", self)
         self.bbox_mode_action.setCheckable(True)
-        self.bbox_mode_action.setChecked(False)
+        self.bbox_mode_action.setChecked(True)
         self.bbox_mode_action.setShortcut("Ctrl+Shift+B")
         self.bbox_mode_action.setToolTip("Show/hide bounding box annotations")
         self.bbox_mode_action.triggered.connect(self.on_menu_show_bboxes_changed)

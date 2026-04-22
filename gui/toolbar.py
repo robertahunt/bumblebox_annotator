@@ -86,14 +86,14 @@ class AnnotationToolbar(QWidget):
         row1.addWidget(self.show_bees_checkbox)
         
         self.show_hives_checkbox = QCheckBox("Hives")
-        self.show_hives_checkbox.setChecked(True)
+        self.show_hives_checkbox.setChecked(False)
         self.show_hives_checkbox.setToolTip("Show/hide hive annotations (video-level)")
         self.show_hives_checkbox.setStyleSheet("QCheckBox { background-color: rgba(255, 255, 0, 50); padding: 2px; }")
         self.show_hives_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('hive', state))
         row1.addWidget(self.show_hives_checkbox)
         
         self.show_chambers_checkbox = QCheckBox("Chambers")
-        self.show_chambers_checkbox.setChecked(True)
+        self.show_chambers_checkbox.setChecked(False)
         self.show_chambers_checkbox.setToolTip("Show/hide chamber annotations (video-level)")
         self.show_chambers_checkbox.setStyleSheet("QCheckBox { background-color: rgba(255, 0, 0, 50); padding: 2px; }")
         self.show_chambers_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('chamber', state))
@@ -107,7 +107,7 @@ class AnnotationToolbar(QWidget):
         row1.addWidget(self.segmentation_checkbox)
         
         self.bbox_checkbox = QCheckBox("BBoxes")
-        self.bbox_checkbox.setChecked(False)
+        self.bbox_checkbox.setChecked(True)
         self.bbox_checkbox.setToolTip("Show/hide bounding boxes (Ctrl+Shift+B)")
         self.bbox_checkbox.stateChanged.connect(self.on_show_bboxes_changed)
         row1.addWidget(self.bbox_checkbox)

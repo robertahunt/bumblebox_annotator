@@ -356,7 +356,7 @@ class TrackingValidationWorker(QThread):
             viz_folder = results_folder / 'visualizations' / f"{sequence.sequence_id}_{algo_name}"
             viz_folder.mkdir(parents=True, exist_ok=True)
         
-        # Load ground truth for all frames
+        # Load ground truth for all frames  
         gt_frames = {}
         for frame_idx in sequence.frame_range:
             annotations = self.main_window.annotation_manager.load_frame_annotations(
@@ -366,6 +366,12 @@ class TrackingValidationWorker(QThread):
             if annotations:
                 gt_ids = [ann.get('mask_id', ann.get('instance_id', 'N/A')) for ann in annotations]
                 self.log_message.emit(f"  Loaded {len(annotations)} GT annotations for frame {frame_idx}, IDs: {gt_ids}")
+                # Debug: Log GT mask shapes on first frame
+                if frame_idx == sequence.start_frame:
+                    for ann in annotations:
+                        if ann.get('mask') is not None:
+                            self.log_message.emit(f"    GT mask shape: {ann['mask'].shape}")
+                            break  # Just log one for debugging
             else:
                 self.log_message.emit(f"  WARNING: No GT annotations found for frame {frame_idx}")
         
@@ -383,6 +389,10 @@ class TrackingValidationWorker(QThread):
             
             frame = cv2.imread(str(frame_path))
             
+            # Debug: Log frame shape on first frame
+            if frame_idx == sequence.start_frame:
+                self.log_message.emit(f"    Frame shape: {frame.shape}")
+            
             # Get detections
             use_ground_truth = self.config.get('use_ground_truth', False)
             if use_ground_truth:
@@ -398,6 +408,10 @@ class TrackingValidationWorker(QThread):
                     iou=self.config['nms_iou_threshold'],
                     verbose=False
                 )
+                
+                # Debug: Log YOLO orig_shape on first frame
+                if frame_idx == sequence.start_frame and len(results) > 0:
+                    self.log_message.emit(f"    YOLO orig_shape: {results[0].orig_shape}")
                 
                 # Convert to Detection objects
                 detections = self._yolo_to_detections(results[0])
@@ -482,7 +496,13 @@ class TrackingValidationWorker(QThread):
                 mask = yolo_result.masks.data[idx].cpu().numpy()
                 # Resize mask to frame size if needed
                 if mask.shape[:2] != yolo_result.orig_shape[:2]:
-                    mask = cv2.resize(mask, (yolo_result.orig_shape[1], yolo_result.orig_shape[0]))
+                    # Debug log on first detection
+                    if idx == 0:
+                        print(f"[MASK RESIZE] Mask shape: {mask.shape}, target: {yolo_result.orig_shape}, resizing to ({yolo_result.orig_shape[1]}, {yolo_result.orig_shape[0]})")
+                    mask = cv2.resize(mask, (yolo_result.orig_shape[1], yolo_result.orig_shape[0]), 
+                                    interpolation=cv2.INTER_NEAREST)
+                    if idx == 0:
+                        print(f"[MASK RESIZE] After resize: {mask.shape}")
                 mask = (mask > 0.5).astype(np.uint8)
             
             det = Detection(
@@ -1114,13 +1134,26 @@ class TrackingValidationWorker(QThread):
                 color = (255, 0, 255)  # Pink - no match
                 thickness = 3
             
-            # Draw detection bbox
-            x1, y1, x2, y2 = det.bbox
-            cv2.rectangle(viz_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
+            # Draw detection mask or bbox
+            if det.mask is not None:
+                # Draw segmentation mask contours
+                contours, _ = cv2.findContours(det.mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(viz_frame, contours, -1, color, thickness)
+            else:
+                # Fall back to bounding box if no mask
+                x1, y1, x2, y2 = det.bbox
+                cv2.rectangle(viz_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
             
-            # Add detection ID label
+            # Add detection ID label at centroid (or top-left of bbox as fallback)
             if det.instance_id is not None:
-                label_pos = (int(x1), int(y1) - 10)
+                # Get centroid position from mask or bbox
+                centroid = self._get_centroid(det.mask, det.bbox)
+                if centroid is not None:
+                    label_pos = centroid
+                else:
+                    x1, y1, x2, y2 = det.bbox
+                    label_pos = (int(x1), int(y1) - 10)
+                
                 label_color = color
                 cv2.putText(viz_frame, f"ID:{det.instance_id}", label_pos, 
                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, label_color, 2)

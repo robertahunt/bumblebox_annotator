@@ -45,6 +45,9 @@ class BatchVideoInferenceWorker(QThread):
         self.accumulated_hive_masks = {}
         # Format: {(video_id, chamber_id): {'accumulated_mask': np.ndarray, 'frame_count': int, 'shape': tuple}}
         self.accumulated_chamber_masks = {}
+        
+        # Memory management: Track size of accumulated data
+        self.accumulated_data_size_mb = 0
     
     def stop(self):
         """Request worker to stop"""
@@ -287,7 +290,7 @@ class BatchVideoInferenceWorker(QThread):
         self.log_message.emit(f"    - {num_trajectories} unique tracked bees")
         self.log_message.emit(f"    - {num_chamber_data} chamber frame records")
         
-        # Collect data
+        # Collect data BEFORE generating visualizations
         self.all_bee_detections.extend(processor.get_bee_detections())
         self.all_chamber_frame_data.extend(processor.get_chamber_frame_data())
         
@@ -296,42 +299,13 @@ class BatchVideoInferenceWorker(QThread):
             composite_key = (video_id, bee_id)
             self.all_bee_trajectories[composite_key] = trajectory
         
-        # Accumulate masks for averaging
-        self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
-        
-        # Reset tracker state to prevent memory buildup across videos
-        if hasattr(tracker, 'reset'):
-            tracker.reset()
-        
-        # Clear GPU cache and run garbage collection to free memory
-        self.log_message.emit(f"  Cleaning up GPU memory...")
-        if torch.cuda.is_available():
-            # Log GPU memory before cleanup
-            mem_allocated = torch.cuda.memory_allocated() / 1e9  # GB
-            mem_reserved = torch.cuda.memory_reserved() / 1e9  # GB
-            self.log_message.emit(f"    Before cleanup: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
-            
-            torch.cuda.empty_cache()
-            
-            # Log GPU memory after cleanup
-            mem_allocated_after = torch.cuda.memory_allocated() / 1e9  # GB
-            mem_reserved_after = torch.cuda.memory_reserved() / 1e9  # GB
-            freed = mem_reserved - mem_reserved_after
-            self.log_message.emit(f"    After cleanup: {mem_allocated_after:.2f} GB allocated, {mem_reserved_after:.2f} GB reserved (freed {freed:.2f} GB)")
-        
-        gc.collect()
-        
-        # Explicitly delete processor to free memory (especially mask storage)
-        del processor
-        
-        # Force another GPU cache clear after deletion
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # Generate visualization if requested
+        # Accumulate masks for averaging (only if visualization disabled)
+        # If visualization enabled, we'll handle masks during viz generation
         visualization_enabled = self.config.get('save_visualizations', False)
-        self.log_message.emit(f"  Visualization setting: {visualization_enabled}")
+        if not visualization_enabled:
+            self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
         
+        # Generate visualization if requested (BEFORE deleting processor)
         if visualization_enabled:
             self.log_message.emit(f"  Generating visualizations...")
             
@@ -357,12 +331,46 @@ class BatchVideoInferenceWorker(QThread):
                     self.log_message.emit(f"    Output folder: {viz_base_folder / video_id}")
                 else:
                     self.log_message.emit(f"  ⚠️ Visualization generation returned False")
+                    
+                # Delete viz_gen to free memory
+                del viz_gen
+                    
             except Exception as e:
                 self.log_message.emit(f"  ⚠️ Visualization error: {str(e)}")
                 import traceback
                 self.log_message.emit(traceback.format_exc())
+            
+            # Accumulate masks after visualization (so we still have averaged masks for CSV)
+            self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
         else:
             self.log_message.emit(f"  Skipping visualizations (checkbox not enabled)")
+        
+        # Reset tracker state to prevent memory buildup across videos
+        if hasattr(tracker, 'reset'):
+            tracker.reset()
+        
+        # Explicitly delete processor to free memory (especially mask storage)
+        # CRITICAL: Must happen AFTER visualization generation
+        self.log_message.emit(f"  Freeing processor memory...")
+        del processor
+        
+        # Clear GPU cache and run garbage collection to free memory
+        self.log_message.emit(f"  Cleaning up GPU memory...")
+        gc.collect()
+        
+        if torch.cuda.is_available():
+            # Log GPU memory before cleanup
+            mem_allocated = torch.cuda.memory_allocated() / 1e9  # GB
+            mem_reserved = torch.cuda.memory_reserved() / 1e9  # GB
+            self.log_message.emit(f"    Before cleanup: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
+            
+            torch.cuda.empty_cache()
+            
+            # Log GPU memory after cleanup
+            mem_allocated_after = torch.cuda.memory_allocated() / 1e9  # GB
+            mem_reserved_after = torch.cuda.memory_reserved() / 1e9  # GB
+            freed = mem_reserved - mem_reserved_after
+            self.log_message.emit(f"    After cleanup: {mem_allocated_after:.2f} GB allocated, {mem_reserved_after:.2f} GB reserved (freed {freed:.2f} GB)")
     
     def _accumulate_masks(self, video_id: str, hive_masks_by_frame: Dict, chambers_by_frame: Dict):
         """
@@ -395,6 +403,9 @@ class BatchVideoInferenceWorker(QThread):
                         'frame_count': 0,
                         'shape': mask.shape
                     }
+                    # Track memory usage (estimate)
+                    mask_size_mb = mask.nbytes / (1024 * 1024)
+                    self.accumulated_data_size_mb += mask_size_mb
                 
                 # Add this frame's mask
                 self.accumulated_hive_masks[key]['accumulated_mask'] += mask.astype(np.float32)
@@ -419,6 +430,9 @@ class BatchVideoInferenceWorker(QThread):
                         'shape': mask.shape,
                         'accumulated_centroid': np.array([0.0, 0.0], dtype=np.float32)
                     }
+                    # Track memory usage (estimate)
+                    mask_size_mb = mask.nbytes / (1024 * 1024)
+                    self.accumulated_data_size_mb += mask_size_mb
                 
                 # Add this frame's mask
                 self.accumulated_chamber_masks[key]['accumulated_mask'] += mask.astype(np.float32)
@@ -427,6 +441,10 @@ class BatchVideoInferenceWorker(QThread):
                 # Accumulate centroid
                 if centroid is not None:
                     self.accumulated_chamber_masks[key]['accumulated_centroid'] += np.array(centroid, dtype=np.float32)
+        
+        # Log memory usage if it's getting large
+        if self.accumulated_data_size_mb > 100:  # Over 100 MB
+            self.log_message.emit(f"  ⚠️  Accumulated mask data: ~{self.accumulated_data_size_mb:.1f} MB in memory")
     
     def _export_csvs(self, intermediate: bool = False):
         """Export all CSV files

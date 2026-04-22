@@ -154,6 +154,9 @@ class BatchVideoProcessor:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         frame_number = 0
         
+        # For progress reporting
+        last_reported_percent = -1
+        
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -161,6 +164,13 @@ class BatchVideoProcessor:
             
             frame_number += 1
             self.frame_count = frame_number
+            
+            # Report progress every 10%
+            if total_frames > 0:
+                percent_complete = int((frame_number / total_frames) * 100)
+                if percent_complete % 10 == 0 and percent_complete != last_reported_percent:
+                    print(f"  Progress: {frame_number}/{total_frames} frames ({percent_complete}%)")
+                    last_reported_percent = percent_complete
             
             # Process this frame
             self._process_frame(frame, frame_number)
@@ -288,6 +298,35 @@ class BatchVideoProcessor:
             gc.collect()
             if TORCH_AVAILABLE and torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        
+        # More aggressive cleanup every 500 frames
+        if frame_number % 500 == 0:
+            print(f"  [Frame {frame_number}] Aggressive memory cleanup...")
+            # Clear stored frames if not needed for visualization
+            if not self.store_masks and frame_number > 100:
+                # Keep only recent frames for trajectory calculation
+                frames_to_keep = set(range(frame_number - 50, frame_number + 1))
+                
+                # Clear old chamber and hive mask data
+                old_chamber_frames = [f for f in self.chambers_by_frame.keys() if f not in frames_to_keep]
+                for f in old_chamber_frames:
+                    del self.chambers_by_frame[f]
+                
+                old_hive_frames = [f for f in self.hive_masks_by_frame.keys() if f not in frames_to_keep]
+                for f in old_hive_frames:
+                    del self.hive_masks_by_frame[f]
+                
+                old_bee_frames = [f for f in self.bee_masks_by_frame.keys() if f not in frames_to_keep]
+                for f in old_bee_frames:
+                    del self.bee_masks_by_frame[f]
+            
+            gc.collect()
+            if TORCH_AVAILABLE and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if frame_number % 1000 == 0:  # Log every 1000 frames
+                    mem_allocated = torch.cuda.memory_allocated() / 1e9
+                    mem_reserved = torch.cuda.memory_reserved() / 1e9
+                    print(f"    GPU: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
     
     def _detect_chambers(self, frame: np.ndarray) -> Dict[int, Dict]:
         """

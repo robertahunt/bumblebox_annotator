@@ -163,7 +163,7 @@ class TrackingValidationConfigDialog(QDialog):
         
         # Centroid tracking
         self.centroid_check = QCheckBox("Centroid Distance Matching")
-        self.centroid_check.setChecked(False)
+        self.centroid_check.setChecked(True)
         self.centroid_check.setToolTip("Match based on centroid distance")
         algo_layout.addWidget(self.centroid_check)
         
