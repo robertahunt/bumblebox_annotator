@@ -36,7 +36,7 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
         List of paths to generated COCO JSON files (or None if cancelled)
     """
     if class_names is None:
-        class_names = ['bee', 'hive', 'chamber']
+        class_names = ['bee', 'hive', 'chamber', 'pollen']
     
     project_path = Path(project_path)
     
@@ -44,7 +44,7 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
     category_name_to_id = {name: i + 1 for i, name in enumerate(class_names)}
     
     # Create categories (shared across all files)
-    supercategories = {'bee': 'insect', 'hive': 'structure', 'chamber': 'structure'}
+    supercategories = {'bee': 'insect', 'hive': 'structure', 'chamber': 'structure', 'pollen': 'resource'}
     categories = []
     for i, class_name in enumerate(class_names):
         categories.append({

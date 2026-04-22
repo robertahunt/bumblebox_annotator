@@ -500,7 +500,7 @@ class TrainingConfigDialog(QDialog):
             model_type_layout = QFormLayout()
             
             self.model_type_combo = QComboBox()
-            self.model_type_combo.addItems(["Bee", "Chamber", "Hive"])
+            self.model_type_combo.addItems(["Bee", "Chamber", "Hive", "Pollen"])
             self.model_type_combo.setCurrentText("Bee")
             self.model_type_combo.setToolTip(
                 "Select which annotation type to train on:\n"
@@ -814,7 +814,7 @@ class TrainingConfigDialog(QDialog):
         
         # Add model type for coarse YOLO training
         if not (self.stage2 or self.sahi or self.beehavesque or self.instance_focused):
-            model_type_map = {'Bee': 'bee', 'Chamber': 'chamber', 'Hive': 'hive'}
+            model_type_map = {'Bee': 'bee', 'Chamber': 'chamber', 'Hive': 'hive', 'Pollen': 'pollen'}
             config['model_type'] = model_type_map.get(self.model_type_combo.currentText(), 'bee')
         
         # Add SAHI/Beehavesque specific parameters

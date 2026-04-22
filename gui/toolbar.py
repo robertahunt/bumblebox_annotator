@@ -68,9 +68,9 @@ class AnnotationToolbar(QWidget):
         # Annotation type selection
         row1.addWidget(QLabel("Type:"))
         self.annotation_type_combo = QComboBox()
-        self.annotation_type_combo.addItems(["Bee", "Hive", "Chamber"])
+        self.annotation_type_combo.addItems(["Bee", "Hive", "Chamber", "Pollen"])
         self.annotation_type_combo.setCurrentText("Bee")
-        self.annotation_type_combo.setToolTip("Select annotation type (video-level for Hive/Chamber)")
+        self.annotation_type_combo.setToolTip("Select annotation type (video-level for Hive/Chamber/Pollen)")
         self.annotation_type_combo.currentTextChanged.connect(self.on_annotation_type_changed)
         row1.addWidget(self.annotation_type_combo)
         
@@ -98,6 +98,13 @@ class AnnotationToolbar(QWidget):
         self.show_chambers_checkbox.setStyleSheet("QCheckBox { background-color: rgba(255, 0, 0, 50); padding: 2px; }")
         self.show_chambers_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('chamber', state))
         row1.addWidget(self.show_chambers_checkbox)
+        
+        self.show_pollen_checkbox = QCheckBox("Pollen")
+        self.show_pollen_checkbox.setChecked(False)
+        self.show_pollen_checkbox.setToolTip("Show/hide pollen annotations (video-level)")
+        self.show_pollen_checkbox.setStyleSheet("QCheckBox { background-color: rgba(255, 165, 0, 50); padding: 2px; }")
+        self.show_pollen_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('pollen', state))
+        row1.addWidget(self.show_pollen_checkbox)
         
         # Keep old checkboxes for backward compatibility with segmentation/bbox view modes
         self.segmentation_checkbox = QCheckBox("Segmentations")
@@ -260,7 +267,7 @@ class AnnotationToolbar(QWidget):
     def on_annotation_type_changed(self, type_text):
         """Handle annotation type dropdown selection"""
         # Convert display name to internal name
-        type_map = {'Bee': 'bee', 'Hive': 'hive', 'Chamber': 'chamber'}
+        type_map = {'Bee': 'bee', 'Hive': 'hive', 'Chamber': 'chamber', 'Pollen': 'pollen'}
         annotation_type = type_map.get(type_text, 'bee')
         self.annotation_type_changed.emit(annotation_type)
     

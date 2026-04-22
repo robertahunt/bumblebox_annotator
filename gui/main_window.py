@@ -236,6 +236,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_annotation_type_visibility('bee', self.toolbar.show_bees_checkbox.isChecked(), rebuild=False)
         self.canvas.set_annotation_type_visibility('hive', self.toolbar.show_hives_checkbox.isChecked(), rebuild=False)
         self.canvas.set_annotation_type_visibility('chamber', self.toolbar.show_chambers_checkbox.isChecked(), rebuild=False)
+        self.canvas.set_annotation_type_visibility('pollen', self.toolbar.show_pollen_checkbox.isChecked(), rebuild=False)
         
         # Create SAM2 toolbar
         if self.sam2_checkpoint:
@@ -278,6 +279,7 @@ class MainWindow(QMainWindow):
         self.hive_chamber_toolbar = HiveChamberToolbar(self)
         self.hive_chamber_toolbar.hive_inference_requested.connect(self.run_hive_inference)
         self.hive_chamber_toolbar.chamber_inference_requested.connect(self.run_chamber_inference)
+        self.hive_chamber_toolbar.pollen_inference_requested.connect(self.run_pollen_inference)
         self.hive_chamber_toolbar.both_inference_requested.connect(self.run_hive_chamber_both)
         
         # Create layout
@@ -1906,7 +1908,7 @@ class MainWindow(QMainWindow):
         return list_idx
     
     def _save_video_level_annotations(self, video_id=None):
-        """Save chamber/hive annotations at the video level (shared across all frames).
+        """Save chamber/hive/pollen annotations at the video level (shared across all frames).
 
         These annotation types do not change between frames, so they are stored once
         per video rather than per frame.
@@ -1922,7 +1924,7 @@ class MainWindow(QMainWindow):
         try:
             all_annotations = self.canvas.get_annotations()
             video_anns = [a for a in all_annotations
-                          if a.get('category', 'bee') in ('chamber', 'hive')]
+                          if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
             self.annotation_manager.save_video_annotations(
                 self.project_path, target_video_id, video_anns
             )
@@ -2388,11 +2390,11 @@ class MainWindow(QMainWindow):
                     
                     annotations = self.canvas.get_annotations()
                     if annotations:
-                        # Split per-frame (bee) vs video-level (chamber/hive)
+                        # Split per-frame (bee) vs video-level (chamber/hive/pollen)
                         bee_annotations = [a for a in annotations
                                            if a.get('category', 'bee') == 'bee']
                         video_level_annotations = [a for a in annotations
-                                                   if a.get('category', 'bee') in ('chamber', 'hive')]
+                                                   if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
 
                         frame_idx_in_video = self._get_frame_idx_in_video(self.current_frame_idx)
                         # Do a blocking save for current frame (bee only)
@@ -2400,7 +2402,7 @@ class MainWindow(QMainWindow):
                             self.project_path, self.current_video_id,
                             frame_idx_in_video, bee_annotations
                         )
-                        # Always save chamber/hive video-level (even if empty, to delete files)
+                        # Always save chamber/hive/pollen video-level (even if empty, to delete files)
                         self.annotation_manager.save_video_annotations(
                             self.project_path, self.current_video_id, video_level_annotations
                         )
@@ -2599,11 +2601,11 @@ class MainWindow(QMainWindow):
                 try:
                     annotations = self.canvas.get_annotations()
                     if old_video_id:  # Only save if we know the video
-                        # Split per-frame (bee) vs video-level (chamber/hive)
+                        # Split per-frame (bee) vs video-level (chamber/hive/pollen)
                         bee_annotations = [a for a in annotations
                                            if a.get('category', 'bee') == 'bee']
                         video_level_annotations = [a for a in annotations
-                                                   if a.get('category', 'bee') in ('chamber', 'hive')]
+                                                   if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
 
                         # Update video next_mask_id tracking
                         if old_video_id in self.video_next_mask_id:
@@ -2620,7 +2622,7 @@ class MainWindow(QMainWindow):
                             self.project_path, old_video_id,
                             frame_idx_in_video, bee_annotations
                         )
-                        # Always save chamber/hive video-level synchronously (even if empty, to delete files)
+                        # Always save chamber/hive/pollen video-level synchronously (even if empty, to delete files)
                         try:
                             self.annotation_manager.save_video_annotations(
                                 self.project_path, old_video_id, video_level_annotations
@@ -2768,13 +2770,13 @@ class MainWindow(QMainWindow):
                     if annotations:
                         self.annotation_manager.set_frame_annotations(idx, annotations, video_id=self.current_video_id)
 
-                # Load video-level chamber/hive annotations and merge
+                # Load video-level chamber/hive/pollen annotations and merge
                 if self.project_path and self.current_video_id:
                     video_level_anns, aruco_tracking = self.annotation_manager.load_video_annotations(
                         self.project_path, self.current_video_id
                     )
                     if video_level_anns:
-                        # Strip any chamber/hive that may have been saved per-frame
+                        # Strip any chamber/hive/pollen that may have been saved per-frame
                         # (backward-compat: old saves may have put them per-frame)
                         bee_anns = [a for a in (annotations or [])
                                     if a.get('category', 'bee') == 'bee']
@@ -2940,7 +2942,7 @@ class MainWindow(QMainWindow):
         print(f"Annotation type changed to: {annotation_type}")
         
         # Auto-hide other annotation types, show only the selected one
-        all_types = ['bee', 'chamber', 'hive']
+        all_types = ['bee', 'chamber', 'hive', 'pollen']
         for atype in all_types:
             visible = (atype == annotation_type)
             self.canvas.set_annotation_type_visibility(atype, visible)
@@ -2953,6 +2955,7 @@ class MainWindow(QMainWindow):
         self.toolbar.show_bees_checkbox.setChecked(annotation_type == 'bee')
         self.toolbar.show_hives_checkbox.setChecked(annotation_type == 'hive')
         self.toolbar.show_chambers_checkbox.setChecked(annotation_type == 'chamber')
+        self.toolbar.show_pollen_checkbox.setChecked(annotation_type == 'pollen')
         
         self.toolbar.show_bees_checkbox.blockSignals(False)
         self.toolbar.show_hives_checkbox.blockSignals(False)
@@ -3351,18 +3354,20 @@ class MainWindow(QMainWindow):
         row_to_select = -1
         current_row = 0
         
-        # Add all instances (bee, chamber, and hive)
+        # Add all instances (bee, chamber, hive, and pollen)
         for instance_id in instance_ids:
             # Get category for this instance
             metadata = self.canvas.annotation_metadata.get(instance_id, {})
             category = metadata.get('category', 'bee')
             
             # Check if this category is visible
-            if not self.canvas.annotation_type_visibility.get(category, True):
+            # Video-level annotations (chamber/hive/pollen) are always shown in list
+            # Only bee annotations respect the visibility filter
+            if category == 'bee' and not self.canvas.annotation_type_visibility.get(category, True):
                 continue
             
             # Determine category prefix
-            category_prefix_map = {'bee': 'B', 'hive': 'H', 'chamber': 'C'}
+            category_prefix_map = {'bee': 'B', 'hive': 'H', 'chamber': 'C', 'pollen': 'P'}
             prefix = category_prefix_map.get(category, 'B')
             
             # Determine if instance has segmentation or is bbox-only
@@ -3885,10 +3890,10 @@ class MainWindow(QMainWindow):
         if self.canvas.editing_instance_id > 0 and self.canvas.editing_instance_id != instance_id:
             self.canvas.commit_editing()
 
-        # Handle chamber/hive/bee instance selection
-        if item_type in ['chamber', 'hive']:
+        # Handle chamber/hive/pollen/bee instance selection
+        if item_type in ['chamber', 'hive', 'pollen']:
             # Switch to that annotation mode
-            mode_map = {'chamber': 'Chamber', 'hive': 'Hive'}
+            mode_map = {'chamber': 'Chamber', 'hive': 'Hive', 'pollen': 'Pollen'}
             self.toolbar.annotation_type_combo.blockSignals(True)
             self.toolbar.annotation_type_combo.setCurrentText(mode_map[item_type])
             self.toolbar.annotation_type_combo.blockSignals(False)
@@ -3899,6 +3904,7 @@ class MainWindow(QMainWindow):
             self.canvas.set_annotation_type_visibility('bee', False, rebuild=False)
             self.canvas.set_annotation_type_visibility('chamber', item_type == 'chamber', rebuild=False)
             self.canvas.set_annotation_type_visibility('hive', item_type == 'hive', rebuild=False)
+            self.canvas.set_annotation_type_visibility('pollen', item_type == 'pollen', rebuild=False)
             # Rebuild once after all changes
             self.canvas.rebuild_visualizations()
             
@@ -3906,12 +3912,15 @@ class MainWindow(QMainWindow):
             self.toolbar.show_bees_checkbox.blockSignals(True)
             self.toolbar.show_chambers_checkbox.blockSignals(True)
             self.toolbar.show_hives_checkbox.blockSignals(True)
+            self.toolbar.show_pollen_checkbox.blockSignals(True)
             self.toolbar.show_bees_checkbox.setChecked(False)
             self.toolbar.show_chambers_checkbox.setChecked(item_type == 'chamber')
             self.toolbar.show_hives_checkbox.setChecked(item_type == 'hive')
+            self.toolbar.show_pollen_checkbox.setChecked(item_type == 'pollen')
             self.toolbar.show_bees_checkbox.blockSignals(False)
             self.toolbar.show_chambers_checkbox.blockSignals(False)
             self.toolbar.show_hives_checkbox.blockSignals(False)
+            self.toolbar.show_pollen_checkbox.blockSignals(False)
             
             # Select the instance
             instance_id = item_data.get('id')
@@ -4065,16 +4074,16 @@ class MainWindow(QMainWindow):
         if annotations:
             frame_idx_in_video = self._get_frame_idx_in_video(self.current_frame_idx)
             try:
-                # Split per-frame (bee) vs video-level (chamber/hive)
+                # Split per-frame (bee) vs video-level (chamber/hive/pollen)
                 bee_annotations = [a for a in annotations
                                    if a.get('category', 'bee') == 'bee']
                 video_level_annotations = [a for a in annotations
-                                           if a.get('category', 'bee') in ('chamber', 'hive')]
+                                           if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
                 self.annotation_manager.save_frame_annotations(
                     self.project_path, self.current_video_id,
                     frame_idx_in_video, bee_annotations
                 )
-                # Always save chamber/hive video-level (even if empty, to delete files)
+                # Always save chamber/hive/pollen video-level (even if empty, to delete files)
                 self.annotation_manager.save_video_annotations(
                     self.project_path, self.current_video_id, video_level_annotations
                 )
@@ -4230,12 +4239,43 @@ class MainWindow(QMainWindow):
             else:
                 clear_aruco_action = None
             
+            # Add category change submenu
+            if item_data:
+                instance_id = item_data.get('id')
+                current_category = item_data.get('type', 'bee')
+                
+                from PyQt6.QtGui import QAction
+                change_category_menu = menu.addMenu(f"Change Category")
+                
+                # Add actions for each category (except current one)
+                categories = [
+                    ('bee', 'Bee (per-frame)'),
+                    ('hive', 'Hive (video-level)'),
+                    ('chamber', 'Chamber (video-level)'),
+                    ('pollen', 'Pollen (video-level)')
+                ]
+                
+                category_actions = {}
+                for cat_id, cat_label in categories:
+                    if cat_id != current_category:
+                        action = QAction(cat_label, menu)
+                        change_category_menu.addAction(action)
+                        category_actions[action] = cat_id
+                    else:
+                        # Show current category as disabled
+                        action = QAction(f"{cat_label} (current)", menu)
+                        action.setEnabled(False)
+                        change_category_menu.addAction(action)
+            else:
+                category_actions = {}
+            
             delete_action = menu.addAction("Delete Instance")
         else:
             # For multiple selection, only show delete
             delete_action = menu.addAction(f"Delete {len(selected_items)} Instances")
             edit_id_action = None
             clear_aruco_action = None
+            category_actions = {}
         
         # Add propagate options if not at last frame
         propagate_action = None
@@ -4264,6 +4304,16 @@ class MainWindow(QMainWindow):
             if item_data:
                 instance_id = item_data.get('id')
                 self.clear_instance_aruco_association(instance_id)
+        elif len(selected_items) == 1 and action in category_actions:
+            # Handle category change
+            new_category = category_actions[action]
+            item = selected_items[0]
+            item_data = item.data(Qt.ItemDataRole.UserRole)
+            if item_data:
+                instance_id = item_data.get('id')
+                self.canvas.change_instance_category(instance_id, new_category)
+                # Update the instance list to reflect the change
+                self._schedule_instance_list_update()
         elif action == delete_action:
             if len(selected_items) == 1:
                 self.delete_selected_instance()
@@ -5065,9 +5115,9 @@ class MainWindow(QMainWindow):
             )
             return
         
-        # Filter to only bee instances (don't delete hive/chamber)
+        # Filter to only bee instances (don't delete hive/chamber/pollen)
         bee_annotations = [a for a in annotations if a.get('category', 'bee') == 'bee']
-        other_annotations = [a for a in annotations if a.get('category', 'bee') in ('chamber', 'hive')]
+        other_annotations = [a for a in annotations if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
         
         if not bee_annotations:
             QMessageBox.information(
@@ -5093,7 +5143,7 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
-            # Keep only non-bee annotations (hive/chamber)
+            # Keep only non-bee annotations (hive/chamber/pollen)
             self.canvas.set_annotations(other_annotations)
             self.update_instance_list_from_canvas()
             
@@ -5977,11 +6027,11 @@ class MainWindow(QMainWindow):
                     # Get frame index within video
                     frame_idx_in_video = self._get_frame_idx_in_video(self.current_frame_idx)
 
-                    # Split per-frame (bee) vs video-level (chamber/hive)
+                    # Split per-frame (bee) vs video-level (chamber/hive/pollen)
                     bee_annotations = [a for a in annotations
                                        if a.get('category', 'bee') == 'bee']
                     video_level_annotations = [a for a in annotations
-                                               if a.get('category', 'bee') in ('chamber', 'hive')]
+                                               if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
 
                     # Save bee annotations per-frame
                     self.annotation_manager.save_frame_annotations(
@@ -5989,8 +6039,8 @@ class MainWindow(QMainWindow):
                         frame_idx_in_video, bee_annotations
                     )
 
-                    # Always save chamber/hive video-level annotations (even if empty, to delete files)
-                    # This ensures that when all hive/chamber instances are deleted, the change is saved
+                    # Always save chamber/hive/pollen video-level annotations (even if empty, to delete files)
+                    # This ensures that when all hive/chamber/pollen instances are deleted, the change is saved
                     self.annotation_manager.save_video_annotations(
                         self.project_path, self.current_video_id, video_level_annotations
                     )
@@ -7776,29 +7826,46 @@ class MainWindow(QMainWindow):
         
         self._run_hive_chamber_inference_impl(model, 'chamber', "Chamber")
     
-    def run_hive_chamber_both(self):
-        """Run both hive and chamber detection on the current frame"""
-        hive_model = self.hive_chamber_toolbar.get_hive_model()
-        chamber_model = self.hive_chamber_toolbar.get_chamber_model()
-        
-        if hive_model is None or chamber_model is None:
+    def run_pollen_inference(self):
+        """Run YOLO pollen detection on the current frame"""
+        model = self.hive_chamber_toolbar.get_pollen_model()
+        if model is None:
             QMessageBox.warning(
-                self, "Models Not Loaded",
-                "Please load both Hive and Chamber models first."
+                self, "No Model",
+                "Please load a Pollen detection model first."
             )
             return
         
-        # Run both models
-        self._run_hive_chamber_inference_impl(hive_model, 'hive', "Hive", show_dialog=False)
-        self._run_hive_chamber_inference_impl(chamber_model, 'chamber', "Chamber", show_dialog=True)
+        self._run_hive_chamber_inference_impl(model, 'pollen', "Pollen")
+    
+    def run_hive_chamber_both(self):
+        """Run hive, chamber, and pollen detection (whichever models are loaded)"""
+        hive_model = self.hive_chamber_toolbar.get_hive_model()
+        chamber_model = self.hive_chamber_toolbar.get_chamber_model()
+        pollen_model = self.hive_chamber_toolbar.get_pollen_model()
+        
+        if hive_model is None and chamber_model is None and pollen_model is None:
+            QMessageBox.warning(
+                self, "Models Not Loaded",
+                "Please load at least one model (Hive, Chamber, or Pollen) first."
+            )
+            return
+        
+        # Run all loaded models
+        if hive_model is not None:
+            self._run_hive_chamber_inference_impl(hive_model, 'hive', "Hive", show_dialog=False)
+        if chamber_model is not None:
+            self._run_hive_chamber_inference_impl(chamber_model, 'chamber', "Chamber", show_dialog=False)
+        if pollen_model is not None:
+            self._run_hive_chamber_inference_impl(pollen_model, 'pollen', "Pollen", show_dialog=True)
     
     def _run_hive_chamber_inference_impl(self, model, category, display_name, show_dialog=True):
-        """Implementation of hive/chamber inference
+        """Implementation of hive/chamber/pollen inference
         
         Args:
             model: The YOLO model to use
-            category: 'hive' or 'chamber'
-            display_name: Display name for messages ("Hive" or "Chamber")
+            category: 'hive', 'chamber', or 'pollen'
+            display_name: Display name for messages ("Hive", "Chamber", or "Pollen")
             show_dialog: Whether to show completion dialog
         """
         if not self.frames or self.current_frame_idx >= len(self.frames):
@@ -7908,7 +7975,7 @@ class MainWindow(QMainWindow):
             # Update next ID for all categories of this video to avoid future conflicts
             if self.current_video_id:
                 new_next_id = next_id + len(detections)
-                for cat in ['bee', 'hive', 'chamber']:
+                for cat in ['bee', 'hive', 'chamber', 'pollen']:
                     cat_key = f"{self.current_video_id}_{cat}"
                     # Update to the max of current stored value or new value
                     if cat_key in self.video_next_mask_id:
@@ -9949,12 +10016,12 @@ class MainWindow(QMainWindow):
                     bee_annotations = [a for a in annotations
                                        if a.get('category', 'bee') == 'bee']
                     video_level_annotations = [a for a in annotations
-                                               if a.get('category', 'bee') in ('chamber', 'hive')]
+                                               if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
                     self.annotation_manager.save_frame_annotations(
                         self.project_path, self.current_video_id,
                         frame_idx_in_video, bee_annotations
                     )
-                    # Always save chamber/hive video-level (even if empty, to delete files)
+                    # Always save chamber/hive/pollen video-level (even if empty, to delete files)
                     self.annotation_manager.save_video_annotations(
                         self.project_path, self.current_video_id, video_level_annotations
                     )

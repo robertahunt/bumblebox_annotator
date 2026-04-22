@@ -9,20 +9,23 @@ from pathlib import Path
 
 
 class HiveChamberToolbar(QWidget):
-    """Toolbar for Hive and Chamber YOLO model inference"""
+    """Toolbar for Hive, Chamber, and Pollen YOLO model inference"""
     
     # Signals for running inference
     hive_inference_requested = pyqtSignal()  # Signal to request hive inference on current frame
     chamber_inference_requested = pyqtSignal()  # Signal to request chamber inference on current frame
-    both_inference_requested = pyqtSignal()  # Signal to run both models on current frame
+    pollen_inference_requested = pyqtSignal()  # Signal to request pollen inference on current frame
+    both_inference_requested = pyqtSignal()  # Signal to run all three models on current frame
     
-    def __init__(self, parent=None, hive_checkpoint_path=None, chamber_checkpoint_path=None):
+    def __init__(self, parent=None, hive_checkpoint_path=None, chamber_checkpoint_path=None, pollen_checkpoint_path=None):
         super().__init__(parent)
         
         self.hive_model_path = None
         self.hive_model = None
         self.chamber_model_path = None
         self.chamber_model = None
+        self.pollen_model_path = None
+        self.pollen_model = None
         
         self.init_ui()
         
@@ -31,6 +34,8 @@ class HiveChamberToolbar(QWidget):
             self._load_hive_checkpoint_from_path(hive_checkpoint_path)
         if chamber_checkpoint_path:
             self._load_chamber_checkpoint_from_path(chamber_checkpoint_path)
+        if pollen_checkpoint_path:
+            self._load_pollen_checkpoint_from_path(pollen_checkpoint_path)
         
     def init_ui(self):
         """Initialize UI"""
@@ -39,7 +44,7 @@ class HiveChamberToolbar(QWidget):
         layout.setSpacing(10)
         
         # Section label
-        layout.addWidget(QLabel("<b>Hive & Chamber Detection:</b>"))
+        layout.addWidget(QLabel("<b>Hive/Chamber/Pollen Detection:</b>"))
         
         # === Hive Model Section ===
         
@@ -87,12 +92,35 @@ class HiveChamberToolbar(QWidget):
         # Separator
         layout.addWidget(self.create_separator())
         
-        # === Run Both Button ===
+        # === Pollen Model Section ===
         
-        # Run both button
-        self.both_inference_btn = QPushButton("Run Both")
-        self.both_inference_btn.setToolTip("Run both hive and chamber detection on the current frame")
-        self.both_inference_btn.setEnabled(False)  # Disabled until both models are loaded
+        # Load pollen model button
+        self.load_pollen_btn = QPushButton("Load Pollen Model...")
+        self.load_pollen_btn.setToolTip("Load a trained YOLO pollen detection model (.pt file)")
+        self.load_pollen_btn.clicked.connect(self.load_pollen_checkpoint)
+        layout.addWidget(self.load_pollen_btn)
+        
+        # Pollen model status label
+        self.pollen_status_label = QLabel("Not loaded")
+        self.pollen_status_label.setStyleSheet("color: gray; font-style: italic;")
+        layout.addWidget(self.pollen_status_label)
+        
+        # Run pollen inference button
+        self.pollen_inference_btn = QPushButton("Run Pollen")
+        self.pollen_inference_btn.setToolTip("Run pollen detection on the current frame")
+        self.pollen_inference_btn.setEnabled(False)  # Disabled until model is loaded
+        self.pollen_inference_btn.clicked.connect(self.on_pollen_inference_requested)
+        layout.addWidget(self.pollen_inference_btn)
+        
+        # Separator
+        layout.addWidget(self.create_separator())
+        
+        # === Run All Button ===
+        
+        # Run all button
+        self.both_inference_btn = QPushButton("Run All")
+        self.both_inference_btn.setToolTip("Run all loaded models (hive, chamber, pollen) on the current frame")
+        self.both_inference_btn.setEnabled(False)  # Disabled until at least one model is loaded
         self.both_inference_btn.clicked.connect(self.on_both_inference_requested)
         layout.addWidget(self.both_inference_btn)
         
@@ -227,10 +255,73 @@ class HiveChamberToolbar(QWidget):
             else:
                 print(f"Failed to load chamber model: {str(e)}")
     
+    def load_pollen_checkpoint(self):
+        """Load a YOLO pollen checkpoint file via file dialog"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select YOLO Pollen Checkpoint",
+            str(Path.home()),
+            "PyTorch Model Files (*.pt);;All Files (*)"
+        )
+        
+        if not file_path:
+            return
+        
+        self._load_pollen_checkpoint_from_path(file_path, show_dialogs=True)
+    
+    def _load_pollen_checkpoint_from_path(self, file_path, show_dialogs=False):
+        """Load a YOLO pollen checkpoint from a file path"""
+        try:
+            # Import ultralytics YOLO
+            from ultralytics import YOLO
+            
+            # Load the model
+            model = YOLO(file_path)
+            
+            # Verify it's a segmentation model
+            if not hasattr(model, 'predictor') or 'segment' not in str(model.task):
+                raise ValueError("Model is not a segmentation model. Please load a YOLO segmentation model (trained with -seg variant).")
+            
+            # Store model
+            self.pollen_model = model
+            self.pollen_model_path = Path(file_path)
+            
+            # Update UI
+            model_name = self.pollen_model_path.name
+            self.pollen_status_label.setText(f"✓ {model_name}")
+            self.pollen_status_label.setStyleSheet("color: green;")
+            self.pollen_inference_btn.setEnabled(True)
+            
+            # Enable "Run All" button if any models are loaded
+            self._update_both_button()
+            
+            if show_dialogs:
+                QMessageBox.information(
+                    self,
+                    "Pollen Model Loaded",
+                    f"Successfully loaded YOLO pollen model:\n{model_name}\n\n"
+                    f"Task: {model.task}\n"
+                    f"Ready for inference!"
+                )
+            else:
+                print(f"Pollen YOLO loaded successfully: {model_name} (Task: {model.task})")
+                
+        except Exception as e:
+            if show_dialogs:
+                QMessageBox.critical(
+                    self,
+                    "Load Failed",
+                    f"Failed to load YOLO pollen model:\n{str(e)}"
+                )
+            else:
+                print(f"Failed to load pollen model: {str(e)}")
+    
     def _update_both_button(self):
-        """Update the 'Run Both' button based on whether both models are loaded"""
-        both_loaded = self.hive_model is not None and self.chamber_model is not None
-        self.both_inference_btn.setEnabled(both_loaded)
+        """Update the 'Run All' button based on whether any models are loaded"""
+        any_loaded = (self.hive_model is not None or 
+                     self.chamber_model is not None or 
+                     self.pollen_model is not None)
+        self.both_inference_btn.setEnabled(any_loaded)
         
     def on_hive_inference_requested(self):
         """Handle hive inference button click"""
@@ -239,9 +330,13 @@ class HiveChamberToolbar(QWidget):
     def on_chamber_inference_requested(self):
         """Handle chamber inference button click"""
         self.chamber_inference_requested.emit()
+    
+    def on_pollen_inference_requested(self):
+        """Handle pollen inference button click"""
+        self.pollen_inference_requested.emit()
         
     def on_both_inference_requested(self):
-        """Handle run both button click"""
+        """Handle run all button click"""
         self.both_inference_requested.emit()
     
     def get_hive_model(self):
@@ -252,6 +347,10 @@ class HiveChamberToolbar(QWidget):
         """Get the loaded chamber model"""
         return self.chamber_model
     
+    def get_pollen_model(self):
+        """Get the loaded pollen model"""
+        return self.pollen_model
+    
     def is_hive_model_loaded(self):
         """Check if hive model is loaded"""
         return self.hive_model is not None
@@ -259,3 +358,7 @@ class HiveChamberToolbar(QWidget):
     def is_chamber_model_loaded(self):
         """Check if chamber model is loaded"""
         return self.chamber_model is not None
+    
+    def is_pollen_model_loaded(self):
+        """Check if pollen model is loaded"""
+        return self.pollen_model is not None

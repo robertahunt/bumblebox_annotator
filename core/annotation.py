@@ -177,7 +177,7 @@ class AnnotationManager:
         self.project_info = {}
         self.frame_annotations = OrderedDict()  # LRU cache: frame_idx -> list of annotations
         self.max_cache_size = max_cache_size  # Maximum frames to keep in memory
-        self.class_names = ['bee', 'hive', 'chamber']  # Multi-category support
+        self.class_names = ['bee', 'hive', 'chamber', 'pollen']  # Multi-category support
         self.unsaved_changes = False
         self.image_width = 0
         self.image_height = 0
@@ -206,7 +206,7 @@ class AnnotationManager:
             data = json.load(f)
             
         self.project_info = data.get('project_info', {})
-        self.class_names = data.get('classes', ['bee', 'hive', 'chamber'])
+        self.class_names = data.get('classes', ['bee', 'hive', 'chamber', 'pollen'])
         
         # Load frame annotations into LRU cache (only recent frames)
         self.frame_annotations = OrderedDict()
@@ -1112,18 +1112,19 @@ class AnnotationManager:
         return output_path
 
     def save_video_annotations(self, project_path, video_id, annotations):
-        """Save video-level annotations (chamber and hive) shared across all frames.
+        """Save video-level annotations (chamber, hive, and pollen) shared across all frames.
 
-        Chamber and hive are stored in **separate** PNG files so their pixels can
+        Chamber, hive, and pollen are stored in **separate** PNG files so their pixels can
         overlap without one overwriting the other:
             video_annotations_chamber.png  — chamber instance IDs
             video_annotations_hive.png     — hive instance IDs
+            video_annotations_pollen.png   — pollen instance IDs
             video_annotations.json         — metadata for all instances
 
         Args:
             project_path: Path to project directory
             video_id: Video identifier
-            annotations: List of annotation dicts (category='chamber' or 'hive')
+            annotations: List of annotation dicts (category='chamber', 'hive', or 'pollen')
         """
         import cv2
         import tempfile
@@ -1146,7 +1147,7 @@ class AnnotationManager:
                                   if ann.get('bbox_only', False) or 'mask' not in ann]
 
         # Write one PNG per category so they never stomp each other's pixels
-        for category in ('chamber', 'hive'):
+        for category in ('chamber', 'hive', 'pollen'):
             cat_anns = [ann for ann in mask_annotations
                         if ann.get('category', 'chamber') == category]
             png_file = png_dir / f'video_annotations_{category}.png'
@@ -1227,10 +1228,10 @@ class AnnotationManager:
             raise e
 
     def load_video_annotations(self, project_path, video_id):
-        """Load video-level annotations (chamber and hive) shared across all frames.
+        """Load video-level annotations (chamber, hive, and pollen) shared across all frames.
 
         Loads per-category PNGs (video_annotations_chamber.png /
-        video_annotations_hive.png).  Falls back to the legacy single
+        video_annotations_hive.png / video_annotations_pollen.png).  Falls back to the legacy single
         video_annotations.png if per-category files are absent.
 
         Args:
@@ -1271,7 +1272,7 @@ class AnnotationManager:
 
         # Load per-category mask PNGs
         category_masks = {}
-        for category in ('chamber', 'hive'):
+        for category in ('chamber', 'hive', 'pollen'):
             cat_png = png_dir / f'video_annotations_{category}.png'
             if cat_png.exists():
                 category_masks[category] = cv2.imread(str(cat_png), cv2.IMREAD_UNCHANGED)
