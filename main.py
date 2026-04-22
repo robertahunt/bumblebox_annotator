@@ -21,10 +21,11 @@ from gui.main_window import MainWindow
 def parse_args():
     parser = argparse.ArgumentParser(description='Bee Annotator - Video Instance Segmentation Tool')
     parser.add_argument('--video', type=str, help='Path to video file to load on startup')
-    parser.add_argument('--project', type=str, help='Path to project directory')
+    parser.add_argument('--project', type=str, help='Path to project directory to load on startup')
     parser.add_argument('--sam2-checkpoint', type=str, help='Path to SAM2 checkpoint (.pt) to load on startup')
     parser.add_argument('--coarse-yolo-checkpoint', type=str, help='Path to coarse-grained YOLO checkpoint (.pt) to load on startup')
-    parser.add_argument('--fine-yolo-checkpoint', type=str, help='Path to fine-grained YOLO checkpoint (.pt) for refinement to load on startup')
+    parser.add_argument('--bbox-checkpoint', type=str, help='Path to YOLO BBox detection checkpoint (.pt) to load on startup')
+    parser.add_argument('--instance-focused-checkpoint', type=str, help='Path to instance-focused YOLO checkpoint (.pt) to load on startup')
     return parser.parse_args()
 
 
@@ -44,7 +45,8 @@ def main():
     window = MainWindow(
         sam2_checkpoint=args.sam2_checkpoint,
         coarse_yolo_checkpoint=args.coarse_yolo_checkpoint,
-        fine_yolo_checkpoint=args.fine_yolo_checkpoint
+        bbox_checkpoint=args.bbox_checkpoint,
+        instance_focused_checkpoint=args.instance_focused_checkpoint
     )
     
     # Load video if specified

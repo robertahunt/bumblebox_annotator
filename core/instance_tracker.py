@@ -18,6 +18,9 @@ class Detection:
     confidence: Optional[float] = None  # Detection confidence (None for manual)
     source: str = 'unknown'  # 'yolo', 'sam2', 'manual', 'propagated'
     class_id: int = 0  # Class ID (0 for bee)
+    class_name: str = 'bee'  # Class name
+    instance_id: Optional[int] = None  # Track ID (if assigned by tracker)
+    gt_id: Optional[Any] = None  # Ground truth ID (for validation with GT detections)
 
 
 @dataclass
@@ -68,13 +71,16 @@ class InstanceTracker:
         self.config = {
             'conf_threshold_high': 0.5,  # Confidence for high-conf detection pool
             'conf_threshold_low': 0.1,   # Confidence for low-conf detection pool
-            'iou_threshold_high': 0.3,   # High-confidence match IoU threshold (lowered for better matching)
-            'iou_threshold_low': 0.2,    # Low-confidence match IoU threshold (lowered for better matching)
+            'iou_threshold_high': 0.15,  # High-confidence match IoU threshold (lowered for better matching)
+            'iou_threshold_low': 0.1,    # Low-confidence match IoU threshold (lowered for better matching)
             'max_frames_lost': 10,       # Frames before track deletion (increased to be more forgiving)
             'min_detection_conf': 0.25,  # Minimum YOLO confidence
             'use_mask_iou': True,        # Use mask IoU vs box IoU
             'match_strategy': 'hungarian',  # 'hungarian' or 'greedy'
             'preserve_manual_ids': True, # Don't reassign manual annotations
+            'use_centroid_distance': True,  # Use centroid distance in addition to IoU
+            'max_centroid_distance': 600,  # Maximum centroid distance (pixels) to consider a match
+            'distance_weight': 0.5,  # Weight for distance vs IoU (0=only IoU, 1=only distance)
         }
         
         if config:
@@ -256,13 +262,18 @@ class InstanceTracker:
         if not detections or not tracks:
             return [], list(range(len(detections))), set(range(len(tracks)))
         
-        # Compute IoU matrix
-        iou_matrix = self._compute_iou_matrix(detections, tracks, use_mask_iou)
+        # Compute cost matrix (combined IoU + centroid distance if enabled)
+        if self.config['use_centroid_distance']:
+            cost_matrix = self._compute_combined_cost_matrix(detections, tracks, use_mask_iou)
+            iou_matrix = self._compute_iou_matrix(detections, tracks, use_mask_iou)
+        else:
+            iou_matrix = self._compute_iou_matrix(detections, tracks, use_mask_iou)
+            cost_matrix = 1.0 - iou_matrix
         
         # Apply Hungarian matching
         if self.config['match_strategy'] == 'hungarian':
             matched, unmatched_d, unmatched_t = self._hungarian_matching(
-                iou_matrix, iou_threshold
+                cost_matrix, iou_matrix, iou_threshold
             )
         else:
             matched, unmatched_d, unmatched_t = self._greedy_matching(
@@ -299,43 +310,97 @@ class InstanceTracker:
         
         return iou_matrix
     
+    def _compute_combined_cost_matrix(
+        self,
+        detections: List[Detection],
+        tracks: List[Track],
+        use_mask_iou: bool
+    ) -> np.ndarray:
+        """
+        Compute combined cost matrix using IoU and centroid distance.
+        Lower cost = better match.
+        
+        Returns:
+            cost_matrix: (N_detections, N_tracks) array of costs
+        """
+        n_det = len(detections)
+        n_track = len(tracks)
+        
+        # Compute IoU matrix
+        iou_matrix = self._compute_iou_matrix(detections, tracks, use_mask_iou)
+        
+        if not self.config['use_centroid_distance']:
+            # Standard IoU-only cost
+            return 1.0 - iou_matrix
+        
+        # Compute centroid distances
+        distance_matrix = np.zeros((n_det, n_track), dtype=np.float32)
+        max_dist = self.config['max_centroid_distance']
+        
+        for i, det in enumerate(detections):
+            det_center = self._get_bbox_center(det.bbox)
+            for j, track in enumerate(tracks):
+                track_center = self._get_bbox_center(track.bbox)
+                distance = np.linalg.norm(det_center - track_center)
+                
+                # Normalize distance (0 = same position, 1 = max_centroid_distance away)
+                distance_matrix[i, j] = min(distance / max_dist, 1.0)
+        
+        # Combine IoU and distance costs
+        # cost_iou: 0 (perfect overlap) to 1 (no overlap)
+        # cost_distance: 0 (same position) to 1 (far away)
+        weight = self.config['distance_weight']
+        cost_iou = 1.0 - iou_matrix
+        cost_distance = distance_matrix
+        
+        # Combined cost: weighted average
+        combined_cost = (1 - weight) * cost_iou + weight * cost_distance
+        
+        return combined_cost
+    
     def _hungarian_matching(
         self,
+        cost_matrix: np.ndarray,
         iou_matrix: np.ndarray,
-        threshold: float
+        iou_threshold: float
     ) -> Tuple[List[Tuple[int, int]], List[int], set]:
         """
-        Perform Hungarian algorithm matching.
+        Perform Hungarian algorithm matching using cost matrix, filter by IoU.
+        
+        Args:
+            cost_matrix: Cost matrix to minimize (lower = better match)
+            iou_matrix: IoU matrix for threshold filtering
+            iou_threshold: Minimum IoU to accept a match
         
         Returns:
             matches: List of (detection_idx, track_idx) tuples
             unmatched_detections: List of detection indices
             unmatched_tracks: Set of track indices
         """
-        # Cost matrix (minimize 1 - IoU)
-        cost_matrix = 1.0 - iou_matrix
-        
-        # Run Hungarian algorithm
+        # Run Hungarian algorithm on cost matrix
         det_indices, track_indices = linear_sum_assignment(cost_matrix)
         
-        # Filter by threshold
+        # Filter by IoU threshold
         matches = []
         matched_dets = set()
         matched_tracks = set()
         
         for d, t in zip(det_indices, track_indices):
             iou_value = iou_matrix[d, t]
-            if iou_value >= threshold:
+            cost_value = cost_matrix[d, t]
+            
+            # Accept match if IoU is above threshold
+            if iou_value >= iou_threshold:
                 matches.append((d, t))
                 matched_dets.add(d)
                 matched_tracks.add(t)
-                print(f"  Matched detection {d} to track {t} with IoU={iou_value:.3f}")
+                print(f"  Matched detection {d} to track {t} with IoU={iou_value:.3f}, cost={cost_value:.3f}")
             else:
-                print(f"  Rejected match: detection {d} to track {t} with IoU={iou_value:.3f} (below threshold {threshold})")
+                print(f"  Rejected match: detection {d} to track {t} with IoU={iou_value:.3f}, cost={cost_value:.3f} (IoU below threshold {iou_threshold})")
         
         # Find unmatched
-        unmatched_dets = [i for i in range(iou_matrix.shape[0]) if i not in matched_dets]
-        unmatched_tracks = set(range(iou_matrix.shape[1])) - matched_tracks
+        unmatched_dets = [i for i in range(cost_matrix.shape[0]) if i not in matched_dets]
+        unmatched_tracks = set(range(cost_matrix.shape[1])) - matched_tracks
         
         return matches, unmatched_dets, unmatched_tracks
     
@@ -404,6 +469,18 @@ class InstanceTracker:
             return 0.0
         
         return intersection / union
+    
+    @staticmethod
+    def _get_bbox_center(bbox: np.ndarray) -> np.ndarray:
+        """
+        Get the center point of a bounding box [x1, y1, x2, y2].
+        
+        Returns:
+            center: [cx, cy] numpy array
+        """
+        cx = (bbox[0] + bbox[2]) / 2.0
+        cy = (bbox[1] + bbox[3]) / 2.0
+        return np.array([cx, cy], dtype=np.float32)
     
     @staticmethod
     def _mask_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:

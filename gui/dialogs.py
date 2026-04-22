@@ -265,3 +265,74 @@ class TrainingDialog(QDialog):
             'auto_retrain': self.auto_retrain_check.isChecked(),
             'retrain_interval': self.retrain_interval_spin.value()
         }
+
+
+class EditBeeIdDialog(QDialog):
+    """Dialog for editing bee instance ID with option to propagate through video"""
+    
+    def __init__(self, parent=None, current_id=None, existing_ids=None, has_next_frames=False):
+        super().__init__(parent)
+        self.current_id = current_id
+        self.existing_ids = existing_ids or []
+        self.has_next_frames = has_next_frames
+        self.propagate_through_video = False  # Flag to indicate if user wants to propagate
+        
+        self.setWindowTitle("Edit Bee ID")
+        self.setModal(True)
+        
+        self.init_ui()
+        
+    def init_ui(self):
+        """Initialize UI"""
+        layout = QVBoxLayout(self)
+        
+        # Info label
+        info_label = QLabel(f"Current Bee ID: {self.current_id}")
+        layout.addWidget(info_label)
+        
+        # ID input
+        id_layout = QHBoxLayout()
+        id_layout.addWidget(QLabel("New Bee ID:"))
+        
+        self.id_spin = QSpinBox()
+        self.id_spin.setMinimum(1)
+        self.id_spin.setMaximum(9999)
+        self.id_spin.setValue(self.current_id)
+        id_layout.addWidget(self.id_spin)
+        
+        layout.addLayout(id_layout)
+        
+        # Buttons
+        button_layout = QVBoxLayout()
+        
+        # OK button (update current frame only)
+        ok_btn = QPushButton("Update Current Frame Only")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self.accept)
+        button_layout.addWidget(ok_btn)
+        
+        # Propagate button (update current + all subsequent frames)
+        if self.has_next_frames:
+            propagate_btn = QPushButton("Update Current Frame + All Subsequent Frames")
+            propagate_btn.clicked.connect(self.accept_with_propagation)
+            button_layout.addWidget(propagate_btn)
+        
+        # Cancel button
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+        
+        layout.addLayout(button_layout)
+        
+    def accept_with_propagation(self):
+        """Accept dialog and set flag to propagate through video"""
+        self.propagate_through_video = True
+        self.accept()
+        
+    def get_new_id(self):
+        """Get the new bee ID"""
+        return self.id_spin.value()
+    
+    def should_propagate(self):
+        """Return whether to propagate through video"""
+        return self.propagate_through_video

@@ -2,7 +2,7 @@
 SAM2 toolbar for segmentation and propagation
 """
 
-from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QPushButton, QToolButton,
+from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QToolButton,
                              QLabel, QFileDialog, QMessageBox, QButtonGroup)
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
@@ -17,6 +17,8 @@ class SAM2Toolbar(QWidget):
     propagate_to_selected_requested = pyqtSignal()
     unload_requested = pyqtSignal()  # Signal to unload SAM2 checkpoint
     sam2_loaded = pyqtSignal(object)  # Signal when SAM2 is loaded (emits SAM2Integrator)
+    finetune_requested = pyqtSignal()  # Signal when fine-tuning is requested
+    run_on_bbox_requested = pyqtSignal()  # Signal to run SAM2 on selected instance's bbox
     
     def __init__(self, parent=None, checkpoint_path=None):
         super().__init__(parent)
@@ -31,79 +33,105 @@ class SAM2Toolbar(QWidget):
             self._load_checkpoint_from_path(checkpoint_path)
         
     def init_ui(self):
-        """Initialize UI"""
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(10)
+        """Initialize UI with two rows"""
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(5)
+        
+        # First row: Model loading and tools
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
         
         # SAM2 section label
-        layout.addWidget(QLabel("<b>SAM2:</b>"))
+        row1.addWidget(QLabel("<b>SAM2:</b>"))
         
         # Load checkpoint button
         self.load_checkpoint_btn = QPushButton("Load Checkpoint...")
         self.load_checkpoint_btn.setToolTip("Load SAM2 checkpoint file (.pt)")
         self.load_checkpoint_btn.clicked.connect(self.load_checkpoint)
-        layout.addWidget(self.load_checkpoint_btn)
+        row1.addWidget(self.load_checkpoint_btn)
         
         # Unload checkpoint button
         self.unload_checkpoint_btn = QPushButton("Unload")
         self.unload_checkpoint_btn.setToolTip("Unload SAM2 checkpoint to free memory")
         self.unload_checkpoint_btn.clicked.connect(self.unload_checkpoint)
         self.unload_checkpoint_btn.setEnabled(False)
-        layout.addWidget(self.unload_checkpoint_btn)
+        row1.addWidget(self.unload_checkpoint_btn)
         
         # Checkpoint status label
         self.checkpoint_status_label = QLabel("No model loaded")
         self.checkpoint_status_label.setStyleSheet("color: gray; font-style: italic;")
-        layout.addWidget(self.checkpoint_status_label)
+        row1.addWidget(self.checkpoint_status_label)
         
         # Separator
-        layout.addWidget(self.create_separator())
+        row1.addWidget(self.create_separator())
         
         # Tool buttons (only enabled when model is loaded)
         self.button_group = QButtonGroup(self)
         self.button_group.setExclusive(True)  # Exclusive so buttons stay checked
         
-        layout.addWidget(QLabel("Tools:"))
+        row1.addWidget(QLabel("Tools:"))
         
         self.point_btn = self.create_tool_button("Point", "sam2_prompt")
         self.point_btn.setToolTip("SAM2 point prompting: Left-click for positive, Right-click for negative")
         self.point_btn.setEnabled(False)
-        layout.addWidget(self.point_btn)
+        row1.addWidget(self.point_btn)
         
         self.box_btn = self.create_tool_button("Box", "sam2_box")
         self.box_btn.setToolTip("SAM2 box prompting: Click and drag to draw a bounding box")
         self.box_btn.setEnabled(False)
-        layout.addWidget(self.box_btn)
+        row1.addWidget(self.box_btn)
         
-        # Separator
-        layout.addWidget(self.create_separator())
+        row1.addStretch()
+        main_layout.addLayout(row1)
         
-        # Action buttons
-        layout.addWidget(QLabel("Actions:"))
+        # Second row: Actions and refinement
+        row2 = QHBoxLayout()
+        row2.setSpacing(10)
+        
+        row2.addWidget(QLabel("Actions:"))
         
         self.clear_prompts_btn = QToolButton()
         self.clear_prompts_btn.setText("Clear Points")
         self.clear_prompts_btn.setToolTip("Clear all SAM2 prompt points for the current instance")
         self.clear_prompts_btn.setEnabled(False)
         self.clear_prompts_btn.clicked.connect(self.on_clear_prompts)
-        layout.addWidget(self.clear_prompts_btn)
+        row2.addWidget(self.clear_prompts_btn)
+        
+        self.run_on_bbox_btn = QToolButton()
+        self.run_on_bbox_btn.setText("Run on Instance Bbox")
+        self.run_on_bbox_btn.setToolTip("Run SAM2 on the selected instance's bounding box to refine the mask")
+        self.run_on_bbox_btn.setEnabled(False)
+        self.run_on_bbox_btn.clicked.connect(self.on_run_on_bbox)
+        row2.addWidget(self.run_on_bbox_btn)
+        
+        row2.addWidget(self.create_separator())
         
         self.propagate_btn = QToolButton()
         self.propagate_btn.setText("Propagate to Next →")
         self.propagate_btn.setToolTip("Propagate current frame masks to next frame using SAM2")
         self.propagate_btn.setEnabled(False)
         self.propagate_btn.clicked.connect(self.on_propagate)
-        layout.addWidget(self.propagate_btn)
+        row2.addWidget(self.propagate_btn)
         
         self.propagate_to_selected_btn = QToolButton()
         self.propagate_to_selected_btn.setText("Propagate to Selected →→")
         self.propagate_to_selected_btn.setToolTip("Propagate through all frames until next training/validation frame")
         self.propagate_to_selected_btn.setEnabled(False)
         self.propagate_to_selected_btn.clicked.connect(self.on_propagate_to_selected)
-        layout.addWidget(self.propagate_to_selected_btn)
+        row2.addWidget(self.propagate_to_selected_btn)
         
-        layout.addStretch()
+        row2.addWidget(self.create_separator())
+        
+        # Fine-tune button
+        self.finetune_btn = QPushButton("Fine-tune SAM2")
+        self.finetune_btn.setToolTip("Fine-tune SAM2 model on your annotated data")
+        self.finetune_btn.clicked.connect(self.on_finetune_requested)
+        self.finetune_btn.setEnabled(False)
+        row2.addWidget(self.finetune_btn)
+        
+        row2.addStretch()
+        main_layout.addLayout(row2)
         
     def create_tool_button(self, text, tool_name):
         """Create a tool button"""
@@ -179,9 +207,11 @@ class SAM2Toolbar(QWidget):
             self.point_btn.setEnabled(True)
             self.box_btn.setEnabled(True)
             self.clear_prompts_btn.setEnabled(True)
+            self.run_on_bbox_btn.setEnabled(True)
             self.propagate_btn.setEnabled(True)
             self.propagate_to_selected_btn.setEnabled(True)
             self.unload_checkpoint_btn.setEnabled(True)
+            self.finetune_btn.setEnabled(True)
             
             # Emit signal that SAM2 is loaded
             print(f"SAM2Toolbar: Emitting sam2_loaded signal with sam2={sam2}")
@@ -227,6 +257,14 @@ class SAM2Toolbar(QWidget):
         """Handle propagate to selected button"""
         self.propagate_to_selected_requested.emit()
     
+    def on_finetune_requested(self):
+        """Handle fine-tune button"""
+        self.finetune_requested.emit()
+    
+    def on_run_on_bbox(self):
+        """Handle run on bbox button"""
+        self.run_on_bbox_requested.emit()
+    
     def is_checkpoint_loaded(self):
         """Check if a checkpoint is loaded"""
         return self.checkpoint_path is not None
@@ -267,9 +305,11 @@ class SAM2Toolbar(QWidget):
             self.point_btn.setEnabled(False)
             self.box_btn.setEnabled(False)
             self.clear_prompts_btn.setEnabled(False)
+            self.run_on_bbox_btn.setEnabled(False)
             self.propagate_btn.setEnabled(False)
             self.propagate_to_selected_btn.setEnabled(False)
             self.unload_checkpoint_btn.setEnabled(False)
+            self.finetune_btn.setEnabled(False)
             
             QMessageBox.information(
                 self,

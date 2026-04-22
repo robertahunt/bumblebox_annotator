@@ -4,7 +4,7 @@ Image canvas with zoom, pan, and annotation capabilities
 
 import numpy as np
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsTextItem
-from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF
+from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF, QTimer
 from PyQt6.QtGui import (QPixmap, QImage, QPen, QBrush, QColor, QPainter,
                         QTransform, QCursor, QPolygonF, QFont)
 from pathlib import Path
@@ -40,10 +40,20 @@ class ImageCanvas(QGraphicsView):
         # Tool state
         self.current_tool = 'pan'
         self.brush_size = 10
-        self.mask_opacity = 128  # Default opacity for masks (0-255)
+        self.mask_opacity = 64  # Default opacity for masks (0-255) - 25%
         
-        # Annotations - Using integer segmentation format
-        self.combined_mask = None  # Single H×W int32 array with instance IDs
+        # Annotation type - determines which category is being added
+        self.current_annotation_type = 'bee'  # 'bee', 'chamber', or 'hive'
+        
+        # Annotations - Separate masks allow overlapping between bee/chamber/hive
+        self.bee_mask = None  # H×W int32 array with bee instance IDs
+        self.chamber_mask = None  # H×W int32 array with chamber instance IDs
+        self.hive_mask = None  # H×W int32 array with hive instance IDs
+        
+        # Legacy compatibility: provide combined view of all masks (readonly, dynamically generated)
+        self._combined_mask_cache = None
+        self._combined_mask_dirty = True
+        
         self.mask_items = []  # List of QGraphicsPixmapItem for visualization
         self.mask_colors = {}  # Dict mapping instance_id -> (r,g,b) color
         self.next_mask_id = 1  # Counter for assigning unique IDs
@@ -51,6 +61,32 @@ class ImageCanvas(QGraphicsView):
         self.masks_visible = True  # Track mask visibility state
         self.label_items = []  # List of QGraphicsTextItem for instance labels
         self.labels_visible = False  # Track label visibility state
+        self.labels_visible_before_hiding = False  # Remember label state when spacebar is pressed
+        self.annotation_metadata = {}  # Dict mapping instance_id -> metadata dict (for marker data, etc.)
+        
+        # Annotation type visibility and colors
+        self.annotation_type_colors = {
+            'bee': None,  # Random colors for bee instances
+            'chamber': (255, 0, 0),  # Red for chamber
+            'hive': (255, 255, 0)  # Yellow for hive
+        }
+        self.annotation_type_visibility = {
+            'bee': True,
+            'chamber': True,
+            'hive': True
+        }
+        
+        # Performance optimization: cache instance IDs and bounding boxes
+        self._cached_instance_ids = None  # Cached sorted list of instance IDs
+        self._cached_bboxes = {}  # Dict mapping instance_id -> (x, y, w, h)
+        
+        # Performance optimization: cache instance IDs and bounding boxes
+        self._cached_instance_ids = None  # Cached sorted list of instance IDs
+        self._cached_bboxes = {}  # Dict mapping instance_id -> (x, y, w, h)
+        
+        # Performance optimization: cache instance IDs and bounding boxes
+        self._cached_instance_ids = None  # Cached sorted list of instance IDs
+        self._cached_bboxes = {}  # Dict mapping instance_id -> (x, y, w, h)
         
         # Editing isolation - temporary mask for current edit
         self.editing_mask = None  # Binary H×W mask for instance being edited
@@ -58,6 +94,14 @@ class ImageCanvas(QGraphicsView):
         self.editing_mask_item = None  # Visualization item for editing mask
         self._editing_overlay_cache = None  # Cached RGBA overlay for editing mask
         self._is_actively_drawing = False  # Flag to skip expensive updates during drawing
+        
+        # Throttling for brush/eraser to improve performance
+        self._pending_viz_update = False  # Flag indicating viz update is pending
+        self._dirty_pixels = None  # Accumulate dirty pixels for batched update
+        self._viz_update_timer = QTimer()
+        self._viz_update_timer.setSingleShot(True)
+        self._viz_update_timer.setInterval(16)  # ~60fps max update rate
+        self._viz_update_timer.timeout.connect(self._flush_pending_viz_update)
         
         # SAM2 prompts
         self.positive_points = []  # List of (x, y) tuples
@@ -80,6 +124,20 @@ class ImageCanvas(QGraphicsView):
         self.dragging_box = False
         self.dragging_handle = None  # 'tl', 'tr', 'bl', 'br', 'move'
         self.drag_offset = None
+        
+        # View toggles
+        self.show_segmentations = True  # Whether to show segmentation masks
+        self.show_bboxes = False  # Whether to show bounding boxes
+        
+        # Bbox editing (for bbox annotation mode)
+        self.bbox_items_map = {}  # Dict mapping mask_id -> QGraphicsRectItem
+        self.drawing_new_bbox = False  # Whether currently drawing a new bbox
+        self.selected_bbox_id = None  # ID of currently selected bbox
+        self.bbox_handles = []  # Corner handle items for selected bbox
+        self.dragging_bbox = False
+        self.dragging_bbox_handle = None  # 'tl', 'tr', 'bl', 'br', 'move'
+        self.bbox_drag_offset = None
+        self.bbox_original_rect = None  # Original rect before editing
         
         # Undo/redo
         self.history = []
@@ -113,6 +171,11 @@ class ImageCanvas(QGraphicsView):
     
     def hide_masks(self):
         """Temporarily hide all masks"""
+        # Flush any pending updates immediately to avoid lag
+        if self._viz_update_timer.isActive():
+            self._viz_update_timer.stop()
+            self._flush_pending_viz_update()
+        
         self.masks_visible = False
         for item in self.mask_items:
             item.setVisible(False)
@@ -122,10 +185,22 @@ class ImageCanvas(QGraphicsView):
         # Also hide selection border
         if self.selection_border_item:
             self.selection_border_item.setVisible(False)
+        
+        # Remember if labels were visible and hide them too
+        self.labels_visible_before_hiding = self.labels_visible
+        if self.labels_visible:
+            for label_item in self.label_items:
+                label_item.setVisible(False)
+        
         self.masks_visibility_changed.emit(False)
     
     def show_masks(self):
         """Show all masks again"""
+        # Flush any pending updates immediately to avoid lag
+        if self._viz_update_timer.isActive():
+            self._viz_update_timer.stop()
+            self._flush_pending_viz_update()
+        
         self.masks_visible = True
         for item in self.mask_items:
             item.setVisible(True)
@@ -135,34 +210,70 @@ class ImageCanvas(QGraphicsView):
         # Show selection border if there's a selection
         if self.selection_border_item and self.selected_mask_idx >= 0:
             self.selection_border_item.setVisible(True)
+        
+        # Restore labels if they were visible before hiding
+        if self.labels_visible_before_hiding:
+            for label_item in self.label_items:
+                label_item.setVisible(True)
+        
         self.masks_visibility_changed.emit(True)
         
     def load_image(self, image_path_or_array):
         """Load an image file or numpy array"""
         # Explicitly clear old resources before loading new image
         if self.image_item:
-            self.scene.removeItem(self.image_item)
+            try:
+                if self.image_item.scene() == self.scene:
+                    self.scene.removeItem(self.image_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
             self.image_item = None
         
         # Clear all visualization items
         for item in self.mask_items:
-            self.scene.removeItem(item)
+            try:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
         self.mask_items.clear()
         
         for item in self.label_items:
-            self.scene.removeItem(item)
+            try:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
         self.label_items.clear()
         
         for item in self.prompt_items:
-            self.scene.removeItem(item)
+            try:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
         self.prompt_items.clear()
         
         if self.selection_border_item:
-            self.scene.removeItem(self.selection_border_item)
+            try:
+                if self.selection_border_item.scene() == self.scene:
+                    self.scene.removeItem(self.selection_border_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
             self.selection_border_item = None
         
         if self.editing_mask_item:
-            self.scene.removeItem(self.editing_mask_item)
+            try:
+                if self.editing_mask_item.scene() == self.scene:
+                    self.scene.removeItem(self.editing_mask_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
             self.editing_mask_item = None
         
         # Clear cached overlays to free memory
@@ -216,7 +327,9 @@ class ImageCanvas(QGraphicsView):
         
         # Clear remaining scene items
         self.scene.clear()
-        self.combined_mask = None
+        self.bee_mask = None
+        self.chamber_mask = None
+        self.hive_mask = None
         self.next_mask_id = 1
         self.mask_colors = {}
         self.positive_points = []
@@ -237,7 +350,9 @@ class ImageCanvas(QGraphicsView):
         self.current_image = None
         self.image_path = None
         self.image_item = None
-        self.combined_mask = None  # Single H×W array with integer instance IDs (0=background)
+        self.bee_mask = None
+        self.chamber_mask = None
+        self.hive_mask = None
         self.next_mask_id = 1
         self.mask_items = []  # QGraphicsPixmapItems for visualization 
         self.mask_colors = {}  # Dict mapping instance_id -> (r,g,b) color
@@ -297,6 +412,11 @@ class ImageCanvas(QGraphicsView):
             
     def set_tool(self, tool_name):
         """Set current tool"""
+        # Flush any pending visualization updates when switching tools
+        if self._viz_update_timer.isActive():
+            self._viz_update_timer.stop()
+            self._flush_pending_viz_update()
+        
         self.current_tool = tool_name
         
         if tool_name == 'pan':
@@ -374,8 +494,87 @@ class ImageCanvas(QGraphicsView):
         elif self.current_tool == 'brush' or self.current_tool == 'eraser':
             # Start drawing/erasing
             if event.button() == Qt.MouseButton.LeftButton:
+                # Only check for instance selection if NOT already in editing mode
+                if self.editing_instance_id <= 0:
+                    # If an instance is already selected (from sidebar), start editing it
+                    if self.selected_mask_idx > 0:
+                        # Start editing the selected instance
+                        self.start_editing_instance(self.selected_mask_idx)
+                    else:
+                        # No instance selected yet - check what's under the click
+                        # Check if clicking on a bbox (when bboxes are visible)
+                        clicked_bbox_id = self._get_bbox_at_pos(scene_pos)
+                        if clicked_bbox_id:
+                            # Clicked on a bbox - start editing that instance
+                            self.start_editing_instance(clicked_bbox_id)
+                            self.selected_mask_idx = clicked_bbox_id
+                        else:
+                            # Check if clicking on an existing instance in the active annotation
+                            # type's mask only — don't pick up instances from other types
+                            x, y = int(scene_pos.x()), int(scene_pos.y())
+                            instance_id = self._find_instance_at_point(x, y,
+                                          category=self.current_annotation_type)
+                            
+                            # If clicked on an instance, start editing mode
+                            if instance_id > 0:
+                                self.start_editing_instance(instance_id)
+                                # Update instance list selection
+                                self.selected_mask_idx = instance_id
+                
                 self.is_drawing = True
                 self.last_point = scene_pos
+        
+        elif self.current_tool == 'bbox':
+            # Start drawing new bbox
+            if event.button() == Qt.MouseButton.LeftButton:
+                # If there's a selected instance, check if it already has a bbox
+                if self.selected_mask_idx > 0:
+                    if self.selected_mask_idx in self.bbox_items_map:
+                        # Instance has a bbox - select it for editing
+                        self._select_bbox(self.selected_mask_idx)
+                        # Check if clicking on handle
+                        handle = self._get_bbox_handle_at_pos(scene_pos)
+                        if handle:
+                            self.dragging_bbox_handle = handle
+                            self.dragging_bbox = True
+                            self.bbox_drag_offset = scene_pos
+                        elif self.bbox_items_map[self.selected_mask_idx].rect().contains(scene_pos):
+                            # Clicking inside bbox - start dragging
+                            self.dragging_bbox = True
+                            self.dragging_bbox_handle = 'move'
+                            rect = self.bbox_items_map[self.selected_mask_idx].rect()
+                            self.bbox_drag_offset = QPointF(scene_pos.x() - rect.x(), scene_pos.y() - rect.y())
+                        return
+                    else:
+                        # Instance doesn't have a bbox yet - allow drawing one
+                        self.is_drawing = True
+                        self.drawing_new_bbox = True
+                        self.drawing_start = scene_pos
+                        return
+                
+                # No selected instance - check general bbox interactions
+                # Check if clicking on existing bbox handle
+                if self.selected_bbox_id:
+                    handle = self._get_bbox_handle_at_pos(scene_pos)
+                    if handle:
+                        self.dragging_bbox_handle = handle
+                        self.dragging_bbox = True
+                        self.bbox_drag_offset = scene_pos
+                        return
+                
+                # Check if clicking inside existing bbox
+                bbox_id = self._get_bbox_at_pos(scene_pos)
+                if bbox_id:
+                    self._select_bbox(bbox_id)
+                    self.dragging_bbox = True
+                    self.dragging_bbox_handle = 'move'
+                    rect = self.bbox_items_map[bbox_id].rect()
+                    self.bbox_drag_offset = QPointF(scene_pos.x() - rect.x(), scene_pos.y() - rect.y())
+                else:
+                    # Start drawing new bbox
+                    self.is_drawing = True
+                    self.drawing_new_bbox = True
+                    self.drawing_start = scene_pos
                 
         else:
             super().mousePressEvent(event)
@@ -388,10 +587,32 @@ class ImageCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.pos())
         
         if self.is_drawing:
-            if self.current_tool == 'sam2_box':
+            if self.drawing_new_bbox:
+                # Update bbox preview
+                if self.temp_item:
+                    try:
+                        self.scene.removeItem(self.temp_item)
+                    except RuntimeError:
+                        pass
+                
+                # Draw temporary rectangle
+                from PyQt6.QtWidgets import QGraphicsRectItem
+                from PyQt6.QtGui import QPen, QColor
+                rect = QRectF(self.drawing_start, scene_pos).normalized()
+                self.temp_item = QGraphicsRectItem(rect)
+                pen = QPen(QColor(255, 255, 0))  # Yellow
+                pen.setWidth(3)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                self.temp_item.setPen(pen)
+                self.temp_item.setZValue(150)
+                self.scene.addItem(self.temp_item)
+            elif self.current_tool == 'sam2_box':
                 # Update box preview
                 if self.temp_item:
-                    self.scene.removeItem(self.temp_item)
+                    try:
+                        self.scene.removeItem(self.temp_item)
+                    except RuntimeError:
+                        pass
                     
                 from PyQt6.QtWidgets import QGraphicsRectItem
                 rect = QRectF(self.drawing_start, scene_pos).normalized()
@@ -402,7 +623,10 @@ class ImageCanvas(QGraphicsView):
             elif self.current_tool == 'inference_box':
                 # Update inference box preview
                 if self.temp_item:
-                    self.scene.removeItem(self.temp_item)
+                    try:
+                        self.scene.removeItem(self.temp_item)
+                    except RuntimeError:
+                        pass
                     
                 from PyQt6.QtWidgets import QGraphicsRectItem
                 rect = QRectF(self.drawing_start, scene_pos).normalized()
@@ -438,6 +662,35 @@ class ImageCanvas(QGraphicsView):
                     rect.setBottomRight(scene_pos)
                 self.inference_box_rect = rect.normalized()
                 self._update_inference_box_display()
+        
+        elif self.dragging_bbox and self.show_bboxes:
+            # Handle dragging/resizing bbox
+            if self.dragging_bbox_handle == 'move':
+                # Move entire bbox
+                if self.selected_bbox_id and self.selected_bbox_id in self.bbox_items_map:
+                    rect_item = self.bbox_items_map[self.selected_bbox_id]
+                    rect = rect_item.rect()
+                    new_x = scene_pos.x() - self.bbox_drag_offset.x()
+                    new_y = scene_pos.y() - self.bbox_drag_offset.y()
+                    rect.moveTo(new_x, new_y)
+                    rect_item.setRect(rect)
+                    self._update_bbox_handles()
+            elif self.dragging_bbox_handle in ['tl', 'tr', 'bl', 'br']:
+                # Resize from corner
+                if self.selected_bbox_id and self.selected_bbox_id in self.bbox_items_map:
+                    rect_item = self.bbox_items_map[self.selected_bbox_id]
+                    rect = rect_item.rect()
+                    if self.dragging_bbox_handle == 'tl':
+                        rect.setTopLeft(scene_pos)
+                    elif self.dragging_bbox_handle == 'tr':
+                        rect.setTopRight(scene_pos)
+                    elif self.dragging_bbox_handle == 'bl':
+                        rect.setBottomLeft(scene_pos)
+                    elif self.dragging_bbox_handle == 'br':
+                        rect.setBottomRight(scene_pos)
+                    rect = rect.normalized()
+                    rect_item.setRect(rect)
+                    self._update_bbox_handles()
                 
         else:
             super().mouseMoveEvent(event)
@@ -450,10 +703,33 @@ class ImageCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.pos())
         
         if self.is_drawing:
-            if self.current_tool == 'sam2_box':
+            if self.drawing_new_bbox:
+                # Finish drawing new bbox
+                if self.temp_item:
+                    try:
+                        self.scene.removeItem(self.temp_item)
+                    except RuntimeError:
+                        pass
+                    self.temp_item = None
+                
+                # Create the new bbox
+                rect = QRectF(self.drawing_start, scene_pos).normalized()
+                
+                # Only create if bbox has minimum size
+                if rect.width() > 10 and rect.height() > 10:
+                    self._create_new_bbox(rect)
+                
+                self.drawing_new_bbox = False
+                self.is_drawing = False
+                self.setToolTip("Click on a bbox to select and edit")
+                
+            elif self.current_tool == 'sam2_box':
                 # Emit box drawn signal
                 if self.temp_item:
-                    self.scene.removeItem(self.temp_item)
+                    try:
+                        self.scene.removeItem(self.temp_item)
+                    except RuntimeError:
+                        pass
                     self.temp_item = None
                     
                 x1, y1 = int(self.drawing_start.x()), int(self.drawing_start.y())
@@ -463,7 +739,10 @@ class ImageCanvas(QGraphicsView):
             elif self.current_tool == 'inference_box':
                 # Finish drawing inference box
                 if self.temp_item:
-                    self.scene.removeItem(self.temp_item)
+                    try:
+                        self.scene.removeItem(self.temp_item)
+                    except RuntimeError:
+                        pass
                     self.temp_item = None
                     
                 # Store the box
@@ -473,10 +752,18 @@ class ImageCanvas(QGraphicsView):
                                    int(rect.right()), int(rect.bottom()))
                 
             elif self.current_tool == 'brush' or self.current_tool == 'eraser':
+                # Flush any pending visualization updates before finishing
+                if self._viz_update_timer.isActive():
+                    self._viz_update_timer.stop()
+                    self._flush_pending_viz_update()
+                
                 # Finish drawing - update border now
                 self._is_actively_drawing = False
                 if self.editing_mask is not None and self.selected_mask_idx == self.editing_instance_id:
                     self.add_selection_border(self.editing_mask)
+                
+                # Emit annotation_changed now that drawing is complete
+                self.annotation_changed. emit()
                 
             self.is_drawing = False
         elif self.dragging_box:
@@ -484,6 +771,22 @@ class ImageCanvas(QGraphicsView):
             self.dragging_box = False
             self.dragging_handle = None
             self.drag_offset = None
+        elif self.dragging_bbox:
+            # Finish dragging/resizing bbox
+            if self.selected_bbox_id and self.selected_bbox_id in self.bbox_items_map:
+                # Update the annotation metadata with new bbox coordinates
+                rect_item = self.bbox_items_map[self.selected_bbox_id]
+                rect = rect_item.rect()
+                self.annotation_metadata[self.selected_bbox_id]['bbox'] = [
+                    int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height())
+                ]
+                # Update labels to reflect new position
+                self.update_instance_labels()
+                # Emit annotation changed signal
+                self.annotation_changed.emit()
+            self.dragging_bbox = False
+            self.dragging_bbox_handle = None
+            self.bbox_drag_offset = None
         else:
             super().mouseReleaseEvent(event)
     
@@ -495,10 +798,16 @@ class ImageCanvas(QGraphicsView):
     def clear_inference_box(self):
         """Remove the inference box from display"""
         if self.inference_box_item:
-            self.scene.removeItem(self.inference_box_item)
+            try:
+                self.scene.removeItem(self.inference_box_item)
+            except RuntimeError:
+                pass
             self.inference_box_item = None
         for handle in self.inference_box_handles:
-            self.scene.removeItem(handle)
+            try:
+                self.scene.removeItem(handle)
+            except RuntimeError:
+                pass
         self.inference_box_handles = []
         self.inference_box_rect = None
     
@@ -513,9 +822,15 @@ class ImageCanvas(QGraphicsView):
         """Update the visual display of the inference box with handles"""
         # Remove old graphics items
         if self.inference_box_item:
-            self.scene.removeItem(self.inference_box_item)
+            try:
+                self.scene.removeItem(self.inference_box_item)
+            except RuntimeError:
+                pass
         for handle in self.inference_box_handles:
-            self.scene.removeItem(handle)
+            try:
+                self.scene.removeItem(handle)
+            except RuntimeError:
+                pass
         self.inference_box_handles = []
         
         if not self.inference_box_rect:
@@ -575,13 +890,22 @@ class ImageCanvas(QGraphicsView):
             
     def draw_on_mask(self, start_pos, end_pos):
         """Draw on the current mask with brush/eraser"""
-        if self.combined_mask is None:
-            # Handle both grayscale (H,W) and RGB (H,W,3) images
-            if len(self.current_image.shape) == 2:
-                h, w = self.current_image.shape
-            else:
-                h, w = self.current_image.shape[:2]
-            self.combined_mask = np.zeros((h, w), dtype=np.int32)
+        # Initialize appropriate mask if needed
+        if self.current_image is not None:
+            h, w = self.current_image.shape[:2]
+        else:
+            return
+        
+        # Initialize appropriate mask based on annotation type
+        if self.current_annotation_type == 'chamber':
+            if self.chamber_mask is None:
+                self.chamber_mask = np.zeros((h, w), dtype=np.int32)
+        elif self.current_annotation_type == 'hive':
+            if self.hive_mask is None:
+                self.hive_mask = np.zeros((h, w), dtype=np.int32)
+        else:  # bee
+            if self.bee_mask is None:
+                self.bee_mask = np.zeros((h, w), dtype=np.int32)
             
         if self.selected_mask_idx < 0:
             # Create new instance
@@ -601,41 +925,98 @@ class ImageCanvas(QGraphicsView):
         x1, y1 = int(start_pos.x()), int(start_pos.y())
         x2, y2 = int(end_pos.x()), int(end_pos.y())
         
-        # Create stroke mask
-        temp_mask = np.zeros(self.editing_mask.shape, dtype=np.uint8)
-        cv2.line(temp_mask, (x1, y1), (x2, y2), 1, self.brush_size)
-        stroke_pixels = temp_mask > 0
-        
-        # Apply tool to editing mask (no overlap protection needed - isolated layer)
+        # Draw directly on editing mask (much faster - no temp array allocation)
         if self.current_tool == 'brush':
-            self.editing_mask[stroke_pixels] = 255
+            cv2.line(self.editing_mask, (x1, y1), (x2, y2), 255, self.brush_size)
         else:  # eraser
-            self.editing_mask[stroke_pixels] = 0
+            cv2.line(self.editing_mask, (x1, y1), (x2, y2), 0, self.brush_size)
         
-        # Update editing mask visualization incrementally
-        self._update_editing_visualization_incremental(stroke_pixels)
-        self.annotation_changed.emit()
+        # Calculate bounding box of stroke for dirty region (much more memory efficient)
+        half_brush = self.brush_size // 2 + 1
+        min_x = max(0, min(x1, x2) - half_brush)
+        max_x = min(self.editing_mask.shape[1], max(x1, x2) + half_brush)
+        min_y = max(0, min(y1, y2) - half_brush)
+        max_y = min(self.editing_mask.shape[0], max(y1, y2) + half_brush)
         
-    def add_mask(self, mask, mask_id=None, color=None, rebuild_viz=True):
-        """Add a new mask to the combined segmentation mask
+        # Create dirty region mask for this stroke
+        stroke_dirty = np.zeros(self.editing_mask.shape, dtype=bool)
+        stroke_dirty[min_y:max_y, min_x:max_x] = True
+        
+        # Accumulate dirty pixels for batched update (major performance improvement)
+        if self._dirty_pixels is None:
+            self._dirty_pixels = stroke_dirty
+        else:
+            self._dirty_pixels |= stroke_dirty
+        
+        # Schedule throttled visualization update
+        if not self._viz_update_timer.isActive():
+            self._viz_update_timer.start()
+        
+        # Only emit annotation_changed for final stroke (on release) to avoid slowdown
+        # The visualization update happens independently via timer
+        
+    def add_mask(self, mask, mask_id=None, color=None, rebuild_viz=True, category=None):
+        """Add a new mask based on current annotation type
         
         Args:
             mask: Binary mask array (H×W with 0/255 or True/False values)
-            mask_id: Optional persistent ID for this mask
-            color: Optional (r,g,b) color tuple. If None, generates random color
-            rebuild_viz: If True, rebuild visualization immediately. Set False for batch operations.
+            mask_id: Optional persistent ID for bee masks (ignored for chamber/hive)
+            color: Optional (r,g,b) color tuple. If None, uses default for type
+            rebuild_viz: If True, rebuild visualization immediately
+            category: Override annotation type ('bee', 'chamber', 'hive'). Defaults to current_annotation_type.
         """
         if not isinstance(mask, np.ndarray):
             return
-            
-        # Initialize combined mask if needed
-        if self.combined_mask is None:
-            h, w = mask.shape[:2]
-            self.combined_mask = np.zeros((h, w), dtype=np.int32)
-            self._cached_overlay = None  # Clear cache
         
+        # Resolve effective category
+        effective_category = category if category is not None else self.current_annotation_type
+
         # Convert binary mask to boolean
         binary_mask = mask > 0 if mask.dtype != bool else mask
+        
+        if effective_category == 'chamber':
+            # Update chamber mask
+            self._add_chamber_mask(binary_mask, mask_id, color, rebuild_viz)
+        elif effective_category == 'hive':
+            # Update hive mask
+            self._add_hive_mask(binary_mask, mask_id, color, rebuild_viz)
+        else:
+            # Default: bee annotation (multi-instance)
+            self._add_bee_mask(binary_mask, mask_id, color, rebuild_viz)
+    
+    def _add_bee_mask(self, binary_mask, mask_id=None, color=None, rebuild_viz=True, category='bee'):
+        """Add an instance mask to the appropriate mask array (bee, chamber, or hive)
+        
+        Args:
+            binary_mask: Boolean array indicating instance pixels
+            mask_id: Optional persistent ID for this instance
+            color: Optional (r,g,b) color tuple
+            rebuild_viz: If True, rebuild visualization immediately
+            category: Instance category ('bee', 'chamber', or 'hive')
+        """
+        # Get reference to the appropriate mask based on category
+        if category == 'chamber':
+            mask_array_name = 'chamber_mask'
+        elif category == 'hive':
+            mask_array_name = 'hive_mask'
+        else:
+            mask_array_name = 'bee_mask'
+        
+        # Initialize mask if needed
+        if getattr(self, mask_array_name) is None:
+            h, w = binary_mask.shape[:2]
+            setattr(self, mask_array_name, np.zeros((h, w), dtype=np.int32))
+            self._cached_overlay = None  # Clear cache
+        
+        mask_array = getattr(self, mask_array_name)
+        
+        # Guard against stale callbacks (e.g. async SAM2) where the mask shape
+        # no longer matches the re-initialised mask array (different video frame size).
+        if binary_mask.shape[:2] != mask_array.shape[:2]:
+            print(f"Warning: add_mask ignored – binary_mask shape {binary_mask.shape[:2]} "
+                  f"doesn't match {mask_array_name} shape {mask_array.shape[:2]} "
+                  f"(likely stale async result from previous video)")
+            return
         
         # Assign or use provided mask ID
         if mask_id is None:
@@ -646,13 +1027,29 @@ class ImageCanvas(QGraphicsView):
             if mask_id >= self.next_mask_id:
                 self.next_mask_id = mask_id + 1
         
-        # Add to combined mask (overwrites overlapping pixels)
-        self.combined_mask[binary_mask] = mask_id
+        # Add to the appropriate mask array
+        mask_array[binary_mask] = mask_id
         
-        # Store color
+        # Mark combined mask cache as dirty
+        self._combined_mask_dirty = True
+        
+        # Invalidate cached instance IDs since we added a new one
+        self._cached_instance_ids = None
+        
+        # Store color based on category
         if color is None:
-            color = tuple(np.random.randint(0, 255, 3).tolist())
+            if category == 'chamber':
+                color = self.annotation_type_colors['chamber']  # Red
+            elif category == 'hive':
+                color = self.annotation_type_colors['hive']  # Yellow
+            else:  # bee
+                color = tuple(np.random.randint(0, 255, 3).tolist())
         self.mask_colors[mask_id] = color
+        
+        # Initialize metadata and store category
+        if mask_id not in self.annotation_metadata:
+            self.annotation_metadata[mask_id] = {}
+        self.annotation_metadata[mask_id]['category'] = category
         
         # Rebuild visualization only if requested
         if rebuild_viz:
@@ -661,61 +1058,383 @@ class ImageCanvas(QGraphicsView):
         
         # Emit signal to notify that annotations have changed
         self.annotation_changed.emit()
+    
+    def _add_chamber_mask(self, binary_mask, mask_id=None, color=None, rebuild_viz=True):
+        """Add chamber instance to combined mask with category='chamber'
+        
+        Args:
+            binary_mask: Boolean array indicating chamber pixels
+            mask_id: Optional persistent ID for this instance
+            color: Optional (r,g,b) color tuple. If None, uses default red for chamber
+            rebuild_viz: If True, rebuild visualization immediately
+        """
+        # Add as a regular instance with chamber category
+        self._add_bee_mask(binary_mask, mask_id=mask_id, color=color, rebuild_viz=rebuild_viz, category='chamber')
+    
+    def _add_hive_mask(self, binary_mask, mask_id=None, color=None, rebuild_viz=True):
+        """Add hive instance to combined mask with category='hive'
+        
+        Args:
+            binary_mask: Boolean array indicating hive pixels
+            mask_id: Optional persistent ID for this instance
+            color: Optional (r,g,b) color tuple. If None, uses default yellow for hive
+            rebuild_viz: If True, rebuild visualization immediately
+        """
+        # Add as a regular instance with hive category
+        self._add_bee_mask(binary_mask, mask_id=mask_id, color=color, rebuild_viz=rebuild_viz, category='hive')
+    
+    def _get_mask_array_for_instance(self, instance_id):
+        """Get the appropriate mask array for a given instance ID
+        
+        Args:
+            instance_id: Instance ID to look up
+            
+        Returns:
+            Tuple of (mask_array, category) or (None, None) if not found
+        """
+        if instance_id <= 0:
+            return None, None
+        
+        # Check metadata for category
+        category = self.annotation_metadata.get(instance_id, {}).get('category', 'bee')
+        
+        if category == 'chamber':
+            return self.chamber_mask, 'chamber'
+        elif category == 'hive':
+            return self.hive_mask, 'hive'
+        else:
+            return self.bee_mask, 'bee'
+    
+    def _find_instance_at_point(self, x, y, category=None):
+        """Find which instance (if any) is at the given point
+
+        Args:
+            x: X coordinate
+            y: Y coordinate
+            category: If given ('bee', 'chamber', or 'hive'), only search that
+                      type's mask. Otherwise all three masks are searched.
+
+        Returns:
+            Instance ID at that point, or 0 if no instance
+        """
+        if category == 'chamber':
+            masks_to_search = [self.chamber_mask]
+        elif category == 'hive':
+            masks_to_search = [self.hive_mask]
+        elif category == 'bee':
+            masks_to_search = [self.bee_mask]
+        else:
+            masks_to_search = [self.bee_mask, self.chamber_mask, self.hive_mask]
+
+        for mask_array in masks_to_search:
+            if (mask_array is not None and
+                0 <= x < mask_array.shape[1] and
+                0 <= y < mask_array.shape[0]):
+                instance_id = int(mask_array[y, x])
+                if instance_id > 0:
+                    return instance_id
+        return 0
+    
+    def _get_binary_mask_for_instance(self, instance_id):
+        """Get binary mask for a specific instance ID
+        
+        Args:
+            instance_id: Instance ID to extract
+            
+        Returns:
+            Binary mask (H×W uint8) or None if instance not found
+        """
+        if instance_id <= 0:
+            return None
+        
+        # Find which mask contains this instance
+        mask_array, category = self._get_mask_array_for_instance(instance_id)
+        if mask_array is not None:
+            return (mask_array == instance_id).astype(np.uint8) * 255
+        
+        return None
+    
+    @property
+    def combined_mask(self):
+        """Legacy compatibility property: provides a readonly combined view of all masks
+        
+        This dynamically generates a single mask with all instances for backward compatibility.
+        Note: This is readonly - modifications won't affect the underlying separate masks.
+        Use the appropriate mask (bee_mask, chamber_mask, hive_mask) directly for modifications.
+        
+        Returns:
+            H×W int32 array with all instance IDs, or None if no masks exist
+        """
+        # Return None if no masks exist
+        if self.bee_mask is None and self.chamber_mask is None and self.hive_mask is None:
+            return None
+        
+        # Use cached version if available and not dirty
+        if self._combined_mask_cache is not None and not self._combined_mask_dirty:
+            return self._combined_mask_cache
+        
+        #Determine dimensions
+        if self.bee_mask is not None:
+            h, w = self.bee_mask.shape
+        elif self.chamber_mask is not None:
+            h, w = self.chamber_mask.shape
+        elif self.hive_mask is not None:
+            h, w = self.hive_mask.shape
+        else:
+            return None
+        
+        # Create combined view (simple approach: bee mask as base since it's most common)
+        combined = np.zeros((h, w), dtype=np.int32)
+        
+        # Layer masks: bee first (base layer), then chamber, then hive
+        # Later layers overwrite earlier ones where they overlap
+        if self.bee_mask is not None:
+            combined[self.bee_mask > 0] = self.bee_mask[self.bee_mask > 0]
+        if self.chamber_mask is not None:
+            if self.chamber_mask.shape[:2] == (h, w):
+                combined[self.chamber_mask > 0] = self.chamber_mask[self.chamber_mask > 0]
+            else:
+                print(f"Warning: combined_mask skipping chamber_mask "
+                      f"(shape {self.chamber_mask.shape[:2]} != {(h, w)})")
+        if self.hive_mask is not None:
+            if self.hive_mask.shape[:2] == (h, w):
+                combined[self.hive_mask > 0] = self.hive_mask[self.hive_mask > 0]
+            else:
+                print(f"Warning: combined_mask skipping hive_mask "
+                      f"(shape {self.hive_mask.shape[:2]} != {(h, w)})")
+        
+        # Cache for future reads
+        self._combined_mask_cache = combined
+        self._combined_mask_dirty = False
+        
+        return combined
+    
+    @combined_mask.setter
+    def combined_mask(self, value):
+        """Setter for backward compatibility - mark cache as dirty"""
+        # Setting to None clears all masks
+        if value is None:
+            self.bee_mask = None
+            self.chamber_mask = None
+            self.hive_mask = None
+            self._combined_mask_cache = None
+            self._combined_mask_dirty = True
+        else:
+            # For other values, just mark cache as dirty
+            # Direct assignment not supported - use set_annotations instead
+            self._combined_mask_dirty = True
             
     def rebuild_visualizations(self):
-        """Rebuild all mask visualizations from combined mask"""
+        """Rebuild all visualizations (masks and/or bboxes) based on display flags"""
         # Clear existing visualization items
         for item in self.mask_items:
-            self.scene.removeItem(item)
+            try:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
         self.mask_items = []
         
-        if self.combined_mask is None:
+        # Clear bbox items properly before clearing the map
+        for mask_id, rect_item in list(self.bbox_items_map.items()):
+            try:
+                if rect_item.scene() == self.scene:
+                    self.scene.removeItem(rect_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
+        self.bbox_items_map = {}
+        
+        # Check if any masks exist
+        has_masks = (self.bee_mask is not None or 
+                     self.chamber_mask is not None or 
+                     self.hive_mask is not None)
+        
+        if not has_masks:
             self._cached_overlay = None
+            # Still draw bbox-only annotations if we have them
+            if self.show_bboxes:
+                self._draw_bboxes_from_metadata()
             return
         
-        # Get unique instance IDs (excluding background 0)
-        instance_ids = np.unique(self.combined_mask)
-        instance_ids = instance_ids[instance_ids > 0]
+        # Collect all instance IDs from all masks
+        all_instance_ids = []
+        mask_lookup = {}  # Map instance_id -> (mask_type, mask_array)
         
-        if len(instance_ids) == 0:
-            self._cached_overlay = None
-            return
+        if self.bee_mask is not None and self.annotation_type_visibility.get('bee', True):
+            bee_ids = np.unique(self.bee_mask)
+            bee_ids = bee_ids[bee_ids > 0]
+            for instance_id in bee_ids:
+                mask_lookup[instance_id] = ('bee', self.bee_mask)
         
-        # Create composite overlay for all instances
-        h, w = self.combined_mask.shape
-        overlay = np.zeros((h, w, 4), dtype=np.uint8)
+        if self.chamber_mask is not None and self.annotation_type_visibility.get('chamber', True):
+            chamber_ids = np.unique(self.chamber_mask)
+            chamber_ids = chamber_ids[chamber_ids > 0]
+            for instance_id in chamber_ids:
+                mask_lookup[instance_id] = ('chamber', self.chamber_mask)
         
-        for instance_id in instance_ids:
-            # Get color for this instance
-            if instance_id not in self.mask_colors:
-                self.mask_colors[instance_id] = tuple(np.random.randint(0, 255, 3).tolist())
-            color = self.mask_colors[instance_id]
+        if self.hive_mask is not None and self.annotation_type_visibility.get('hive', True):
+            hive_ids = np.unique(self.hive_mask)
+            hive_ids = hive_ids[hive_ids > 0]
+            for instance_id in hive_ids:
+                mask_lookup[instance_id] = ('hive', self.hive_mask)
+        
+        # Build rendering order: chamber and hive first (background), bees last (on top)
+        chamber_ids_visible = [iid for iid, (cat, _) in mask_lookup.items() if cat == 'chamber']
+        hive_ids_visible = [iid for iid, (cat, _) in mask_lookup.items() if cat == 'hive']
+        bee_ids_visible = [iid for iid, (cat, _) in mask_lookup.items() if cat == 'bee']
+        all_instance_ids = chamber_ids_visible + hive_ids_visible + bee_ids_visible
+        
+        # Draw segmentation masks if enabled
+        if self.show_segmentations and len(all_instance_ids) > 0:
+            # Get dimensions from the first non-None mask
+            if self.bee_mask is not None:
+                h, w = self.bee_mask.shape
+            elif self.chamber_mask is not None:
+                h, w = self.chamber_mask.shape
+            else:
+                h, w = self.hive_mask.shape
             
-            # Apply color with appropriate opacity
-            mask_pixels = self.combined_mask == instance_id
-            alpha = self.mask_opacity
-            overlay[mask_pixels] = [color[0], color[1], color[2], alpha]
+            # Create composite overlay for all instances
+            overlay = np.zeros((h, w, 4), dtype=np.uint8)
+            
+            # Render each instance with category-based color
+            for instance_id in all_instance_ids:
+                # Get category and mask array
+                category, mask_array = mask_lookup[instance_id]
+                
+                # Get metadata
+                metadata = self.annotation_metadata.get(instance_id, {})
+                
+                # Get color for this instance
+                if instance_id not in self.mask_colors:
+                    # Assign color based on category
+                    if category == 'chamber':
+                        self.mask_colors[instance_id] = self.annotation_type_colors['chamber']
+                    elif category == 'hive':
+                        self.mask_colors[instance_id] = self.annotation_type_colors['hive']
+                    else:  # bee
+                        self.mask_colors[instance_id] = tuple(np.random.randint(0, 255, 3).tolist())
+                
+                color = self.mask_colors[instance_id]
+                
+                # Apply color with appropriate opacity
+                mask_pixels = mask_array == instance_id
+                if mask_pixels.shape[:2] != (h, w):
+                    print(f"Warning: rebuild_visualizations skipping instance {instance_id} – "
+                          f"mask shape {mask_pixels.shape[:2]} != overlay shape {(h, w)}")
+                    continue
+                alpha = self.mask_opacity
+                overlay[mask_pixels] = [color[0], color[1], color[2], alpha]
+            
+            # Cache the overlay for incremental updates
+            self._cached_overlay = overlay
+            
+            # Convert to QPixmap and add to scene
+            q_image = QImage(overlay.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
+            pixmap = QPixmap.fromImage(q_image.copy())  # copy to prevent memory leak
+            
+            mask_item = QGraphicsPixmapItem(pixmap)
+            mask_item.setZValue(1)
+            mask_item.setVisible(self.masks_visible)
+            self.scene.addItem(mask_item)
+            self.mask_items.append(mask_item)
+            
+            # Add border around selected instance using the optimized method
+            if self.selected_mask_idx > 0:
+                self.update_selection_border()
+        else:
+            self._cached_overlay = None
         
-        # Cache the overlay for incremental updates
-        self._cached_overlay = overlay
-        
-        # Convert to QPixmap and add to scene
-        q_image = QImage(overlay.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
-        pixmap = QPixmap.fromImage(q_image.copy())  # copy to prevent memory leak
-        
-        mask_item = QGraphicsPixmapItem(pixmap)
-        mask_item.setZValue(1)
-        mask_item.setVisible(self.masks_visible)
-        self.scene.addItem(mask_item)
-        self.mask_items.append(mask_item)
-        
-        # Add border around selected instance
-        if self.selected_mask_idx > 0:
-            selected_mask_binary = (self.combined_mask == self.selected_mask_idx).astype(np.uint8) * 255
-            self.add_selection_border(selected_mask_binary)
+        # Draw bounding boxes if enabled
+        if self.show_bboxes:
+            self._draw_bboxes()
         
         # Update instance labels
         self.update_instance_labels()
+    
+    def _draw_bboxes(self):
+        """Draw bounding boxes for all instances from masks and metadata"""
+        from PyQt6.QtWidgets import QGraphicsRectItem
+        from PyQt6.QtGui import QPen, QColor
+        from PyQt6.QtCore import Qt
+        
+        # Draw bboxes for all instance types from their separate masks
+        mask_sources = [
+            ('bee', self.bee_mask),
+            ('chamber', self.chamber_mask),
+            ('hive', self.hive_mask)
+        ]
+        
+        for category, mask_array in mask_sources:
+            if mask_array is None:
+                continue
+            if not self.annotation_type_visibility.get(category, True):
+                continue
+            
+            instance_ids = np.unique(mask_array)
+            instance_ids = instance_ids[instance_ids > 0]
+            
+            for instance_id in instance_ids:
+                if instance_id in self.bbox_items_map:
+                    continue  # Already drawn
+                # Get bbox from mask
+                mask = (mask_array == instance_id)
+                bbox = self.get_mask_bbox(mask.astype(np.uint8) * 255)
+                
+                if bbox is not None:
+                    x, y, w, h = bbox
+                    color = self.mask_colors.get(instance_id, (255, 255, 255))
+                    
+                    rect_item = QGraphicsRectItem(x, y, w, h)
+                    pen = QPen(QColor(color[0], color[1], color[2]))
+                    pen.setWidth(4)
+                    rect_item.setPen(pen)
+                    rect_item.setZValue(100)
+                    
+                    self.scene.addItem(rect_item)
+                    self.mask_items.append(rect_item)
+                    self.bbox_items_map[instance_id] = rect_item
+        
+        # Also draw bbox-only annotations from metadata
+        self._draw_bboxes_from_metadata()
+    
+    def _draw_bboxes_from_metadata(self):
+        """Draw bounding boxes from bbox-only annotations in metadata"""
+        from PyQt6.QtWidgets import QGraphicsRectItem
+        from PyQt6.QtGui import QPen, QColor
+        from PyQt6.QtCore import Qt
+        
+        # Draw bbox-only annotations (those not already in bbox_items_map)
+        for instance_id, metadata in self.annotation_metadata.items():
+            # Skip if already drawn from a mask
+            if instance_id in self.bbox_items_map:
+                continue
+            
+            # Skip if this instance is currently being edited
+            if instance_id == self.editing_instance_id:
+                continue
+            
+            # Use the instance's own category for visibility check
+            category = metadata.get('category', 'bee')
+            if not self.annotation_type_visibility.get(category, True):
+                continue
+            
+            # Only draw if it's a bbox-only annotation with a valid bbox
+            if 'bbox' in metadata and metadata['bbox'] != [0, 0, 0, 0]:
+                x, y, w, h = metadata['bbox']
+                color = self.mask_colors.get(instance_id, (255, 255, 255))
+                
+                rect_item = QGraphicsRectItem(x, y, w, h)
+                pen = QPen(QColor(color[0], color[1], color[2]))
+                pen.setWidth(4)
+                rect_item.setPen(pen)
+                rect_item.setZValue(100)
+                
+                self.scene.addItem(rect_item)
+                self.mask_items.append(rect_item)
+                self.bbox_items_map[instance_id] = rect_item
     
     def _update_overlay_region(self, affected_pixels, instance_id):
         """Incrementally update only the affected region of the visualization
@@ -816,10 +1535,65 @@ class ImageCanvas(QGraphicsView):
         """Create or update text labels showing instance numbers on the canvas"""
         # Clear existing labels
         for label_item in self.label_items:
-            self.scene.removeItem(label_item)
+            try:
+                if label_item.scene() == self.scene:
+                    self.scene.removeItem(label_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
         self.label_items = []
         
-        if self.combined_mask is None or not self.labels_visible:
+        if not self.labels_visible:
+            return
+        
+        # Show labels for bboxes if bbox view is enabled
+        if self.show_bboxes and self.bbox_items_map:
+            # Clean up any deleted items while iterating
+            to_remove = []
+            
+            for instance_id, rect_item in self.bbox_items_map.items():
+                try:
+                    # Check category visibility - only show labels for visible categories
+                    category = self.annotation_metadata.get(instance_id, {}).get('category', 'bee')
+                    if not self.annotation_type_visibility.get(category, True):
+                        continue  # Skip this instance if its category is not visible
+                    
+                    rect = rect_item.rect()
+                    color = self.mask_colors.get(instance_id, (255, 255, 255))
+                    
+                    # Create text label with instance ID
+                    label_text = str(instance_id)
+                    text_item = QGraphicsTextItem(label_text)
+                    
+                    # Style the text with black outline
+                    text_item.setHtml(
+                        f'<div style="color: rgb({color[0]}, {color[1]}, {color[2]}); '
+                        f'text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, '
+                        f'-1px 0px 0 #000, 1px 0px 0 #000, 0px -1px 0 #000, 0px 1px 0 #000; '
+                        f'font-size: 30px; font-weight: bold;">{label_text}</div>'
+                    )
+                    
+                    # Position at top-left corner of bbox
+                    text_item.setPos(rect.x() + 5, rect.y() + 5)
+                    
+                    # Set high z-value to appear above bboxes
+                    text_item.setZValue(102)
+                    
+                    # Add to scene
+                    self.scene.addItem(text_item)
+                    self.label_items.append(text_item)
+                    
+                except (RuntimeError, AttributeError):
+                    # Item has been deleted by Qt or is invalid
+                    to_remove.append(instance_id)
+            
+            # Clean up deleted items from map
+            for instance_id in to_remove:
+                if instance_id in self.bbox_items_map:
+                    del self.bbox_items_map[instance_id]
+        
+        # For mask mode, show labels at centroids (only if segmentations are shown)
+        if not self.show_segmentations or self.combined_mask is None:
             return
         
         # Get unique instance IDs (excluding background 0)
@@ -827,6 +1601,11 @@ class ImageCanvas(QGraphicsView):
         instance_ids = instance_ids[instance_ids > 0]
         
         for idx, instance_id in enumerate(instance_ids, start=1):
+            # Check category visibility - only show labels for visible categories
+            category = self.annotation_metadata.get(instance_id, {}).get('category', 'bee')
+            if not self.annotation_type_visibility.get(category, True):
+                continue  # Skip this instance if its category is not visible
+            
             # Get the mask for this instance
             instance_mask = (self.combined_mask == instance_id)
             
@@ -857,9 +1636,9 @@ class ImageCanvas(QGraphicsView):
             # We'll do this by drawing the text multiple times with offset
             text_item.setHtml(
                 f'<div style="color: rgb({color[0]}, {color[1]}, {color[2]}); '
-                f'text-shadow: -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000, '
-                f'-2px 0px 0 #000, 2px 0px 0 #000, 0px -2px 0 #000, 0px 2px 0 #000; '
-                f'font-size: 50px; font-weight: bold;">{label_text}</div>'
+                f'text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, '
+                f'-1px 0px 0 #000, 1px 0px 0 #000, 0px -1px 0 #000, 0px 1px 0 #000; '
+                f'font-size: 30px; font-weight: bold;">{label_text}</div>'
             )
             
             # Position at centroid (offset by half text width/height for centering)
@@ -888,7 +1667,12 @@ class ImageCanvas(QGraphicsView):
         else:
             # Hide all labels
             for label_item in self.label_items:
-                self.scene.removeItem(label_item)
+                try:
+                    if label_item.scene() == self.scene:
+                        self.scene.removeItem(label_item)
+                except (RuntimeError, AttributeError):
+                    # Item already deleted by Qt or invalid
+                    pass
             self.label_items = []
     
     def toggle_labels(self):
@@ -899,7 +1683,7 @@ class ImageCanvas(QGraphicsView):
         """Load annotations for current frame
         
         Args:
-            annotations: List of annotation dictionaries
+            annotations: List of annotation dictionaries (all types: bee, chamber, hive)
             mask_colors: Optional dict mapping mask_id to (r,g,b) color tuple
         """
         # Commit any pending edits first
@@ -907,10 +1691,10 @@ class ImageCanvas(QGraphicsView):
             self.commit_editing()
         
         # Clear existing masks and free memory
-        # Explicitly clear the combined mask array
-        if self.combined_mask is not None:
-            del self.combined_mask
-            self.combined_mask = None
+        for mask_attr in ['bee_mask', 'chamber_mask', 'hive_mask']:
+            if getattr(self, mask_attr) is not None:
+                delattr(self, mask_attr)
+                setattr(self, mask_attr, None)
         
         # Clear cached overlay
         if self._cached_overlay is not None:
@@ -918,7 +1702,12 @@ class ImageCanvas(QGraphicsView):
             self._cached_overlay = None
         
         for item in self.mask_items:
-            self.scene.removeItem(item)
+            try:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
             # Explicitly delete the item to free Qt resources
             try:
                 item.setPixmap(None)  # Release pixmap data
@@ -930,10 +1719,16 @@ class ImageCanvas(QGraphicsView):
         self.mask_items = []
         self.mask_colors = {}  # Reset to dict
         self.next_mask_id = 1
+        self.annotation_metadata = {}  # Clear metadata
         
         # Clear selection border
         if self.selection_border_item:
-            self.scene.removeItem(self.selection_border_item)
+            try:
+                if self.selection_border_item.scene() == self.scene:
+                    self.scene.removeItem(self.selection_border_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
             try:
                 self.selection_border_item.setPixmap(None)
             except:
@@ -945,6 +1740,10 @@ class ImageCanvas(QGraphicsView):
         self.selected_mask_idx = -1
         self.active_sam2_mask_idx = -1
         
+        # Clear cached data for performance optimization
+        self._cached_instance_ids = None
+        self._cached_bboxes = {}
+        
         # Force garbage collection to free memory
         import gc
         gc.collect()
@@ -952,85 +1751,377 @@ class ImageCanvas(QGraphicsView):
         if not annotations:
             return
         
-        # Determine combined mask size from first annotation
-        if annotations and 'mask' in annotations[0]:
-            h, w = annotations[0]['mask'].shape[:2]
-            self.combined_mask = np.zeros((h, w), dtype=np.int32)
-        else:
-            return
+        # Determine dimensions from current image or first mask
+        has_masks = any('mask' in ann for ann in annotations)
+        h, w = None, None
         
-        # Build combined mask from individual annotations (no rebuild per annotation)
+        if self.current_image is not None:
+            h, w = self.current_image.shape[:2]
+        elif has_masks:
+            first_mask_ann = next((ann for ann in annotations if 'mask' in ann), None)
+            if first_mask_ann:
+                h, w = first_mask_ann['mask'].shape[:2]
+        
+        if h is None or w is None:
+            return  # Can't determine size
+        
+        # Initialize separate masks for each category
+        self.bee_mask = np.zeros((h, w), dtype=np.int32)
+        self.chamber_mask = np.zeros((h, w), dtype=np.int32)
+        self.hive_mask = np.zeros((h, w), dtype=np.int32)
+        
+        # Build separate masks from annotations
         for ann in annotations:
-            if 'mask' not in ann:
-                continue
-            
-            mask = ann['mask']
-            if not isinstance(mask, np.ndarray):
-                continue
-            
             # Get instance ID
             mask_id = ann.get('mask_id', self.next_mask_id)
             if mask_id >= self.next_mask_id:
                 self.next_mask_id = mask_id + 1
             
-            # Add to combined mask
-            binary_mask = mask > 0 if mask.dtype != bool else mask
-            self.combined_mask[binary_mask] = mask_id
+            # Get category (defaults to 'bee' for backward compatibility)
+            category = ann.get('category', 'bee')
+            
+            # Determine which mask array to use
+            if category == 'chamber':
+                mask_array = self.chamber_mask
+                color = self.annotation_type_colors['chamber']
+            elif category == 'hive':
+                mask_array = self.hive_mask
+                color = self.annotation_type_colors['hive']
+            else:  # bee
+                mask_array = self.bee_mask
+                color = tuple(np.random.randint(0, 255, 3).tolist())
             
             # Store or assign color
             if mask_colors and mask_id in mask_colors:
                 self.mask_colors[mask_id] = mask_colors[mask_id]
             else:
-                self.mask_colors[mask_id] = tuple(np.random.randint(0, 255, 3).tolist())
+                self.mask_colors[mask_id] = color
+            
+            if 'mask' in ann:
+                # Annotation with mask
+                mask = ann['mask']
+                if not isinstance(mask, np.ndarray):
+                    continue
+                
+                # Validate mask dimensions
+                if mask.shape[:2] != (h, w):
+                    print(f"Warning: Skipping instance {mask_id} - mask dimensions {mask.shape[:2]} don't match image dimensions {(h, w)}")
+                    # Still store metadata for bbox-only fallback
+                    metadata = {k: v for k, v in ann.items() if k != 'mask'}
+                    metadata['bbox_only'] = True
+                    metadata['category'] = category
+                    self.annotation_metadata[mask_id] = metadata
+                    continue
+                
+                # Store metadata (everything except mask)
+                metadata = {k: v for k, v in ann.items() if k != 'mask'}
+                metadata['category'] = category
+                self.annotation_metadata[mask_id] = metadata
+                
+                # Add to the appropriate mask array
+                binary_mask = mask > 0 if mask.dtype != bool else mask
+                mask_array[binary_mask] = mask_id
+            else:
+                # Bbox-only annotation - store metadata for later drawing
+                metadata = ann.copy()
+                metadata['category'] = category
+                self.annotation_metadata[mask_id] = metadata
+        
+        # Mark combined mask cache as dirty since we modified masks
+        self._combined_mask_dirty = True
         
         # Rebuild visualizations once at the end
         self.rebuild_visualizations()
-                    
-    def get_annotations(self):
-        """Get current annotations - extracts binary masks from combined mask
+    
+    def _set_bbox_annotations(self, bbox_annotations, mask_colors=None):
+        """DEPRECATED: Bbox-only annotations are now handled in main set_annotations flow
         
-        Includes the editing mask if currently editing an instance.
+        This method is kept for backward compatibility but should not be called
+        since bbox-only annotations now go through the unified annotation path.
         """
-        if self.combined_mask is None:
-            return []
+        # This method is deprecated - bbox annotations are handled in set_annotations
+        pass
+    
+    def get_annotations(self):
+        """Get all current annotations (bee, chamber, and hive)
+        
+        Includes the editing mask if currently editing.
+        Also includes bbox-only annotations if present.
+        Preserves metadata including category.
+        """
+        # Flush any pending visualization updates from throttled drawing
+        self._flush_pending_viz_update()
         
         annotations = []
         
-        # Get unique instance IDs from combined mask (excluding background 0)
-        instance_ids = np.unique(self.combined_mask)
-        instance_ids = instance_ids[instance_ids > 0].tolist()
+        # Process all three mask types
+        mask_sources = [
+            ('bee', self.bee_mask),
+            ('chamber', self.chamber_mask),
+            ('hive', self.hive_mask)
+        ]
         
-        # Add editing instance ID if currently editing
-        if self.editing_instance_id > 0 and self.editing_mask is not None:
-            if self.editing_instance_id not in instance_ids:
-                instance_ids.append(self.editing_instance_id)
-        
-        for instance_id in instance_ids:
-            # Check if this is the editing instance
-            if instance_id == self.editing_instance_id and self.editing_mask is not None:
-                # Use editing mask
-                binary_mask = self.editing_mask.copy()
-            else:
-                # Extract binary mask from combined mask
-                binary_mask = (self.combined_mask == instance_id).astype(np.uint8) * 255
+        for category, mask_array in mask_sources:
+            if mask_array is None:
+                continue
             
-            ann = {
-                'mask': binary_mask,
-                'label': f'instance_{instance_id}',
-                'area': int(np.sum(binary_mask > 0)),
-                'mask_id': int(instance_id)
-            }
-            annotations.append(ann)
+            # Get unique instance IDs from this mask (excluding background 0)
+            instance_ids = np.unique(mask_array)
+            instance_ids = instance_ids[instance_ids > 0].tolist()
+            
+            # Add editing instance ID if currently editing and matches this category
+            if (self.editing_instance_id > 0 and 
+                self.editing_mask is not None and 
+                self.annotation_metadata.get(self.editing_instance_id, {}).get('category', 'bee') == category):
+                if self.editing_instance_id not in instance_ids:
+                    instance_ids.append(self.editing_instance_id)
+            
+            for instance_id in instance_ids:
+                # Check if this is the editing instance
+                if instance_id == self.editing_instance_id and self.editing_mask is not None:
+                    # Use editing mask
+                    binary_mask = self.editing_mask.copy()
+                else:
+                    # Extract binary mask from the appropriate mask array
+                    binary_mask = (mask_array == instance_id).astype(np.uint8) * 255
+                
+                # Start with stored metadata if available
+                if instance_id in self.annotation_metadata:
+                    ann = self.annotation_metadata[instance_id].copy()
+                else:
+                    ann = {}
+                
+                # Always update/add these core fields
+                ann['mask'] = binary_mask
+                ann['label'] = ann.get('label', f'instance_{instance_id}')
+                ann['area'] = int(np.sum(binary_mask > 0))
+                ann['mask_id'] = int(instance_id)
+                ann['category'] = category
+                
+                # Auto-compute bbox from mask
+                bbox = self.get_mask_bbox(binary_mask)
+                if bbox is not None:
+                    ann['bbox'] = list(bbox)  # [x, y, width, height]
+                
+                annotations.append(ann)
+        
+        # Also return bbox-only annotations (stored in metadata but not in combined_mask)
+        # These don't have masks, just bboxes
+        # Track which IDs were already added from combined_mask to avoid duplicates
+        added_ids = {ann['mask_id'] for ann in annotations}
+        
+        for instance_id, metadata in self.annotation_metadata.items():
+            if metadata.get('bbox_only', False) and instance_id not in added_ids:
+                # Skip placeholder bboxes (0,0,0,0)
+                if 'bbox' not in metadata or metadata['bbox'] == [0, 0, 0, 0]:
+                    continue
+                
+                # This is a bbox-only annotation that wasn't already added
+                ann = metadata.copy()
+                ann['mask_id'] = int(instance_id)
+                # Make sure bbox_only flag is set
+                ann['bbox_only'] = True
+                annotations.append(ann)
         
         return annotations
+    
+    def get_instance_ids(self):
+        """
+        Get list of all instance IDs (cached for performance)
+        
+        Returns:
+            Sorted list of instance IDs
+        """
+        # Return cached list if available
+        if self._cached_instance_ids is not None:
+            return self._cached_instance_ids
+        
+        # Build instance ID list
+        instance_ids_set = set()
+        
+        # 1. From all three mask arrays (instances with segmentations)
+        for mask_array in [self.bee_mask, self.chamber_mask, self.hive_mask]:
+            if mask_array is not None:
+                mask_instance_ids = np.unique(mask_array)
+                mask_instance_ids = mask_instance_ids[mask_instance_ids > 0]  # Exclude background (0)
+                instance_ids_set.update(mask_instance_ids.tolist())
+        
+        # 2. From annotation_metadata (bbox-only instances)
+        instance_ids_set.update(self.annotation_metadata.keys())
+        
+        # 3. Add editing instance if currently in editing mode
+        if self.editing_instance_id > 0 and self.editing_mask is not None:
+            instance_ids_set.add(self.editing_instance_id)
+        
+        # Cache and return sorted list
+        self._cached_instance_ids = sorted(list(instance_ids_set))
+        return self._cached_instance_ids
+    
+    def reassign_instance_id(self, old_id, new_id):
+        """Reassign an instance from old_id to new_id (for ArUco tracking)
+        
+        Args:
+            old_id: Current instance ID
+            new_id: New instance ID to assign
+            
+        Returns:
+            bool: True if successful, False if failed
+        """
+        if old_id == new_id:
+            return True
+        
+        # Find which mask array contains this instance
+        mask_array, category = self._get_mask_array_for_instance(old_id)
+        
+        if mask_array is None:
+            # Try metadata-only (bbox-only annotation)
+            if old_id not in self.annotation_metadata:
+                return False
+            mask_array = None  # Will handle metadata-only below
+        
+        # Check if new_id already exists
+        existing_ids = self.get_instance_ids()
+        if new_id in existing_ids and new_id != old_id:
+            # Merge instances: new_id exists, so we're merging old_id into it
+            print(f"  ArUco reassignment: Merging instance {old_id} into existing instance {new_id}")
+            
+            if mask_array is not None:
+                # Get target mask array for new_id
+                target_mask_array, target_category = self._get_mask_array_for_instance(new_id)
+                
+                if target_mask_array is not None and target_category == category:
+                    # Merge masks: pixels from old_id become new_id
+                    target_mask_array[mask_array == old_id] = new_id
+                    # Clear old_id from original mask
+                    mask_array[mask_array == old_id] = 0
+                else:
+                    print(f"  Warning: Cannot merge - target instance {new_id} not found or category mismatch")
+                    return False
+            
+            # Merge metadata (prefer existing new_id metadata, but add marker info from old_id if present)
+            if old_id in self.annotation_metadata:
+                old_metadata = self.annotation_metadata.pop(old_id)
+                # Only transfer marker info if new_id doesn't have it
+                if new_id in self.annotation_metadata:
+                    if 'marker' in old_metadata and 'marker' not in self.annotation_metadata[new_id]:
+                        self.annotation_metadata[new_id]['marker'] = old_metadata['marker']
+            
+            # Keep color of new_id
+            if old_id in self.mask_colors:
+                self.mask_colors.pop(old_id)
+                
+        else:
+            # Simple reassignment: old_id becomes new_id
+            if mask_array is not None:
+                # Update mask array
+                mask_array[mask_array == old_id] = new_id
+            
+            # Update metadata
+            if old_id in self.annotation_metadata:
+                metadata = self.annotation_metadata.pop(old_id)
+                self.annotation_metadata[new_id] = metadata
+            
+            # Update colors
+            if old_id in self.mask_colors:
+                color = self.mask_colors.pop(old_id)
+                self.mask_colors[new_id] = color
+            
+            # Update next_mask_id if needed
+            if new_id >= self.next_mask_id:
+                self.next_mask_id = new_id + 1
+        
+        # Clear caches
+        self._cached_instance_ids = None
+        self._cached_bboxes = {}
+        if self._cached_overlay is not None:
+            del self._cached_overlay
+            self._cached_overlay = None
+        
+        # Update selection if needed
+        if self.selected_mask_idx == old_id:
+            self.selected_mask_idx = new_id
+        if self.editing_instance_id == old_id:
+            self.editing_instance_id = new_id
+        
+        return True
+    
+    def get_instance_bbox_cached(self, instance_id):
+        """
+        Get bounding box for an instance (cached for performance)
+        
+        Args:
+            instance_id: Instance ID
+            
+        Returns:
+            tuple: (x, y, width, height) or None if mask is empty/invalid
+        """
+        # Check cache first
+        if instance_id in self._cached_bboxes:
+            return self._cached_bboxes[instance_id]
+        
+        bbox = None
+        
+        # Try to get bbox from editing mask
+        if instance_id == self.editing_instance_id and self.editing_mask is not None:
+            bbox = self.get_mask_bbox(self.editing_mask)
+        # Try to get bbox from combined_mask
+        elif self.combined_mask is not None and instance_id > 0:
+            instance_mask = (self.combined_mask == instance_id)
+            if np.any(instance_mask):
+                bbox = self.get_mask_bbox(instance_mask)
+        
+        # Try to get bbox from metadata (for bbox-only annotations)
+        if bbox is None and instance_id in self.annotation_metadata:
+            metadata = self.annotation_metadata[instance_id]
+            if 'bbox' in metadata and metadata['bbox'] != [0, 0, 0, 0]:
+                bbox = tuple(metadata['bbox'])
+        
+        # Cache the result (even if None)
+        if bbox is not None:
+            self._cached_bboxes[instance_id] = bbox
+        
+        return bbox
+    
+    def zoom_to_instance_fast(self, idx, padding=50):
+        """Fast version of zoom_to_instance using cached bounding box
+        
+        Args:
+            idx: Instance ID (mask_id) to zoom to
+            padding: Extra space around the instance (in pixels)
+        """
+        bbox = self.get_instance_bbox_cached(idx)
+        if bbox:
+            x, y, width, height = bbox
+            self.zoom_to_rect(x, y, width, height, padding)
         
     def set_selected_instance(self, idx):
         """Set selected instance by ID and zoom to it"""
         self.selected_mask_idx = idx
         
-        # Zoom to the selected instance (idx is now an instance ID, not index)
-        if self.combined_mask is not None and idx > 0:
-            self.zoom_to_instance(idx)
+        # If brush/eraser tool is active and instance has a segmentation, start editing mode
+        # For bbox-only instances, wait until user actually starts drawing
+        if self.current_tool in ['brush', 'eraser']:
+            # Check if instance has segmentation data
+            has_segmentation = (
+                self.combined_mask is not None and 
+                np.any(self.combined_mask == idx)
+            )
+            if has_segmentation:
+                # Zoom to instance before entering editing mode using fast cached version
+                self.zoom_to_instance_fast(idx)
+                
+                # Now start editing
+                self.start_editing_instance(idx)
+                return
+            # For bbox-only, just select and wait for user to start drawing
+        
+        # Try to zoom to the instance using cached bbox (much faster)
+        # If bbox graphics item exists (bboxes are visible), use it
+        if idx in self.bbox_items_map:
+            self._select_bbox(idx)
+        else:
+            # Use cached bbox for fast zooming
+            self.zoom_to_instance_fast(idx)
     
     def get_mask_bbox(self, mask):
         """
@@ -1111,25 +2202,65 @@ class ImageCanvas(QGraphicsView):
     
     def highlight_instance(self, idx):
         """Highlight a specific instance by ID"""
-        if self.combined_mask is None or idx <= 0:
-            return
-        
         # Commit any edits to previous instance before switching
         if self.editing_instance_id > 0 and self.editing_instance_id != idx:
             self.commit_editing()
+
+        # In bbox view mode, don't rebuild visualizations (would clear bbox selection)
+        if self.show_bboxes:
+            self.selected_mask_idx = idx
+            return
         
         self.selected_mask_idx = idx
-        self.rebuild_visualizations()
+        
+        # PERFORMANCE OPTIMIZATION: Only update the selection border instead of rebuilding everything
+        # This is much faster when there are many instances
+        self.update_selection_border()
             
     def refresh_all_visualizations(self):
         """Refresh all mask visualizations with current selection highlighting"""
         self.rebuild_visualizations()
             
+    def update_selection_border(self):
+        """Update the selection border for the currently selected instance
+        
+        This is a lightweight method that only updates the border without rebuilding
+        all visualizations. Much faster for instance switching.
+        """
+        # Remove old border
+        if self.selection_border_item:
+            try:
+                if self.selection_border_item.scene() == self.scene:
+                    self.scene.removeItem(self.selection_border_item)
+            except (RuntimeError, AttributeError):
+                pass
+            self.selection_border_item = None
+        
+        # Add new border if we have a valid selection
+        if self.selected_mask_idx > 0 and self.combined_mask is not None:
+            # Check if instance exists in combined_mask or is being edited
+            if self.selected_mask_idx == self.editing_instance_id and self.editing_mask is not None:
+                # Use editing mask
+                binary_mask = self.editing_mask
+            elif np.any(self.combined_mask == self.selected_mask_idx):
+                # Use combined mask
+                binary_mask = (self.combined_mask == self.selected_mask_idx).astype(np.uint8) * 255
+            else:
+                # No mask to highlight (bbox-only instance)
+                return
+            
+            self.add_selection_border(binary_mask)
+    
     def add_selection_border(self, mask):
         """Add a border around the selected mask"""
         # Remove previous border if it exists
         if self.selection_border_item:
-            self.scene.removeItem(self.selection_border_item)
+            try:
+                if self.selection_border_item.scene() == self.scene:
+                    self.scene.removeItem(self.selection_border_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
             self.selection_border_item = None
         
         # Find contours of the mask
@@ -1166,10 +2297,6 @@ class ImageCanvas(QGraphicsView):
         self.scene.addItem(border_item)
         self.selection_border_item = border_item
         
-    def resolve_all_overlaps(self):
-        """No-op: overlaps are impossible with integer mask format"""
-        return 0  # No overlaps possible
-    
     def start_editing_instance(self, instance_id):
         """Start editing an instance in isolation mode
         
@@ -1183,22 +2310,56 @@ class ImageCanvas(QGraphicsView):
         if self.editing_instance_id > 0:
             self.commit_editing()
         
-        # Initialize editing mask
-        if self.combined_mask is not None:
-            h, w = self.combined_mask.shape
-            self.editing_mask = np.zeros((h, w), dtype=np.uint8)
-            
-            # Extract this instance to editing mask (remove from combined mask temporarily)
-            instance_pixels = self.combined_mask == instance_id
+        # Get the appropriate mask array for this instance
+        mask_array, category = self._get_mask_array_for_instance(instance_id)
+        
+        # Ensure mask exists
+        if mask_array is None:
+            if self.current_image is not None:
+                h, w = self.current_image.shape[:2]
+                # Create the appropriate mask based on category
+                if category == 'chamber' or self.current_annotation_type == 'chamber':
+                    if self.chamber_mask is None:
+                        self.chamber_mask = np.zeros((h, w), dtype=np.int32)
+                    mask_array = self.chamber_mask
+                elif category == 'hive' or self.current_annotation_type == 'hive':
+                    if self.hive_mask is None:
+                        self.hive_mask = np.zeros((h, w), dtype=np.int32)
+                    mask_array = self.hive_mask
+                else:  # bee
+                    if self.bee_mask is None:
+                        self.bee_mask = np.zeros((h, w), dtype=np.int32)
+                    mask_array = self.bee_mask
+            else:
+                return
+        
+        h, w = mask_array.shape
+        self.editing_mask = np.zeros((h, w), dtype=np.uint8)
+        
+        # Check if this instance exists in mask_array or is bbox-only
+        if np.any(mask_array == instance_id):
+            # Instance has segmentation - extract it
+            instance_pixels = mask_array == instance_id
             self.editing_mask[instance_pixels] = 255
-            self.combined_mask[instance_pixels] = 0
+            mask_array[instance_pixels] = 0
+            # Mark combined mask cache as dirty
+            self._combined_mask_dirty = True
         else:
-            # No combined mask yet, create fresh
-            h, w = self.current_image.shape[:2]
-            self.editing_mask = np.zeros((h, w), dtype=np.uint8)
-            self.combined_mask = np.zeros((h, w), dtype=np.int32)
+            # Instance is bbox-only or new - start with empty editing mask
+            # User will draw segmentation with brush or SAM2
+            pass
         
         self.editing_instance_id = instance_id
+        self.selected_mask_idx = instance_id  # Sync selected_mask_idx with editing_instance_id
+        
+        # Stamp the correct category into annotation_metadata for new instances.
+        # _get_mask_array_for_instance defaults to 'bee' when the instance is brand-new
+        # (not yet in metadata), so we must record the actual current type here so
+        # that get_annotations() and commit_editing() both resolve the right category.
+        if instance_id not in self.annotation_metadata:
+            self.annotation_metadata[instance_id] = {}
+        if 'category' not in self.annotation_metadata[instance_id]:
+            self.annotation_metadata[instance_id]['category'] = self.current_annotation_type
         
         # Rebuild base visualization (without the editing instance)
         self.rebuild_visualizations()
@@ -1211,16 +2372,90 @@ class ImageCanvas(QGraphicsView):
         
         Merges the temporary editing mask back into the main combined mask.
         """
+        # Flush any pending visualization updates first
+        if self._viz_update_timer.isActive():
+            self._viz_update_timer.stop()
+            self._flush_pending_viz_update()
+        
         if self.editing_instance_id <= 0 or self.editing_mask is None:
             return
         
-        # Check if combined_mask exists
-        if self.combined_mask is None:
+        # Check if editing mask is empty (no pixels drawn)
+        has_pixels = np.any(self.editing_mask > 0)
+        
+        if not has_pixels:
+            # Empty editing mask - don't commit, just exit editing mode
+            # This preserves bbox-only instances that were selected but not drawn on
+            self.editing_mask = None
+            self.editing_instance_id = -1
+            
+            # Clear editing overlay cache
+            if self._editing_overlay_cache is not None:
+                del self._editing_overlay_cache
+                self._editing_overlay_cache = None
+            
+            # Remove editing visualization
+            if self.editing_mask_item:
+                try:
+                    if self.editing_mask_item.scene() == self.scene:
+                        self.scene.removeItem(self.editing_mask_item)
+                except (RuntimeError, AttributeError):
+                    # Item already deleted by Qt or invalid
+                    pass
+                try:
+                    self.editing_mask_item.setPixmap(None)
+                except:
+                    pass
+                del self.editing_mask_item
+                self.editing_mask_item = None
+            
+            # Rebuild visualization to restore bbox-only instances
+            self.rebuild_visualizations()
             return
         
-        # Merge editing mask back into combined mask
+        # Create appropriate mask if it doesn't exist (e.g., when converting bbox-only to mask)
+        if self.current_image is not None:
+            h, w = self.current_image.shape[:2]
+        else:
+            return
+        
+        # Get category from metadata or use current annotation type
+        category = self.annotation_metadata.get(self.editing_instance_id, {}).get('category', self.current_annotation_type)
+        
+        # Get or create the appropriate mask array
+        if category == 'chamber':
+            if self.chamber_mask is None:
+                self.chamber_mask = np.zeros((h, w), dtype=np.int32)
+            mask_array = self.chamber_mask
+        elif category == 'hive':
+            if self.hive_mask is None:
+                self.hive_mask = np.zeros((h, w), dtype=np.int32)
+            mask_array = self.hive_mask
+        else:  # bee
+            if self.bee_mask is None:
+                self.bee_mask = np.zeros((h, w), dtype=np.int32)
+            mask_array = self.bee_mask
+        
+        # Merge editing mask back into appropriate mask array
         editing_pixels = self.editing_mask > 0
-        self.combined_mask[editing_pixels] = self.editing_instance_id
+        mask_array[editing_pixels] = self.editing_instance_id
+        
+        # Mark combined mask cache as dirty
+        self._combined_mask_dirty = True
+        
+        # Invalidate cached instance IDs (in case this was a new instance)
+        self._cached_instance_ids = None
+        
+        # Persist the resolved category in annotation_metadata so subsequent
+        # get_annotations() calls always return the right category.
+        if self.editing_instance_id not in self.annotation_metadata:
+            self.annotation_metadata[self.editing_instance_id] = {}
+        self.annotation_metadata[self.editing_instance_id]['category'] = category
+        
+        # If this was a bbox-only annotation, remove the bbox_only flag from metadata
+        if self.editing_instance_id in self.annotation_metadata:
+                if 'bbox_only' in self.annotation_metadata[self.editing_instance_id]:
+                    del self.annotation_metadata[self.editing_instance_id]['bbox_only']
         
         # Clear editing state and free memory
         old_editing_mask = self.editing_mask
@@ -1235,7 +2470,12 @@ class ImageCanvas(QGraphicsView):
         
         # Remove editing visualization
         if self.editing_mask_item:
-            self.scene.removeItem(self.editing_mask_item)
+            try:
+                if self.editing_mask_item.scene() == self.scene:
+                    self.scene.removeItem(self.editing_mask_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
             try:
                 self.editing_mask_item.setPixmap(None)
             except:
@@ -1259,7 +2499,12 @@ class ImageCanvas(QGraphicsView):
         
         # Remove previous editing visualization
         if self.editing_mask_item:
-            self.scene.removeItem(self.editing_mask_item)
+            try:
+                if self.editing_mask_item.scene() == self.scene:
+                    self.scene.removeItem(self.editing_mask_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
             self.editing_mask_item = None
         
         # Create or rebuild cached overlay for editing mask
@@ -1283,12 +2528,19 @@ class ImageCanvas(QGraphicsView):
         # Add to scene on top of everything
         self.editing_mask_item = QGraphicsPixmapItem(pixmap)
         self.editing_mask_item.setZValue(2)  # Above regular masks (which are at 1)
-        self.editing_mask_item.setVisible(self.masks_visible)
+        # Always show editing mask when in editing mode, regardless of show_segmentations
+        self.editing_mask_item.setVisible(True)
         self.scene.addItem(self.editing_mask_item)
         
         # Update selection border for editing mask (skip if actively drawing)
         if not self._is_actively_drawing and self.selected_mask_idx == self.editing_instance_id:
             self.add_selection_border(self.editing_mask)
+    
+    def _flush_pending_viz_update(self):
+        """Flush pending visualization update (called by timer)"""
+        if self._dirty_pixels is not None:
+            self._update_editing_visualization_incremental(self._dirty_pixels)
+            self._dirty_pixels = None
     
     def _update_editing_visualization_incremental(self, affected_pixels):
         """Update only the affected region of the editing visualization
@@ -1319,11 +2571,13 @@ class ImageCanvas(QGraphicsView):
         self._editing_overlay_cache[brush_pixels] = [color[0], color[1], color[2], alpha]
         self._editing_overlay_cache[eraser_pixels] = [0, 0, 0, 0]
         
-        # Update the pixmap from cached overlay
-        # Use QImage.copy() to prevent memory leak from buffer references
+        # Update the pixmap from cached overlay (optimized: reuse buffer)
         h, w = self._editing_overlay_cache.shape[:2]
+        # Create QImage directly from buffer without copy for better performance
+        # The buffer is kept alive by self._editing_overlay_cache
         q_image = QImage(self._editing_overlay_cache.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
-        pixmap = QPixmap.fromImage(q_image.copy())  # copy() creates independent image
+        # Only copy when creating pixmap to avoid tearing
+        pixmap = QPixmap.fromImage(q_image)
         
         # Update existing item
         if self.editing_mask_item:
@@ -1332,7 +2586,8 @@ class ImageCanvas(QGraphicsView):
             # Create item if it doesn't exist
             self.editing_mask_item = QGraphicsPixmapItem(pixmap)
             self.editing_mask_item.setZValue(2)
-            self.editing_mask_item.setVisible(self.masks_visible)
+            # Always show editing mask when in editing mode
+            self.editing_mask_item.setVisible(True)
             self.scene.addItem(self.editing_mask_item)
     
     def clear_selected_instance(self):
@@ -1340,26 +2595,62 @@ class ImageCanvas(QGraphicsView):
         if self.selected_mask_idx <= 0:
             return
         
-        # If editing this instance, just clear the editing mask
-        if self.editing_instance_id == self.selected_mask_idx:
-            self.editing_mask = np.zeros_like(self.editing_mask)
-            self._update_editing_visualization()
+        instance_to_clear = self.selected_mask_idx
+        
+        # If editing this instance, clear the editing mask and exit editing mode
+        if self.editing_instance_id == instance_to_clear:
+            self.editing_mask = None
+            self.editing_instance_id = -1
+            # Remove editing visualization
+            if self.editing_mask_item:
+                try:
+                    if self.editing_mask_item.scene() == self.scene:
+                        self.scene.removeItem(self.editing_mask_item)
+                except (RuntimeError, AttributeError):
+                    # Item already deleted by Qt or invalid
+                    pass
+                self.editing_mask_item = None
         else:
-            # Not in editing mode, directly clear from combined mask
-            if self.combined_mask is not None:
-                self.combined_mask[self.combined_mask == self.selected_mask_idx] = 0
+            # Not in editing mode, directly clear from the appropriate mask array
+            # Find which mask array contains this instance
+            mask_array, category = self._get_mask_array_for_instance(instance_to_clear)
+            if mask_array is not None:
+                mask_array[mask_array == instance_to_clear] = 0
+                # Mark combined mask cache as dirty
+                self._combined_mask_dirty = True
+                # Invalidate cached instance IDs since we removed one
+                self._cached_instance_ids = None
+        
+        # Remove from annotation_metadata (for bbox-only instances or metadata)
+        if instance_to_clear in self.annotation_metadata:
+            del self.annotation_metadata[instance_to_clear]
         
         # Remove color entry
-        if self.selected_mask_idx in self.mask_colors:
-            del self.mask_colors[self.selected_mask_idx]
+        if instance_to_clear in self.mask_colors:
+            del self.mask_colors[instance_to_clear]
+        
+        # Remove from bbox_items_map if present
+        if instance_to_clear in self.bbox_items_map:
+            rect_item = self.bbox_items_map[instance_to_clear]
+            try:
+                if rect_item.scene() == self.scene:
+                    self.scene.removeItem(rect_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
+            del self.bbox_items_map[instance_to_clear]
         
         # Rebuild visualization
-        if self.editing_instance_id <= 0:
-            self.rebuild_visualizations()
+        self.rebuild_visualizations()
         
         # Clear prompt points
         for item in self.prompt_items:
-            self.scene.removeItem(item)
+            try:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
         self.positive_points = []
         self.negative_points = []
         self.prompt_items = []
@@ -1410,7 +2701,12 @@ class ImageCanvas(QGraphicsView):
         """Clear all SAM2 prompt points and remove active mask (only if it's a new temporary mask)"""
         # Remove visual markers
         for item in self.prompt_items:
-            self.scene.removeItem(item)
+            try:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
         
         # Clear storage
         self.positive_points = []
@@ -1434,17 +2730,27 @@ class ImageCanvas(QGraphicsView):
         
         # Remove selection border
         if self.selection_border_item:
-            self.scene.removeItem(self.selection_border_item)
+            try:
+                if self.selection_border_item.scene() == self.scene:
+                    self.scene.removeItem(self.selection_border_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
             self.selection_border_item = None
         
         # Reset active mask index
         self.active_sam2_mask_idx = -1
-        
+    
     def start_new_sam2_instance(self):
         """Start annotating a new SAM2 instance"""
         # Clear prompts and reset for new instance
         for item in self.prompt_items:
-            self.scene.removeItem(item)
+            try:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
         
         self.positive_points = []
         self.negative_points = []
@@ -1454,12 +2760,324 @@ class ImageCanvas(QGraphicsView):
         
         # Remove selection border
         if self.selection_border_item:
-            self.scene.removeItem(self.selection_border_item)
+            try:
+                if self.selection_border_item.scene() == self.scene:
+                    self.scene.removeItem(self.selection_border_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
             self.selection_border_item = None
-        
+    
     def get_prompt_points(self):
         """Get all accumulated prompt points for SAM2"""
         return {
             'positive': self.positive_points.copy(),
             'negative': self.negative_points.copy()
         }
+    
+    def set_show_segmentations(self, show):
+        """Enable or disable segmentation mask display"""
+        self.show_segmentations = show
+        self.rebuild_visualizations()
+    
+    def set_show_bboxes(self, show):
+        """Enable or disable bounding box display"""
+        self.show_bboxes = show
+        if not show:
+            self._deselect_bbox()
+        self.rebuild_visualizations()
+    
+    def set_bbox_mode(self, enabled):
+        """DEPRECATED: Use set_show_bboxes instead"""
+        self.set_show_bboxes(enabled)
+    
+    def _get_bbox_at_pos(self, pos):
+        """Get bbox ID at scene position
+        
+        Args:
+            pos: QPointF scene position
+            
+        Returns:
+            mask_id of bbox at position, or None
+        """
+        # Clean up any deleted items while iterating
+        to_remove = []
+        
+        for mask_id, rect_item in self.bbox_items_map.items():
+            try:
+                if rect_item.rect().contains(pos):
+                    return mask_id
+            except (RuntimeError, AttributeError):
+                # Item has been deleted by Qt or is invalid
+                to_remove.append(mask_id)
+        
+        # Clean up deleted items from map
+        for mask_id in to_remove:
+            del self.bbox_items_map[mask_id]
+        
+        return None
+    
+    def _select_bbox(self, mask_id):
+        """Select a bbox for editing
+        
+        Args:
+            mask_id: ID of bbox to select
+        """
+        if mask_id not in self.bbox_items_map:
+            return
+        
+        # Deselect previous bbox
+        if self.selected_bbox_id and self.selected_bbox_id != mask_id:
+            self._deselect_bbox()
+        
+        self.selected_bbox_id = mask_id
+        self.selected_mask_idx = mask_id  # Keep instance selection in sync
+        rect_item = self.bbox_items_map[mask_id]
+        
+        # Highlight selected bbox by increasing pen width
+        color = self.mask_colors.get(mask_id, (255, 255, 0))
+        pen = QPen(QColor(color[0], color[1], color[2]))
+        pen.setWidth(6)  # Thicker for selected bbox
+        rect_item.setPen(pen)
+        rect_item.setZValue(101)  # Bring to front
+        
+        # Always allow bbox editing — the bbox is independent metadata
+        # even when the instance also has a segmentation mask
+        self._create_bbox_handles()
+        self.setToolTip("Drag corners to resize, drag center to move bbox")
+        
+        # Zoom to bbox
+        rect = rect_item.rect()
+        self.zoom_to_rect(int(rect.x()), int(rect.y()), 
+                         int(rect.width()), int(rect.height()), padding=100)
+    
+    def _deselect_bbox(self):
+        """Deselect currently selected bbox"""
+        if self.selected_bbox_id and self.selected_bbox_id in self.bbox_items_map:
+            rect_item = self.bbox_items_map[self.selected_bbox_id]
+            
+            # Reset pen to normal
+            color = self.mask_colors.get(self.selected_bbox_id, (255, 255, 0))
+            pen = QPen(QColor(color[0], color[1], color[2]))
+            pen.setWidth(4)  # Normal width
+            rect_item.setPen(pen)
+            rect_item.setZValue(100)  # Normal z-order
+        
+        # Remove handles
+        for handle in self.bbox_handles:
+            try:
+                self.scene.removeItem(handle)
+            except RuntimeError:
+                pass
+        self.bbox_handles = []
+        
+        self.selected_bbox_id = None
+        if self.show_bboxes:
+            self.setToolTip("Click on a bbox to select and edit")
+    
+    def _create_new_bbox(self, rect):
+        """Create a new bbox annotation from a drawn rectangle
+        
+        Args:
+            rect: QRectF of the drawn bbox
+        """
+        from PyQt6.QtWidgets import QGraphicsRectItem
+        from PyQt6.QtGui import QPen, QColor
+        
+        # Use selected instance ID if available, otherwise create new
+        if self.selected_mask_idx > 0:
+            mask_id = self.selected_mask_idx
+        else:
+            mask_id = self.next_mask_id
+            self.next_mask_id += 1
+        
+        # Assign color if not already assigned (use category-appropriate color)
+        if mask_id not in self.mask_colors:
+            if self.current_annotation_type == 'chamber':
+                color = self.annotation_type_colors['chamber']  # Red
+            elif self.current_annotation_type == 'hive':
+                color = self.annotation_type_colors['hive']  # Yellow
+            else:
+                color = tuple(np.random.randint(0, 255, 3).tolist())
+            self.mask_colors[mask_id] = color
+        else:
+            color = self.mask_colors[mask_id]
+        
+        # Create bbox metadata
+        bbox = [int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height())]
+        
+        # Update or create metadata for this instance
+        if mask_id not in self.annotation_metadata:
+            self.annotation_metadata[mask_id] = {}
+        
+        # Preserve existing category if set; otherwise use current annotation type
+        existing_category = self.annotation_metadata[mask_id].get('category', self.current_annotation_type)
+        
+        self.annotation_metadata[mask_id].update({
+            'mask_id': mask_id,
+            'bbox': bbox,
+            'bbox_only': True,  # Mark as bbox-only until segmentation is added
+            'category': existing_category
+        })
+        
+        # Invalidate cached instance IDs since we created a new one
+        self._cached_instance_ids = None
+        
+        # Create rectangle item for visualization
+        rect_item = QGraphicsRectItem(rect)
+        pen = QPen(QColor(color[0], color[1], color[2]))
+        pen.setWidth(4)
+        rect_item.setPen(pen)
+        rect_item.setZValue(100)
+        
+        self.scene.addItem(rect_item)
+        self.mask_items.append(rect_item)
+        self.bbox_items_map[mask_id] = rect_item
+        
+        # Update labels if visible
+        self.update_instance_labels()
+        
+        # Select the newly created bbox
+        self._select_bbox(mask_id)
+        
+        # Emit annotation changed signal
+        self.annotation_changed.emit()
+        
+        print(f"Created new bbox with ID {mask_id}: {bbox}")
+    
+    def _create_bbox_handles(self):
+        """Create corner handles for selected bbox"""
+        from PyQt6.QtWidgets import QGraphicsEllipseItem
+        
+        # Remove old handles
+        for handle in self.bbox_handles:
+            try:
+                self.scene.removeItem(handle)
+            except RuntimeError:
+                pass
+        self.bbox_handles = []
+        
+        if not self.selected_bbox_id or self.selected_bbox_id not in self.bbox_items_map:
+            return
+        
+        rect = self.bbox_items_map[self.selected_bbox_id].rect()
+        handle_size = 10
+        handle_color = QColor(255, 255, 0)  # Yellow handles
+        
+        # Create corner handles
+        corners = {
+            'tl': rect.topLeft(),
+            'tr': rect.topRight(),
+            'bl': rect.bottomLeft(),
+            'br': rect.bottomRight()
+        }
+        
+        for corner_id, corner_pos in corners.items():
+            handle = QGraphicsEllipseItem(
+                corner_pos.x() - handle_size/2,
+                corner_pos.y() - handle_size/2,
+                handle_size, handle_size
+            )
+            handle.setBrush(QBrush(handle_color))
+            handle.setPen(QPen(QColor(0, 0, 0), 1))
+            handle.setZValue(102)  # Above bbox
+            handle.setData(0, corner_id)  # Store corner ID
+            self.scene.addItem(handle)
+            self.bbox_handles.append(handle)
+    
+    def _update_bbox_handles(self):
+        """Update corner handle positions"""
+        if not self.selected_bbox_id or self.selected_bbox_id not in self.bbox_items_map:
+            return
+        
+        rect = self.bbox_items_map[self.selected_bbox_id].rect()
+        handle_size = 10
+        
+        corners = {
+            'tl': rect.topLeft(),
+            'tr': rect.topRight(),
+            'bl': rect.bottomLeft(),
+            'br': rect.bottomRight()
+        }
+        
+        for handle in self.bbox_handles:
+            corner_id = handle.data(0)
+            if corner_id in corners:
+                corner_pos = corners[corner_id]
+                handle.setRect(
+                    corner_pos.x() - handle_size/2,
+                    corner_pos.y() - handle_size/2,
+                    handle_size, handle_size
+                )
+    
+    def _get_bbox_handle_at_pos(self, pos):
+        """Get bbox handle at scene position
+        
+        Args:
+            pos: QPointF scene position
+            
+        Returns:
+            Handle ID ('tl', 'tr', 'bl', 'br') or None
+        """
+        for handle in self.bbox_handles:
+            try:
+                if handle.contains(pos):
+                    return handle.data(0)
+            except RuntimeError:
+                # Handle has been deleted by Qt
+                continue
+        return None
+    
+    
+    def set_annotation_type_visibility(self, annotation_type, visible, rebuild=True):
+        """Set visibility for a specific annotation type
+        
+        Args:
+            annotation_type: Annotation type ('bee', 'hive', or 'chamber')
+            visible: Boolean visibility state
+            rebuild: If True, rebuild visualizations immediately (default: True)
+        """
+        if annotation_type in self.annotation_type_visibility:
+            self.annotation_type_visibility[annotation_type] = visible
+            if rebuild:
+                self.rebuild_visualizations()
+    
+    
+    # Chamber and Hive mask management methods
+    
+    def set_annotation_type(self, annotation_type, rebuild=True):
+        """Set the current annotation type (bee/chamber/hive)
+        
+        Args:
+            annotation_type: 'bee', 'chamber', or 'hive'
+            rebuild: If True, rebuild visualizations immediately (default: True)
+        """
+        if annotation_type not in ['bee', 'chamber', 'hive']:
+            return
+
+        if annotation_type == self.current_annotation_type:
+            return  # No change — nothing to do
+
+        # Commit any active editing before switching type so the
+        # edited mask is written back to the correct array and the
+        # editing overlay is cleared.
+        if self.editing_instance_id > 0:
+            self.commit_editing()
+
+        # Deselect current instance — it belongs to the old type
+        self.selected_mask_idx = -1
+        self.active_sam2_mask_idx = -1
+
+        self.current_annotation_type = annotation_type
+
+        # Rebuild so only the new type's overlay is shown
+        if rebuild:
+            self.rebuild_visualizations()
+    
+    def get_annotation_type(self):
+        """Get the current annotation type
+        
+        Returns:
+            String: 'bee', 'chamber', or 'hive'
+        """
+        return self.current_annotation_type

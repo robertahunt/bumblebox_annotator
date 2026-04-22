@@ -36,8 +36,10 @@ class ProjectManager:
         folders = [
             'input_data/train',
             'input_data/val',
+            'input_data/test',
             'frames',
-            'annotations/pkl',
+            'annotations/png',
+            'annotations/json',
             'annotations/coco',
             'models'
         ]
@@ -86,21 +88,40 @@ class ProjectManager:
         
         Args:
             video_paths: List of video file paths
-            split: 'train' or 'val'
+            split: 'train', 'val', 'test', or 'inference'
             copy_to_project: Whether to copy videos or just reference them
             
         Returns:
             dict with results
         """
-        if split not in ['train', 'val']:
-            raise ValueError(f"Split must be 'train' or 'val', got: {split}")
+        if split not in ['train', 'val', 'test', 'inference']:
+            raise ValueError(f"Split must be 'train', 'val', 'test', or 'inference', got: {split}")
         
         dest_folder = self.project_path / 'input_data' / split
         results = {'added': [], 'failed': []}
         
+        # Get existing videos from all splits
+        existing_videos = self.scan_videos()
+        all_existing = existing_videos['train'] + existing_videos['val'] + existing_videos['test'] + existing_videos['inference']
+        
         for video_path in video_paths:
             try:
                 video_id = video_path.stem  # filename without extension
+                
+                # Check if video already exists in any split
+                if video_id in all_existing:
+                    # Determine which split it's already in
+                    if video_id in existing_videos['train']:
+                        existing_split = 'train'
+                    elif video_id in existing_videos['val']:
+                        existing_split = 'val'
+                    else:
+                        existing_split = 'test'
+                    results['failed'].append({
+                        'video_path': str(video_path),
+                        'error': f"Video already exists in {existing_split} set"
+                    })
+                    continue
                 
                 # Copy or move video
                 if copy_to_project:
@@ -132,11 +153,11 @@ class ProjectManager:
         Scan input_data folders to get current video lists
         
         Returns:
-            dict with 'train' and 'val' lists of video IDs
+            dict with 'train', 'val', 'test', and 'inference' lists of video IDs
         """
-        videos = {'train': [], 'val': []}
+        videos = {'train': [], 'val': [], 'test': [], 'inference': []}
         
-        for split in ['train', 'val']:
+        for split in ['train', 'val', 'test', 'inference']:
             folder = self.project_path / 'input_data' / split
             if folder.exists():
                 for video_file in folder.glob('*.mp4'):
@@ -162,6 +183,18 @@ class ProjectManager:
             if path.exists():
                 return path
         
+        # Check test folder
+        for ext in ['.mp4', '.avi', '.mov', '.mkv', '.mjpeg', '.mjpg']:
+            path = self.project_path / 'input_data/test' / f'{video_id}{ext}'
+            if path.exists():
+                return path
+        
+        # Check inference folder
+        for ext in ['.mp4', '.avi', '.mov', '.mkv', '.mjpeg', '.mjpg']:
+            path = self.project_path / 'input_data/inference' / f'{video_id}{ext}'
+            if path.exists():
+                return path
+        
         return None
     
     def get_video_split(self, video_id: str) -> Optional[str]:
@@ -176,12 +209,22 @@ class ProjectManager:
             if (self.project_path / 'input_data/val' / f'{video_id}{ext}').exists():
                 return 'val'
         
+        # Check test folder
+        for ext in ['.mp4', '.avi', '.mov', '.mkv', '.mjpeg', '.mjpg']:
+            if (self.project_path / 'input_data/test' / f'{video_id}{ext}').exists():
+                return 'test'
+        
+        # Check inference folder
+        for ext in ['.mp4', '.avi', '.mov', '.mkv', '.mjpeg', '.mjpg']:
+            if (self.project_path / 'input_data/inference' / f'{video_id}{ext}').exists():
+                return 'inference'
+        
         return None
     
     def move_video(self, video_id: str, to_split: str) -> bool:
-        """Move video between train and val folders"""
-        if to_split not in ['train', 'val']:
-            raise ValueError(f"Split must be 'train' or 'val', got: {to_split}")
+        """Move video between train, val, test, and inference folders"""
+        if to_split not in ['train', 'val', 'test', 'inference']:
+            raise ValueError(f"Split must be 'train', 'val', 'test', or 'inference', got: {to_split}")
         
         # Find current location
         current_path = self.get_video_path(video_id)
@@ -209,8 +252,9 @@ class ProjectManager:
             'last_scanned': datetime.now().isoformat(),
             'train_videos': videos['train'],
             'val_videos': videos['val'],
-            'total_videos': len(videos['train']) + len(videos['val']),
-            'note': 'Generated from input_data/ folder structure. Move videos between train/val to change splits.'
+            'test_videos': videos['test'],
+            'total_videos': len(videos['train']) + len(videos['val']) + len(videos['test']),
+            'note': 'Generated from input_data/ folder structure. Move videos between train/val/test to change splits.'
         }
         
         # Save to file
@@ -223,16 +267,24 @@ class ProjectManager:
         return self.project_path / 'frames' / video_id
     
     def get_annotations_dir(self, video_id: str) -> Path:
-        """Get directory for video's annotations"""
-        return self.project_path / 'annotations/pkl' / video_id
+        """Get directory for video's PNG annotations"""
+        return self.project_path / 'annotations/png' / video_id
+    
+    def get_json_annotations_dir(self, video_id: str) -> Path:
+        """Get directory for video's JSON annotations"""
+        return self.project_path / 'annotations/json' / video_id
     
     def get_frame_path(self, video_id: str, frame_idx: int) -> Path:
         """Get path to specific frame image"""
         return self.get_frames_dir(video_id) / f'frame_{frame_idx:06d}.jpg'
     
     def get_annotation_path(self, video_id: str, frame_idx: int) -> Path:
-        """Get path to specific frame annotation"""
-        return self.get_annotations_dir(video_id) / f'frame_{frame_idx:06d}.pkl'
+        """Get path to specific frame PNG annotation"""
+        return self.get_annotations_dir(video_id) / f'frame_{frame_idx:06d}.png'
+    
+    def get_json_annotation_path(self, video_id: str, frame_idx: int) -> Path:
+        """Get path to specific frame JSON annotation"""
+        return self.get_json_annotations_dir(video_id) / f'frame_{frame_idx:06d}.json'
     
     def extract_video_frames(self, video_id: str, frame_indices: List[int]) -> Dict:
         """

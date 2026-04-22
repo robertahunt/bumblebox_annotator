@@ -18,6 +18,13 @@ try:
 except ImportError:
     YOLO_AVAILABLE = False
 
+try:
+    import albumentations as A
+    from ultralytics.data.augment import Albumentations
+    ALBUMENTATIONS_AVAILABLE = True
+except ImportError:
+    ALBUMENTATIONS_AVAILABLE = False
+
 
 class YOLOTrainingWorker(QThread):
     """Background worker for YOLO model training"""
@@ -108,29 +115,47 @@ class YOLOTrainingWorker(QThread):
             shutil.rmtree(labels_root)
         
         # Convert train and val sets (processing multiple JSON files)
-        train_count = sum(self._coco_to_yolo(json_file, yolo_dir, 'train') for json_file in train_jsons)
-        val_count = sum(self._coco_to_yolo(json_file, yolo_dir, 'val') for json_file in val_jsons)
+        model_type = self.config.get('model_type', 'bee')
+        train_count = sum(self._coco_to_yolo(json_file, yolo_dir, 'train', model_type) for json_file in train_jsons)
+        val_count = sum(self._coco_to_yolo(json_file, yolo_dir, 'val', model_type) for json_file in val_jsons)
         
-        # Create dataset YAML
+        # Create dataset YAML - single class model for the selected type
         dataset_yaml = yolo_dir / 'dataset.yaml'
         yaml_content = {
             'path': str(yolo_dir.absolute()),
             'train': 'images/train',
             'val': 'images/val',
-            'names': {0: 'bee'}
+            'names': {0: model_type},  # Single class for the selected annotation type
+            'nc': 1
         }
         
         with open(dataset_yaml, 'w') as f:
             yaml.dump(yaml_content, f, default_flow_style=False)
         
-        self.stage_update.emit(f"Dataset prepared: {train_count} train, {val_count} val")
+        self.stage_update.emit(f"Dataset prepared for {model_type.upper()} model: {train_count} train, {val_count} val")
         
         return yolo_dir, dataset_yaml
         
-    def _coco_to_yolo(self, coco_json_path, output_dir, split='train'):
-        """Convert COCO format to YOLO segmentation format"""
+    def _coco_to_yolo(self, coco_json_path, output_dir, split='train', model_type='bee'):
+        """Convert COCO format to YOLO segmentation format
+        
+        Args:
+            coco_json_path: Path to COCO JSON file
+            output_dir: Output directory for YOLO format
+            split: 'train' or 'val'
+            model_type: 'bee', 'chamber', or 'hive' - filters annotations to this type
+        """
         with open(coco_json_path, 'r') as f:
             coco = json.load(f)
+        
+        # Map model type to COCO category ID
+        # Based on class_names = ['bee', 'hive', 'chamber'] in annotation.py
+        category_map = {
+            'bee': 1,      # First class
+            'hive': 2,     # Second class
+            'chamber': 3   # Third class
+        }
+        target_category_id = category_map.get(model_type, 1)
         
         # Create output directories
         images_dir = output_dir / 'images' / split
@@ -183,28 +208,56 @@ class YOLOTrainingWorker(QThread):
             label_file = labels_dir / f"{video_name}_{original_name}.txt"
             annotations = img_annotations.get(img_id, [])
             
-            with open(label_file, 'w') as f:
-                for ann in annotations:
-                    class_id = 0  # Single class
-                    
-                    if 'segmentation' not in ann or not ann['segmentation']:
-                        continue
-                    
-                    for seg in ann['segmentation']:
-                        if len(seg) < 6:
-                            continue
-                        
-                        # Normalize coordinates
-                        normalized_seg = []
-                        for i in range(0, len(seg), 2):
-                            x = seg[i] / img_width
-                            y = seg[i+1] / img_height
-                            normalized_seg.extend([x, y])
-                        
-                        line = f"{class_id} " + " ".join([f"{coord:.6f}" for coord in normalized_seg])
-                        f.write(line + "\n")
+            # Collect valid segmentation annotation lines before writing
+            # Only process annotations that have actual segmentation masks (not bbox-only)
+            annotation_lines = []
             
-            converted_count += 1
+            for ann in annotations:
+                # Filter by category - only include annotations matching the model type
+                if ann.get('category_id') != target_category_id:
+                    continue
+                
+                class_id = 0  # Always 0 since we're training a single-class model
+                
+                # Only handle annotations with actual segmentation polygons
+                # Skip bbox-only annotations as they don't have real masks
+                if 'segmentation' not in ann or not ann['segmentation']:
+                    continue
+                
+                # Log if annotation has multiple polygons (debugging)
+                if len(ann['segmentation']) > 1:
+                    print(f"  Note: Annotation has {len(ann['segmentation'])} polygons - writing largest one only")
+                
+                # Find the largest polygon (by number of points) to use as the main mask
+                largest_seg = max(ann['segmentation'], key=len)
+                
+                if largest_seg is None or len(largest_seg) < 6:
+                    continue
+                
+                # Normalize coordinates
+                normalized_seg = []
+                for i in range(0, len(largest_seg), 2):
+                    x = largest_seg[i] / img_width
+                    y = largest_seg[i+1] / img_height
+                    # Ensure coordinates are in valid range
+                    x = max(0.0, min(1.0, x))
+                    y = max(0.0, min(1.0, y))
+                    normalized_seg.extend([x, y])
+                
+                if len(normalized_seg) >= 6:
+                    line = f"{class_id} " + " ".join([f"{coord:.6f}" for coord in normalized_seg])
+                    annotation_lines.append(line)
+            
+            # Only write label file and include image if there are valid segmentation annotations
+            if annotation_lines:
+                with open(label_file, 'w') as f:
+                    f.write('\n'.join(annotation_lines) + '\n')
+                converted_count += 1
+            else:
+                # Remove copied image if no segmentation annotations
+                # (image may have only bbox-only annotations or no annotations at all)
+                if dst_img_path.exists():
+                    dst_img_path.unlink()
             
         return converted_count
         
@@ -243,7 +296,43 @@ class YOLOTrainingWorker(QThread):
             'overlap_mask': False,  # Prevent overlapping masks for close-together bees
             'verbose': True,
             #'freeze':10,
+            
+            # Enhanced augmentation parameters
+            'hsv_v': 0.2,
+            'degrees': 20.0,
+            'translate': 0.2,
+            'scale': 0.4,
+            'shear': 5.0,
+            'perspective': 0.0005,
+            'flipud': 0.5,
+            'fliplr': 0.5,
+            'mosaic': 0.1,
+            'mixup': 0.05,
+            'cutmix': 0.05,
+            'copy_paste': 0.05,
+            'copy_paste_mode': 'mixup',
+            'erasing': 0.05,
+            
+            # Multi-scale training
+            'rect': False,
+            'close_mosaic': 10,
+            'visualize': True,
         }
+        
+        # Add custom Albumentations for blur augmentation (to handle blurry videos)
+        if ALBUMENTATIONS_AVAILABLE:
+            custom_transforms = [
+                A.Blur(blur_limit=(3, 15), p=0.15),  # Gaussian blur with 15% probability
+                A.MedianBlur(blur_limit=15, p=0.15),  # Median blur with 15% probability
+            ]
+            # Monkey-patch the Albumentations class into the model's data augmentation
+            # This will be applied during data loading
+            training_params['augment'] = True  # Enable augmentation
+            model.add_callback('on_train_start', 
+                lambda trainer: setattr(trainer.train_loader.dataset, 'albumentations',
+                    Albumentations(p=1.0, transforms=custom_transforms)) 
+                    if hasattr(trainer, 'train_loader') and hasattr(trainer.train_loader, 'dataset') else None
+            )
         
         # Train with callback for progress
         class ProgressCallback:

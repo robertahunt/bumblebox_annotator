@@ -4,7 +4,7 @@ Training progress dialog for YOLO model training
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QProgressBar, QTextEdit, QGroupBox,
-                             QFormLayout, QSpinBox, QComboBox, QCheckBox)
+                             QFormLayout, QSpinBox, QComboBox, QCheckBox, QSlider)
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QFont
 import matplotlib.pyplot as plt
@@ -15,19 +15,25 @@ from matplotlib.figure import Figure
 class TrainingProgressDialog(QDialog):
     """Dialog showing YOLO training progress with metrics"""
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, instance_focused=False):
         super().__init__(parent)
         self.setWindowTitle("YOLO Training Progress")
         self.setModal(True)
         self.setMinimumSize(800, 600)
         
+        self.instance_focused = instance_focused  # Track if this is instance-focused training
         self.training_worker = None
         # Store metrics as lists of (epoch, value) tuples to keep them synchronized
+        # Support both mAP and IoU metric names
         self.metrics_history = {
             'train_loss': [],  # [(epoch, value), ...]
             'val_loss': [],
-            'mAP50': [],
-            'mAP50-95': []
+            'mAP50': [],  # Legacy/general training
+            'mAP50-95': [],
+            'Mask_IoU@0.5': [],  # Instance-focused training
+            'Mask_IoU@0.5:0.95': [],
+            'Box_IoU@0.5': [],
+            'Box_IoU@0.5:0.95': []
         }
         
         # Track completion status
@@ -65,8 +71,14 @@ class TrainingProgressDialog(QDialog):
         metrics_layout.addRow("Epoch:", self.epoch_label)
         metrics_layout.addRow("Train Loss:", self.train_loss_label)
         metrics_layout.addRow("Val Loss:", self.val_loss_label)
-        metrics_layout.addRow("mAP50:", self.map50_label)
-        metrics_layout.addRow("mAP50-95:", self.map50_95_label)
+        
+        # Labels change based on training type
+        if self.instance_focused:
+            metrics_layout.addRow("Mask IoU@0.5:", self.map50_label)
+            metrics_layout.addRow("Mask IoU@0.5:0.95:", self.map50_95_label)
+        else:
+            metrics_layout.addRow("mAP50:", self.map50_label)
+            metrics_layout.addRow("mAP50-95:", self.map50_95_label)
         
         metrics_group.setLayout(metrics_layout)
         layout.addWidget(metrics_group)
@@ -166,13 +178,25 @@ class TrainingProgressDialog(QDialog):
                 self.train_loss_label.setText(f"{metrics['train_loss']:.4f}")
             if 'val_loss' in metrics:
                 self.val_loss_label.setText(f"{metrics['val_loss']:.4f}")
-            if 'mAP50' in metrics:
-                self.map50_label.setText(f"{metrics['mAP50']:.4f}")
-            if 'mAP50-95' in metrics:
-                self.map50_95_label.setText(f"{metrics['mAP50-95']:.4f}")
+            
+            # Support both mAP (general) and IoU (instance-focused) metric names
+            if self.instance_focused:
+                # Instance-focused training: look for IoU metrics
+                if 'Mask_IoU@0.5' in metrics:
+                    self.map50_label.setText(f"{metrics['Mask_IoU@0.5']:.4f}")
+                if 'Mask_IoU@0.5:0.95' in metrics:
+                    self.map50_95_label.setText(f"{metrics['Mask_IoU@0.5:0.95']:.4f}")
+            else:
+                # General training: look for mAP metrics
+                if 'mAP50' in metrics:
+                    self.map50_label.setText(f"{metrics['mAP50']:.4f}")
+                if 'mAP50-95' in metrics:
+                    self.map50_95_label.setText(f"{metrics['mAP50-95']:.4f}")
             
             # Store metrics history as (epoch, value) tuples
-            for key in ['train_loss', 'val_loss', 'mAP50', 'mAP50-95']:
+            metric_keys = ['train_loss', 'val_loss', 'mAP50', 'mAP50-95', 
+                          'Mask_IoU@0.5', 'Mask_IoU@0.5:0.95', 'Box_IoU@0.5', 'Box_IoU@0.5:0.95']
+            for key in metric_keys:
                 if key in metrics:
                     self.metrics_history[key].append((epoch, metrics[key]))
             
@@ -183,7 +207,10 @@ class TrainingProgressDialog(QDialog):
         log_msg = f"Epoch {epoch}/{total_epochs}"
         if metrics:
             log_msg += f" - Loss: {metrics.get('train_loss', 0):.4f}"
-            log_msg += f" - mAP50: {metrics.get('mAP50', 0):.4f}"
+            if self.instance_focused:
+                log_msg += f" - Mask IoU@0.5: {metrics.get('Mask_IoU@0.5', 0):.4f}"
+            else:
+                log_msg += f" - mAP50: {metrics.get('mAP50', 0):.4f}"
         self.log(log_msg)
     
     def _init_empty_plot(self):
@@ -201,10 +228,14 @@ class TrainingProgressDialog(QDialog):
                 ha='center', va='center', transform=ax1.transAxes,
                 fontsize=10, color='gray')
         
-        # Set up mAP plot
+        # Set up metric plot (mAP or IoU depending on training type)
         ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('mAP')
-        ax2.set_title('Validation mAP')
+        if self.instance_focused:
+            ax2.set_ylabel('IoU')
+            ax2.set_title('Validation Mask IoU')
+        else:
+            ax2.set_ylabel('mAP')
+            ax2.set_title('Validation mAP')
         ax2.grid(True, alpha=0.3)
         ax2.text(0.5, 0.5, 'Waiting for training data...', 
                 ha='center', va='center', transform=ax2.transAxes,
@@ -244,20 +275,36 @@ class TrainingProgressDialog(QDialog):
             ax1.legend()
         ax1.grid(True, alpha=0.3)
         
-        # Plot mAP
+        # Plot mAP or IoU depending on training type
         has_map_data = False
-        if self.metrics_history['mAP50']:
-            epochs, values = zip(*self.metrics_history['mAP50'])
-            ax2.plot(epochs, values, 'g-', label='mAP50', linewidth=2)
-            has_map_data = True
-        if self.metrics_history['mAP50-95']:
-            epochs, values = zip(*self.metrics_history['mAP50-95'])
-            ax2.plot(epochs, values, 'm-', label='mAP50-95', linewidth=2)
-            has_map_data = True
-        
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('mAP')
-        ax2.set_title('Validation mAP')
+        if self.instance_focused:
+            # Instance-focused: plot IoU metrics
+            if self.metrics_history['Mask_IoU@0.5']:
+                epochs, values = zip(*self.metrics_history['Mask_IoU@0.5'])
+                ax2.plot(epochs, values, 'g-', label='Mask IoU@0.5', linewidth=2)
+                has_map_data = True
+            if self.metrics_history['Mask_IoU@0.5:0.95']:
+                epochs, values = zip(*self.metrics_history['Mask_IoU@0.5:0.95'])
+                ax2.plot(epochs, values, 'm-', label='Mask IoU@0.5:0.95', linewidth=2)
+                has_map_data = True
+            
+            ax2.set_xlabel('Epoch')
+            ax2.set_ylabel('IoU')
+            ax2.set_title('Validation Mask IoU')
+        else:
+            # General training: plot mAP metrics
+            if self.metrics_history['mAP50']:
+                epochs, values = zip(*self.metrics_history['mAP50'])
+                ax2.plot(epochs, values, 'g-', label='mAP50', linewidth=2)
+                has_map_data = True
+            if self.metrics_history['mAP50-95']:
+                epochs, values = zip(*self.metrics_history['mAP50-95'])
+                ax2.plot(epochs, values, 'm-', label='mAP50-95', linewidth=2)
+                has_map_data = True
+            
+            ax2.set_xlabel('Epoch')
+            ax2.set_ylabel('mAP')
+            ax2.set_title('Validation mAP')
         if has_map_data:
             ax2.legend()
         ax2.grid(True, alpha=0.3)
@@ -308,13 +355,19 @@ class TrainingProgressDialog(QDialog):
 class TrainingConfigDialog(QDialog):
     """Dialog for configuring YOLO training parameters"""
     
-    def __init__(self, parent=None, current_model_path=None, stage2=False, sahi=False):
+    def __init__(self, parent=None, current_model_path=None, stage2=False, sahi=False, beehavesque=False, instance_focused=False):
         super().__init__(parent)
         self.stage2 = stage2
         self.sahi = sahi
+        self.beehavesque = beehavesque
+        self.instance_focused = instance_focused
         
-        if sahi:
+        if beehavesque:
+            title = "Configure Beehavesque Training"
+        elif sahi:
             title = "Configure SAHI Training"
+        elif instance_focused:
+            title = "Configure Instance-Focused Training"
         elif stage2:
             title = "Configure Stage 2 Training"
         else:
@@ -331,11 +384,25 @@ class TrainingConfigDialog(QDialog):
         layout = QVBoxLayout(self)
         
         # Info label
-        if self.sahi:
+        if self.beehavesque:
+            info_text = (
+                "Configure parameters for training the Beehavesque model with temporal context.\n"
+                "This model uses previous/current/next frames as RGB channels to learn motion patterns.\n"
+                "Training uses tiled crops with enhanced augmentation for improved detection.\n"
+                "The current model will be backed up before training starts."
+            )
+        elif self.sahi:
             info_text = (
                 "Configure parameters for training the SAHI model with enhanced augmentation.\n"
                 "This model is trained on full images with aggressive data augmentation,\n"
                 "optimized for sliced inference on large images.\n"
+                "The current model will be backed up before training starts."
+            )
+        elif self.instance_focused:
+            info_text = (
+                "Configure parameters for training the Instance-Focused refinement model.\n"
+                "Training crops are generated around each bee with configurable padding, resized to uniform size.\n"
+                "Only the primary instance is labeled in each crop (other bees are ignored).\n"
                 "The current model will be backed up before training starts."
             )
         elif self.stage2:
@@ -360,8 +427,10 @@ class TrainingConfigDialog(QDialog):
         # Epochs
         self.epochs_spin = QSpinBox()
         self.epochs_spin.setRange(1, 1000)
-        if self.sahi:
-            self.epochs_spin.setValue(100)  # More epochs for SAHI training
+        if self.sahi or self.beehavesque:
+            self.epochs_spin.setValue(100)  # More epochs for SAHI/Beehavesque training
+        elif self.instance_focused:
+            self.epochs_spin.setValue(100)  # More epochs for instance-focused training
         else:
             self.epochs_spin.setValue(50)
         self.epochs_spin.setSuffix(" epochs")
@@ -370,19 +439,21 @@ class TrainingConfigDialog(QDialog):
         # Batch size
         self.batch_spin = QSpinBox()
         self.batch_spin.setRange(1, 64)
-        if self.sahi:
+        if self.sahi or self.beehavesque:
             self.batch_spin.setValue(8)  # Smaller batch for larger images
+        elif self.instance_focused:
+            self.batch_spin.setValue(16)  # Larger batch for uniform-sized crops
         else:
             self.batch_spin.setValue(8)
         params_layout.addRow("Batch Size:", self.batch_spin)
         
         # Image size
         self.imgsz_combo = QComboBox()
-        if self.sahi:
+        if self.sahi or self.beehavesque:
             self.imgsz_combo.addItems(['640', '800', '1024', '1280', '1536'])
-            self.imgsz_combo.setCurrentText('640')  # Larger size for SAHI
+            self.imgsz_combo.setCurrentText('640')  # Larger size for SAHI/Beehavesque
         else:
-            self.imgsz_combo.addItems(['320', '480', '640', '800', '1024'])
+            self.imgsz_combo.addItems(['320', '480', '640', '800', '1024', '1280', '1536', '1920'])
             self.imgsz_combo.setCurrentText('640')
         params_layout.addRow("Image Size:", self.imgsz_combo)
         
@@ -395,8 +466,10 @@ class TrainingConfigDialog(QDialog):
         # Patience (early stopping)
         self.patience_spin = QSpinBox()
         self.patience_spin.setRange(1, 100)
-        if self.sahi:
-            self.patience_spin.setValue(20)  # More patience for SAHI
+        if self.sahi or self.beehavesque:
+            self.patience_spin.setValue(20)  # More patience for SAHI/Beehavesque
+        elif self.instance_focused:
+            self.patience_spin.setValue(20)  # More patience for instance-focused
         else:
             self.patience_spin.setValue(10)
         self.patience_spin.setSuffix(" epochs")
@@ -421,9 +494,31 @@ class TrainingConfigDialog(QDialog):
         export_group.setLayout(export_layout)
         layout.addWidget(export_group)
         
-        # SAHI specific parameters
-        if self.sahi:
-            sahi_group = QGroupBox("SAHI Random Crop Parameters")
+        # Model Type Selection (only for coarse YOLO training)
+        if not (self.stage2 or self.sahi or self.beehavesque or self.instance_focused):
+            model_type_group = QGroupBox("Model Type")
+            model_type_layout = QFormLayout()
+            
+            self.model_type_combo = QComboBox()
+            self.model_type_combo.addItems(["Bee", "Chamber", "Hive"])
+            self.model_type_combo.setCurrentText("Bee")
+            self.model_type_combo.setToolTip(
+                "Select which annotation type to train on:\n"
+                "• Bee: Per-frame multi-instance bee annotations\n"
+                "• Chamber: Video-level chamber masks\n"
+                "• Hive: Video-level hive masks"
+            )
+            model_type_layout.addRow("Annotation Type:", self.model_type_combo)
+            
+            model_type_group.setLayout(model_type_layout)
+            layout.addWidget(model_type_group)
+        
+        # SAHI/Beehavesque specific parameters
+        if self.sahi or self.beehavesque:
+            if self.beehavesque:
+                param_group = QGroupBox("Temporal Crop Parameters")
+            else:
+                param_group = QGroupBox("SAHI Random Crop Parameters")
             sahi_layout = QFormLayout()
             
             # Crop size
@@ -432,7 +527,10 @@ class TrainingConfigDialog(QDialog):
             self.crop_size_spin.setSingleStep(64)
             self.crop_size_spin.setValue(640)
             self.crop_size_spin.setSuffix(" px")
-            self.crop_size_spin.setToolTip("Size of random crops (should match SAHI slice size at inference)")
+            if self.beehavesque:
+                self.crop_size_spin.setToolTip("Size of temporal image crops (should match slice size at inference)")
+            else:
+                self.crop_size_spin.setToolTip("Size of random crops (should match SAHI slice size at inference)")
             sahi_layout.addRow("Crop Size:", self.crop_size_spin)
             
             # Maximum number of crops per image
@@ -449,11 +547,140 @@ class TrainingConfigDialog(QDialog):
             # Include full images checkbox
             self.include_full_checkbox = QCheckBox()
             self.include_full_checkbox.setChecked(True)
-            self.include_full_checkbox.setToolTip("Include full images in addition to crops")
+            if self.beehavesque:
+                self.include_full_checkbox.setToolTip("Include full temporal images in addition to crops")
+            else:
+                self.include_full_checkbox.setToolTip("Include full images in addition to crops")
             sahi_layout.addRow("Include Full Images:", self.include_full_checkbox)
             
-            sahi_group.setLayout(sahi_layout)
-            layout.addWidget(sahi_group)
+            param_group.setLayout(sahi_layout)
+            layout.addWidget(param_group)
+            
+            # Data augmentation parameters for SAHI
+            aug_group = QGroupBox("Data Augmentation")
+            aug_layout = QFormLayout()
+            
+            # HSV augmentation
+            hsv_h_layout = QHBoxLayout()
+            self.hsv_h_slider = QSlider(Qt.Orientation.Horizontal)
+            self.hsv_h_slider.setRange(0, 50)
+            self.hsv_h_slider.setValue(15)  # 0.015 * 1000
+            self.hsv_h_slider.setTickInterval(5)
+            self.hsv_h_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.hsv_h_label = QLabel("0.015")
+            self.hsv_h_slider.valueChanged.connect(lambda v: self.hsv_h_label.setText(f"{v/1000:.3f}"))
+            hsv_h_layout.addWidget(self.hsv_h_slider)
+            hsv_h_layout.addWidget(self.hsv_h_label)
+            aug_layout.addRow("HSV-Hue:", hsv_h_layout)
+            
+            hsv_s_layout = QHBoxLayout()
+            self.hsv_s_slider = QSlider(Qt.Orientation.Horizontal)
+            self.hsv_s_slider.setRange(0, 100)
+            self.hsv_s_slider.setValue(70)  # 0.7 * 100
+            self.hsv_s_slider.setTickInterval(10)
+            self.hsv_s_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.hsv_s_label = QLabel("0.70")
+            self.hsv_s_slider.valueChanged.connect(lambda v: self.hsv_s_label.setText(f"{v/100:.2f}"))
+            hsv_s_layout.addWidget(self.hsv_s_slider)
+            hsv_s_layout.addWidget(self.hsv_s_label)
+            aug_layout.addRow("HSV-Saturation:", hsv_s_layout)
+            
+            hsv_v_layout = QHBoxLayout()
+            self.hsv_v_slider = QSlider(Qt.Orientation.Horizontal)
+            self.hsv_v_slider.setRange(0, 100)
+            self.hsv_v_slider.setValue(40)  # 0.4 * 100
+            self.hsv_v_slider.setTickInterval(10)
+            self.hsv_v_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.hsv_v_label = QLabel("0.40")
+            self.hsv_v_slider.valueChanged.connect(lambda v: self.hsv_v_label.setText(f"{v/100:.2f}"))
+            hsv_v_layout.addWidget(self.hsv_v_slider)
+            hsv_v_layout.addWidget(self.hsv_v_label)
+            aug_layout.addRow("HSV-Value:", hsv_v_layout)
+            
+            # Geometric augmentation
+            self.degrees_spin = QSpinBox()
+            self.degrees_spin.setRange(0, 45)
+            self.degrees_spin.setValue(10)
+            self.degrees_spin.setSuffix("°")
+            self.degrees_spin.setToolTip("Image rotation range")
+            aug_layout.addRow("Rotation:", self.degrees_spin)
+            
+            translate_layout = QHBoxLayout()
+            self.translate_slider = QSlider(Qt.Orientation.Horizontal)
+            self.translate_slider.setRange(0, 50)
+            self.translate_slider.setValue(20)  # 0.2 * 100
+            self.translate_slider.setTickInterval(5)
+            self.translate_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.translate_label = QLabel("0.20")
+            self.translate_slider.valueChanged.connect(lambda v: self.translate_label.setText(f"{v/100:.2f}"))
+            translate_layout.addWidget(self.translate_slider)
+            translate_layout.addWidget(self.translate_label)
+            aug_layout.addRow("Translation:", translate_layout)
+            
+            scale_layout = QHBoxLayout()
+            self.scale_slider = QSlider(Qt.Orientation.Horizontal)
+            self.scale_slider.setRange(0, 100)
+            self.scale_slider.setValue(90)  # 0.9 * 100
+            self.scale_slider.setTickInterval(10)
+            self.scale_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.scale_label = QLabel("0.90")
+            self.scale_slider.valueChanged.connect(lambda v: self.scale_label.setText(f"{v/100:.2f}"))
+            scale_layout.addWidget(self.scale_slider)
+            scale_layout.addWidget(self.scale_label)
+            aug_layout.addRow("Scale:", scale_layout)
+            
+            # Flip probabilities
+            flipud_layout = QHBoxLayout()
+            self.flipud_slider = QSlider(Qt.Orientation.Horizontal)
+            self.flipud_slider.setRange(0, 100)
+            self.flipud_slider.setValue(50)  # 0.5 * 100
+            self.flipud_slider.setTickInterval(10)
+            self.flipud_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.flipud_label = QLabel("0.50")
+            self.flipud_slider.valueChanged.connect(lambda v: self.flipud_label.setText(f"{v/100:.2f}"))
+            flipud_layout.addWidget(self.flipud_slider)
+            flipud_layout.addWidget(self.flipud_label)
+            aug_layout.addRow("Flip Up-Down:", flipud_layout)
+            
+            fliplr_layout = QHBoxLayout()
+            self.fliplr_slider = QSlider(Qt.Orientation.Horizontal)
+            self.fliplr_slider.setRange(0, 100)
+            self.fliplr_slider.setValue(50)  # 0.5 * 100
+            self.fliplr_slider.setTickInterval(10)
+            self.fliplr_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.fliplr_label = QLabel("0.50")
+            self.fliplr_slider.valueChanged.connect(lambda v: self.fliplr_label.setText(f"{v/100:.2f}"))
+            fliplr_layout.addWidget(self.fliplr_slider)
+            fliplr_layout.addWidget(self.fliplr_label)
+            aug_layout.addRow("Flip Left-Right:", fliplr_layout)
+            
+            # Advanced augmentation probabilities
+            mosaic_layout = QHBoxLayout()
+            self.mosaic_slider = QSlider(Qt.Orientation.Horizontal)
+            self.mosaic_slider.setRange(0, 100)
+            self.mosaic_slider.setValue(10)  # 0.1 * 100
+            self.mosaic_slider.setTickInterval(10)
+            self.mosaic_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.mosaic_label = QLabel("0.10")
+            self.mosaic_slider.valueChanged.connect(lambda v: self.mosaic_label.setText(f"{v/100:.2f}"))
+            mosaic_layout.addWidget(self.mosaic_slider)
+            mosaic_layout.addWidget(self.mosaic_label)
+            aug_layout.addRow("Mosaic:", mosaic_layout)
+            
+            mixup_layout = QHBoxLayout()
+            self.mixup_slider = QSlider(Qt.Orientation.Horizontal)
+            self.mixup_slider.setRange(0, 50)
+            self.mixup_slider.setValue(5)  # 0.05 * 100
+            self.mixup_slider.setTickInterval(5)
+            self.mixup_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            self.mixup_label = QLabel("0.05")
+            self.mixup_slider.valueChanged.connect(lambda v: self.mixup_label.setText(f"{v/100:.2f}"))
+            mixup_layout.addWidget(self.mixup_slider)
+            mixup_layout.addWidget(self.mixup_label)
+            aug_layout.addRow("Mixup:", mixup_layout)
+            
+            aug_group.setLayout(aug_layout)
+            layout.addWidget(aug_group)
         
         # Stage 2 specific parameters
         if self.stage2:
@@ -479,15 +706,75 @@ class TrainingConfigDialog(QDialog):
             stage2_group.setLayout(stage2_layout)
             layout.addWidget(stage2_group)
         
+        # Instance-focused specific parameters
+        if self.instance_focused:
+            instance_group = QGroupBox("Instance-Focused Crop Parameters")
+            instance_layout = QFormLayout()
+            
+            # Padding mode
+            self.padding_mode_combo = QComboBox()
+            self.padding_mode_combo.addItems(['absolute', 'relative'])
+            self.padding_mode_combo.setCurrentText('absolute')
+            self.padding_mode_combo.setToolTip("Use absolute padding (pixels) or relative padding (percentage)")
+            instance_layout.addRow("Padding Mode:", self.padding_mode_combo)
+            
+            # Absolute padding
+            self.padding_px_spin = QSpinBox()
+            self.padding_px_spin.setRange(0, 500)
+            self.padding_px_spin.setValue(50)
+            self.padding_px_spin.setSuffix(" px")
+            self.padding_px_spin.setToolTip("Absolute padding in pixels (used when mode is 'absolute')")
+            instance_layout.addRow("Padding (Absolute):", self.padding_px_spin)
+            
+            # Relative padding
+            self.padding_pct_spin = QSpinBox()
+            self.padding_pct_spin.setRange(0, 100)
+            self.padding_pct_spin.setValue(30)
+            self.padding_pct_spin.setSuffix("%")
+            self.padding_pct_spin.setToolTip("Relative padding as percentage of bbox size (used when mode is 'relative')")
+            instance_layout.addRow("Padding (Relative):", self.padding_pct_spin)
+            
+            # Target crop size
+            self.target_crop_size_spin = QSpinBox()
+            self.target_crop_size_spin.setRange(320, 1536)
+            self.target_crop_size_spin.setSingleStep(64)
+            self.target_crop_size_spin.setValue(640)
+            self.target_crop_size_spin.setSuffix(" px")
+            self.target_crop_size_spin.setToolTip("All crops will be resized to this size")
+            instance_layout.addRow("Target Crop Size:", self.target_crop_size_spin)
+            
+            # Maintain aspect ratio
+            self.maintain_aspect_checkbox = QCheckBox()
+            self.maintain_aspect_checkbox.setChecked(False)
+            self.maintain_aspect_checkbox.setToolTip("If checked, pad to maintain aspect ratio; if unchecked, resize to square")
+            instance_layout.addRow("Maintain Aspect Ratio:", self.maintain_aspect_checkbox)
+            
+            # Min crop size
+            self.instance_min_crop_size_spin = QSpinBox()
+            self.instance_min_crop_size_spin.setRange(32, 512)
+            self.instance_min_crop_size_spin.setValue(128)
+            self.instance_min_crop_size_spin.setSuffix(" px")
+            self.instance_min_crop_size_spin.setToolTip("Minimum crop size (smaller crops will be skipped)")
+            instance_layout.addRow("Min Crop Size:", self.instance_min_crop_size_spin)
+            
+            instance_group.setLayout(instance_layout)
+            layout.addWidget(instance_group)
+        
         # Model name
         name_group = QGroupBox("Model Name")
         name_layout = QFormLayout()
         
         self.name_combo = QComboBox()
         self.name_combo.setEditable(True)
-        if self.sahi:
+        if self.beehavesque:
+            self.name_combo.addItems(['bee_segmentation_beehavesque', 'bee_segmentation_beehavesque_v2', 'bee_beehavesque'])
+            self.name_combo.setCurrentText('bee_segmentation_beehavesque')
+        elif self.sahi:
             self.name_combo.addItems(['bee_segmentation_sahi', 'bee_segmentation_sahi_v2', 'bee_sahi'])
             self.name_combo.setCurrentText('bee_segmentation_sahi')
+        elif self.instance_focused:
+            self.name_combo.addItems(['bee_segmentation_instance_focused', 'bee_segmentation_instance_v2', 'bee_instance'])
+            self.name_combo.setCurrentText('bee_segmentation_instance_focused')
         elif self.stage2:
             self.name_combo.addItems(['bee_segmentation_stage2', 'bee_segmentation_stage2_v2', 'bee_stage2'])
             self.name_combo.setCurrentText('bee_segmentation_stage2')
@@ -525,15 +812,41 @@ class TrainingConfigDialog(QDialog):
             'export_coco': self.export_coco_checkbox.isChecked()
         }
         
-        # Add SAHI specific parameters
-        if self.sahi:
+        # Add model type for coarse YOLO training
+        if not (self.stage2 or self.sahi or self.beehavesque or self.instance_focused):
+            model_type_map = {'Bee': 'bee', 'Chamber': 'chamber', 'Hive': 'hive'}
+            config['model_type'] = model_type_map.get(self.model_type_combo.currentText(), 'bee')
+        
+        # Add SAHI/Beehavesque specific parameters
+        if self.sahi or self.beehavesque:
             config['crop_size'] = self.crop_size_spin.value()
             config['max_crops_per_image'] = self.max_crops_spin.value()
             config['include_full_images'] = self.include_full_checkbox.isChecked()
+            
+            # Add augmentation parameters
+            config['hsv_h'] = self.hsv_h_slider.value() / 1000.0
+            config['hsv_s'] = self.hsv_s_slider.value() / 100.0
+            config['hsv_v'] = self.hsv_v_slider.value() / 100.0
+            config['degrees'] = self.degrees_spin.value()
+            config['translate'] = self.translate_slider.value() / 100.0
+            config['scale'] = self.scale_slider.value() / 100.0
+            config['flipud'] = self.flipud_slider.value() / 100.0
+            config['fliplr'] = self.fliplr_slider.value() / 100.0
+            config['mosaic'] = self.mosaic_slider.value() / 100.0
+            config['mixup'] = self.mixup_slider.value() / 100.0
         
         # Add Stage 2 specific parameters
         if self.stage2:
             config['crop_padding'] = self.crop_padding_spin.value() / 100.0  # Convert to decimal
             config['min_crop_size'] = self.min_crop_size_spin.value()
+        
+        # Add Instance-Focused specific parameters
+        if self.instance_focused:
+            config['crop_padding_mode'] = self.padding_mode_combo.currentText()
+            config['crop_padding_px'] = self.padding_px_spin.value()
+            config['crop_padding_pct'] = self.padding_pct_spin.value() / 100.0  # Convert to decimal
+            config['target_crop_size'] = self.target_crop_size_spin.value()
+            config['maintain_aspect_ratio'] = self.maintain_aspect_checkbox.isChecked()
+            config['min_crop_size'] = self.instance_min_crop_size_spin.value()
         
         return config

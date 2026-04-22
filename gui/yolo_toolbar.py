@@ -13,6 +13,8 @@ class YOLOToolbar(QWidget):
     
     inference_requested = pyqtSignal()  # Signal to request inference on current frame
     track_from_last_requested = pyqtSignal()  # Signal to request tracking from last annotated frame
+    propagate_requested = pyqtSignal()  # Signal to request propagation through video
+    process_video_requested = pyqtSignal()  # Signal to request processing entire video
     
     def __init__(self, parent=None, checkpoint_path=None):
         super().__init__(parent)
@@ -66,6 +68,26 @@ class YOLOToolbar(QWidget):
         self.track_btn.clicked.connect(self.on_track_requested)
         layout.addWidget(self.track_btn)
         
+        # Separator
+        layout.addWidget(self.create_separator())
+        
+        # Propagate button
+        self.propagate_btn = QPushButton("Propagate Through Video")
+        self.propagate_btn.setToolTip("Run YOLO detection and tracking through multiple frames")
+        self.propagate_btn.setEnabled(False)  # Disabled until model is loaded
+        self.propagate_btn.clicked.connect(self.on_propagate_requested)
+        layout.addWidget(self.propagate_btn)
+        
+        # Separator
+        layout.addWidget(self.create_separator())
+        
+        # Process entire video button
+        self.process_video_btn = QPushButton("Process Entire Video")
+        self.process_video_btn.setToolTip("Run YOLO detection from current frame to end of video")
+        self.process_video_btn.setEnabled(False)  # Disabled until model is loaded
+        self.process_video_btn.clicked.connect(self.on_process_video_requested)
+        layout.addWidget(self.process_video_btn)
+        
         layout.addStretch()
         
     def create_separator(self):
@@ -113,7 +135,8 @@ class YOLOToolbar(QWidget):
             self.model_status_label.setStyleSheet("color: green;")
             self.inference_btn.setEnabled(True)
             self.track_btn.setEnabled(True)
-            self.box_inference_btn.setEnabled(True)
+            self.propagate_btn.setEnabled(True)
+            self.process_video_btn.setEnabled(True)
             
             if show_dialogs:
                 QMessageBox.information(
@@ -144,6 +167,8 @@ class YOLOToolbar(QWidget):
             self.model_status_label.setStyleSheet("color: red;")
             self.inference_btn.setEnabled(False)
             self.track_btn.setEnabled(False)
+            self.propagate_btn.setEnabled(False)
+            self.process_video_btn.setEnabled(False)
     
     def on_inference_requested(self):
         """Handle inference button click"""
@@ -168,6 +193,30 @@ class YOLOToolbar(QWidget):
             return
             
         self.track_from_last_requested.emit()
+    
+    def on_propagate_requested(self):
+        """Handle propagate button click"""
+        if self.model is None:
+            QMessageBox.warning(
+                self,
+                "No Model",
+                "Please load a YOLO checkpoint first."
+            )
+            return
+            
+        self.propagate_requested.emit()
+    
+    def on_process_video_requested(self):
+        """Handle process entire video button click"""
+        if self.model is None:
+            QMessageBox.warning(
+                self,
+                "No Model",
+                "Please load a YOLO checkpoint first."
+            )
+            return
+            
+        self.process_video_requested.emit()
     
     def get_model(self):
         """Get the loaded YOLO model"""

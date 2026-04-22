@@ -91,34 +91,47 @@ class FrameCache:
 
 
 class PreloadWorker(threading.Thread):
-    """Background worker thread for preloading frames"""
+    """Background worker thread for preloading frames and annotations"""
     
-    def __init__(self, frame_cache):
+    def __init__(self, frame_cache, annotation_manager=None):
         """
         Initialize preload worker
         
         Args:
             frame_cache: FrameCache instance to populate
+            annotation_manager: AnnotationManager instance for preloading annotations (optional)
         """
         super().__init__(daemon=True)
         self.frame_cache = frame_cache
+        self.annotation_manager = annotation_manager
         self.request_queue = queue.Queue()
         self.running = True
         self.current_request_id = 0
         self.lock = threading.Lock()
+        self.project_path = None
+        self.current_video_id = None
+        self.frame_video_ids = []
         
-    def request_preload(self, current_idx, frame_paths, selected_indices=None):
+    def request_preload(self, current_idx, frame_paths, selected_indices=None, 
+                       project_path=None, video_id=None, frame_video_ids=None):
         """
-        Request preloading of frames around current index
+        Request preloading of frames and annotations around current index
         
         Args:
             current_idx: Current frame index
             frame_paths: List of frame paths
             selected_indices: List of indices that are selected for train/val
+            project_path: Path to project (for annotation loading)
+            video_id: Current video ID (for annotation loading)
+            frame_video_ids: List mapping frame index to video ID
         """
         with self.lock:
             self.current_request_id += 1
             request_id = self.current_request_id
+            # Update context for annotation loading
+            self.project_path = project_path
+            self.current_video_id = video_id
+            self.frame_video_ids = frame_video_ids or []
         
         self.request_queue.put({
             'request_id': request_id,
@@ -157,9 +170,88 @@ class PreloadWorker(threading.Thread):
         Args:
             request: Dict with current_idx, frame_paths, selected_indices
         """
-        # Disabled: background preloading was causing excessive cache churn and memory issues
-        # The cache still works - it just stores frames as they are viewed, not predictively
-        return
+        current_idx = request['current_idx']
+        frame_paths = request['frame_paths']
+        
+        if not frame_paths:
+            return
+        
+        # Define preload window: 1 frame behind, 2-3 frames ahead
+        # This balances responsiveness with memory usage
+        indices_to_preload = []
+        
+        # Preload backward (1 frame)
+        if current_idx > 0:
+            indices_to_preload.append(current_idx - 1)
+        
+        # Preload forward (2-3 frames)
+        for offset in range(1, 4):
+            if current_idx + offset < len(frame_paths):
+                indices_to_preload.append(current_idx + offset)
+        
+        # Preload frames and annotations
+        for idx in indices_to_preload:
+            # Check if already cached - skip if so
+            if self.frame_cache.is_cached(idx):
+                continue
+            
+            # Check if cache is full - don't cause evictions
+            if self.frame_cache.get_size() >= self.frame_cache.max_size:
+                break
+            
+            # Load frame
+            frame_image = self._load_frame(frame_paths[idx])
+            if frame_image is not None:
+                self.frame_cache.put(idx, frame_image)
+                # print(f"Preloaded frame {idx}")
+            
+            # Load annotations if annotation manager is available
+            if self.annotation_manager and self.project_path:
+                # Get video ID for this frame
+                if idx < len(self.frame_video_ids):
+                    frame_video_id = self.frame_video_ids[idx]
+                else:
+                    frame_video_id = self.current_video_id
+                
+                # Only preload if not already cached
+                cached_anns = self.annotation_manager.get_frame_annotations(idx)
+                if not cached_anns and frame_video_id:
+                    # Extract frame index within video from filename
+                    frame_idx_in_video = self._get_frame_idx_in_video(idx, frame_paths)
+                    
+                    # Load annotations
+                    try:
+                        annotations = self.annotation_manager.load_frame_annotations(
+                            self.project_path, frame_video_id, frame_idx_in_video
+                        )
+                        if annotations:
+                            self.annotation_manager.set_frame_annotations(idx, annotations)
+                            # print(f"Preloaded annotations for frame {idx}")
+                    except Exception as e:
+                        # Silent failure - annotation preloading is best-effort
+                        pass
+    
+    def _get_frame_idx_in_video(self, list_idx, frame_paths):
+        """
+        Get the frame index within the video for a given list index
+        
+        Extracts frame number from filename: frame_000001.jpg -> 1
+        """
+        if list_idx >= len(frame_paths):
+            return list_idx
+        
+        frame = frame_paths[list_idx]
+        if isinstance(frame, (Path, str)):
+            # Extract frame number from filename
+            frame_path = Path(frame)
+            if frame_path.stem.startswith('frame_'):
+                try:
+                    return int(frame_path.stem.split('_')[1])
+                except (ValueError, IndexError):
+                    pass
+        
+        # Fallback to list index
+        return list_idx
     
     def _load_frame(self, frame_path):
         """
