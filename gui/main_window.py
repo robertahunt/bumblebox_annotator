@@ -231,6 +231,12 @@ class MainWindow(QMainWindow):
         self.toolbar.annotation_type_changed.connect(self.on_annotation_type_changed)
         self.toolbar.annotation_type_visibility_changed.connect(self.on_annotation_type_visibility_changed)
         
+        # Synchronize canvas visibility with toolbar checkbox initial states
+        # (in case signals fired before connections were made)
+        self.canvas.set_annotation_type_visibility('bee', self.toolbar.show_bees_checkbox.isChecked(), rebuild=False)
+        self.canvas.set_annotation_type_visibility('hive', self.toolbar.show_hives_checkbox.isChecked(), rebuild=False)
+        self.canvas.set_annotation_type_visibility('chamber', self.toolbar.show_chambers_checkbox.isChecked(), rebuild=False)
+        
         # Create SAM2 toolbar
         if self.sam2_checkpoint:
             print(f"Loading SAM2 checkpoint from command line: {self.sam2_checkpoint}")
@@ -7861,26 +7867,34 @@ class MainWindow(QMainWindow):
             other_category_annotations = [ann for ann in existing_annotations 
                                          if ann.get('category', 'bee') != category]
             
-            # Get the highest existing ID for this category across all frames in the video
-            # (Hive/chamber annotations are video-level, so IDs should be unique per video)
+            # Get the highest existing ID across ALL categories (not just this category)
+            # This is important because all instances (bee, hive, chamber) share the same ID space
+            # and we need to avoid ID conflicts
             if self.current_video_id:
-                # Get next ID for this category
-                category_key = f"{self.current_video_id}_{category}"
-                if category_key not in self.video_next_mask_id:
-                    # Find highest existing ID for this category in the video
-                    max_id = 0
-                    for ann in existing_annotations:
-                        if ann.get('category', 'bee') == category:
-                            mask_id = ann.get('instance_id', ann.get('mask_id', 0))
-                            max_id = max(max_id, mask_id)
-                    self.video_next_mask_id[category_key] = max_id + 1
+                # Always find the max ID across ALL categories and ALL stored next_ids
+                # to ensure we never have ID conflicts
+                max_id = 0
                 
-                next_id = self.video_next_mask_id[category_key]
+                # Check existing annotations
+                for ann in existing_annotations:
+                    mask_id = ann.get('instance_id', ann.get('mask_id', 0))
+                    max_id = max(max_id, mask_id)
+                
+                # Also check all stored next_id values for this video
+                for key, stored_next_id in self.video_next_mask_id.items():
+                    if key.startswith(f"{self.current_video_id}_"):
+                        max_id = max(max_id, stored_next_id - 1)
+                
+                next_id = max_id + 1
+                
+                # Store the updated next_id for this category
+                category_key = f"{self.current_video_id}_{category}"
+                self.video_next_mask_id[category_key] = next_id
             else:
                 # No video loaded, use simple sequential IDs
+                # Find max ID across ALL categories to avoid conflicts
                 next_id = max([ann.get('instance_id', ann.get('mask_id', 0)) 
-                              for ann in existing_annotations 
-                              if ann.get('category', 'bee') == category], 
+                              for ann in existing_annotations], 
                              default=0) + 1
             
             # Add new detections with the appropriate category
@@ -7891,10 +7905,16 @@ class MainWindow(QMainWindow):
                 self.canvas.add_mask(detection.mask, mask_id=mask_id, rebuild_viz=rebuild_viz, 
                                    category=category)
             
-            # Update next ID
+            # Update next ID for all categories of this video to avoid future conflicts
             if self.current_video_id:
-                category_key = f"{self.current_video_id}_{category}"
-                self.video_next_mask_id[category_key] = next_id + len(detections)
+                new_next_id = next_id + len(detections)
+                for cat in ['bee', 'hive', 'chamber']:
+                    cat_key = f"{self.current_video_id}_{cat}"
+                    # Update to the max of current stored value or new value
+                    if cat_key in self.video_next_mask_id:
+                        self.video_next_mask_id[cat_key] = max(self.video_next_mask_id[cat_key], new_next_id)
+                    else:
+                        self.video_next_mask_id[cat_key] = new_next_id
             
             self._register_canvas_colors()
             

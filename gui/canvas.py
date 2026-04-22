@@ -70,10 +70,11 @@ class ImageCanvas(QGraphicsView):
             'chamber': (255, 0, 0),  # Red for chamber
             'hive': (255, 255, 0)  # Yellow for hive
         }
+        # Initialize visibility to match toolbar checkbox defaults (bees=True, others=False)
         self.annotation_type_visibility = {
             'bee': True,
-            'chamber': True,
-            'hive': True
+            'chamber': False,
+            'hive': False
         }
         
         # Performance optimization: cache instance IDs and bounding boxes
@@ -1344,6 +1345,9 @@ class ImageCanvas(QGraphicsView):
             # Add border around selected instance using the optimized method
             if self.selected_mask_idx > 0:
                 self.update_selection_border()
+            
+            # Draw outlines for hive and chamber instances (helps distinguish overlapping regions)
+            self._draw_instance_outlines(all_instance_ids, mask_lookup)
         else:
             self._cached_overlay = None
         
@@ -1435,6 +1439,98 @@ class ImageCanvas(QGraphicsView):
                 self.scene.addItem(rect_item)
                 self.mask_items.append(rect_item)
                 self.bbox_items_map[instance_id] = rect_item
+    
+    def _draw_instance_outlines(self, instance_ids, mask_lookup):
+        """Draw contour outlines for hive and chamber instances to better distinguish overlapping regions
+        
+        Args:
+            instance_ids: List of instance IDs to potentially draw outlines for
+            mask_lookup: Dict mapping instance_id -> (category, mask_array)
+        """
+        from PyQt6.QtWidgets import QGraphicsPathItem
+        from PyQt6.QtGui import QPainterPath, QPen, QColor
+        
+        # Only draw outlines for hive and chamber instances
+        categories_to_outline = {'hive', 'chamber'}
+        
+        for instance_id in instance_ids:
+            if instance_id not in mask_lookup:
+                continue
+            
+            category, mask_array = mask_lookup[instance_id]
+            
+            # Only draw outlines for hive and chamber
+            if category not in categories_to_outline:
+                continue
+            
+            # Check if this category is visible
+            if not self.annotation_type_visibility.get(category, True):
+                continue
+            
+            # Extract binary mask for this instance
+            binary_mask = (mask_array == instance_id).astype(np.uint8)
+            
+            # Find contours (both external and internal/holes)
+            contours, hierarchy = cv2.findContours(
+                binary_mask,
+                cv2.RETR_CCOMP,  # Retrieve both external and internal contours
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+            
+            if not contours:
+                continue
+            
+            # Get instance color for outline
+            color = self.mask_colors.get(instance_id, (255, 255, 255))
+            
+            # Create path for all contours (external and internal)
+            path = QPainterPath()
+            
+            if hierarchy is not None:
+                hierarchy = hierarchy[0]  # Reshape from (1, n, 4) to (n, 4)
+                
+                for i, contour in enumerate(contours):
+                    if len(contour) < 3:  # Skip degenerate contours
+                        continue
+                    
+                    # Start at first point
+                    first_point = contour[0][0]
+                    path.moveTo(float(first_point[0]), float(first_point[1]))
+                    
+                    # Draw lines to other points
+                    for point in contour[1:]:
+                        pt = point[0]
+                        path.lineTo(float(pt[0]), float(pt[1]))
+                    
+                    # Close the path
+                    path.closeSubpath()
+            else:
+                # No hierarchy, just draw all contours
+                for contour in contours:
+                    if len(contour) < 3:
+                        continue
+                    
+                    first_point = contour[0][0]
+                    path.moveTo(float(first_point[0]), float(first_point[1]))
+                    
+                    for point in contour[1:]:
+                        pt = point[0]
+                        path.lineTo(float(pt[0]), float(pt[1]))
+                    
+                    path.closeSubpath()
+            
+            # Create graphics item with contrasting outline
+            # Use white outline with black shadow for good visibility
+            outline_item = QGraphicsPathItem(path)
+            
+            # Use a brighter/contrasting color for the outline
+            # White outline is most visible on colored backgrounds
+            pen = QPen(QColor(255, 255, 255), 2)  # White, 2px thick
+            outline_item.setPen(pen)
+            outline_item.setZValue(5)  # Above masks (1) but below selection border (10)
+            
+            self.scene.addItem(outline_item)
+            self.mask_items.append(outline_item)
     
     def _update_overlay_region(self, affected_pixels, instance_id):
         """Incrementally update only the affected region of the visualization
@@ -2238,6 +2334,12 @@ class ImageCanvas(QGraphicsView):
         
         # Add new border if we have a valid selection
         if self.selected_mask_idx > 0 and self.combined_mask is not None:
+            # Check if the selected instance's category is visible
+            metadata = self.annotation_metadata.get(self.selected_mask_idx, {})
+            category = metadata.get('category', 'bee')
+            if not self.annotation_type_visibility.get(category, True):
+                # Category is hidden, don't show selection border
+                return
             # Check if instance exists in combined_mask or is being edited
             if self.selected_mask_idx == self.editing_instance_id and self.editing_mask is not None:
                 # Use editing mask
@@ -2262,6 +2364,14 @@ class ImageCanvas(QGraphicsView):
                 # Item already deleted by Qt or invalid
                 pass
             self.selection_border_item = None
+        
+        # Check if the selected instance's category is visible
+        if self.selected_mask_idx > 0:
+            metadata = self.annotation_metadata.get(self.selected_mask_idx, {})
+            category = metadata.get('category', 'bee')
+            if not self.annotation_type_visibility.get(category, True):
+                # Category is hidden, don't show selection border
+                return
         
         # Find contours of the mask
         contours, _ = cv2.findContours((mask > 0).astype(np.uint8), 
