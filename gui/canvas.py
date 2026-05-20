@@ -3,12 +3,42 @@ Image canvas with zoom, pan, and annotation capabilities
 """
 
 import numpy as np
-from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsTextItem, QMenu
+from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+                             QGraphicsTextItem, QMenu, QGraphicsRectItem,
+                             QGraphicsEllipseItem, QGraphicsItem, QWidget,
+                             QHBoxLayout, QPushButton)
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF, QTimer
 from PyQt6.QtGui import (QPixmap, QImage, QPen, QBrush, QColor, QPainter,
                         QTransform, QCursor, QPolygonF, QFont, QAction)
 from pathlib import Path
 import cv2
+import time
+
+
+class OutwardBBoxRectItem(QGraphicsRectItem):
+    """BBox rectangle whose painted stroke stays outside the stored rectangle."""
+
+    def boundingRect(self):
+        pen = self.pen()
+        margin = pen.widthF() if pen.style() != Qt.PenStyle.NoPen else 0
+        return self.rect().adjusted(-margin, -margin, margin, margin)
+
+    def paint(self, painter, option, widget=None):
+        pen = self.pen()
+        painter.setPen(pen)
+        painter.setBrush(self.brush())
+
+        width = pen.widthF()
+        if width <= 0 or pen.style() == Qt.PenStyle.NoPen:
+            painter.drawRect(self.rect())
+            return
+
+        # QGraphicsRectItem normally centers the stroke on rect(). Expanding the
+        # painted rect by half the pen width makes the stroke's inner edge match
+        # rect(), so the true bbox pixels are not covered by the line.
+        visual_rect = self.rect().adjusted(-width / 2, -width / 2,
+                                           width / 2, width / 2)
+        painter.drawRect(visual_rect)
 
 
 class ImageCanvas(QGraphicsView):
@@ -18,6 +48,13 @@ class ImageCanvas(QGraphicsView):
     box_drawn = pyqtSignal(int, int, int, int)  # x1, y1, x2, y2
     annotation_changed = pyqtSignal()
     masks_visibility_changed = pyqtSignal(bool)  # Signal when mask visibility changes
+    instance_visibility_changed = pyqtSignal(int, str, bool)  # instance_id, category, visible
+    instance_visibility_toggle_blocked = pyqtSignal(int, str)  # instance_id, category
+    instance_selected = pyqtSignal(int, str)  # instance_id, category
+    brush_size_step_requested = pyqtSignal(int)  # +1 larger, -1 smaller
+    brush_size_unit_step_requested = pyqtSignal(int)  # exact +1 larger, -1 smaller
+    brush_eraser_toggle_requested = pyqtSignal()
+    instance_switch_tap_progress = pyqtSignal(int, str, int)  # instance_id, category, taps remaining
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -59,10 +96,14 @@ class ImageCanvas(QGraphicsView):
         self.mask_colors = {}  # Dict mapping instance_id -> (r,g,b) color
         self.next_mask_id = 1  # Counter for assigning unique IDs
         self.selected_mask_idx = -1
+        self.selected_instance_category = None
         self.masks_visible = True  # Track mask visibility state
         self.label_items = []  # List of QGraphicsTextItem for instance labels
         self.labels_visible = False  # Track label visibility state
-        self.labels_visible_before_hiding = False  # Remember label state when spacebar is pressed
+        self.labels_visible_before_hiding = False  # Remember label state while masks are toggled off
+        self.aruco_label_items = []  # List of QGraphicsTextItem for ArUco labels
+        self.aruco_labels_visible = False
+        self.aruco_instance_labels = {}  # Dict mapping instance_id -> ArUco ID
         self.annotation_metadata = {}  # Dict mapping instance_id -> metadata dict (for marker data, etc.)
         
         # Annotation type visibility and colors
@@ -95,9 +136,23 @@ class ImageCanvas(QGraphicsView):
         # Editing isolation - temporary mask for current edit
         self.editing_mask = None  # Binary H×W mask for instance being edited
         self.editing_instance_id = -1  # ID of instance being edited
+        self.editing_instance_category = None
         self.editing_mask_item = None  # Visualization item for editing mask
+        self.editing_bbox_item = None  # Visualization item for active editing bbox
         self._editing_overlay_cache = None  # Cached RGBA overlay for editing mask
         self._is_actively_drawing = False  # Flag to skip expensive updates during drawing
+        self.brush_history_limit = 10
+        self.brush_undo_stack = []
+        self.brush_redo_stack = []
+        self._brush_step_active = False
+        self._brush_step_start_snapshot = None
+        self._switch_tap_required = 3
+        self._switch_tap_max_interval_seconds = 0.8
+        self._switch_tap_candidate = None
+        self._switch_tap_count = 0
+        self._switch_tap_last_time = 0.0
+        self._pending_switch_tap = None
+        self._tap_move_tolerance_px = 8.0
         
         # Throttling for brush/eraser to improve performance
         self._pending_viz_update = False  # Flag indicating viz update is pending
@@ -113,7 +168,8 @@ class ImageCanvas(QGraphicsView):
         self.prompt_items = []  # List of graphics items for visualization
         self.active_sam2_mask_idx = -1  # Index of mask being edited with SAM2 prompts
         
-        # Selection border
+        # Selection marker. The variable name is kept for compatibility with
+        # the existing selection cleanup/show-hide paths.
         self.selection_border_item = None
         
         # Drawing state
@@ -132,6 +188,9 @@ class ImageCanvas(QGraphicsView):
         # View toggles
         self.show_segmentations = True  # Whether to show segmentation masks
         self.show_bboxes = False  # Whether to show bounding boxes
+        self.hidden_instance_keys = set()  # Per-frame individual object display toggles
+        self.hidden_bbox_instance_ids = set()  # Legacy alias for older bbox-only paths
+        self._view_restore_token = 0  # Guards stale queued fit/restore callbacks
         
         # Bbox editing (for bbox annotation mode)
         self.bbox_items_map = {}  # Dict mapping mask_id -> QGraphicsRectItem
@@ -151,13 +210,38 @@ class ImageCanvas(QGraphicsView):
         
         # Enable focus to receive keyboard events
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._create_brush_size_overlay()
         
     def keyPressEvent(self, event):
         """Handle key press events"""
-        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
-            # Hide masks while spacebar is held
-            if self.masks_visible:
+        if event.key() == Qt.Key.Key_Space:
+            if event.isAutoRepeat():
+                event.accept()
+                return
+
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.toggle_selected_instance_visibility()
+            elif self.show_segmentations:
                 self.hide_masks()
+            else:
+                self.show_masks()
+            event.accept()
+        elif (event.modifiers() & Qt.KeyboardModifier.ControlModifier and
+              event.key() in (Qt.Key.Key_Plus, Qt.Key.Key_Equal) and
+              not event.isAutoRepeat()):
+            self.zoom_in()
+            event.accept()
+        elif (event.modifiers() & Qt.KeyboardModifier.ControlModifier and
+              event.key() in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore) and
+              not event.isAutoRepeat()):
+            self.zoom_out()
+            event.accept()
+        elif event.key() in (Qt.Key.Key_Plus, Qt.Key.Key_Equal) and not event.isAutoRepeat():
+            self.brush_size_step_requested.emit(1)
+            event.accept()
+        elif event.key() in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore) and not event.isAutoRepeat():
+            self.brush_size_step_requested.emit(-1)
+            event.accept()
         elif event.key() == Qt.Key.Key_F and not event.isAutoRepeat():
             # Fit image to window (reset zoom)
             self.fit_to_window()
@@ -166,64 +250,217 @@ class ImageCanvas(QGraphicsView):
     
     def keyReleaseEvent(self, event):
         """Handle key release events"""
-        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
-            # Show masks when spacebar is released
-            if not self.masks_visible:
-                self.show_masks()
+        if event.key() == Qt.Key.Key_Space:
+            event.accept()
         else:
             super().keyReleaseEvent(event)
+
+    def _create_brush_size_overlay(self):
+        """Create floating +/- brush-size controls over the viewport."""
+        self._brush_size_overlay = QWidget(self.viewport())
+        self._brush_size_overlay.setObjectName("brushSizeOverlay")
+        self._brush_size_overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._brush_size_overlay.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        layout = QHBoxLayout(self._brush_size_overlay)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        self._brush_decrease_button = self._create_brush_size_button("-", -1)
+        self._brush_increase_button = self._create_brush_size_button("+", 1)
+        layout.addWidget(self._brush_decrease_button)
+        layout.addWidget(self._brush_increase_button)
+
+        self._brush_size_overlay.setStyleSheet("""
+            QWidget#brushSizeOverlay {
+                background-color: rgba(30, 34, 42, 190);
+                border: 1px solid rgba(255, 255, 255, 80);
+                border-radius: 8px;
+            }
+            QPushButton {
+                background-color: rgba(255, 255, 255, 235);
+                border: 1px solid rgba(20, 24, 30, 120);
+                border-radius: 5px;
+                color: rgb(20, 24, 30);
+                font-size: 22px;
+                font-weight: 700;
+                min-width: 36px;
+                max-width: 36px;
+                min-height: 34px;
+                max-height: 34px;
+            }
+            QPushButton:hover {
+                background-color: rgb(255, 246, 170);
+            }
+            QPushButton:pressed {
+                background-color: rgb(238, 221, 94);
+            }
+        """)
+        self._brush_size_overlay.adjustSize()
+        self._position_brush_size_overlay()
+        self._brush_size_overlay.show()
+
+    def _create_brush_size_button(self, label, direction):
+        button = QPushButton(label, self._brush_size_overlay)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setToolTip("Decrease brush size by 1" if direction < 0 else "Increase brush size by 1")
+        button.clicked.connect(lambda checked=False, step=direction: self._request_brush_size_step(step))
+        return button
+
+    def _request_brush_size_step(self, direction):
+        self.brush_size_unit_step_requested.emit(direction)
+        self.setFocus()
+
+    def _position_brush_size_overlay(self):
+        if not hasattr(self, '_brush_size_overlay') or self._brush_size_overlay is None:
+            return
+        self._brush_size_overlay.adjustSize()
+        viewport_rect = self.viewport().rect()
+        x = int((viewport_rect.width() - self._brush_size_overlay.width()) / 2 + 110)
+        y = int(viewport_rect.height() - self._brush_size_overlay.height() - 24)
+        x = max(8, min(x, viewport_rect.width() - self._brush_size_overlay.width() - 8))
+        y = max(8, y)
+        self._brush_size_overlay.move(x, y)
+        self._brush_size_overlay.raise_()
     
     def hide_masks(self):
-        """Temporarily hide all masks"""
-        # Flush any pending updates immediately to avoid lag
-        if self._viz_update_timer.isActive():
-            self._viz_update_timer.stop()
-            self._flush_pending_viz_update()
-        
-        self.masks_visible = False
-        for item in self.mask_items:
-            item.setVisible(False)
-        # Hide editing mask if present
-        if self.editing_mask_item:
-            self.editing_mask_item.setVisible(False)
-        # Also hide selection border
-        if self.selection_border_item:
-            self.selection_border_item.setVisible(False)
-        
-        # Remember if labels were visible and hide them too
-        self.labels_visible_before_hiding = self.labels_visible
-        if self.labels_visible:
-            for label_item in self.label_items:
-                label_item.setVisible(False)
-        
-        self.masks_visibility_changed.emit(False)
+        """Hide all masks until toggled visible again."""
+        self.set_show_segmentations(False)
     
     def show_masks(self):
         """Show all masks again"""
-        # Flush any pending updates immediately to avoid lag
-        if self._viz_update_timer.isActive():
-            self._viz_update_timer.stop()
-            self._flush_pending_viz_update()
+        self.set_show_segmentations(True)
+
+    def _segmentation_overlays_visible(self):
+        """Return whether segmentation-derived visuals should be shown."""
+        return self.show_segmentations and self.masks_visible
+
+    def _event_view_pos(self, event):
+        if hasattr(event, 'position'):
+            return QPointF(event.position())
+        return QPointF(event.pos())
+
+    def _reset_instance_switch_tap_sequence(self):
+        self._switch_tap_candidate = None
+        self._switch_tap_count = 0
+        self._switch_tap_last_time = 0.0
+
+    def _cancel_pending_instance_switch_tap(self, reset_sequence=False):
+        self._pending_switch_tap = None
+        if reset_sequence:
+            self._reset_instance_switch_tap_sequence()
+
+    def _active_brush_instance(self):
+        if self.editing_instance_id > 0:
+            return self.editing_instance_id, (
+                self.editing_instance_category or
+                self.annotation_metadata.get(self.editing_instance_id, {}).get('category', self.current_annotation_type)
+            )
+        if self.selected_mask_idx > 0:
+            return self.selected_mask_idx, (
+                self.selected_instance_category or
+                self.annotation_metadata.get(self.selected_mask_idx, {}).get('category', self.current_annotation_type)
+            )
+        return -1, None
+
+    def _is_active_brush_instance(self, instance_id, category):
+        active_id, active_category = self._active_brush_instance()
+        if active_id != instance_id:
+            return False
+        return category is None or active_category is None or category == active_category
+
+    def _brush_switch_target_at(self, scene_pos):
+        x, y = int(scene_pos.x()), int(scene_pos.y())
+
+        if (
+            self.editing_instance_id > 0 and
+            self.editing_mask is not None and
+            0 <= y < self.editing_mask.shape[0] and
+            0 <= x < self.editing_mask.shape[1] and
+            self.editing_mask[y, x] > 0
+        ):
+            return self.editing_instance_id, (
+                self.editing_instance_category or
+                self.current_annotation_type
+            )
+
+        instance_id, category = self._find_instance_entry_at_point(
+            x, y, category=self.current_annotation_type
+        )
+        if instance_id > 0:
+            return instance_id, category
+
+        if self.show_bboxes:
+            bbox_id = self._get_bbox_at_pos(scene_pos)
+            if bbox_id:
+                return bbox_id, self.annotation_metadata.get(
+                    bbox_id, {}
+                ).get('category', self.current_annotation_type)
+
+        return 0, None
+
+    def _begin_pending_instance_switch_tap(self, instance_id, category, scene_pos, event):
+        self._pending_switch_tap = {
+            'instance_id': instance_id,
+            'category': category,
+            'scene_pos': QPointF(scene_pos),
+            'view_pos': self._event_view_pos(event),
+        }
+
+    def _pending_switch_tap_moved(self, event):
+        if not self._pending_switch_tap:
+            return False
+        start_pos = self._pending_switch_tap['view_pos']
+        current_pos = self._event_view_pos(event)
+        dx = current_pos.x() - start_pos.x()
+        dy = current_pos.y() - start_pos.y()
+        return (dx * dx + dy * dy) ** 0.5 > self._tap_move_tolerance_px
+
+    def _complete_instance_switch_tap(self, instance_id, category):
+        now = time.monotonic()
+        candidate = (instance_id, category)
+        if (
+            self._switch_tap_candidate != candidate or
+            now - self._switch_tap_last_time > self._switch_tap_max_interval_seconds
+        ):
+            self._switch_tap_candidate = candidate
+            self._switch_tap_count = 0
+
+        self._switch_tap_count += 1
+        self._switch_tap_last_time = now
+        remaining = self._switch_tap_required - self._switch_tap_count
+
+        if remaining <= 0:
+            self._reset_instance_switch_tap_sequence()
+            self.start_editing_instance(instance_id, category=category)
+            self.instance_switch_tap_progress.emit(instance_id, category, 0)
+            return True
+
+        self.instance_switch_tap_progress.emit(instance_id, category, remaining)
+        return False
+
+    def _start_brush_stroke_at(self, scene_pos):
+        if self.editing_instance_id <= 0 and self.selected_mask_idx > 0:
+            self.start_editing_instance(
+                self.selected_mask_idx,
+                category=self.selected_instance_category or self.current_annotation_type
+            )
+
+        self._begin_brush_history_step()
+        self.is_drawing = True
+        self.last_point = scene_pos
         
-        self.masks_visible = True
-        for item in self.mask_items:
-            item.setVisible(True)
-        # Show editing mask if present
-        if self.editing_mask_item:
-            self.editing_mask_item.setVisible(True)
-        # Show selection border if there's a selection
-        if self.selection_border_item and self.selected_mask_idx >= 0:
-            self.selection_border_item.setVisible(True)
-        
-        # Restore labels if they were visible before hiding
-        if self.labels_visible_before_hiding:
-            for label_item in self.label_items:
-                label_item.setVisible(True)
-        
-        self.masks_visibility_changed.emit(True)
-        
-    def load_image(self, image_path_or_array):
-        """Load an image file or numpy array"""
+    def load_image(self, image_path_or_array, preserve_view=False):
+        """Load an image file or numpy array.
+
+        Args:
+            image_path_or_array: Path or numpy image array to display.
+            preserve_view: Keep the current zoom/pan transform after replacing
+                the frame image. Used for frame-to-frame navigation.
+        """
+        view_state = self.get_view_state() if preserve_view else None
+        self._cancel_pending_instance_switch_tap(reset_sequence=True)
+
         # Explicitly clear old resources before loading new image
         if self.image_item:
             try:
@@ -252,6 +489,15 @@ class ImageCanvas(QGraphicsView):
                 # Item already deleted by Qt or invalid
                 pass
         self.label_items.clear()
+
+        for item in self.aruco_label_items:
+            try:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
+        self.aruco_label_items.clear()
         
         for item in self.prompt_items:
             try:
@@ -279,6 +525,7 @@ class ImageCanvas(QGraphicsView):
                 # Item already deleted by Qt or invalid
                 pass
             self.editing_mask_item = None
+        self._remove_editing_bbox_item()
         
         # Clear cached overlays to free memory
         self._cached_overlay = None
@@ -340,14 +587,25 @@ class ImageCanvas(QGraphicsView):
         self.positive_points = []
         self.negative_points = []
         self.active_sam2_mask_idx = -1
+        self.selected_instance_category = None
+        self.editing_instance_category = None
+        self.editing_bbox_item = None
+        self.hidden_instance_keys.clear()
+        self.hidden_bbox_instance_ids.clear()
+        self.aruco_instance_labels = {}
+        self._clear_brush_history()
         
         # Add image to scene
         self.image_item = QGraphicsPixmapItem(pixmap)
         self.scene.addItem(self.image_item)
         
-        # Fit to window - use QTimer to ensure widget is properly sized
+        self._view_restore_token += 1
+        view_token = self._view_restore_token
         from PyQt6.QtCore import QTimer
-        QTimer.singleShot(0, self.fit_to_window)
+        QTimer.singleShot(
+            0,
+            lambda token=view_token, state=view_state: self._apply_initial_view(token, state)
+        )
     
     def clear_image(self):
         """Clear the current image and all annotations"""
@@ -363,21 +621,63 @@ class ImageCanvas(QGraphicsView):
         self.mask_items = []  # QGraphicsPixmapItems for visualization 
         self.mask_colors = {}  # Dict mapping instance_id -> (r,g,b) color
         self.label_items = []  # Clear instance label items
+        self.aruco_label_items = []
+        self.aruco_instance_labels = {}
         self.positive_points = []
         self.negative_points = []
         self.prompt_items = []
         self.active_sam2_mask_idx = -1
         self.selection_border_item = None
+        self.selected_instance_category = None
+        self.editing_instance_category = None
+        self.editing_bbox_item = None
+        self.hidden_instance_keys.clear()
+        self.hidden_bbox_instance_ids.clear()
+        self._clear_brush_history()
         
     def fit_to_window(self):
         """Fit image to window"""
         if self.image_item:
             self.fitInView(self.image_item, Qt.AspectRatioMode.KeepAspectRatio)
             self.zoom_factor = 1.0
+
+    def _apply_initial_view(self, token, view_state):
+        """Apply the queued fit/restore for the latest loaded image only."""
+        if token != self._view_restore_token:
+            return
+        if view_state is not None:
+            self.restore_view_state(view_state)
+        else:
+            self.fit_to_window()
+
+    def get_view_state(self):
+        """Capture current zoom and pan state."""
+        viewport_center = self.viewport().rect().center()
+        return {
+            'transform': QTransform(self.transform()),
+            'center': QPointF(self.mapToScene(viewport_center)),
+            'h_scroll': self.horizontalScrollBar().value(),
+            'v_scroll': self.verticalScrollBar().value(),
+            'zoom_factor': self.zoom_factor,
+        }
+
+    def restore_view_state(self, state):
+        """Restore a zoom and pan state captured before frame navigation."""
+        if not state or not self.image_item:
+            return
+
+        self.setTransform(state['transform'])
+        if 'center' in state:
+            self.centerOn(state['center'])
+        else:
+            self.horizontalScrollBar().setValue(state['h_scroll'])
+            self.verticalScrollBar().setValue(state['v_scroll'])
+        self.zoom_factor = state.get('zoom_factor', self.transform().m11())
             
     def resizeEvent(self, event):
         """Handle resize event to fit image to new window size"""
         super().resizeEvent(event)
+        self._position_brush_size_overlay()
         if self.image_item and self.zoom_factor == 1.0:
             # Only auto-fit if not zoomed in/out
             self.fit_to_window()
@@ -422,6 +722,7 @@ class ImageCanvas(QGraphicsView):
         if self._viz_update_timer.isActive():
             self._viz_update_timer.stop()
             self._flush_pending_viz_update()
+        self._cancel_pending_instance_switch_tap(reset_sequence=True)
         
         self.current_tool = tool_name
         
@@ -441,16 +742,43 @@ class ImageCanvas(QGraphicsView):
                 self.setCursor(Qt.CursorShape.CrossCursor)
             elif tool_name == 'inference_box':
                 self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def mouseDoubleClickEvent(self, event):
+        """Treat brush/eraser double-clicks as regular taps for switch counting."""
+        if (
+            self.current_tool in {'brush', 'eraser'} and
+            event.button() == Qt.MouseButton.LeftButton
+        ):
+            self.mousePressEvent(event)
+            return
+        super().mouseDoubleClickEvent(event)
                 
     def mousePressEvent(self, event):
         """Handle mouse press"""
         if self.current_image is None:
             return
+
+        if event.button() == Qt.MouseButton.MiddleButton:
+            if self.current_tool in {'brush', 'eraser'}:
+                self.brush_eraser_toggle_requested.emit()
+                event.accept()
+                return
         
-        # Handle right-click for context menu (category change)
+        # Handle right-click for context menu (category change). Avoid
+        # intercepting active annotation tools: SAM2 uses right-click for
+        # negative prompts, and brush/eraser right-clicks are easy accidents.
         if event.button() == Qt.MouseButton.RightButton:
-            self._show_category_context_menu(event)
-            return
+            if self.current_tool == 'sam2_prompt':
+                pass
+            elif self.is_drawing:
+                event.accept()
+                return
+            elif self.current_tool in {'brush', 'eraser'}:
+                self._show_brush_context_menu(event)
+                return
+            else:
+                self._show_category_context_menu(event)
+                return
             
         # Get scene position
         scene_pos = self.mapToScene(event.pos())
@@ -505,35 +833,23 @@ class ImageCanvas(QGraphicsView):
         elif self.current_tool == 'brush' or self.current_tool == 'eraser':
             # Start drawing/erasing
             if event.button() == Qt.MouseButton.LeftButton:
-                # Only check for instance selection if NOT already in editing mode
-                if self.editing_instance_id <= 0:
-                    # If an instance is already selected (from sidebar), start editing it
-                    if self.selected_mask_idx > 0:
-                        # Start editing the selected instance
-                        self.start_editing_instance(self.selected_mask_idx)
-                    else:
-                        # No instance selected yet - check what's under the click
-                        # Check if clicking on a bbox (when bboxes are visible)
-                        clicked_bbox_id = self._get_bbox_at_pos(scene_pos)
-                        if clicked_bbox_id:
-                            # Clicked on a bbox - start editing that instance
-                            self.start_editing_instance(clicked_bbox_id)
-                            self.selected_mask_idx = clicked_bbox_id
-                        else:
-                            # Check if clicking on an existing instance in the active annotation
-                            # type's mask only — don't pick up instances from other types
-                            x, y = int(scene_pos.x()), int(scene_pos.y())
-                            instance_id = self._find_instance_at_point(x, y,
-                                          category=self.current_annotation_type)
-                            
-                            # If clicked on an instance, start editing mode
-                            if instance_id > 0:
-                                self.start_editing_instance(instance_id)
-                                # Update instance list selection
-                                self.selected_mask_idx = instance_id
-                
-                self.is_drawing = True
-                self.last_point = scene_pos
+                clicked_instance_id, clicked_category = self._brush_switch_target_at(scene_pos)
+
+                if (clicked_instance_id > 0 and
+                    not self._is_active_brush_instance(clicked_instance_id, clicked_category)):
+                    self._begin_pending_instance_switch_tap(
+                        clicked_instance_id,
+                        clicked_category,
+                        scene_pos,
+                        event
+                    )
+                    event.accept()
+                    return
+
+                self._reset_instance_switch_tap_sequence()
+                self._start_brush_stroke_at(scene_pos)
+                event.accept()
+                return
         
         elif self.current_tool == 'bbox':
             # Start drawing new bbox
@@ -541,21 +857,24 @@ class ImageCanvas(QGraphicsView):
                 # If there's a selected instance, check if it already has a bbox
                 if self.selected_mask_idx > 0:
                     if self.selected_mask_idx in self.bbox_items_map:
-                        # Instance has a bbox - select it for editing
-                        self._select_bbox(self.selected_mask_idx)
+                        # Instance has a bbox - interact with it only if the
+                        # click lands on this bbox or one of its handles.
                         # Check if clicking on handle
                         handle = self._get_bbox_handle_at_pos(scene_pos)
                         if handle:
+                            self._select_bbox(self.selected_mask_idx, zoom=False)
                             self.dragging_bbox_handle = handle
                             self.dragging_bbox = True
                             self.bbox_drag_offset = scene_pos
+                            return
                         elif self.bbox_items_map[self.selected_mask_idx].rect().contains(scene_pos):
+                            self._select_bbox(self.selected_mask_idx, zoom=False)
                             # Clicking inside bbox - start dragging
                             self.dragging_bbox = True
                             self.dragging_bbox_handle = 'move'
                             rect = self.bbox_items_map[self.selected_mask_idx].rect()
                             self.bbox_drag_offset = QPointF(scene_pos.x() - rect.x(), scene_pos.y() - rect.y())
-                        return
+                            return
                     else:
                         # Instance doesn't have a bbox yet - allow drawing one
                         self.is_drawing = True
@@ -576,7 +895,7 @@ class ImageCanvas(QGraphicsView):
                 # Check if clicking inside existing bbox
                 bbox_id = self._get_bbox_at_pos(scene_pos)
                 if bbox_id:
-                    self._select_bbox(bbox_id)
+                    self._select_bbox(bbox_id, zoom=False)
                     self.dragging_bbox = True
                     self.dragging_bbox_handle = 'move'
                     rect = self.bbox_items_map[bbox_id].rect()
@@ -586,9 +905,63 @@ class ImageCanvas(QGraphicsView):
                     self.is_drawing = True
                     self.drawing_new_bbox = True
                     self.drawing_start = scene_pos
+
+        elif self.current_tool == 'pan':
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._select_instance_or_bbox_at_scene_pos(scene_pos)
+            super().mousePressEvent(event)
                 
         else:
+            if event.button() == Qt.MouseButton.LeftButton:
+                if self._select_instance_or_bbox_at_scene_pos(scene_pos):
+                    event.accept()
+                    return
             super().mousePressEvent(event)
+
+    def _find_instance_entry_at_point(self, x, y, category=None):
+        """Find the visible instance and category at an image coordinate."""
+        if not self._segmentation_overlays_visible():
+            return 0, None
+
+        if category in ('bee', 'chamber', 'hive', 'pollen'):
+            masks_to_search = [(category, self._get_mask_array_by_category(category))]
+        else:
+            # Search in approximate visual top-to-bottom order.
+            masks_to_search = [
+                ('bee', self.bee_mask),
+                ('pollen', self.pollen_mask),
+                ('hive', self.hive_mask),
+                ('chamber', self.chamber_mask),
+            ]
+
+        for candidate_category, mask_array in masks_to_search:
+            if not self.annotation_type_visibility.get(candidate_category, True):
+                continue
+            if mask_array is None:
+                continue
+            if not (0 <= x < mask_array.shape[1] and 0 <= y < mask_array.shape[0]):
+                continue
+            instance_id = int(mask_array[y, x])
+            if instance_id > 0 and self.is_instance_enabled(instance_id, candidate_category):
+                return instance_id, candidate_category
+
+        return 0, None
+
+    def _select_instance_or_bbox_at_scene_pos(self, scene_pos):
+        """Select a visible instance or bbox under the cursor."""
+        x, y = int(scene_pos.x()), int(scene_pos.y())
+        instance_id, category = self._find_instance_entry_at_point(x, y)
+
+        if instance_id > 0:
+            self.highlight_instance(instance_id, category=category)
+            return True
+
+        bbox_id = self._get_bbox_at_pos(scene_pos)
+        if bbox_id:
+            self._select_bbox(bbox_id, zoom=False)
+            return True
+
+        return False
     
     def _show_category_context_menu(self, event):
         """Show context menu for changing instance categories"""
@@ -620,8 +993,10 @@ class ImageCanvas(QGraphicsView):
             for cat_id, cat_label in categories:
                 if cat_id != current_category:
                     action = QAction(cat_label, self)
-                    action.triggered.connect(lambda checked, iid=instance_id, new_cat=cat_id: 
-                                            self.change_instance_category(iid, new_cat))
+                    action.triggered.connect(
+                        lambda checked, iid=instance_id, old_cat=current_category, new_cat=cat_id:
+                        self.change_instance_category(iid, new_cat, old_category=old_cat)
+                    )
                     change_category_menu.addAction(action)
                 else:
                     # Show current category as disabled
@@ -629,8 +1004,44 @@ class ImageCanvas(QGraphicsView):
                     action.setEnabled(False)
                     change_category_menu.addAction(action)
             
-            # Show menu at cursor position
-            menu.exec(event.globalPos())
+            menu.exec(self._event_global_pos(event))
+
+    def _event_global_pos(self, event):
+        """Return the global cursor position for PyQt6/PyQt5 mouse events."""
+        if hasattr(event, 'globalPosition'):
+            return event.globalPosition().toPoint()
+        return event.globalPos()
+
+    def _show_brush_context_menu(self, event):
+        """Show brush-specific actions at the cursor."""
+        scene_pos = self.mapToScene(event.pos())
+        menu = QMenu(self)
+
+        fill_action = QAction("Fill Enclosed Area", self)
+        fill_action.setEnabled(
+            self.editing_mask is not None and self.editing_instance_id > 0
+        )
+        fill_action.triggered.connect(
+            lambda checked=False, pos=QPointF(scene_pos): self.fill_enclosed_region_at(pos)
+        )
+        menu.addAction(fill_action)
+
+        if not fill_action.isEnabled():
+            fill_action.setText("Fill Enclosed Area (select/draw an instance first)")
+
+        menu.addSeparator()
+
+        undo_action = QAction("Undo Brush Step", self)
+        undo_action.setEnabled(bool(self.brush_undo_stack))
+        undo_action.triggered.connect(lambda checked=False: self.undo())
+        menu.addAction(undo_action)
+
+        redo_action = QAction("Redo Brush Step", self)
+        redo_action.setEnabled(bool(self.brush_redo_stack))
+        redo_action.triggered.connect(lambda checked=False: self.redo())
+        menu.addAction(redo_action)
+
+        menu.exec(self._event_global_pos(event))
             
     def mouseMoveEvent(self, event):
         """Handle mouse move"""
@@ -638,6 +1049,19 @@ class ImageCanvas(QGraphicsView):
             return
             
         scene_pos = self.mapToScene(event.pos())
+
+        if self._pending_switch_tap is not None:
+            if self._pending_switch_tap_moved(event):
+                press_scene_pos = self._pending_switch_tap['scene_pos']
+                self._cancel_pending_instance_switch_tap(reset_sequence=True)
+                active_id, _ = self._active_brush_instance()
+                if active_id > 0:
+                    self._start_brush_stroke_at(press_scene_pos)
+                    self._is_actively_drawing = True
+                    self.draw_on_mask(self.last_point, scene_pos)
+                    self.last_point = scene_pos
+            event.accept()
+            return
         
         if self.is_drawing:
             if self.drawing_new_bbox:
@@ -649,10 +1073,8 @@ class ImageCanvas(QGraphicsView):
                         pass
                 
                 # Draw temporary rectangle
-                from PyQt6.QtWidgets import QGraphicsRectItem
-                from PyQt6.QtGui import QPen, QColor
                 rect = QRectF(self.drawing_start, scene_pos).normalized()
-                self.temp_item = QGraphicsRectItem(rect)
+                self.temp_item = OutwardBBoxRectItem(rect)
                 pen = QPen(QColor(255, 255, 0))  # Yellow
                 pen.setWidth(3)
                 pen.setStyle(Qt.PenStyle.DashLine)
@@ -752,6 +1174,18 @@ class ImageCanvas(QGraphicsView):
         """Handle mouse release"""
         if self.current_image is None:
             return
+
+        if self._pending_switch_tap is not None:
+            pending_tap = self._pending_switch_tap
+            moved = self._pending_switch_tap_moved(event)
+            self._cancel_pending_instance_switch_tap(reset_sequence=moved)
+            if not moved:
+                self._complete_instance_switch_tap(
+                    pending_tap['instance_id'],
+                    pending_tap['category']
+                )
+            event.accept()
+            return
             
         scene_pos = self.mapToScene(event.pos())
         
@@ -812,6 +1246,7 @@ class ImageCanvas(QGraphicsView):
                 
                 # Finish drawing - update border now
                 self._is_actively_drawing = False
+                self._finish_brush_history_step()
                 if self.editing_mask is not None and self.selected_mask_idx == self.editing_instance_id:
                     self.add_selection_border(self.editing_mask)
                 
@@ -967,13 +1402,30 @@ class ImageCanvas(QGraphicsView):
             # Create new instance
             self.selected_mask_idx = self.next_mask_id
             self.next_mask_id += 1
+            self.selected_instance_category = self.current_annotation_type
+            self.set_instance_visible(
+                self.selected_mask_idx,
+                self.selected_instance_category,
+                True,
+                rebuild=False
+            )
             # Ensure color exists for new instance
             if self.selected_mask_idx not in self.mask_colors:
                 self.mask_colors[self.selected_mask_idx] = tuple(np.random.randint(0, 255, 3).tolist())
         
         # Start editing mode if not already active
-        if self.editing_instance_id != self.selected_mask_idx:
-            self.start_editing_instance(self.selected_mask_idx)
+        was_tracking_brush_step = self._brush_step_active
+        selected_category = self.selected_instance_category or self.current_annotation_type
+        if (self.editing_instance_id != self.selected_mask_idx or
+            self.editing_instance_category != selected_category):
+            self.start_editing_instance(
+                self.selected_mask_idx,
+                category=selected_category
+            )
+            if was_tracking_brush_step:
+                self._brush_step_active = True
+                self._brush_step_start_snapshot = None
+        self._capture_brush_step_start_if_needed()
             
         instance_id = self.selected_mask_idx
         
@@ -986,6 +1438,7 @@ class ImageCanvas(QGraphicsView):
             cv2.line(self.editing_mask, (x1, y1), (x2, y2), 255, self.brush_size)
         else:  # eraser
             cv2.line(self.editing_mask, (x1, y1), (x2, y2), 0, self.brush_size)
+        self._cached_bboxes.pop(instance_id, None)
         
         # Calculate bounding box of stroke for dirty region (much more memory efficient)
         half_brush = self.brush_size // 2 + 1
@@ -1009,7 +1462,174 @@ class ImageCanvas(QGraphicsView):
             self._viz_update_timer.start()
         
         # Only emit annotation_changed for final stroke (on release) to avoid slowdown
-        # The visualization update happens independently via timer
+
+    def fill_enclosed_region_at(self, scene_pos):
+        """Fill the enclosed blank region under the cursor in the editing mask.
+
+        The current instance's nonzero pixels act as the boundary. If the
+        clicked blank region reaches the image edge, the outline is considered
+        open and no fill is applied.
+        """
+        if self.current_image is None:
+            return False
+
+        if self._viz_update_timer.isActive():
+            self._viz_update_timer.stop()
+            self._flush_pending_viz_update()
+
+        if self.editing_mask is None or self.editing_instance_id <= 0:
+            print("Fill skipped: no active brush-edit instance.")
+            return False
+
+        x = int(scene_pos.x())
+        y = int(scene_pos.y())
+        h, w = self.editing_mask.shape
+        if x < 0 or x >= w or y < 0 or y >= h:
+            print("Fill skipped: click was outside the image.")
+            return False
+
+        if self.editing_mask[y, x] > 0:
+            print("Fill skipped: click inside the unfilled enclosed area, not on the outline.")
+            return False
+
+        # Flood-fill the blank component under the cursor. Existing mask pixels
+        # are boundaries; 128 marks the candidate fill region.
+        flood_source = self.editing_mask.copy()
+        flood_source[flood_source > 0] = 255
+        flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        cv2.floodFill(flood_source, flood_mask, (x, y), 128)
+        fill_region = flood_source == 128
+
+        if not np.any(fill_region):
+            print("Fill skipped: no fillable region found.")
+            return False
+
+        touches_image_edge = (
+            np.any(fill_region[0, :]) or
+            np.any(fill_region[-1, :]) or
+            np.any(fill_region[:, 0]) or
+            np.any(fill_region[:, -1])
+        )
+        if touches_image_edge:
+            print("Fill skipped: the clicked region is not fully enclosed.")
+            return False
+
+        self._push_current_brush_undo_snapshot()
+        self.editing_mask[fill_region] = 255
+        self._cached_bboxes.pop(self.editing_instance_id, None)
+        self._update_editing_visualization_incremental(fill_region)
+
+        if self.selected_mask_idx == self.editing_instance_id:
+            self.add_selection_border(self.editing_mask)
+
+        self.annotation_changed.emit()
+        return True
+
+    def _clear_brush_history(self):
+        """Clear brush/eraser undo history for the active edit session."""
+        self.brush_undo_stack = []
+        self.brush_redo_stack = []
+        self._brush_step_active = False
+        self._brush_step_start_snapshot = None
+
+    def _make_editing_mask_snapshot(self):
+        """Return a compressed binary snapshot of the active editing mask."""
+        if self.editing_mask is None or self.editing_instance_id <= 0:
+            return None
+
+        binary_mask = self.editing_mask.reshape(-1) > 0
+        return {
+            'instance_id': self.editing_instance_id,
+            'category': self.editing_instance_category,
+            'shape': self.editing_mask.shape,
+            'data': np.packbits(binary_mask)
+        }
+
+    def _snapshots_equal(self, first, second):
+        """Compare two compressed editing-mask snapshots."""
+        if first is None or second is None:
+            return first is second
+        return (
+            first['instance_id'] == second['instance_id'] and
+            first.get('category') == second.get('category') and
+            first['shape'] == second['shape'] and
+            np.array_equal(first['data'], second['data'])
+        )
+
+    def _restore_editing_mask_snapshot(self, snapshot):
+        """Restore a compressed editing-mask snapshot."""
+        if snapshot is None:
+            return False
+
+        instance_id = snapshot['instance_id']
+        category = snapshot.get('category') or self.annotation_metadata.get(
+            instance_id, {}
+        ).get('category', self.current_annotation_type)
+        shape = snapshot['shape']
+        total_pixels = shape[0] * shape[1]
+        restored = np.unpackbits(snapshot['data'], count=total_pixels)
+        self.editing_mask = restored.reshape(shape).astype(np.uint8) * 255
+        self.editing_instance_id = instance_id
+        self.editing_instance_category = category
+        self.selected_mask_idx = instance_id
+        self.selected_instance_category = category
+        self._cached_bboxes.pop(instance_id, None)
+        self._dirty_pixels = None
+
+        if self._editing_overlay_cache is not None:
+            del self._editing_overlay_cache
+            self._editing_overlay_cache = None
+
+        self._update_editing_visualization()
+        self.annotation_changed.emit()
+        return True
+
+    def _trim_brush_stack(self, stack):
+        """Keep a brush history stack within the configured limit."""
+        overflow = len(stack) - self.brush_history_limit
+        if overflow > 0:
+            del stack[:overflow]
+
+    def _push_current_brush_undo_snapshot(self):
+        """Push the current editing mask onto the undo stack."""
+        snapshot = self._make_editing_mask_snapshot()
+        if snapshot is None:
+            return False
+        self.brush_undo_stack.append(snapshot)
+        self._trim_brush_stack(self.brush_undo_stack)
+        self.brush_redo_stack.clear()
+        return True
+
+    def _begin_brush_history_step(self):
+        """Start tracking one brush/eraser drag as a single undo step."""
+        self._brush_step_active = True
+        self._brush_step_start_snapshot = None
+        self._capture_brush_step_start_if_needed()
+
+    def _capture_brush_step_start_if_needed(self):
+        """Capture the pre-edit mask once the editing mask exists."""
+        if not self._brush_step_active or self._brush_step_start_snapshot is not None:
+            return
+        self._brush_step_start_snapshot = self._make_editing_mask_snapshot()
+
+    def _finish_brush_history_step(self):
+        """Finish the active brush/eraser drag and save it if it changed."""
+        if not self._brush_step_active:
+            return
+
+        start_snapshot = self._brush_step_start_snapshot
+        current_snapshot = self._make_editing_mask_snapshot()
+        self._brush_step_active = False
+        self._brush_step_start_snapshot = None
+
+        if start_snapshot is None or current_snapshot is None:
+            return
+        if self._snapshots_equal(start_snapshot, current_snapshot):
+            return
+
+        self.brush_undo_stack.append(start_snapshot)
+        self._trim_brush_stack(self.brush_undo_stack)
+        self.brush_redo_stack.clear()
         
     def add_mask(self, mask, mask_id=None, color=None, rebuild_viz=True, category=None):
         """Add a new mask based on current annotation type
@@ -1087,6 +1707,8 @@ class ImageCanvas(QGraphicsView):
             # Update next_mask_id if necessary to avoid conflicts
             if mask_id >= self.next_mask_id:
                 self.next_mask_id = mask_id + 1
+
+        self.set_instance_visible(mask_id, category, True, rebuild=False)
         
         # Add to the appropriate mask array
         mask_array[binary_mask] = mask_id
@@ -1158,11 +1780,12 @@ class ImageCanvas(QGraphicsView):
         # Add as a regular instance with pollen category
         self._add_bee_mask(binary_mask, mask_id=mask_id, color=color, rebuild_viz=rebuild_viz, category='pollen')
     
-    def _get_mask_array_for_instance(self, instance_id):
+    def _get_mask_array_for_instance(self, instance_id, category=None):
         """Get the appropriate mask array for a given instance ID
         
         Args:
             instance_id: Instance ID to look up
+            category: Optional explicit category ('bee', 'chamber', 'hive', 'pollen')
             
         Returns:
             Tuple of (mask_array, category) or (None, None) if not found
@@ -1170,8 +1793,27 @@ class ImageCanvas(QGraphicsView):
         if instance_id <= 0:
             return None, None
         
-        # Check metadata for category
-        category = self.annotation_metadata.get(instance_id, {}).get('category', 'bee')
+        # Use explicit category first. Otherwise prefer selection/editing state
+        # before falling back to metadata; duplicate same-ID masks can otherwise
+        # make the wrong category win.
+        if category is None and instance_id == self.editing_instance_id:
+            category = self.editing_instance_category
+        if category is None and instance_id == self.selected_mask_idx:
+            category = self.selected_instance_category
+        if category is None:
+            category = self.annotation_metadata.get(instance_id, {}).get('category')
+        if category is None:
+            for candidate_category, candidate_mask in [
+                ('bee', self.bee_mask),
+                ('chamber', self.chamber_mask),
+                ('hive', self.hive_mask),
+                ('pollen', self.pollen_mask)
+            ]:
+                if candidate_mask is not None and np.any(candidate_mask == instance_id):
+                    category = candidate_category
+                    break
+        if category is None:
+            category = 'bee'
         
         if category == 'chamber':
             return self.chamber_mask, 'chamber'
@@ -1194,25 +1836,8 @@ class ImageCanvas(QGraphicsView):
         Returns:
             Instance ID at that point, or 0 if no instance
         """
-        if category == 'chamber':
-            masks_to_search = [self.chamber_mask]
-        elif category == 'hive':
-            masks_to_search = [self.hive_mask]
-        elif category == 'bee':
-            masks_to_search = [self.bee_mask]
-        elif category == 'pollen':
-            masks_to_search = [self.pollen_mask]
-        else:
-            masks_to_search = [self.bee_mask, self.chamber_mask, self.hive_mask, self.pollen_mask]
-
-        for mask_array in masks_to_search:
-            if (mask_array is not None and
-                0 <= x < mask_array.shape[1] and
-                0 <= y < mask_array.shape[0]):
-                instance_id = int(mask_array[y, x])
-                if instance_id > 0:
-                    return instance_id
-        return 0
+        instance_id, _ = self._find_instance_entry_at_point(x, y, category)
+        return instance_id
     
     def _get_binary_mask_for_instance(self, instance_id):
         """Get binary mask for a specific instance ID
@@ -1233,18 +1858,20 @@ class ImageCanvas(QGraphicsView):
         
         return None
     
-    def change_instance_category(self, instance_id, new_category):
+    def change_instance_category(self, instance_id, new_category, old_category=None):
         """Move an instance from its current category to a new category
         
         Args:
             instance_id: Instance ID to move
             new_category: New category ('bee', 'chamber', 'hive', or 'pollen')
+            old_category: Optional current category, used when the same numeric
+                instance ID exists in multiple category masks.
         """
         if instance_id <= 0:
             return
         
         # Find current category and get the binary mask
-        old_mask_array, old_category = self._get_mask_array_for_instance(instance_id)
+        old_mask_array, old_category = self._get_mask_array_for_instance(instance_id, old_category)
         if old_mask_array is None:
             print(f"Warning: Instance {instance_id} not found in any mask")
             return
@@ -1320,6 +1947,86 @@ class ImageCanvas(QGraphicsView):
             self.hive_mask = mask_array
         elif category == 'pollen':
             self.pollen_mask = mask_array
+
+    def _instance_key(self, instance_id, category=None):
+        """Stable key for per-instance UI state."""
+        if category is None:
+            category = self.annotation_metadata.get(instance_id, {}).get('category')
+        if category is None and instance_id == self.editing_instance_id:
+            category = self.editing_instance_category
+        if category is None and instance_id == self.selected_mask_idx:
+            category = self.selected_instance_category
+        if category is None:
+            category = 'bee'
+        return (str(category), int(instance_id))
+
+    def _remove_instance_from_other_category_masks(self, instance_id, keep_category):
+        """Ensure one instance ID is represented by only one category mask."""
+        removed_categories = []
+        for category, mask_attr in [
+            ('bee', 'bee_mask'),
+            ('chamber', 'chamber_mask'),
+            ('hive', 'hive_mask'),
+            ('pollen', 'pollen_mask')
+        ]:
+            if category == keep_category:
+                continue
+
+            mask_array = getattr(self, mask_attr)
+            if mask_array is not None and np.any(mask_array == instance_id):
+                mask_array[mask_array == instance_id] = 0
+                removed_categories.append(category)
+
+        if removed_categories:
+            self._combined_mask_dirty = True
+            self._cached_instance_ids = None
+            self._cached_bboxes = {
+                key: value for key, value in self._cached_bboxes.items()
+                if key != instance_id and key != self._instance_key(instance_id)
+            }
+            print(
+                f"Removed duplicate instance {instance_id} mask(s) from "
+                f"{', '.join(removed_categories)}; keeping {keep_category}."
+            )
+
+    def get_instance_entries(self):
+        """Return category-aware instance entries for UI display."""
+        entries = []
+        seen = set()
+
+        for category, mask_array in [
+            ('bee', self.bee_mask),
+            ('chamber', self.chamber_mask),
+            ('hive', self.hive_mask),
+            ('pollen', self.pollen_mask)
+        ]:
+            if mask_array is None:
+                continue
+            instance_ids = np.unique(mask_array)
+            instance_ids = instance_ids[instance_ids > 0]
+            for instance_id in instance_ids:
+                key = self._instance_key(int(instance_id), category)
+                if key not in seen:
+                    seen.add(key)
+                    entries.append({'id': int(instance_id), 'category': category})
+
+        for instance_id, metadata in self.annotation_metadata.items():
+            category = metadata.get('category', 'bee')
+            key = self._instance_key(instance_id, category)
+            if key not in seen:
+                seen.add(key)
+                entries.append({'id': int(instance_id), 'category': category})
+
+        if self.editing_instance_id > 0 and self.editing_mask is not None:
+            category = self.editing_instance_category or self.annotation_metadata.get(
+                self.editing_instance_id, {}
+            ).get('category', self.current_annotation_type)
+            key = self._instance_key(self.editing_instance_id, category)
+            if key not in seen:
+                entries.append({'id': int(self.editing_instance_id), 'category': category})
+
+        category_order = {'bee': 0, 'hive': 1, 'chamber': 2, 'pollen': 3}
+        return sorted(entries, key=lambda entry: (entry['id'], category_order.get(entry['category'], 99)))
     
     @property
     def combined_mask(self):
@@ -1411,6 +2118,7 @@ class ImageCanvas(QGraphicsView):
                 # Item already deleted by Qt or invalid
                 pass
         self.mask_items = []
+        self.editing_bbox_item = None
         
         # Clear bbox items properly before clearing the map
         for mask_id, rect_item in list(self.bbox_items_map.items()):
@@ -1433,6 +2141,8 @@ class ImageCanvas(QGraphicsView):
             # Still draw bbox-only annotations if we have them
             if self.show_bboxes:
                 self._draw_bboxes_from_metadata()
+                self._draw_or_update_editing_bbox()
+            self._sync_editing_mask_visibility()
             return
         
         # Collect all instance IDs from all masks
@@ -1443,24 +2153,32 @@ class ImageCanvas(QGraphicsView):
             bee_ids = np.unique(self.bee_mask)
             bee_ids = bee_ids[bee_ids > 0]
             for instance_id in bee_ids:
+                if not self.is_instance_enabled(instance_id, 'bee'):
+                    continue
                 mask_lookup[instance_id] = ('bee', self.bee_mask)
         
         if self.chamber_mask is not None and self.annotation_type_visibility.get('chamber', True):
             chamber_ids = np.unique(self.chamber_mask)
             chamber_ids = chamber_ids[chamber_ids > 0]
             for instance_id in chamber_ids:
+                if not self.is_instance_enabled(instance_id, 'chamber'):
+                    continue
                 mask_lookup[instance_id] = ('chamber', self.chamber_mask)
         
         if self.hive_mask is not None and self.annotation_type_visibility.get('hive', True):
             hive_ids = np.unique(self.hive_mask)
             hive_ids = hive_ids[hive_ids > 0]
             for instance_id in hive_ids:
+                if not self.is_instance_enabled(instance_id, 'hive'):
+                    continue
                 mask_lookup[instance_id] = ('hive', self.hive_mask)
         
         if self.pollen_mask is not None and self.annotation_type_visibility.get('pollen', True):
             pollen_ids = np.unique(self.pollen_mask)
             pollen_ids = pollen_ids[pollen_ids > 0]
             for instance_id in pollen_ids:
+                if not self.is_instance_enabled(instance_id, 'pollen'):
+                    continue
                 mask_lookup[instance_id] = ('pollen', self.pollen_mask)
         
         # Build rendering order: chamber and hive first (background), bees last (on top)
@@ -1471,7 +2189,7 @@ class ImageCanvas(QGraphicsView):
         all_instance_ids = chamber_ids_visible + hive_ids_visible + pollen_ids_visible + bee_ids_visible
         
         # Draw segmentation masks if enabled
-        if self.show_segmentations and len(all_instance_ids) > 0:
+        if self._segmentation_overlays_visible() and len(all_instance_ids) > 0:
             # Get dimensions from the first non-None mask
             if self.pollen_mask is not None:
                 h, w = self.pollen_mask.shape
@@ -1525,11 +2243,11 @@ class ImageCanvas(QGraphicsView):
             
             mask_item = QGraphicsPixmapItem(pixmap)
             mask_item.setZValue(1)
-            mask_item.setVisible(self.masks_visible)
+            mask_item.setVisible(self._segmentation_overlays_visible())
             self.scene.addItem(mask_item)
             self.mask_items.append(mask_item)
             
-            # Add border around selected instance using the optimized method
+            # Add marker for selected instance using the optimized method
             if self.selected_mask_idx > 0:
                 self.update_selection_border()
             
@@ -1544,10 +2262,11 @@ class ImageCanvas(QGraphicsView):
         
         # Update instance labels
         self.update_instance_labels()
+        self.update_aruco_labels()
+        self._sync_editing_mask_visibility()
     
     def _draw_bboxes(self):
         """Draw bounding boxes for all instances from masks and metadata"""
-        from PyQt6.QtWidgets import QGraphicsRectItem
         from PyQt6.QtGui import QPen, QColor
         from PyQt6.QtCore import Qt
         
@@ -1569,6 +2288,8 @@ class ImageCanvas(QGraphicsView):
             instance_ids = instance_ids[instance_ids > 0]
             
             for instance_id in instance_ids:
+                if not self.is_bbox_instance_visible(instance_id, category):
+                    continue
                 if instance_id in self.bbox_items_map:
                     continue  # Already drawn
                 # Get bbox from mask
@@ -1579,7 +2300,7 @@ class ImageCanvas(QGraphicsView):
                     x, y, w, h = bbox
                     color = self.mask_colors.get(instance_id, (255, 255, 255))
                     
-                    rect_item = QGraphicsRectItem(x, y, w, h)
+                    rect_item = OutwardBBoxRectItem(x, y, w, h)
                     pen = QPen(QColor(color[0], color[1], color[2]))
                     pen.setWidth(4)
                     rect_item.setPen(pen)
@@ -1591,10 +2312,10 @@ class ImageCanvas(QGraphicsView):
         
         # Also draw bbox-only annotations from metadata
         self._draw_bboxes_from_metadata()
+        self._draw_or_update_editing_bbox()
     
     def _draw_bboxes_from_metadata(self):
         """Draw bounding boxes from bbox-only annotations in metadata"""
-        from PyQt6.QtWidgets import QGraphicsRectItem
         from PyQt6.QtGui import QPen, QColor
         from PyQt6.QtCore import Qt
         
@@ -1612,13 +2333,15 @@ class ImageCanvas(QGraphicsView):
             category = metadata.get('category', 'bee')
             if not self.annotation_type_visibility.get(category, True):
                 continue
+            if not self.is_bbox_instance_visible(instance_id, category):
+                continue
             
             # Only draw if it's a bbox-only annotation with a valid bbox
             if 'bbox' in metadata and metadata['bbox'] != [0, 0, 0, 0]:
                 x, y, w, h = metadata['bbox']
                 color = self.mask_colors.get(instance_id, (255, 255, 255))
                 
-                rect_item = QGraphicsRectItem(x, y, w, h)
+                rect_item = OutwardBBoxRectItem(x, y, w, h)
                 pen = QPen(QColor(color[0], color[1], color[2]))
                 pen.setWidth(4)
                 rect_item.setPen(pen)
@@ -1627,6 +2350,88 @@ class ImageCanvas(QGraphicsView):
                 self.scene.addItem(rect_item)
                 self.mask_items.append(rect_item)
                 self.bbox_items_map[instance_id] = rect_item
+
+    def _remove_editing_bbox_item(self):
+        """Remove the active-edit bbox item without touching annotation data."""
+        if not self.editing_bbox_item:
+            return
+
+        try:
+            if self.editing_bbox_item.scene() == self.scene:
+                self.scene.removeItem(self.editing_bbox_item)
+        except (RuntimeError, AttributeError):
+            pass
+
+        self.mask_items = [
+            item for item in self.mask_items
+            if item is not self.editing_bbox_item
+        ]
+        for instance_id, item in list(self.bbox_items_map.items()):
+            if item is self.editing_bbox_item:
+                del self.bbox_items_map[instance_id]
+        self.editing_bbox_item = None
+
+    def _get_editing_bbox(self):
+        """Return the bbox for the active edit mask or bbox-only metadata."""
+        if self.editing_instance_id <= 0:
+            return None
+
+        if self.editing_mask is not None and np.any(self.editing_mask > 0):
+            return self.get_mask_bbox(self.editing_mask)
+
+        metadata = self.annotation_metadata.get(self.editing_instance_id, {})
+        bbox = metadata.get('bbox')
+        if metadata.get('bbox_only', False) and bbox and bbox != [0, 0, 0, 0]:
+            return tuple(bbox)
+
+        return None
+
+    def _draw_or_update_editing_bbox(self):
+        """Draw the active edit bbox above all regular boxes."""
+        if self.editing_instance_id <= 0 or not self.show_bboxes:
+            self._remove_editing_bbox_item()
+            return
+
+        category = self.editing_instance_category or self.annotation_metadata.get(
+            self.editing_instance_id, {}
+        ).get('category', self.current_annotation_type)
+        if not self.is_annotation_instance_visible(self.editing_instance_id, category):
+            self._remove_editing_bbox_item()
+            return
+
+        bbox = self._get_editing_bbox()
+        if bbox is None:
+            self._remove_editing_bbox_item()
+            return
+
+        x, y, w, h = bbox
+        color = self.mask_colors.get(self.editing_instance_id, (255, 255, 255))
+        if self.editing_bbox_item is None:
+            self.editing_bbox_item = OutwardBBoxRectItem(x, y, w, h)
+            self.scene.addItem(self.editing_bbox_item)
+            self.mask_items.append(self.editing_bbox_item)
+        else:
+            self.editing_bbox_item.setRect(QRectF(x, y, w, h))
+
+        pen = QPen(QColor(color[0], color[1], color[2]))
+        pen.setWidth(6)
+        self.editing_bbox_item.setPen(pen)
+        self.editing_bbox_item.setZValue(140)
+        self.editing_bbox_item.setVisible(True)
+        self.bbox_items_map[self.editing_instance_id] = self.editing_bbox_item
+
+    def _sync_editing_bbox_visibility(self):
+        """Apply current bbox/class/instance visibility to the active edit bbox."""
+        if not self.editing_bbox_item or self.editing_instance_id <= 0:
+            return
+
+        category = self.editing_instance_category or self.annotation_metadata.get(
+            self.editing_instance_id, {}
+        ).get('category', self.current_annotation_type)
+        self.editing_bbox_item.setVisible(
+            self.show_bboxes and
+            self.is_annotation_instance_visible(self.editing_instance_id, category)
+        )
     
     def _draw_instance_outlines(self, instance_ids, mask_lookup):
         """Draw contour outlines for hive, chamber, and pollen instances to better distinguish overlapping regions
@@ -1716,6 +2521,7 @@ class ImageCanvas(QGraphicsView):
             pen = QPen(QColor(255, 255, 255), 2)  # White, 2px thick
             outline_item.setPen(pen)
             outline_item.setZValue(5)  # Above masks (1) but below selection border (10)
+            outline_item.setVisible(self._segmentation_overlays_visible())
             
             self.scene.addItem(outline_item)
             self.mask_items.append(outline_item)
@@ -1771,13 +2577,13 @@ class ImageCanvas(QGraphicsView):
         else:
             mask_item = QGraphicsPixmapItem(pixmap)
             mask_item.setZValue(1)
-            mask_item.setVisible(self.masks_visible)
+            mask_item.setVisible(self._segmentation_overlays_visible())
             self.scene.addItem(mask_item)
             self.mask_items.append(mask_item)
         
-        # Update selection border if we modified the selected instance
+        # Update selection marker if we modified the selected instance
         if self.selected_mask_idx > 0 and (instance_id == self.selected_mask_idx or instance_id is None):
-            # Refresh border for selected instance
+            # Refresh marker for selected instance
             selected_mask_binary = (self.combined_mask == self.selected_mask_idx).astype(np.uint8) * 255
             self.add_selection_border(selected_mask_binary)
     
@@ -1805,7 +2611,7 @@ class ImageCanvas(QGraphicsView):
         # Add to scene
         mask_item = QGraphicsPixmapItem(pixmap)
         mask_item.setZValue(1)  # Above image
-        mask_item.setVisible(self.masks_visible)  # Respect current visibility state
+        mask_item.setVisible(self._segmentation_overlays_visible())
         self.scene.addItem(mask_item)
         self.mask_items.append(mask_item)
         
@@ -1841,6 +2647,8 @@ class ImageCanvas(QGraphicsView):
                     category = self.annotation_metadata.get(instance_id, {}).get('category', 'bee')
                     if not self.annotation_type_visibility.get(category, True):
                         continue  # Skip this instance if its category is not visible
+                    if not self.is_instance_enabled(instance_id, category):
+                        continue
                     
                     rect = rect_item.rect()
                     color = self.mask_colors.get(instance_id, (255, 255, 255))
@@ -1877,7 +2685,7 @@ class ImageCanvas(QGraphicsView):
                     del self.bbox_items_map[instance_id]
         
         # For mask mode, show labels at centroids (only if segmentations are shown)
-        if not self.show_segmentations or self.combined_mask is None:
+        if not self._segmentation_overlays_visible() or self.combined_mask is None:
             return
         
         # Get unique instance IDs (excluding background 0)
@@ -1889,6 +2697,8 @@ class ImageCanvas(QGraphicsView):
             category = self.annotation_metadata.get(instance_id, {}).get('category', 'bee')
             if not self.annotation_type_visibility.get(category, True):
                 continue  # Skip this instance if its category is not visible
+            if not self.is_instance_enabled(instance_id, category):
+                continue
             
             # Get the mask for this instance
             instance_mask = (self.combined_mask == instance_id)
@@ -1962,6 +2772,130 @@ class ImageCanvas(QGraphicsView):
     def toggle_labels(self):
         """Toggle visibility of instance number labels"""
         self.set_labels_visible(not self.labels_visible)
+
+    def _clear_aruco_label_items(self):
+        """Remove ArUco overlay labels from the scene."""
+        for label_item in self.aruco_label_items:
+            try:
+                if label_item.scene() == self.scene:
+                    self.scene.removeItem(label_item)
+            except (RuntimeError, AttributeError):
+                # Item already deleted by Qt or invalid
+                pass
+        self.aruco_label_items = []
+
+    def set_aruco_labels_visible(self, visible):
+        """Show or hide ArUco marker labels on the canvas."""
+        self.aruco_labels_visible = visible
+        if visible:
+            self.update_aruco_labels()
+        else:
+            self._clear_aruco_label_items()
+
+    def set_aruco_instance_labels(self, instance_to_aruco, rebuild=True):
+        """Set video-level ArUco labels keyed by instance ID."""
+        self.aruco_instance_labels = {
+            int(instance_id): aruco_id
+            for instance_id, aruco_id in (instance_to_aruco or {}).items()
+        }
+        if rebuild:
+            self.update_aruco_labels()
+
+    def update_aruco_labels(self):
+        """Draw ArUco IDs next to matching bee instances."""
+        self._clear_aruco_label_items()
+
+        if not self.aruco_labels_visible or not self.aruco_instance_labels:
+            return
+
+        for instance_id, aruco_id in sorted(self.aruco_instance_labels.items()):
+            metadata = self.annotation_metadata.get(instance_id, {})
+            if metadata.get('category', 'bee') != 'bee':
+                continue
+            if not self.annotation_type_visibility.get('bee', True):
+                continue
+            if not self.is_instance_enabled(instance_id, 'bee'):
+                continue
+
+            bbox = None
+            if instance_id in self.bbox_items_map:
+                rect = self.bbox_items_map[instance_id].rect()
+                bbox = (rect.x(), rect.y(), rect.width(), rect.height())
+            else:
+                bbox = self.get_instance_bbox_cached(instance_id)
+
+            if not bbox:
+                continue
+
+            x, y, _w, _h = bbox
+            label_text = f"ArUco {aruco_id}"
+            text_item = QGraphicsTextItem()
+            text_item.setHtml(
+                '<div style="'
+                'background-color: rgba(0, 0, 0, 190); '
+                'color: rgb(0, 255, 255); '
+                'font-size: 24px; '
+                'font-weight: bold; '
+                'padding: 2px 4px;'
+                f'">{label_text}</div>'
+            )
+            text_item.setPos(float(x) + 5, max(0.0, float(y) - 34))
+            text_item.setZValue(120)
+            self.scene.addItem(text_item)
+            self.aruco_label_items.append(text_item)
+
+    def is_instance_enabled(self, instance_id, category=None):
+        """Return whether an individual instance switch is enabled."""
+        return self._instance_key(instance_id, category) not in self.hidden_instance_keys
+
+    def is_annotation_instance_visible(self, instance_id, category=None):
+        """Return effective visibility: class switch first, then instance switch."""
+        if category is None:
+            category = self.annotation_metadata.get(instance_id, {}).get('category', 'bee')
+        return (
+            self.annotation_type_visibility.get(category, True) and
+            self.is_instance_enabled(instance_id, category)
+        )
+
+    def set_instance_visible(self, instance_id, category, visible, rebuild=True):
+        """Show or hide one instance without changing annotation data."""
+        key = self._instance_key(instance_id, category)
+        if visible:
+            self.hidden_instance_keys.discard(key)
+        else:
+            self.hidden_instance_keys.add(key)
+            if self.selected_bbox_id == instance_id:
+                self._deselect_bbox()
+
+        if rebuild:
+            self.rebuild_visualizations()
+
+    def toggle_selected_instance_visibility(self):
+        """Toggle visibility for the currently selected instance."""
+        if self.selected_mask_idx <= 0:
+            return False
+
+        category = (
+            self.selected_instance_category or
+            self.annotation_metadata.get(self.selected_mask_idx, {}).get('category', self.current_annotation_type)
+        )
+
+        if not self.annotation_type_visibility.get(category, True):
+            self.instance_visibility_toggle_blocked.emit(self.selected_mask_idx, category)
+            return False
+
+        visible = not self.is_instance_enabled(self.selected_mask_idx, category)
+        self.set_instance_visible(self.selected_mask_idx, category, visible)
+        self.instance_visibility_changed.emit(self.selected_mask_idx, category, visible)
+        return True
+
+    def is_bbox_instance_visible(self, instance_id, category=None):
+        """Backward-compatible alias for the unified instance visibility switch."""
+        return self.is_instance_enabled(instance_id, category)
+
+    def set_bbox_instance_visible(self, instance_id, visible, rebuild=True, category=None):
+        """Backward-compatible alias for the unified instance visibility switch."""
+        self.set_instance_visible(instance_id, category, visible, rebuild=rebuild)
             
     def set_annotations(self, annotations, mask_colors=None):
         """Load annotations for current frame
@@ -2022,7 +2956,13 @@ class ImageCanvas(QGraphicsView):
         
         # Reset selection
         self.selected_mask_idx = -1
+        self.selected_instance_category = None
         self.active_sam2_mask_idx = -1
+        self.editing_instance_category = None
+        self.hidden_instance_keys.clear()
+        self.hidden_bbox_instance_ids.clear()
+        self._clear_aruco_label_items()
+        self._clear_brush_history()
         
         # Clear cached data for performance optimization
         self._cached_instance_ids = None
@@ -2334,7 +3274,7 @@ class ImageCanvas(QGraphicsView):
         
         return True
     
-    def get_instance_bbox_cached(self, instance_id):
+    def get_instance_bbox_cached(self, instance_id, category=None):
         """
         Get bounding box for an instance (cached for performance)
         
@@ -2345,8 +3285,9 @@ class ImageCanvas(QGraphicsView):
             tuple: (x, y, width, height) or None if mask is empty/invalid
         """
         # Check cache first
-        if instance_id in self._cached_bboxes:
-            return self._cached_bboxes[instance_id]
+        cache_key = self._instance_key(instance_id, category)
+        if cache_key in self._cached_bboxes:
+            return self._cached_bboxes[cache_key]
         
         bbox = None
         
@@ -2354,9 +3295,10 @@ class ImageCanvas(QGraphicsView):
         if instance_id == self.editing_instance_id and self.editing_mask is not None:
             bbox = self.get_mask_bbox(self.editing_mask)
         # Try to get bbox from combined_mask
-        elif self.combined_mask is not None and instance_id > 0:
-            instance_mask = (self.combined_mask == instance_id)
-            if np.any(instance_mask):
+        elif instance_id > 0:
+            mask_array, resolved_category = self._get_mask_array_for_instance(instance_id, category)
+            instance_mask = mask_array == instance_id if mask_array is not None else None
+            if instance_mask is not None and np.any(instance_mask):
                 bbox = self.get_mask_bbox(instance_mask)
         
         # Try to get bbox from metadata (for bbox-only annotations)
@@ -2367,50 +3309,60 @@ class ImageCanvas(QGraphicsView):
         
         # Cache the result (even if None)
         if bbox is not None:
-            self._cached_bboxes[instance_id] = bbox
+            self._cached_bboxes[cache_key] = bbox
         
         return bbox
     
-    def zoom_to_instance_fast(self, idx, padding=50):
+    def zoom_to_instance_fast(self, idx, padding=50, category=None):
         """Fast version of zoom_to_instance using cached bounding box
         
         Args:
             idx: Instance ID (mask_id) to zoom to
             padding: Extra space around the instance (in pixels)
         """
-        bbox = self.get_instance_bbox_cached(idx)
+        bbox = self.get_instance_bbox_cached(idx, category)
         if bbox:
             x, y, width, height = bbox
             self.zoom_to_rect(x, y, width, height, padding)
         
-    def set_selected_instance(self, idx):
-        """Set selected instance by ID and zoom to it"""
+    def set_selected_instance(self, idx, category=None, zoom=True):
+        """Set selected instance by ID.
+
+        Args:
+            idx: Instance ID.
+            category: Optional explicit category for duplicate numeric IDs.
+            zoom: Whether to recenter/zoom the view on the selected instance.
+        """
         self.selected_mask_idx = idx
+        self.selected_instance_category = category or self.annotation_metadata.get(idx, {}).get(
+            'category', self.current_annotation_type
+        )
         
         # If brush/eraser tool is active and instance has a segmentation, start editing mode
         # For bbox-only instances, wait until user actually starts drawing
         if self.current_tool in ['brush', 'eraser']:
             # Check if instance has segmentation data
+            mask_array, _ = self._get_mask_array_for_instance(idx, self.selected_instance_category)
             has_segmentation = (
-                self.combined_mask is not None and 
-                np.any(self.combined_mask == idx)
+                mask_array is not None and
+                np.any(mask_array == idx)
             )
             if has_segmentation:
-                # Zoom to instance before entering editing mode using fast cached version
-                self.zoom_to_instance_fast(idx)
+                if zoom:
+                    self.zoom_to_instance_fast(idx, category=self.selected_instance_category)
                 
                 # Now start editing
-                self.start_editing_instance(idx)
+                self.start_editing_instance(idx, category=self.selected_instance_category)
                 return
             # For bbox-only, just select and wait for user to start drawing
         
         # Try to zoom to the instance using cached bbox (much faster)
         # If bbox graphics item exists (bboxes are visible), use it
         if idx in self.bbox_items_map:
-            self._select_bbox(idx)
-        else:
+            self._select_bbox(idx, zoom=zoom)
+        elif zoom:
             # Use cached bbox for fast zooming
-            self.zoom_to_instance_fast(idx)
+            self.zoom_to_instance_fast(idx, category=self.selected_instance_category)
     
     def get_mask_bbox(self, mask):
         """
@@ -2489,34 +3441,41 @@ class ImageCanvas(QGraphicsView):
         x, y, width, height = bbox
         self.zoom_to_rect(x, y, width, height, padding)
     
-    def highlight_instance(self, idx):
+    def highlight_instance(self, idx, category=None):
         """Highlight a specific instance by ID"""
         # Commit any edits to previous instance before switching
-        if self.editing_instance_id > 0 and self.editing_instance_id != idx:
+        target_category = category or self.annotation_metadata.get(idx, {}).get(
+            'category', self.current_annotation_type
+        )
+        if (self.editing_instance_id > 0 and
+            (self.editing_instance_id != idx or self.editing_instance_category != target_category)):
             self.commit_editing()
 
         # In bbox view mode, don't rebuild visualizations (would clear bbox selection)
         if self.show_bboxes:
             self.selected_mask_idx = idx
+            self.selected_instance_category = target_category
             return
         
         self.selected_mask_idx = idx
+        self.selected_instance_category = target_category
         
-        # PERFORMANCE OPTIMIZATION: Only update the selection border instead of rebuilding everything
+        # PERFORMANCE OPTIMIZATION: Only update the selection marker instead of rebuilding everything
         # This is much faster when there are many instances
         self.update_selection_border()
+        self.instance_selected.emit(idx, target_category)
             
     def refresh_all_visualizations(self):
         """Refresh all mask visualizations with current selection highlighting"""
         self.rebuild_visualizations()
             
     def update_selection_border(self):
-        """Update the selection border for the currently selected instance
+        """Update the selection marker for the currently selected instance
         
-        This is a lightweight method that only updates the border without rebuilding
+        This is a lightweight method that only updates the marker without rebuilding
         all visualizations. Much faster for instance switching.
         """
-        # Remove old border
+        # Remove old marker
         if self.selection_border_item:
             try:
                 if self.selection_border_item.scene() == self.scene:
@@ -2524,31 +3483,36 @@ class ImageCanvas(QGraphicsView):
             except (RuntimeError, AttributeError):
                 pass
             self.selection_border_item = None
+
+        if not self._segmentation_overlays_visible():
+            return
         
-        # Add new border if we have a valid selection
-        if self.selected_mask_idx > 0 and self.combined_mask is not None:
+        # Add new marker if we have a valid selection
+        if self.selected_mask_idx > 0:
             # Check if the selected instance's category is visible
-            metadata = self.annotation_metadata.get(self.selected_mask_idx, {})
-            category = metadata.get('category', 'bee')
-            if not self.annotation_type_visibility.get(category, True):
-                # Category is hidden, don't show selection border
+            category = (
+                self.selected_instance_category or
+                self.annotation_metadata.get(self.selected_mask_idx, {}).get('category', 'bee')
+            )
+            if not self.is_annotation_instance_visible(self.selected_mask_idx, category):
+                # Category is hidden, don't show selection marker
                 return
             # Check if instance exists in combined_mask or is being edited
             if self.selected_mask_idx == self.editing_instance_id and self.editing_mask is not None:
                 # Use editing mask
                 binary_mask = self.editing_mask
-            elif np.any(self.combined_mask == self.selected_mask_idx):
-                # Use combined mask
-                binary_mask = (self.combined_mask == self.selected_mask_idx).astype(np.uint8) * 255
             else:
-                # No mask to highlight (bbox-only instance)
-                return
+                mask_array, _ = self._get_mask_array_for_instance(self.selected_mask_idx, category)
+                if mask_array is None or not np.any(mask_array == self.selected_mask_idx):
+                    return
+                # Use combined mask
+                binary_mask = (mask_array == self.selected_mask_idx).astype(np.uint8) * 255
             
             self.add_selection_border(binary_mask)
     
     def add_selection_border(self, mask):
-        """Add a border around the selected mask"""
-        # Remove previous border if it exists
+        """Add a centroid marker for the selected mask."""
+        # Remove previous marker if it exists
         if self.selection_border_item:
             try:
                 if self.selection_border_item.scene() == self.scene:
@@ -2557,50 +3521,44 @@ class ImageCanvas(QGraphicsView):
                 # Item already deleted by Qt or invalid
                 pass
             self.selection_border_item = None
+
+        if not self._segmentation_overlays_visible():
+            return
         
         # Check if the selected instance's category is visible
         if self.selected_mask_idx > 0:
-            metadata = self.annotation_metadata.get(self.selected_mask_idx, {})
-            category = metadata.get('category', 'bee')
-            if not self.annotation_type_visibility.get(category, True):
-                # Category is hidden, don't show selection border
+            category = (
+                self.selected_instance_category or
+                self.annotation_metadata.get(self.selected_mask_idx, {}).get('category', 'bee')
+            )
+            if not self.is_annotation_instance_visible(self.selected_mask_idx, category):
+                # Category is hidden, don't show selection marker
                 return
         
-        # Find contours of the mask
-        contours, _ = cv2.findContours((mask > 0).astype(np.uint8), 
-                                       cv2.RETR_EXTERNAL, 
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
+        mask_pixels = mask > 0
+        if not np.any(mask_pixels):
             return
+
+        y_coords, x_coords = np.nonzero(mask_pixels)
+        centroid_x = float(np.mean(x_coords))
+        centroid_y = float(np.mean(y_coords))
+
+        radius = 6.0
+        marker_item = QGraphicsEllipseItem(-radius, -radius, radius * 2, radius * 2)
+        marker_item.setPos(centroid_x, centroid_y)
+        marker_item.setBrush(QBrush(QColor(255, 255, 0, 230)))
+
+        pen = QPen(QColor(0, 0, 0))
+        pen.setWidthF(1.5)
+        pen.setCosmetic(True)
+        marker_item.setPen(pen)
+
+        marker_item.setZValue(150)  # Above masks and bbox lines
+        marker_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.scene.addItem(marker_item)
+        self.selection_border_item = marker_item
         
-        # Draw contours as polygon
-        from PyQt6.QtWidgets import QGraphicsPathItem
-        from PyQt6.QtGui import QPainterPath
-        
-        path = QPainterPath()
-        for contour in contours:
-            if len(contour) > 0:
-                # Start at first point
-                first_point = contour[0][0]
-                path.moveTo(float(first_point[0]), float(first_point[1]))
-                
-                # Draw lines to other points
-                for point in contour[1:]:
-                    pt = point[0]
-                    path.lineTo(float(pt[0]), float(pt[1]))
-                
-                # Close the path
-                path.closeSubpath()
-        
-        # Create graphics item with thick yellow border
-        border_item = QGraphicsPathItem(path)
-        border_item.setPen(QPen(QColor(255, 255, 0), 3))  # Yellow, 3px thick
-        border_item.setZValue(10)  # Above masks
-        self.scene.addItem(border_item)
-        self.selection_border_item = border_item
-        
-    def start_editing_instance(self, instance_id):
+    def start_editing_instance(self, instance_id, category=None):
         """Start editing an instance in isolation mode
         
         Extracts the instance to a temporary editing mask so edits don't affect other instances
@@ -2608,13 +3566,25 @@ class ImageCanvas(QGraphicsView):
         
         Args:
             instance_id: ID of instance to edit
+            category: Optional explicit category to edit
         """
+        category = category or self.selected_instance_category or self.annotation_metadata.get(
+            instance_id, {}
+        ).get('category', self.current_annotation_type)
+
+        if (self.editing_instance_id == instance_id and
+            self.editing_instance_category == category and
+            self.editing_mask is not None):
+            return
+
         # Commit any previous edits
-        if self.editing_instance_id > 0:
+        if (self.editing_instance_id > 0 and
+            (self.editing_instance_id != instance_id or self.editing_instance_category != category)):
             self.commit_editing()
+        self._clear_brush_history()
         
         # Get the appropriate mask array for this instance
-        mask_array, category = self._get_mask_array_for_instance(instance_id)
+        mask_array, category = self._get_mask_array_for_instance(instance_id, category)
         
         # Ensure mask exists
         if mask_array is None:
@@ -2642,6 +3612,7 @@ class ImageCanvas(QGraphicsView):
         
         h, w = mask_array.shape
         self.editing_mask = np.zeros((h, w), dtype=np.uint8)
+        self._remove_instance_from_other_category_masks(instance_id, category)
         
         # Check if this instance exists in mask_array or is bbox-only
         if np.any(mask_array == instance_id):
@@ -2657,7 +3628,10 @@ class ImageCanvas(QGraphicsView):
             pass
         
         self.editing_instance_id = instance_id
+        self.editing_instance_category = category
         self.selected_mask_idx = instance_id  # Sync selected_mask_idx with editing_instance_id
+        self.selected_instance_category = category
+        self.set_instance_visible(instance_id, category, True, rebuild=False)
         
         # Stamp the correct category into annotation_metadata for new instances.
         # _get_mask_array_for_instance defaults to 'bee' when the instance is brand-new
@@ -2665,14 +3639,14 @@ class ImageCanvas(QGraphicsView):
         # that get_annotations() and commit_editing() both resolve the right category.
         if instance_id not in self.annotation_metadata:
             self.annotation_metadata[instance_id] = {}
-        if 'category' not in self.annotation_metadata[instance_id]:
-            self.annotation_metadata[instance_id]['category'] = self.current_annotation_type
+        self.annotation_metadata[instance_id]['category'] = category
         
         # Rebuild base visualization (without the editing instance)
         self.rebuild_visualizations()
         
         # Show editing mask on top
         self._update_editing_visualization()
+        self.instance_selected.emit(instance_id, category)
     
     def commit_editing(self):
         """Commit editing mask back to combined mask
@@ -2695,6 +3669,7 @@ class ImageCanvas(QGraphicsView):
             # This preserves bbox-only instances that were selected but not drawn on
             self.editing_mask = None
             self.editing_instance_id = -1
+            self.editing_instance_category = None
             
             # Clear editing overlay cache
             if self._editing_overlay_cache is not None:
@@ -2718,6 +3693,7 @@ class ImageCanvas(QGraphicsView):
             
             # Rebuild visualization to restore bbox-only instances
             self.rebuild_visualizations()
+            self._clear_brush_history()
             return
         
         # Create appropriate mask if it doesn't exist (e.g., when converting bbox-only to mask)
@@ -2727,7 +3703,9 @@ class ImageCanvas(QGraphicsView):
             return
         
         # Get category from metadata or use current annotation type
-        category = self.annotation_metadata.get(self.editing_instance_id, {}).get('category', self.current_annotation_type)
+        category = self.editing_instance_category or self.annotation_metadata.get(
+            self.editing_instance_id, {}
+        ).get('category', self.current_annotation_type)
         
         # Get or create the appropriate mask array
         if category == 'chamber':
@@ -2772,6 +3750,7 @@ class ImageCanvas(QGraphicsView):
         old_editing_mask = self.editing_mask
         self.editing_mask = None
         self.editing_instance_id = -1
+        self.editing_instance_category = None
         del old_editing_mask
         
         # Clear editing overlay cache
@@ -2796,6 +3775,7 @@ class ImageCanvas(QGraphicsView):
         
         # Rebuild full visualization
         self.rebuild_visualizations()
+        self._clear_brush_history()
         
         self.annotation_changed.emit()
     
@@ -2838,14 +3818,33 @@ class ImageCanvas(QGraphicsView):
         
         # Add to scene on top of everything
         self.editing_mask_item = QGraphicsPixmapItem(pixmap)
-        self.editing_mask_item.setZValue(2)  # Above regular masks (which are at 1)
-        # Always show editing mask when in editing mode, regardless of show_segmentations
-        self.editing_mask_item.setVisible(True)
+        self.editing_mask_item.setZValue(125)  # Above regular masks and non-active boxes
+        self.editing_mask_item.setVisible(self._is_editing_mask_visible())
         self.scene.addItem(self.editing_mask_item)
+        self._draw_or_update_editing_bbox()
         
         # Update selection border for editing mask (skip if actively drawing)
         if not self._is_actively_drawing and self.selected_mask_idx == self.editing_instance_id:
             self.add_selection_border(self.editing_mask)
+
+    def _is_editing_mask_visible(self):
+        """Return whether the active editing overlay should be visible."""
+        if self.editing_instance_id <= 0:
+            return False
+        category = self.editing_instance_category or self.annotation_metadata.get(
+            self.editing_instance_id, {}
+        ).get('category', self.current_annotation_type)
+        return (
+            self._segmentation_overlays_visible() and
+            self.is_annotation_instance_visible(self.editing_instance_id, category)
+        )
+
+    def _sync_editing_mask_visibility(self):
+        """Apply current global/class/instance visibility to the editing overlay."""
+        if self.editing_mask_item:
+            self.editing_mask_item.setZValue(125)
+            self.editing_mask_item.setVisible(self._is_editing_mask_visible())
+        self._sync_editing_bbox_visibility()
     
     def _flush_pending_viz_update(self):
         """Flush pending visualization update (called by timer)"""
@@ -2893,13 +3892,15 @@ class ImageCanvas(QGraphicsView):
         # Update existing item
         if self.editing_mask_item:
             self.editing_mask_item.setPixmap(pixmap)
+            self.editing_mask_item.setZValue(125)
         else:
             # Create item if it doesn't exist
             self.editing_mask_item = QGraphicsPixmapItem(pixmap)
-            self.editing_mask_item.setZValue(2)
-            # Always show editing mask when in editing mode
-            self.editing_mask_item.setVisible(True)
+            self.editing_mask_item.setZValue(125)
+            self.editing_mask_item.setVisible(self._is_editing_mask_visible())
             self.scene.addItem(self.editing_mask_item)
+        self._draw_or_update_editing_bbox()
+        self._sync_editing_mask_visibility()
     
     def clear_selected_instance(self):
         """Remove the selected instance from the combined mask"""
@@ -2912,6 +3913,8 @@ class ImageCanvas(QGraphicsView):
         if self.editing_instance_id == instance_to_clear:
             self.editing_mask = None
             self.editing_instance_id = -1
+            self.editing_instance_category = None
+            self._clear_brush_history()
             # Remove editing visualization
             if self.editing_mask_item:
                 try:
@@ -2924,7 +3927,10 @@ class ImageCanvas(QGraphicsView):
         else:
             # Not in editing mode, directly clear from the appropriate mask array
             # Find which mask array contains this instance
-            mask_array, category = self._get_mask_array_for_instance(instance_to_clear)
+            mask_array, category = self._get_mask_array_for_instance(
+                instance_to_clear,
+                self.selected_instance_category
+            )
             if mask_array is not None:
                 mask_array[mask_array == instance_to_clear] = 0
                 # Mark combined mask cache as dirty
@@ -2973,14 +3979,50 @@ class ImageCanvas(QGraphicsView):
         self.annotation_changed.emit()
         
     def undo(self):
-        """Undo last action"""
-        # TODO: Implement proper undo/redo
-        pass
+        """Undo the last brush/eraser/fill edit for the active instance."""
+        if self._viz_update_timer.isActive():
+            self._viz_update_timer.stop()
+            self._flush_pending_viz_update()
+
+        if self.editing_mask is None or self.editing_instance_id <= 0:
+            print("Undo skipped: no active brush-edit instance.")
+            return
+        if not self.brush_undo_stack:
+            print("Undo skipped: no brush history available.")
+            return
+
+        current_snapshot = self._make_editing_mask_snapshot()
+        previous_snapshot = self.brush_undo_stack.pop()
+        if current_snapshot is not None:
+            self.brush_redo_stack.append(current_snapshot)
+            self._trim_brush_stack(self.brush_redo_stack)
+
+        self._brush_step_active = False
+        self._brush_step_start_snapshot = None
+        self._restore_editing_mask_snapshot(previous_snapshot)
         
     def redo(self):
-        """Redo last action"""
-        # TODO: Implement proper undo/redo
-        pass
+        """Redo the last undone brush/eraser/fill edit for the active instance."""
+        if self._viz_update_timer.isActive():
+            self._viz_update_timer.stop()
+            self._flush_pending_viz_update()
+
+        if self.editing_mask is None or self.editing_instance_id <= 0:
+            print("Redo skipped: no active brush-edit instance.")
+            return
+        if not self.brush_redo_stack:
+            print("Redo skipped: no brush redo history available.")
+            return
+
+        current_snapshot = self._make_editing_mask_snapshot()
+        next_snapshot = self.brush_redo_stack.pop()
+        if current_snapshot is not None:
+            self.brush_undo_stack.append(current_snapshot)
+            self._trim_brush_stack(self.brush_undo_stack)
+
+        self._brush_step_active = False
+        self._brush_step_start_snapshot = None
+        self._restore_editing_mask_snapshot(next_snapshot)
         
     def set_brush_size(self, size):
         """Set brush size"""
@@ -3051,6 +4093,8 @@ class ImageCanvas(QGraphicsView):
         
         # Reset active mask index
         self.active_sam2_mask_idx = -1
+        self.selected_instance_category = None
+        self._clear_brush_history()
     
     def start_new_sam2_instance(self):
         """Start annotating a new SAM2 instance"""
@@ -3068,6 +4112,8 @@ class ImageCanvas(QGraphicsView):
         self.prompt_items = []
         self.active_sam2_mask_idx = -1
         self.selected_mask_idx = -1
+        self.selected_instance_category = None
+        self._clear_brush_history()
         
         # Remove selection border
         if self.selection_border_item:
@@ -3088,8 +4134,20 @@ class ImageCanvas(QGraphicsView):
     
     def set_show_segmentations(self, show):
         """Enable or disable segmentation mask display"""
+        show = bool(show)
+        if self._viz_update_timer.isActive():
+            self._viz_update_timer.stop()
+            self._flush_pending_viz_update()
+
+        if not show:
+            self.labels_visible_before_hiding = self.labels_visible
+
         self.show_segmentations = show
+        # Keep the old quick-mask state as an alias for the real segmentation
+        # switch so Space, the toolbar checkbox, and the menu cannot disagree.
+        self.masks_visible = show
         self.rebuild_visualizations()
+        self.masks_visibility_changed.emit(show)
     
     def set_show_bboxes(self, show):
         """Enable or disable bounding box display"""
@@ -3103,7 +4161,10 @@ class ImageCanvas(QGraphicsView):
         self.set_show_bboxes(enabled)
     
     def _get_bbox_at_pos(self, pos):
-        """Get bbox ID at scene position
+        """Get bbox ID at scene position.
+
+        If multiple bboxes contain the point, keep the active selection when it
+        is one of the hits. Otherwise the click is ambiguous and returns None.
         
         Args:
             pos: QPointF scene position
@@ -3113,11 +4174,12 @@ class ImageCanvas(QGraphicsView):
         """
         # Clean up any deleted items while iterating
         to_remove = []
+        hits = []
         
         for mask_id, rect_item in self.bbox_items_map.items():
             try:
                 if rect_item.rect().contains(pos):
-                    return mask_id
+                    hits.append(mask_id)
             except (RuntimeError, AttributeError):
                 # Item has been deleted by Qt or is invalid
                 to_remove.append(mask_id)
@@ -3125,14 +4187,29 @@ class ImageCanvas(QGraphicsView):
         # Clean up deleted items from map
         for mask_id in to_remove:
             del self.bbox_items_map[mask_id]
+
+        if not hits:
+            return None
+
+        for active_id in (
+            self.editing_instance_id,
+            self.selected_bbox_id,
+            self.selected_mask_idx,
+        ):
+            if active_id and active_id in hits:
+                return active_id
+
+        if len(hits) == 1:
+            return hits[0]
         
         return None
     
-    def _select_bbox(self, mask_id):
+    def _select_bbox(self, mask_id, zoom=True):
         """Select a bbox for editing
         
         Args:
             mask_id: ID of bbox to select
+            zoom: Whether to zoom to the bbox after selecting it.
         """
         if mask_id not in self.bbox_items_map:
             return
@@ -3143,6 +4220,9 @@ class ImageCanvas(QGraphicsView):
         
         self.selected_bbox_id = mask_id
         self.selected_mask_idx = mask_id  # Keep instance selection in sync
+        self.selected_instance_category = self.annotation_metadata.get(mask_id, {}).get(
+            'category', self.selected_instance_category or self.current_annotation_type
+        )
         rect_item = self.bbox_items_map[mask_id]
         
         # Highlight selected bbox by increasing pen width
@@ -3157,10 +4237,11 @@ class ImageCanvas(QGraphicsView):
         self._create_bbox_handles()
         self.setToolTip("Drag corners to resize, drag center to move bbox")
         
-        # Zoom to bbox
-        rect = rect_item.rect()
-        self.zoom_to_rect(int(rect.x()), int(rect.y()), 
-                         int(rect.width()), int(rect.height()), padding=100)
+        if zoom:
+            rect = rect_item.rect()
+            self.zoom_to_rect(int(rect.x()), int(rect.y()),
+                              int(rect.width()), int(rect.height()), padding=100)
+        self.instance_selected.emit(mask_id, self.selected_instance_category)
     
     def _deselect_bbox(self):
         """Deselect currently selected bbox"""
@@ -3192,7 +4273,6 @@ class ImageCanvas(QGraphicsView):
         Args:
             rect: QRectF of the drawn bbox
         """
-        from PyQt6.QtWidgets import QGraphicsRectItem
         from PyQt6.QtGui import QPen, QColor
         
         # Use selected instance ID if available, otherwise create new
@@ -3235,7 +4315,7 @@ class ImageCanvas(QGraphicsView):
         self._cached_instance_ids = None
         
         # Create rectangle item for visualization
-        rect_item = QGraphicsRectItem(rect)
+        rect_item = OutwardBBoxRectItem(rect)
         pen = QPen(QColor(color[0], color[1], color[2]))
         pen.setWidth(4)
         rect_item.setPen(pen)
@@ -3377,6 +4457,7 @@ class ImageCanvas(QGraphicsView):
 
         # Deselect current instance — it belongs to the old type
         self.selected_mask_idx = -1
+        self.selected_instance_category = None
         self.active_sam2_mask_idx = -1
 
         self.current_annotation_type = annotation_type

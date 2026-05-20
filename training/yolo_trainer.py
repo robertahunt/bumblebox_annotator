@@ -10,6 +10,7 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
+from training.gpu import require_cuda_device
 
 try:
     from ultralytics import YOLO
@@ -271,6 +272,10 @@ class YOLOTrainingWorker(QThread):
         
     def _train_model(self, dataset_yaml):
         """Train YOLO model"""
+        device, device_label = require_cuda_device()
+        self.stage_update.emit(f"Using GPU: {device_label}")
+        print(f"YOLO training using GPU: {device_label}")
+
         # Initialize model
         model = YOLO('yolov8s-seg.pt')
         
@@ -288,13 +293,19 @@ class YOLOTrainingWorker(QThread):
             'save_period': -1,
             'val': True,  # Enable validation during training
             'plots': True,  # Save validation prediction plots
-            'device': 0 if torch.cuda.is_available() else 'cpu',
+            'device': device,
             'optimizer': 'AdamW',
             'lr0': self.config.get('lr0', 0.001),
             'lrf': 0.01,
             'warmup_epochs': 3.0,
-            'overlap_mask': False,  # Prevent overlapping masks for close-together bees
+            # Keep segmentation training memory sane. overlap_mask=True is the
+            # Ultralytics default and is much lighter than separate full-size
+            # binary masks for every bee in high-resolution frames.
+            'overlap_mask': True,
+            'amp': True,
+            'cache': False,
             'verbose': True,
+            'workers': self.config.get('workers', 0),  # Stable in GUI: avoid orphaned dataloader processes
             #'freeze':10,
             
             # Enhanced augmentation parameters
@@ -316,7 +327,7 @@ class YOLOTrainingWorker(QThread):
             # Multi-scale training
             'rect': False,
             'close_mosaic': 10,
-            'visualize': True,
+            'visualize': False,
         }
         
         # Add custom Albumentations for blur augmentation (to handle blurry videos)

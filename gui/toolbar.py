@@ -126,13 +126,12 @@ class AnnotationToolbar(QWidget):
         row2 = QHBoxLayout()
         row2.setSpacing(5)
         
-        # Brush size control (log_2 scale up to 300)
+        # Brush size control (log_2 scale up to 1000)
         row2.addWidget(QLabel("Brush Size:"))
         self.brush_size_slider = QSlider(Qt.Orientation.Horizontal)
         self.brush_size_slider.setMinimum(0)
         self.brush_size_slider.setMaximum(100)
-        # Default to brush size 10: slider_value = 100 * log2(10) / log2(300) ≈ 40
-        self.brush_size_slider.setValue(20)
+        self.brush_size_slider.setValue(self._brush_size_to_slider_value(10))
         self.brush_size_slider.setMinimumWidth(120)
         self.brush_size_slider.valueChanged.connect(self.on_brush_size_changed)
         row2.addWidget(self.brush_size_slider)
@@ -219,8 +218,8 @@ class AnnotationToolbar(QWidget):
         
     def on_brush_size_changed(self, value):
         """Handle brush size change (converts from log_2 scale)"""
-        # Convert slider value (0-100) to brush size (1-300) on log_2 scale
-        # brush_size = 2^(slider_value * log2(300) / 100)
+        # Convert slider value (0-100) to brush size (1-1000) on log_2 scale
+        # brush_size = 2^(slider_value * log2(1000) / 100)
         if value == 0:
             brush_size = 1
         else:
@@ -229,6 +228,26 @@ class AnnotationToolbar(QWidget):
         
         self.brush_size_label.setText(str(brush_size))
         self.brush_size_changed.emit(brush_size)
+
+    def _brush_size_to_slider_value(self, brush_size):
+        """Convert a brush size in pixels to the toolbar's log-scale slider value."""
+        brush_size = max(1, min(1000, int(brush_size)))
+        if brush_size <= 1:
+            return 0
+        return max(0, min(100, round(100 * math.log2(brush_size) / math.log2(1000))))
+
+    def set_brush_size(self, brush_size, emit=True):
+        """Set brush size from code while keeping slider and label in sync."""
+        brush_size = max(1, min(1000, int(brush_size)))
+        slider_value = self._brush_size_to_slider_value(brush_size)
+
+        self.brush_size_slider.blockSignals(True)
+        self.brush_size_slider.setValue(slider_value)
+        self.brush_size_slider.blockSignals(False)
+        self.brush_size_label.setText(str(brush_size))
+
+        if emit:
+            self.brush_size_changed.emit(brush_size)
     
     def on_opacity_changed(self, value):
         """Handle opacity change"""

@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
+from training.gpu import require_cuda_device
 
 try:
     from sam2.build_sam import build_sam2
@@ -266,6 +267,10 @@ class SAM2TrainingWorker(QThread):
     
     def _load_sam2_model(self):
         """Load SAM2 model"""
+        _device, device_label = require_cuda_device()
+        self.stage_update.emit(f"Using GPU: {device_label}")
+        print(f"SAM2 training using GPU: {device_label}")
+
         checkpoint_path = self.config['checkpoint_path']
         config_name = self.config.get('config_name', 'sam2_hiera_l.yaml')
         

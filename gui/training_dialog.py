@@ -444,7 +444,7 @@ class TrainingConfigDialog(QDialog):
         elif self.instance_focused:
             self.batch_spin.setValue(16)  # Larger batch for uniform-sized crops
         else:
-            self.batch_spin.setValue(8)
+            self.batch_spin.setValue(4)  # Safer default for full-frame segmentation masks
         params_layout.addRow("Batch Size:", self.batch_spin)
         
         # Image size

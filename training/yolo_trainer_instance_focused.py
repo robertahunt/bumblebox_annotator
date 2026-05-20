@@ -13,6 +13,7 @@ from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 import torch
 from ultralytics import YOLO
+from training.gpu import require_cuda_device
 
 try:
     import albumentations as A
@@ -386,6 +387,10 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
     
     def _train_model(self, dataset_yaml):
         """Train instance-focused YOLO model"""
+        device, device_label = require_cuda_device()
+        self.stage_update.emit(f"Using GPU: {device_label}")
+        print(f"YOLO instance-focused training using GPU: {device_label}")
+
         # Get base model from config, default to yolov8s-seg.pt
         base_model = self.config.get('base_model', 'yolov8s-seg.pt')
         
@@ -406,13 +411,14 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
             'save_period': -1,
             'val': True,  # Enable validation during training
             'plots': True,  # Save validation prediction plots
-            'device': 0 if torch.cuda.is_available() else 'cpu',
+            'device': device,
             'optimizer': 'AdamW',
             'lr0': self.config.get('lr0', 0.001),
             'lrf': 0.01,
             'warmup_epochs': 3.0,
             'overlap_mask': False,  # No overlapping masks since we have single instances
             'verbose': True,
+            'workers': self.config.get('workers', 0),  # Stable in GUI: avoid orphaned dataloader processes
             
             # Augmentation parameters
             'hsv_h': 0.015,

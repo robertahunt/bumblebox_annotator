@@ -10,6 +10,7 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
+from training.gpu import require_cuda_device
 
 try:
     from ultralytics import YOLO
@@ -220,6 +221,10 @@ class YOLOTrainingWorkerBBox(QThread):
     
     def _train_model(self, dataset_yaml):
         """Train YOLO bbox detection model"""
+        device, device_label = require_cuda_device()
+        self.stage_update.emit(f"Using GPU: {device_label}")
+        print(f"YOLO bbox training using GPU: {device_label}")
+
         # Get base model from config, default to yolov8s.pt (detection)
         base_model = self.config.get('base_model', 'yolov8s.pt')
         
@@ -240,12 +245,13 @@ class YOLOTrainingWorkerBBox(QThread):
             'save_period': -1,
             'val': True,
             'plots': True,
-            'device': 0 if torch.cuda.is_available() else 'cpu',
+            'device': device,
             'optimizer': 'AdamW',
             'lr0': self.config.get('lr0', 0.001),
             'lrf': 0.01,
             'warmup_epochs': 3.0,
             'verbose': True,
+            'workers': self.config.get('workers', 0),  # Stable in GUI: avoid orphaned dataloader processes
             
             # Enhanced augmentation parameters
             'hsv_v': 0.2,

@@ -152,6 +152,9 @@ class MainWindow(QMainWindow):
         
         # Track unsaved changes to avoid unnecessary saves
         self.current_frame_modified = False
+        self.dirty_frame_annotation_keys = set()
+        self.dirty_video_annotation_ids = set()
+        self.coco_export_dirty = False
         
         # Throttled instance list update (performance optimization)
         self._instance_list_update_timer = QTimer()
@@ -212,9 +215,21 @@ class MainWindow(QMainWindow):
         self.canvas.point_clicked.connect(self.on_canvas_point_clicked)
         self.canvas.box_drawn.connect(self.on_canvas_box_drawn)
         self.canvas.masks_visibility_changed.connect(self.on_masks_visibility_changed)
+        self.canvas.instance_visibility_changed.connect(self.on_instance_visibility_shortcut_changed)
+        self.canvas.instance_visibility_toggle_blocked.connect(self.on_instance_visibility_shortcut_blocked)
+        self.canvas.instance_selected.connect(self.on_canvas_instance_selected)
+        self.canvas.brush_size_step_requested.connect(self.on_brush_size_step_requested)
+        self.canvas.brush_size_unit_step_requested.connect(self.on_brush_size_unit_step_requested)
+        self.canvas.brush_eraser_toggle_requested.connect(self.on_brush_eraser_toggle_requested)
+        self.canvas.instance_switch_tap_progress.connect(self.on_instance_switch_tap_progress)
         self.canvas.annotation_changed.connect(self.on_annotation_changed)
         self.canvas.annotation_changed.connect(self._schedule_instance_list_update)
-        self.canvas.setToolTip("Hold Spacebar to temporarily hide masks & numbers | Press F to fit image to window")
+        self.canvas.setToolTip(
+            "Space toggles segmentations | "
+            "Shift+Space toggles selected instance | Ctrl+/- zooms | +/- changes brush size | "
+            "Middle-click toggles Brush/Eraser | Triple-tap another instance to switch while brushing | "
+            "Press F to fit image to window"
+        )
         
         # Create annotation toolbar
         self.toolbar = AnnotationToolbar(self)
@@ -233,6 +248,9 @@ class MainWindow(QMainWindow):
         
         # Synchronize canvas visibility with toolbar checkbox initial states
         # (in case signals fired before connections were made)
+        self.canvas.show_segmentations = self.toolbar.segmentation_checkbox.isChecked()
+        self.canvas.masks_visible = self.canvas.show_segmentations
+        self.canvas.show_bboxes = self.toolbar.bbox_checkbox.isChecked()
         self.canvas.set_annotation_type_visibility('bee', self.toolbar.show_bees_checkbox.isChecked(), rebuild=False)
         self.canvas.set_annotation_type_visibility('hive', self.toolbar.show_hives_checkbox.isChecked(), rebuild=False)
         self.canvas.set_annotation_type_visibility('chamber', self.toolbar.show_chambers_checkbox.isChecked(), rebuild=False)
@@ -664,6 +682,83 @@ class MainWindow(QMainWindow):
                 tracker.set_next_track_id(self.video_next_mask_id[video_id])
             self.video_trackers[video_id] = tracker
         return self.video_trackers[video_id]
+
+    def _get_current_bee_bbox_annotations(self):
+        """Get bbox-only bee annotations currently shown on the canvas."""
+        annotations = self.canvas.get_annotations()
+        bbox_annotations = []
+        for ann in annotations:
+            if ann.get('category', 'bee') != 'bee':
+                continue
+            if not ann.get('bbox_only', False):
+                continue
+            bbox = ann.get('bbox')
+            if not bbox or bbox == [0, 0, 0, 0]:
+                continue
+            bbox_annotations.append(ann)
+        return bbox_annotations
+
+    def _box_iou_xyxy(self, box_a, box_b):
+        """Calculate IoU between two xyxy boxes."""
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+
+        inter_w = max(0, inter_x2 - inter_x1)
+        inter_h = max(0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        union = area_a + area_b - inter_area
+        return inter_area / union if union > 0 else 0.0
+
+    def _match_bbox_detections_to_existing_annotations(self, detections, existing_annotations, min_iou=0.1):
+        """Preserve existing IDs when rerunning bbox detection on the same frame."""
+        existing_boxes = []
+        max_existing_id = 0
+
+        for ann in existing_annotations:
+            instance_id = int(ann.get('mask_id', ann.get('instance_id', 0)))
+            bbox = ann.get('bbox')
+            if instance_id <= 0 or not bbox:
+                continue
+            x, y, w, h = bbox
+            existing_boxes.append((instance_id, [x, y, x + w, y + h]))
+            max_existing_id = max(max_existing_id, instance_id)
+
+        candidates = []
+        for det_idx, detection in enumerate(detections):
+            for existing_idx, (_, existing_box) in enumerate(existing_boxes):
+                iou = self._box_iou_xyxy(detection.bbox, existing_box)
+                if iou >= min_iou:
+                    candidates.append((iou, det_idx, existing_idx))
+
+        candidates.sort(reverse=True, key=lambda item: item[0])
+        assigned_detections = {}
+        used_existing = set()
+
+        for _, det_idx, existing_idx in candidates:
+            if det_idx in assigned_detections or existing_idx in used_existing:
+                continue
+            assigned_detections[det_idx] = existing_boxes[existing_idx][0]
+            used_existing.add(existing_idx)
+
+        next_id = max_existing_id + 1
+        matched = []
+        for det_idx, detection in enumerate(detections):
+            if det_idx in assigned_detections:
+                instance_id = assigned_detections[det_idx]
+            else:
+                instance_id = next_id
+                next_id += 1
+            matched.append((detection, instance_id))
+
+        return matched, next_id
     
     def _yolo_results_to_detections(self, yolo_result, model):
         """Convert YOLO results to Detection objects"""
@@ -1753,12 +1848,19 @@ class MainWindow(QMainWindow):
         self.show_labels_checkbox.setChecked(False)
         self.show_labels_checkbox.stateChanged.connect(self.on_show_labels_changed)
         layout.addWidget(self.show_labels_checkbox)
+
+        self.show_aruco_labels_checkbox = QCheckBox("Show ArUco Tags")
+        self.show_aruco_labels_checkbox.setChecked(False)
+        self.show_aruco_labels_checkbox.stateChanged.connect(self.on_show_aruco_labels_changed)
+        layout.addWidget(self.show_aruco_labels_checkbox)
         
         # Add instance list
+        self._instance_list_updating = False
         self.instance_list = QListWidget()
         self.instance_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)  # Enable multi-selection with Shift/Ctrl
         self.instance_list.currentRowChanged.connect(self.on_instance_changed)
         self.instance_list.itemClicked.connect(self.on_instance_clicked)  # Also handle re-clicks on same item
+        self.instance_list.itemChanged.connect(self.on_instance_bbox_visibility_changed)
         self.instance_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.instance_list.customContextMenuRequested.connect(self.show_instance_context_menu)
         layout.addWidget(self.instance_list)
@@ -1883,6 +1985,91 @@ class MainWindow(QMainWindow):
                 raise
         except Exception as e:
             print(f"Warning: Could not save max_mask_id to metadata: {e}")
+
+    def _extract_max_mask_id_from_json_data(self, data):
+        """Return the highest bee instance ID in a frame/bbox annotation JSON payload."""
+        max_id = 0
+        if isinstance(data, dict):
+            annotations = data.get('annotations', [])
+        elif isinstance(data, list):
+            annotations = data
+        else:
+            annotations = []
+
+        for ann in annotations:
+            if not isinstance(ann, dict):
+                continue
+            if ann.get('category', 'bee') != 'bee':
+                continue
+            try:
+                instance_id = int(ann.get('mask_id', ann.get('instance_id', 0)) or 0)
+            except (TypeError, ValueError):
+                instance_id = 0
+            max_id = max(max_id, instance_id)
+
+        return max_id
+
+    def _recompute_max_mask_id_for_video(self, video_id):
+        """Scan saved annotation files and cache to find the real max bee ID."""
+        if not self.project_path or not video_id:
+            return 0
+
+        import json
+        import pickle
+
+        max_id = 0
+        project_path = Path(self.project_path)
+
+        # Current in-memory cache may contain unsaved or recently changed frames.
+        for cache_key, annotations in self.annotation_manager.frame_annotations.items():
+            key_video = cache_key[0] if isinstance(cache_key, tuple) else None
+            if key_video != video_id:
+                continue
+            for ann in annotations:
+                if ann.get('category', 'bee') != 'bee':
+                    continue
+                try:
+                    instance_id = int(ann.get('mask_id', ann.get('instance_id', 0)) or 0)
+                except (TypeError, ValueError):
+                    instance_id = 0
+                max_id = max(max_id, instance_id)
+
+        # Frame metadata and bbox-only files are the current primary formats.
+        for subdir in ('json', 'bbox'):
+            annotations_dir = project_path / 'annotations' / subdir / video_id
+            if not annotations_dir.exists():
+                continue
+            for ann_file in annotations_dir.glob('frame_*.json'):
+                try:
+                    with open(ann_file, 'r') as f:
+                        data = json.load(f)
+                    max_id = max(max_id, self._extract_max_mask_id_from_json_data(data))
+                except Exception as e:
+                    print(f"Warning: Could not scan {ann_file} for max_mask_id: {e}")
+
+        # Legacy pickle annotations may still exist in older projects.
+        pkl_dir = project_path / 'annotations' / 'pkl' / video_id
+        if pkl_dir.exists():
+            for ann_file in pkl_dir.glob('frame_*.pkl'):
+                try:
+                    with open(ann_file, 'rb') as f:
+                        annotations = pickle.load(f)
+                    max_id = max(max_id, self._extract_max_mask_id_from_json_data(annotations))
+                except Exception as e:
+                    print(f"Warning: Could not scan {ann_file} for max_mask_id: {e}")
+
+        return max_id
+
+    def _refresh_video_next_mask_id(self, video_id):
+        """Refresh next instance ID from saved annotations after deletions."""
+        max_id = self._recompute_max_mask_id_for_video(video_id)
+        next_id = max_id + 1
+        self.video_next_mask_id[video_id] = next_id
+        self._save_max_mask_id_to_metadata(video_id, max_id)
+        if self.current_video_id == video_id:
+            self.canvas.next_mask_id = next_id
+        print(f"Refreshed max_mask_id for video {video_id}: {max_id} (next={next_id})")
+        return next_id
     
     def _get_frame_idx_in_video(self, list_idx):
         """
@@ -1906,6 +2093,141 @@ class MainWindow(QMainWindow):
         
         # Fallback to list index
         return list_idx
+
+    def _frame_annotation_key(self, video_id=None, list_idx=None):
+        """Return the dirty-tracking key for a frame annotation file."""
+        target_video_id = video_id or self.current_video_id
+        if not target_video_id:
+            return None
+
+        target_list_idx = self.current_frame_idx if list_idx is None else list_idx
+        if target_list_idx is None:
+            return None
+
+        return (target_video_id, self._get_frame_idx_in_video(target_list_idx))
+
+    def _split_source_annotations(self, annotations):
+        """Split canvas annotations into per-frame and video-level sources."""
+        bee_annotations = [
+            ann for ann in annotations
+            if ann.get('category', 'bee') == 'bee'
+        ]
+        video_level_annotations = [
+            ann for ann in annotations
+            if ann.get('category', 'bee') in ('chamber', 'hive', 'pollen')
+        ]
+        return bee_annotations, video_level_annotations
+
+    def _mark_current_annotations_dirty(self, include_frame=True, include_video=True):
+        """Mark the current annotation source files as needing a save."""
+        self.current_frame_modified = True
+        self.coco_export_dirty = True
+
+        if include_frame:
+            frame_key = self._frame_annotation_key()
+            if frame_key is not None:
+                self.dirty_frame_annotation_keys.add(frame_key)
+
+        if include_video and self.current_video_id:
+            self.dirty_video_annotation_ids.add(self.current_video_id)
+
+    def _commit_canvas_edit_if_needed(self):
+        """Commit an active canvas edit and mark it dirty if it contains pixels."""
+        if not hasattr(self, 'canvas') or self.canvas.editing_instance_id <= 0:
+            return False
+
+        had_edit_pixels = (
+            self.canvas.editing_mask is not None
+            and np.any(self.canvas.editing_mask > 0)
+        )
+        self.canvas.commit_editing()
+        if had_edit_pixels:
+            self._mark_current_annotations_dirty()
+        return had_edit_pixels
+
+    def _save_annotation_sources(self, video_id=None, list_idx=None, annotations=None,
+                                 force=False, use_background=False, refresh_next_id=False):
+        """Save dirty source annotation files without regenerating derived COCO files."""
+        if not self.project_path:
+            return {'saved_any': False, 'reason': 'no_project'}
+
+        target_video_id = video_id or self.current_video_id
+        if not target_video_id:
+            return {'saved_any': False, 'reason': 'no_video'}
+
+        target_list_idx = self.current_frame_idx if list_idx is None else list_idx
+        frame_key = self._frame_annotation_key(target_video_id, target_list_idx)
+        frame_idx_in_video = frame_key[1] if frame_key is not None else target_list_idx
+
+        if annotations is None:
+            self._commit_canvas_edit_if_needed()
+            annotations = self.canvas.get_annotations()
+
+        save_frame = (
+            force
+            or self.current_frame_modified
+            or frame_key in self.dirty_frame_annotation_keys
+        )
+        save_video = (
+            force
+            or self.current_frame_modified
+            or target_video_id in self.dirty_video_annotation_ids
+        )
+
+        if not save_frame and not save_video:
+            return {
+                'saved_any': False,
+                'reason': 'clean',
+                'frame_idx': frame_idx_in_video,
+                'video_id': target_video_id,
+            }
+
+        bee_annotations, video_level_annotations = self._split_source_annotations(annotations)
+        saved_files = []
+
+        if save_frame:
+            self.annotation_manager.set_frame_annotations(
+                target_list_idx, bee_annotations, video_id=target_video_id
+            )
+            if use_background:
+                self.save_worker.add_save_task(
+                    self.project_path, target_video_id,
+                    frame_idx_in_video, bee_annotations
+                )
+            else:
+                self.annotation_manager.save_frame_annotations(
+                    self.project_path, target_video_id,
+                    frame_idx_in_video, bee_annotations
+                )
+            saved_files.append('frame')
+            if frame_key is not None:
+                self.dirty_frame_annotation_keys.discard(frame_key)
+
+        if save_video:
+            self.annotation_manager.save_video_annotations(
+                self.project_path, target_video_id, video_level_annotations
+            )
+            saved_files.append('video-level')
+            self.dirty_video_annotation_ids.discard(target_video_id)
+
+        if refresh_next_id:
+            self._refresh_video_next_mask_id(target_video_id)
+
+        if saved_files:
+            self.coco_export_dirty = True
+
+        current_key = self._frame_annotation_key()
+        if target_video_id == self.current_video_id and frame_key == current_key:
+            self.current_frame_modified = False
+
+        return {
+            'saved_any': bool(saved_files),
+            'saved_files': saved_files,
+            'frame_idx': frame_idx_in_video,
+            'video_id': target_video_id,
+            'bee_count': len(bee_annotations),
+            'video_level_count': len(video_level_annotations),
+        }
     
     def _save_video_level_annotations(self, video_id=None):
         """Save chamber/hive/pollen annotations at the video level (shared across all frames).
@@ -2376,38 +2698,19 @@ class MainWindow(QMainWindow):
             # Save current frame annotations before switching videos
             if self.current_video_id and self.current_video_id != video_id:
                 try:
-                    # Commit any pending edits before saving, just like when switching frames
-                    # This ensures that editing instances (e.g., new hive instances being drawn)
-                    # are properly saved before switching to another video
-                    if self.canvas.editing_instance_id > 0:
-                        had_edit_pixels = (
-                            self.canvas.editing_mask is not None
-                            and np.any(self.canvas.editing_mask > 0)
+                    self._commit_canvas_edit_if_needed()
+                    save_summary = self._save_annotation_sources(
+                        video_id=self.current_video_id,
+                        list_idx=self.current_frame_idx,
+                        annotations=self.canvas.get_annotations(),
+                        use_background=False,
+                        refresh_next_id=False
+                    )
+                    if save_summary.get('saved_any'):
+                        print(
+                            f"Saved {save_summary['video_id']} frame "
+                            f"{save_summary['frame_idx']} before switching videos"
                         )
-                        self.canvas.commit_editing()
-                        if had_edit_pixels:
-                            self.current_frame_modified = True
-                    
-                    annotations = self.canvas.get_annotations()
-                    if annotations:
-                        # Split per-frame (bee) vs video-level (chamber/hive/pollen)
-                        bee_annotations = [a for a in annotations
-                                           if a.get('category', 'bee') == 'bee']
-                        video_level_annotations = [a for a in annotations
-                                                   if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
-
-                        frame_idx_in_video = self._get_frame_idx_in_video(self.current_frame_idx)
-                        # Do a blocking save for current frame (bee only)
-                        self.annotation_manager.save_frame_annotations(
-                            self.project_path, self.current_video_id,
-                            frame_idx_in_video, bee_annotations
-                        )
-                        # Always save chamber/hive/pollen video-level (even if empty, to delete files)
-                        self.annotation_manager.save_video_annotations(
-                            self.project_path, self.current_video_id, video_level_annotations
-                        )
-                        # Mark frame as saved to prevent duplicate saves
-                        self.current_frame_modified = False
                 except Exception as e:
                     print(f"Warning: Failed to save before switching videos: {e}")
                 
@@ -2582,6 +2885,12 @@ class MainWindow(QMainWindow):
                 old_video_id = self.frame_video_ids[self.current_frame_idx]
             if old_video_id is None:
                 old_video_id = self.current_video_id
+            target_video_id = self.frame_video_ids[idx] if idx < len(self.frame_video_ids) else self.current_video_id
+            preserve_canvas_view = (
+                self.canvas.current_image is not None
+                and self.current_frame_idx != idx
+                and old_video_id == target_video_id
+            )
             
             # Always commit any pending edits before navigating away, regardless of
             # current_frame_modified.  SAM2 predictions go directly into editing_mask
@@ -2594,41 +2903,23 @@ class MainWindow(QMainWindow):
                 )
                 self.canvas.commit_editing()
                 if had_edit_pixels:
-                    self.current_frame_modified = True
+                    self._mark_current_annotations_dirty()
 
             # Auto-save current frame annotations before loading new frame (only if modified)
             if self.current_frame_idx != idx and self.project_path and self.current_frame_modified:
                 try:
-                    annotations = self.canvas.get_annotations()
                     if old_video_id:  # Only save if we know the video
-                        # Split per-frame (bee) vs video-level (chamber/hive/pollen)
-                        bee_annotations = [a for a in annotations
-                                           if a.get('category', 'bee') == 'bee']
-                        video_level_annotations = [a for a in annotations
-                                                   if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
-
                         # Update video next_mask_id tracking
                         if old_video_id in self.video_next_mask_id:
                             self.video_next_mask_id[old_video_id] = self.canvas.next_mask_id
 
-                        # Update in-memory cache (bee only for per-frame)
-                        self.annotation_manager.set_frame_annotations(
-                            self.current_frame_idx, bee_annotations, video_id=old_video_id
+                        self._save_annotation_sources(
+                            video_id=old_video_id,
+                            list_idx=self.current_frame_idx,
+                            annotations=self.canvas.get_annotations(),
+                            use_background=True,
+                            refresh_next_id=False
                         )
-                        # Get actual frame index within video (not the list index)
-                        frame_idx_in_video = self._get_frame_idx_in_video(self.current_frame_idx)
-                        # Queue background save (bee per-frame) - non-blocking!
-                        self.save_worker.add_save_task(
-                            self.project_path, old_video_id,
-                            frame_idx_in_video, bee_annotations
-                        )
-                        # Always save chamber/hive/pollen video-level synchronously (even if empty, to delete files)
-                        try:
-                            self.annotation_manager.save_video_annotations(
-                                self.project_path, old_video_id, video_level_annotations
-                            )
-                        except Exception as e:
-                            print(f"Warning: Failed to save video-level annotations: {e}")
                 except Exception as e:
                     print(f"Warning: Failed to queue save: {e}")
             
@@ -2683,7 +2974,7 @@ class MainWindow(QMainWindow):
             
             try:
                 # Pass frame to canvas (can be path or array)
-                self.canvas.load_image(image_to_load)
+                self.canvas.load_image(image_to_load, preserve_view=preserve_canvas_view)
                 
                 # Force garbage collection after loading to free memory from old frame
                 import gc
@@ -2700,7 +2991,7 @@ class MainWindow(QMainWindow):
                 if cached_image is None and self.canvas.current_image is not None:
                     self.frame_cache.put(idx, self.canvas.current_image.copy())
                 
-                # Give focus to canvas for keyboard shortcuts (spacebar to hide masks)
+                # Give focus to canvas for keyboard shortcuts (spacebar toggles masks)
                 self.canvas.setFocus()
                 
                 # Store image dimensions in annotation manager (for COCO export)
@@ -2712,36 +3003,19 @@ class MainWindow(QMainWindow):
                 # Restore next_mask_id for this video to maintain unique IDs
                 if self.current_video_id:
                     if self.current_video_id not in self.video_next_mask_id:
-                        # Try to load cached max_mask_id from metadata (backward compatible)
-                        max_id = self._load_max_mask_id_from_metadata(self.current_video_id)
-                        
-                        if max_id is None:
-                            # No cached value - compute by scanning all frames (slow, first time only)
-                            import time
-                            t_start = time.perf_counter()
-                            max_id = 0
-                            file_count = 0
-                            if self.project_path:
-                                annotations_dir = self.project_path / 'annotations' / 'pkl' / self.current_video_id
-                                if annotations_dir.exists():
-                                    for ann_file in annotations_dir.glob('frame_*.pkl'):
-                                        file_count += 1
-                                        try:
-                                            import pickle
-                                            with open(ann_file, 'rb') as f:
-                                                anns = pickle.load(f)
-                                                for ann in anns:
-                                                    if 'mask_rle' in ann or 'mask' in ann:
-                                                        mask_id = ann.get('mask_id', 0)
-                                                        max_id = max(max_id, mask_id)
-                                        except Exception:
-                                            pass
-                            t_elapsed = (time.perf_counter() - t_start) * 1000
-                            if file_count > 0:
-                                print(f"  ⚠ Scanned {file_count} annotation files to find max_mask_id (took {t_elapsed:.0f}ms, caching...)")
-                            
-                            # Cache for future use
-                            self._save_max_mask_id_to_metadata(self.current_video_id, max_id)
+                        # Recompute once per video per session so stale metadata from deleted
+                        # annotation files cannot keep IDs artificially high.
+                        import time
+                        t_start = time.perf_counter()
+                        max_id = self._recompute_max_mask_id_for_video(self.current_video_id)
+                        t_elapsed = (time.perf_counter() - t_start) * 1000
+                        cached_max_id = self._load_max_mask_id_from_metadata(self.current_video_id)
+                        if cached_max_id != max_id:
+                            print(
+                                f"  Updated max_mask_id cache for {self.current_video_id}: "
+                                f"{cached_max_id} -> {max_id} (scan took {t_elapsed:.0f}ms)"
+                            )
+                        self._save_max_mask_id_to_metadata(self.current_video_id, max_id)
                         
                         self.video_next_mask_id[self.current_video_id] = max_id + 1
                     
@@ -2816,7 +3090,11 @@ class MainWindow(QMainWindow):
                 # Find the list row for this frame index
                 try:
                     list_row = self.frame_list_to_frames_map.index(idx)
-                    self.frame_list.setCurrentRow(list_row)
+                    previous_block_state = self.frame_list.blockSignals(True)
+                    try:
+                        self.frame_list.setCurrentRow(list_row)
+                    finally:
+                        self.frame_list.blockSignals(previous_block_state)
                     # Update slider to match
                     self.frame_slider.blockSignals(True)
                     self.frame_slider.setValue(list_row)
@@ -2897,12 +3175,20 @@ class MainWindow(QMainWindow):
         # But only if the instance has segmentation (not bbox-only)
         if tool_name in ['brush', 'eraser'] and self.canvas.selected_mask_idx > 0:
             # Check if instance has segmentation
+            selected_category = self.canvas.selected_instance_category
+            mask_array, _ = self.canvas._get_mask_array_for_instance(
+                self.canvas.selected_mask_idx,
+                selected_category
+            )
             has_segmentation = (
-                self.canvas.combined_mask is not None and 
-                np.any(self.canvas.combined_mask == self.canvas.selected_mask_idx)
+                mask_array is not None and
+                np.any(mask_array == self.canvas.selected_mask_idx)
             )
             if has_segmentation:
-                self.canvas.start_editing_instance(self.canvas.selected_mask_idx)
+                self.canvas.start_editing_instance(
+                    self.canvas.selected_mask_idx,
+                    category=selected_category
+                )
         
         # When switching away from SAM2 tools, uncheck SAM2 toolbar buttons
         if tool_name not in ['sam2_prompt', 'sam2_box']:
@@ -2911,57 +3197,112 @@ class MainWindow(QMainWindow):
         # When switching to SAM2 tools, uncheck annotation toolbar buttons
         if tool_name in ['sam2_prompt', 'sam2_box']:
             self.toolbar.uncheck_all_tools()
+
+    def on_brush_size_step_requested(self, direction):
+        """Handle +/- keyboard shortcuts for brush and eraser size."""
+        current_size = max(1, int(self.canvas.brush_size))
+
+        if direction > 0:
+            new_size = current_size + 1 if current_size < 10 else round(current_size * 1.15)
+        else:
+            new_size = current_size - 1 if current_size <= 10 else round(current_size / 1.15)
+
+        if new_size == current_size:
+            new_size = current_size + (1 if direction > 0 else -1)
+
+        new_size = max(1, min(1000, int(new_size)))
+        self.toolbar.set_brush_size(new_size, emit=True)
+        self.status_label.setText(f"Brush size: {new_size}")
+        self.canvas.setFocus()
+
+    def on_brush_size_unit_step_requested(self, direction):
+        """Handle floating +/- buttons for exact one-pixel brush-size changes."""
+        current_size = max(1, int(self.canvas.brush_size))
+        new_size = max(1, min(1000, current_size + (1 if direction > 0 else -1)))
+        self.toolbar.set_brush_size(new_size, emit=True)
+        self.status_label.setText(f"Brush size: {new_size}")
+        self.canvas.setFocus()
+
+    def on_brush_eraser_toggle_requested(self):
+        """Handle middle-click toggling between brush and eraser."""
+        if self.canvas.current_tool == 'brush':
+            next_tool = 'eraser'
+        elif self.canvas.current_tool == 'eraser':
+            next_tool = 'brush'
+        else:
+            return
+
+        self.toolbar.set_tool(next_tool)
+        self.status_label.setText(f"{next_tool.capitalize()} selected")
+        self.canvas.setFocus()
+
+    def on_instance_switch_tap_progress(self, instance_id, category, remaining):
+        """Show progress for triple-tap instance switching while brushing."""
+        label = category or "instance"
+        if remaining > 0:
+            plural = "s" if remaining != 1 else ""
+            self.status_label.setText(
+                f"Tap {remaining} more time{plural} to switch to {label} {instance_id}"
+            )
+        else:
+            self.status_label.setText(f"Editing {label} {instance_id}")
+        self.canvas.setFocus()
     
     def on_show_segmentations_changed(self, show):
         """Handle show segmentations checkbox change from toolbar"""
         self.canvas.set_show_segmentations(show)
-        # Sync with menu action
-        self.segmentation_mode_action.setChecked(show)
+        self._sync_segmentation_visibility_controls(show)
     
     def on_show_bboxes_changed(self, show):
         """Handle show bboxes checkbox change from toolbar"""
         self.canvas.set_show_bboxes(show)
-        # Sync with menu action
-        self.bbox_mode_action.setChecked(show)
+        self._sync_bbox_visibility_controls(show)
     
     def on_menu_show_segmentations_changed(self, checked):
         """Handle show segmentations menu action change"""
         self.canvas.set_show_segmentations(checked)
-        # Sync with toolbar checkbox
-        self.toolbar.segmentation_checkbox.setChecked(checked)
+        self._sync_segmentation_visibility_controls(checked)
+
+    def _sync_segmentation_visibility_controls(self, visible):
+        """Keep all segmentation visibility controls showing the same state."""
+        visible = bool(visible)
+
+        if hasattr(self, 'segmentation_mode_action'):
+            self.segmentation_mode_action.blockSignals(True)
+            self.segmentation_mode_action.setChecked(visible)
+            self.segmentation_mode_action.blockSignals(False)
+
+        if hasattr(self, 'toolbar') and hasattr(self.toolbar, 'segmentation_checkbox'):
+            self.toolbar.segmentation_checkbox.blockSignals(True)
+            self.toolbar.segmentation_checkbox.setChecked(visible)
+            self.toolbar.segmentation_checkbox.blockSignals(False)
     
     def on_menu_show_bboxes_changed(self, checked):
         """Handle show bboxes menu action change"""
         self.canvas.set_show_bboxes(checked)
-        # Sync with toolbar checkbox
-        self.toolbar.bbox_checkbox.setChecked(checked)
+        self._sync_bbox_visibility_controls(checked)
+
+    def _sync_bbox_visibility_controls(self, visible):
+        """Keep all bounding-box visibility controls showing the same state."""
+        visible = bool(visible)
+
+        if hasattr(self, 'bbox_mode_action'):
+            self.bbox_mode_action.blockSignals(True)
+            self.bbox_mode_action.setChecked(visible)
+            self.bbox_mode_action.blockSignals(False)
+
+        if hasattr(self, 'toolbar') and hasattr(self.toolbar, 'bbox_checkbox'):
+            self.toolbar.bbox_checkbox.blockSignals(True)
+            self.toolbar.bbox_checkbox.setChecked(visible)
+            self.toolbar.bbox_checkbox.blockSignals(False)
     
     def on_annotation_type_changed(self, annotation_type):
         """Handle annotation type selection change from toolbar"""
         self.canvas.set_annotation_type(annotation_type)
         print(f"Annotation type changed to: {annotation_type}")
         
-        # Auto-hide other annotation types, show only the selected one
-        all_types = ['bee', 'chamber', 'hive', 'pollen']
-        for atype in all_types:
-            visible = (atype == annotation_type)
-            self.canvas.set_annotation_type_visibility(atype, visible)
-        
-        # Update toolbar checkboxes to reflect new visibility state
-        self.toolbar.show_bees_checkbox.blockSignals(True)
-        self.toolbar.show_hives_checkbox.blockSignals(True)
-        self.toolbar.show_chambers_checkbox.blockSignals(True)
-        
-        self.toolbar.show_bees_checkbox.setChecked(annotation_type == 'bee')
-        self.toolbar.show_hives_checkbox.setChecked(annotation_type == 'hive')
-        self.toolbar.show_chambers_checkbox.setChecked(annotation_type == 'chamber')
-        self.toolbar.show_pollen_checkbox.setChecked(annotation_type == 'pollen')
-        
-        self.toolbar.show_bees_checkbox.blockSignals(False)
-        self.toolbar.show_hives_checkbox.blockSignals(False)
-        self.toolbar.show_chambers_checkbox.blockSignals(False)
-        
-        # Update instance list to reflect visibility changes
+        # Annotation type chooses what new edits create; class visibility is
+        # controlled independently by the show/hide checkboxes.
         self.update_instance_list_from_canvas()
     
     def on_annotation_type_visibility_changed(self, annotation_type, visible):
@@ -3166,8 +3507,12 @@ class MainWindow(QMainWindow):
                 # Check if we're editing an existing selected instance
                 if self.canvas.selected_mask_idx > 0:
                     # Start editing mode if not already active
-                    if self.canvas.editing_instance_id != self.canvas.selected_mask_idx:
-                        self.canvas.start_editing_instance(self.canvas.selected_mask_idx)
+                    if (self.canvas.editing_instance_id != self.canvas.selected_mask_idx or
+                        self.canvas.editing_instance_category != self.canvas.selected_instance_category):
+                        self.canvas.start_editing_instance(
+                            self.canvas.selected_mask_idx,
+                            category=self.canvas.selected_instance_category
+                        )
                     # Update the editing mask directly
                     self.canvas.editing_mask = (mask > 0).astype(np.uint8) * 255
                     self.canvas._update_editing_visualization()
@@ -3176,7 +3521,10 @@ class MainWindow(QMainWindow):
                 elif self.canvas.active_sam2_mask_idx > 0:
                     # Start editing mode if not already active
                     if self.canvas.editing_instance_id != self.canvas.active_sam2_mask_idx:
-                        self.canvas.start_editing_instance(self.canvas.active_sam2_mask_idx)
+                        self.canvas.start_editing_instance(
+                            self.canvas.active_sam2_mask_idx,
+                            category=self.canvas.selected_instance_category
+                        )
                     # Update the editing mask
                     self.canvas.editing_mask = (mask > 0).astype(np.uint8) * 255
                     self.canvas._update_editing_visualization()
@@ -3184,7 +3532,8 @@ class MainWindow(QMainWindow):
                     # Create new mask with new ID and start editing it
                     mask_id = self.canvas.next_mask_id
                     self.canvas.selected_mask_idx = mask_id
-                    self.canvas.start_editing_instance(mask_id)
+                    self.canvas.selected_instance_category = self.canvas.current_annotation_type
+                    self.canvas.start_editing_instance(mask_id, category=self.canvas.current_annotation_type)
                     self.canvas.editing_mask = (mask > 0).astype(np.uint8) * 255
                     self.canvas._update_editing_visualization()
                     self.canvas.active_sam2_mask_idx = mask_id
@@ -3252,7 +3601,10 @@ class MainWindow(QMainWindow):
                 if self.canvas.active_sam2_mask_idx > 0:
                     # Start editing mode if not already active
                     if self.canvas.editing_instance_id != self.canvas.active_sam2_mask_idx:
-                        self.canvas.start_editing_instance(self.canvas.active_sam2_mask_idx)
+                        self.canvas.start_editing_instance(
+                            self.canvas.active_sam2_mask_idx,
+                            category=self.canvas.selected_instance_category
+                        )
                     # Update the editing mask
                     self.canvas.editing_mask = (mask > 0).astype(np.uint8) * 255
                     self.canvas._update_editing_visualization()
@@ -3260,7 +3612,8 @@ class MainWindow(QMainWindow):
                     # Create new mask with new ID and start editing it
                     mask_id = self.canvas.next_mask_id
                     self.canvas.selected_mask_idx = mask_id
-                    self.canvas.start_editing_instance(mask_id)
+                    self.canvas.selected_instance_category = self.canvas.current_annotation_type
+                    self.canvas.start_editing_instance(mask_id, category=self.canvas.current_annotation_type)
                     self.canvas.editing_mask = (mask > 0).astype(np.uint8) * 255
                     self.canvas._update_editing_visualization()
                     self.canvas.active_sam2_mask_idx = mask_id
@@ -3284,25 +3637,48 @@ class MainWindow(QMainWindow):
     
     def on_masks_visibility_changed(self, visible):
         """Handle mask visibility changes"""
+        self._sync_segmentation_visibility_controls(visible)
+
         # Flush pending instance list update to avoid lag
         if self._instance_list_update_timer.isActive():
             self._instance_list_update_timer.stop()
             self._do_update_instance_list()
         
         if visible:
-            self.status_label.setText("Masks visible")
+            self.status_label.setText("Segmentation masks visible")
         else:
-            self.status_label.setText("⚠ Annotations hidden (release Spacebar to show)")
+            self.status_label.setText("⚠ Segmentation masks hidden (press Spacebar to show)")
+
+    def on_instance_visibility_shortcut_changed(self, instance_id, category, visible):
+        """Handle Shift+Space toggling the selected instance."""
+        self.update_instance_list_from_canvas()
+        state = "shown" if visible else "hidden"
+        self.status_label.setText(f"{category.capitalize()} instance {instance_id} {state}")
+        self.canvas.setFocus()
+
+    def on_instance_visibility_shortcut_blocked(self, instance_id, category):
+        """Handle selected-instance shortcut when the parent class is hidden."""
+        self.status_label.setText(
+            f"Turn on {category} visibility before showing instance {instance_id}"
+        )
+        self.canvas.setFocus()
     
     def on_annotation_changed(self):
         """Handle annotation changes - mark frame as modified"""
-        self.current_frame_modified = True
+        self._mark_current_annotations_dirty()
     
     def on_show_labels_changed(self, state):
         """Handle show instance labels checkbox change"""
         from PyQt6.QtCore import Qt
         visible = (state == Qt.CheckState.Checked.value)
         self.canvas.set_labels_visible(visible)
+
+    def on_show_aruco_labels_changed(self, state):
+        """Handle show ArUco labels checkbox change"""
+        from PyQt6.QtCore import Qt
+        visible = (state == Qt.CheckState.Checked.value)
+        self._sync_canvas_aruco_labels()
+        self.canvas.set_aruco_labels_visible(visible)
                 
     def update_instance_list(self):
         """Update the instance list widget from annotation manager"""
@@ -3325,9 +3701,11 @@ class MainWindow(QMainWindow):
         """Update the instance list widget from current canvas masks"""
         from PyQt6.QtWidgets import QListWidgetItem
         
+        self._instance_list_updating = True
         self.instance_list.clear()
         
         if self.canvas.combined_mask is None:
+            self._instance_list_updating = False
             return
 
         # Preserve selection for the active/editing instance
@@ -3336,50 +3714,48 @@ class MainWindow(QMainWindow):
             if self.canvas.editing_instance_id > 0
             else self.canvas.selected_mask_idx
         )
+        active_instance_category = (
+            self.canvas.editing_instance_category
+            if self.canvas.editing_instance_id > 0
+            else self.canvas.selected_instance_category
+        )
         
         # Get ArUco tracking from video-level annotations
-        instance_to_aruco = {}  # instance_id -> aruco_id
-        if self.current_video_id and self.project_path:
-            _, aruco_tracking = self.annotation_manager.load_video_annotations(
-                self.project_path, self.current_video_id
-            )
-            # Build reverse map: instance -> aruco
-            for aruco_str, instance_id in aruco_tracking.items():
-                instance_to_aruco[instance_id] = int(aruco_str)
+        instance_to_aruco = self._get_instance_to_aruco_map()
+        self.canvas.set_aruco_instance_labels(instance_to_aruco, rebuild=False)
         
-        # Use cached instance IDs for performance (avoids expensive np.unique call)
-        instance_ids = self.canvas.get_instance_ids()
+        instance_entries = self.canvas.get_instance_entries()
         
         # Track which row to select
         row_to_select = -1
         current_row = 0
         
-        # Add all instances (bee, chamber, hive, and pollen)
-        for instance_id in instance_ids:
-            # Get category for this instance
+        # Add all instances (bee, chamber, hive, and pollen). Class visibility
+        # controls canvas display, not whether the row exists in this list.
+        for entry in instance_entries:
+            instance_id = entry['id']
+            category = entry['category']
             metadata = self.canvas.annotation_metadata.get(instance_id, {})
-            category = metadata.get('category', 'bee')
-            
-            # Check if this category is visible
-            # Video-level annotations (chamber/hive/pollen) are always shown in list
-            # Only bee annotations respect the visibility filter
-            if category == 'bee' and not self.canvas.annotation_type_visibility.get(category, True):
-                continue
             
             # Determine category prefix
             category_prefix_map = {'bee': 'B', 'hive': 'H', 'chamber': 'C', 'pollen': 'P'}
             prefix = category_prefix_map.get(category, 'B')
+            class_visible = self.canvas.annotation_type_visibility.get(category, True)
             
             # Determine if instance has segmentation or is bbox-only
             # Check all three mask arrays for this instance
-            mask_array, _ = self.canvas._get_mask_array_for_instance(instance_id)
+            mask_array, _ = self.canvas._get_mask_array_for_instance(instance_id, category)
             has_segmentation = (
-                (instance_id == self.canvas.editing_instance_id and self.canvas.editing_mask is not None) or
+                (instance_id == self.canvas.editing_instance_id and
+                 category == self.canvas.editing_instance_category and
+                 self.canvas.editing_mask is not None) or
                 (mask_array is not None and np.any(mask_array == instance_id))
             )
             
             # Calculate area from appropriate source
-            if instance_id == self.canvas.editing_instance_id and self.canvas.editing_mask is not None:
+            if (instance_id == self.canvas.editing_instance_id and
+                category == self.canvas.editing_instance_category and
+                self.canvas.editing_mask is not None):
                 area = np.sum(self.canvas.editing_mask > 0)
             elif mask_array is not None and has_segmentation:
                 area = np.sum(mask_array == instance_id)
@@ -3397,24 +3773,59 @@ class MainWindow(QMainWindow):
                 display_text += f" [ArUco: {aruco_id}]"
             
             display_text += f" (area: {area})"
+            if not class_visible:
+                display_text += " [class hidden]"
             
             item = QListWidgetItem(display_text)
             item.setData(Qt.ItemDataRole.UserRole, {'type': category, 'id': instance_id})
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if self.canvas.is_instance_enabled(instance_id, category)
+                else Qt.CheckState.Unchecked
+            )
+            item.setToolTip(
+                "Checked: show this instance. Unchecked: hide this instance."
+                if class_visible else
+                f"Turn on {category} visibility first; the class switch overrides this row."
+            )
             self.instance_list.addItem(item)
             
-            if instance_id == active_instance_id:
+            if instance_id == active_instance_id and category == active_instance_category:
                 row_to_select = current_row
             current_row += 1
         
         # Update instance labels on canvas if they are currently visible
         if self.canvas.labels_visible:
             self.canvas.update_instance_labels()
+        if self.canvas.aruco_labels_visible:
+            self.canvas.update_aruco_labels()
 
         # Restore selection
         if row_to_select >= 0:
             self.instance_list.blockSignals(True)
             self.instance_list.setCurrentRow(row_to_select)
             self.instance_list.blockSignals(False)
+
+        self._instance_list_updating = False
+
+    def _get_instance_to_aruco_map(self):
+        """Build reverse map: instance ID -> ArUco ID for the current video."""
+        instance_to_aruco = {}
+        if self.current_video_id and self.project_path:
+            _, aruco_tracking = self.annotation_manager.load_video_annotations(
+                self.project_path, self.current_video_id
+            )
+            for aruco_str, instance_id in aruco_tracking.items():
+                try:
+                    instance_to_aruco[int(instance_id)] = int(aruco_str)
+                except (TypeError, ValueError):
+                    continue
+        return instance_to_aruco
+
+    def _sync_canvas_aruco_labels(self):
+        """Refresh canvas ArUco labels from video-level tracking."""
+        self.canvas.set_aruco_instance_labels(self._get_instance_to_aruco_map(), rebuild=False)
     
     def detect_and_update_markers(self):
         """Detect ArUco/QR markers in current frame annotations and update annotation data"""
@@ -3678,7 +4089,7 @@ class MainWindow(QMainWindow):
         
         # Mark frame as modified so it gets auto-saved
         if markers_found > 0 or reassignments or preservations:
-            self.current_frame_modified = True
+            self._mark_current_annotations_dirty()
         
         # Update the instance list to show markers
         self.update_instance_list_from_canvas()
@@ -3887,46 +4298,25 @@ class MainWindow(QMainWindow):
 
         # Commit any active editing before switching instance/type
         instance_id = item_data.get('id')
-        if self.canvas.editing_instance_id > 0 and self.canvas.editing_instance_id != instance_id:
+        if (self.canvas.editing_instance_id > 0 and
+            (self.canvas.editing_instance_id != instance_id or
+             self.canvas.editing_instance_category != item_type)):
             self.canvas.commit_editing()
 
-        # Handle chamber/hive/pollen/bee instance selection
+        # Handle chamber/hive/pollen instance selection
         if item_type in ['chamber', 'hive', 'pollen']:
             # Switch to that annotation mode
             mode_map = {'chamber': 'Chamber', 'hive': 'Hive', 'pollen': 'Pollen'}
             self.toolbar.annotation_type_combo.blockSignals(True)
             self.toolbar.annotation_type_combo.setCurrentText(mode_map[item_type])
             self.toolbar.annotation_type_combo.blockSignals(False)
-            # Don't rebuild yet - we'll do it once after all visibility changes
             self.canvas.set_annotation_type(item_type, rebuild=False)
-            
-            # Auto-hide other annotation types (batch visibility changes)
-            self.canvas.set_annotation_type_visibility('bee', False, rebuild=False)
-            self.canvas.set_annotation_type_visibility('chamber', item_type == 'chamber', rebuild=False)
-            self.canvas.set_annotation_type_visibility('hive', item_type == 'hive', rebuild=False)
-            self.canvas.set_annotation_type_visibility('pollen', item_type == 'pollen', rebuild=False)
-            # Rebuild once after all changes
-            self.canvas.rebuild_visualizations()
-            
-            # Update toolbar checkboxes
-            self.toolbar.show_bees_checkbox.blockSignals(True)
-            self.toolbar.show_chambers_checkbox.blockSignals(True)
-            self.toolbar.show_hives_checkbox.blockSignals(True)
-            self.toolbar.show_pollen_checkbox.blockSignals(True)
-            self.toolbar.show_bees_checkbox.setChecked(False)
-            self.toolbar.show_chambers_checkbox.setChecked(item_type == 'chamber')
-            self.toolbar.show_hives_checkbox.setChecked(item_type == 'hive')
-            self.toolbar.show_pollen_checkbox.setChecked(item_type == 'pollen')
-            self.toolbar.show_bees_checkbox.blockSignals(False)
-            self.toolbar.show_chambers_checkbox.blockSignals(False)
-            self.toolbar.show_hives_checkbox.blockSignals(False)
-            self.toolbar.show_pollen_checkbox.blockSignals(False)
             
             # Select the instance
             instance_id = item_data.get('id')
             if instance_id is not None:
-                self.canvas.set_selected_instance(instance_id)
-                self.canvas.highlight_instance(instance_id)
+                self.canvas.set_selected_instance(instance_id, category=item_type, zoom=False)
+                self.canvas.highlight_instance(instance_id, category=item_type)
             
             self.status_label.setText(f"Switched to {item_type.capitalize()} mode - selected instance {instance_id}")
             # Don't rebuild the list - we're responding to a click on it!
@@ -3937,8 +4327,8 @@ class MainWindow(QMainWindow):
         if item_type == 'bee':
             instance_id = item_data.get('id')
             if instance_id is not None:
-                self.canvas.set_selected_instance(instance_id)
-                self.canvas.highlight_instance(instance_id)
+                self.canvas.set_selected_instance(instance_id, category='bee', zoom=False)
+                self.canvas.highlight_instance(instance_id, category='bee')
                 self.status_label.setText(f"Selected instance {instance_id} - Use Brush/Eraser to edit")
     
     def on_instance_clicked(self, item):
@@ -3958,6 +4348,42 @@ class MainWindow(QMainWindow):
         
         # Set focus to canvas so keyboard shortcuts (spacebar, etc.) work immediately
         self.canvas.setFocus()
+
+    def on_canvas_instance_selected(self, instance_id, category):
+        """Select the matching row when an instance is clicked on the canvas."""
+        if getattr(self, '_instance_list_updating', False):
+            return
+
+        matching_row = -1
+        for row in range(self.instance_list.count()):
+            item = self.instance_list.item(row)
+            item_data = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if not item_data:
+                continue
+            if item_data.get('id') == instance_id and item_data.get('type') == category:
+                matching_row = row
+                break
+
+        if matching_row < 0:
+            self.update_instance_list_from_canvas()
+            for row in range(self.instance_list.count()):
+                item = self.instance_list.item(row)
+                item_data = item.data(Qt.ItemDataRole.UserRole) if item else None
+                if item_data and item_data.get('id') == instance_id and item_data.get('type') == category:
+                    matching_row = row
+                    break
+
+        if matching_row < 0:
+            return
+
+        self.instance_list.blockSignals(True)
+        self.instance_list.clearSelection()
+        self.instance_list.setCurrentRow(matching_row)
+        selected_item = self.instance_list.item(matching_row)
+        if selected_item is not None:
+            selected_item.setSelected(True)
+            self.instance_list.scrollToItem(selected_item)
+        self.instance_list.blockSignals(False)
     
     def on_instance_double_clicked(self, item):
         """Handle double-click on instance to edit ID"""
@@ -4055,7 +4481,7 @@ class MainWindow(QMainWindow):
             self.canvas.next_mask_id = new_id + 1
         
         # Mark frame as modified so it will be saved
-        self.current_frame_modified = True
+        self._mark_current_annotations_dirty()
         
         # Rebuild visualization
         self.canvas.rebuild_visualizations()
@@ -4072,28 +4498,17 @@ class MainWindow(QMainWindow):
         # Save current frame first (blocking save to disk)
         annotations = self.canvas.get_annotations()
         if annotations:
-            frame_idx_in_video = self._get_frame_idx_in_video(self.current_frame_idx)
             try:
-                # Split per-frame (bee) vs video-level (chamber/hive/pollen)
-                bee_annotations = [a for a in annotations
-                                   if a.get('category', 'bee') == 'bee']
-                video_level_annotations = [a for a in annotations
-                                           if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
-                self.annotation_manager.save_frame_annotations(
-                    self.project_path, self.current_video_id,
-                    frame_idx_in_video, bee_annotations
-                )
-                # Always save chamber/hive/pollen video-level (even if empty, to delete files)
-                self.annotation_manager.save_video_annotations(
-                    self.project_path, self.current_video_id, video_level_annotations
-                )
-                # Update cache and clear unsaved flag (we just saved!)
-                self.annotation_manager.set_frame_annotations(
-                    self.current_frame_idx, bee_annotations, video_id=self.current_video_id
+                save_summary = self._save_annotation_sources(
+                    annotations=annotations,
+                    force=True,
+                    refresh_next_id=False
                 )
                 self.annotation_manager.unsaved_changes = False  # Clear unsaved flag since we just saved
-                self.current_frame_modified = False
-                print(f"✓ Saved current frame (frame {frame_idx_in_video}) to disk before propagation")
+                print(
+                    f"✓ Saved current frame (frame {save_summary['frame_idx']}) "
+                    f"to disk before propagation"
+                )
             except Exception as e:
                 print(f"Warning: Failed to save current frame before propagation: {e}")
                 import traceback
@@ -4205,6 +4620,11 @@ class MainWindow(QMainWindow):
         selected_items = self.instance_list.selectedItems()
         if not selected_items:
             return
+        selected_item_data = [
+            dict(item.data(Qt.ItemDataRole.UserRole) or {})
+            for item in selected_items
+        ]
+        first_item_data = selected_item_data[0] if selected_item_data else {}
         
         from PyQt6.QtWidgets import QMenu
         menu = QMenu()
@@ -4214,8 +4634,7 @@ class MainWindow(QMainWindow):
             edit_id_action = menu.addAction("Edit Bee ID...")
             
             # Check if instance has ArUco marker
-            item = selected_items[0]
-            item_data = item.data(Qt.ItemDataRole.UserRole)
+            item_data = first_item_data
             if item_data and item_data.get('type') == 'bee':
                 instance_id = item_data.get('id')
                 
@@ -4299,19 +4718,20 @@ class MainWindow(QMainWindow):
                 self.on_instance_double_clicked(item)
         elif clear_aruco_action and action == clear_aruco_action:
             # Clear ArUco association for this instance
-            item = selected_items[0]
-            item_data = item.data(Qt.ItemDataRole.UserRole)
-            if item_data:
-                instance_id = item_data.get('id')
+            instance_id = first_item_data.get('id')
+            if instance_id is not None:
                 self.clear_instance_aruco_association(instance_id)
         elif len(selected_items) == 1 and action in category_actions:
             # Handle category change
             new_category = category_actions[action]
-            item = selected_items[0]
-            item_data = item.data(Qt.ItemDataRole.UserRole)
-            if item_data:
-                instance_id = item_data.get('id')
-                self.canvas.change_instance_category(instance_id, new_category)
+            instance_id = first_item_data.get('id')
+            current_category = first_item_data.get('type', 'bee')
+            if instance_id is not None:
+                self.canvas.change_instance_category(
+                    instance_id,
+                    new_category,
+                    old_category=current_category
+                )
                 # Update the instance list to reflect the change
                 self._schedule_instance_list_update()
         elif action == delete_action:
@@ -4999,13 +5419,14 @@ class MainWindow(QMainWindow):
             
             # Set this instance as selected and start editing
             self.canvas.selected_mask_idx = mask_id
-            self.canvas.start_editing_instance(mask_id)
+            self.canvas.selected_instance_category = category
+            self.canvas.start_editing_instance(mask_id, category=category)
             
             # Update instance list
             self.update_instance_list_from_canvas()
             
             # Mark frame as modified
-            self.current_frame_modified = True
+            self._mark_current_annotations_dirty()
             
             self.status_label.setText(
                 f"✓ Copied Instance ID {instance_id} (now in edit mode - adjust as needed)"
@@ -5185,8 +5606,19 @@ class MainWindow(QMainWindow):
                     if self.current_frame_idx in self.annotation_manager.frame_annotations:
                         del self.annotation_manager.frame_annotations[self.current_frame_idx]
                         print(f"Cleared cache for frame {self.current_frame_idx}")
+
+                    cache_key = (video_id, self.current_frame_idx)
+                    if cache_key in self.annotation_manager.frame_annotations:
+                        del self.annotation_manager.frame_annotations[cache_key]
+                        print(f"Cleared video cache for frame {self.current_frame_idx}")
+
+                    next_id = self._refresh_video_next_mask_id(video_id)
                     
-                    self.status_label.setText(f"✓ Deleted all {num_instances} bee instance(s) and removed annotation files")
+                    self.status_label.setText(
+                        f"✓ Deleted all {num_instances} bee instance(s); next ID is {next_id}"
+                    )
+                    self.dirty_frame_annotation_keys.discard((video_id, frame_idx_in_video))
+                    self.coco_export_dirty = True
                     self.current_frame_modified = False  # Mark as not modified since we explicitly deleted
                     
                 except Exception as e:
@@ -5200,7 +5632,7 @@ class MainWindow(QMainWindow):
                     self.status_label.setText(f"⚠ Deleted instances but file deletion failed")
             else:
                 self.status_label.setText(f"✓ Deleted all {num_instances} bee instance(s)")
-                self.current_frame_modified = True
+                self._mark_current_annotations_dirty()
     
     def clear_selected_instance(self):
         """Clear the selected instance's mask and prompt points"""
@@ -5218,6 +5650,39 @@ class MainWindow(QMainWindow):
         self.canvas.clear_prompt_points()
         self.update_instance_list_from_canvas()
         self.status_label.setText("Prompts cleared")
+
+    def on_instance_bbox_visibility_changed(self, item):
+        """Toggle one instance's mask/bbox display from the instance-list checkbox."""
+        if getattr(self, '_instance_list_updating', False) or item is None:
+            return
+
+        item_data = item.data(Qt.ItemDataRole.UserRole)
+        if not item_data:
+            return
+
+        instance_id = item_data.get('id')
+        category = item_data.get('type', 'bee')
+        if instance_id is None:
+            return
+
+        visible = item.checkState() == Qt.CheckState.Checked
+
+        if not self.canvas.annotation_type_visibility.get(category, True):
+            self._instance_list_updating = True
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if self.canvas.is_instance_enabled(instance_id, category)
+                else Qt.CheckState.Unchecked
+            )
+            self._instance_list_updating = False
+            self.status_label.setText(f"Turn on {category} visibility before changing instance {instance_id}")
+            self.canvas.setFocus()
+            return
+
+        self.canvas.set_instance_visible(instance_id, category, visible)
+        state = "shown" if visible else "hidden"
+        self.status_label.setText(f"{category.capitalize()} instance {instance_id} {state}")
+        self.canvas.setFocus()
     
     def on_sam2_run_on_bbox(self):
         """Run SAM2 on the selected instance's bounding box"""
@@ -5284,8 +5749,10 @@ class MainWindow(QMainWindow):
             print(f"SAM2 mask shape: {mask.shape}, unique values: {np.unique(mask)}")
             
             # Start editing mode for this instance
-            if self.canvas.editing_instance_id != selected_id:
-                self.canvas.start_editing_instance(selected_id)
+            selected_category = self.canvas.selected_instance_category
+            if (self.canvas.editing_instance_id != selected_id or
+                self.canvas.editing_instance_category != selected_category):
+                self.canvas.start_editing_instance(selected_id, category=selected_category)
             
             # Update the editing mask with SAM2 prediction
             self.canvas.editing_mask = (mask > 0).astype(np.uint8) * 255
@@ -5709,7 +6176,7 @@ class MainWindow(QMainWindow):
             self.video_next_mask_id[self.current_video_id] = self.canvas.next_mask_id
         
         # Mark frame as modified so annotations will be saved
-        self.current_frame_modified = True
+        self._mark_current_annotations_dirty()
         
         self.update_instance_list_from_canvas()
         
@@ -6013,126 +6480,33 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Inference", "Inference feature coming soon!")
         
     def save_annotations(self):
-        """Save current annotations and regenerate COCO datasets"""
-        if self.project_path:
-            try:
-                # Commit any pending edits before saving
-                if self.canvas.editing_instance_id > 0:
-                    self.canvas.commit_editing()
-                
-                # Save current frame annotations using video-based structure
-                annotations = self.canvas.get_annotations()
-                
-                if self.current_video_id:
-                    # Get frame index within video
-                    frame_idx_in_video = self._get_frame_idx_in_video(self.current_frame_idx)
-
-                    # Split per-frame (bee) vs video-level (chamber/hive/pollen)
-                    bee_annotations = [a for a in annotations
-                                       if a.get('category', 'bee') == 'bee']
-                    video_level_annotations = [a for a in annotations
-                                               if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
-
-                    # Save bee annotations per-frame
-                    self.annotation_manager.save_frame_annotations(
-                        self.project_path, self.current_video_id,
-                        frame_idx_in_video, bee_annotations
-                    )
-
-                    # Always save chamber/hive/pollen video-level annotations (even if empty, to delete files)
-                    # This ensures that when all hive/chamber/pollen instances are deleted, the change is saved
-                    self.annotation_manager.save_video_annotations(
-                        self.project_path, self.current_video_id, video_level_annotations
-                    )
-
-                    # Update cache (bee only for per-frame)
-                    self.annotation_manager.set_frame_annotations(
-                        self.current_frame_idx, bee_annotations, video_id=self.current_video_id
-                    )
-
-                    annotations = bee_annotations  # used in status/success messages below
-                    
-                    # Update cached max_mask_id for this video (performance optimization)
-                    if self.current_video_id in self.video_next_mask_id:
-                        max_id = self.video_next_mask_id[self.current_video_id] - 1
-                        self._save_max_mask_id_to_metadata(self.current_video_id, max_id)
-                    
-                    num_instances = len(annotations)
-                    self.status_label.setText(
-                        f"Saving... {num_instances} instance(s) to {self.current_video_id}"
-                    )
-                else:
-                    self.status_label.setText("✓ Nothing to save")
-                
-                # Regenerate COCO datasets for training
-                self.status_label.setText("Regenerating COCO datasets...")
-                QApplication.processEvents()
-                
-                train_videos = self.project_manager.get_videos_by_split('train')
-                val_videos = self.project_manager.get_videos_by_split('val')
-                
-                coco_files_generated = []
-                
-                # Export train split if videos exist
-                if train_videos:
-                    train_paths = export_coco_per_video(
-                        self.project_path,
-                        train_videos,
-                        'train',
-                        class_names=self.annotation_manager.class_names,
-                        image_width=self.annotation_manager.image_width,
-                        image_height=self.annotation_manager.image_height
-                    )
-                    coco_files_generated.append(f"Training: {len(train_paths)} videos")
-                
-                # Export val split if videos exist
-                if val_videos:
-                    val_paths = export_coco_per_video(
-                        self.project_path,
-                        val_videos,
-                        'val',
-                        class_names=self.annotation_manager.class_names,
-                        image_width=self.annotation_manager.image_width,
-                        image_height=self.annotation_manager.image_height
-                    )
-                    coco_files_generated.append(f"Validation: {len(val_paths)} videos")
-                
-                # Show success message
-                project_name = self.project_path.name
-                coco_msg = "\n".join(coco_files_generated) if coco_files_generated else "No COCO files (no videos in splits)"
-                
-                if annotations and self.current_video_id:
-                    success_msg = (
-                        f"Annotations and COCO datasets saved!\n\n"
-                        f"Project: {project_name}\n"
-                        f"Video: {self.current_video_id}\n"
-                        f"Frame: {frame_idx_in_video}\n"
-                        f"Instances: {num_instances}\n\n"
-                        f"COCO Datasets:\n{coco_msg}"
-                    )
-                else:
-                    success_msg = (
-                        f"COCO datasets regenerated!\n\n"
-                        f"Project: {project_name}\n\n"
-                        f"COCO Datasets:\n{coco_msg}"
-                    )
-                
-                self.status_label.setText(
-                    f"✓ Saved and regenerated COCO datasets"
-                )
-                QMessageBox.information(
-                    self, 
-                    "Save Successful", 
-                    success_msg
-                )
-                    
-            except Exception as e:
-                import traceback
-                error_msg = f"Failed to save annotations:\n\n{str(e)}\n\n{traceback.format_exc()}"
-                self.status_label.setText("✗ Save failed")
-                QMessageBox.critical(self, "Save Error", error_msg)
-        else:
+        """Save current annotation source files without regenerating COCO datasets."""
+        if not self.project_path:
             QMessageBox.warning(self, "No Project", "Please create or open a project first")
+            return
+
+        try:
+            save_summary = self._save_annotation_sources(refresh_next_id=True)
+
+            if save_summary.get('saved_any'):
+                saved_parts = ", ".join(save_summary.get('saved_files', []))
+                self.status_label.setText(
+                    f"✓ Saved {saved_parts} annotations for "
+                    f"{save_summary['video_id']} frame {save_summary['frame_idx']} "
+                    f"(COCO updates on Export/Train)"
+                )
+            elif self.coco_export_dirty:
+                self.status_label.setText(
+                    "✓ Annotation files already saved; COCO updates on Export/Train"
+                )
+            else:
+                self.status_label.setText("✓ No unsaved annotation changes")
+
+        except Exception as e:
+            import traceback
+            error_msg = f"Failed to save annotations:\n\n{str(e)}\n\n{traceback.format_exc()}"
+            self.status_label.setText("✗ Save failed")
+            QMessageBox.critical(self, "Save Error", error_msg)
     
     def train_yolo_bbox_model(self):
         """Train YOLO bounding box detection model"""
@@ -6524,12 +6898,9 @@ class MainWindow(QMainWindow):
             return
         
         try:
-            # Save current frame first
+            # Save dirty source annotations first because COCO export reads from disk.
             if self.current_frame_idx is not None:
-                annotations = self.canvas.get_annotations()
-                self.annotation_manager.set_frame_annotations(
-                    self.current_frame_idx, annotations, video_id=self.current_video_id
-                )
+                self._save_annotation_sources(refresh_next_id=True)
             
             # Get train, validation, and test videos (inference videos are excluded from export)
             train_videos = self.project_manager.get_videos_by_split('train')
@@ -6644,6 +7015,7 @@ class MainWindow(QMainWindow):
                 f"{files_list}\n\n"
                 f"Location: {self.project_path / 'annotations/coco'}"
             )
+            self.coco_export_dirty = False
             self.status_label.setText(f"✓ Exported COCO format ({files_list})")
             
         except Exception as e:
@@ -7511,7 +7883,7 @@ class MainWindow(QMainWindow):
                 self.video_next_mask_id[self.current_video_id] = tracker.next_track_id
                 
                 # Mark frame as modified so annotations will be saved
-                self.current_frame_modified = True
+                self._mark_current_annotations_dirty()
                 
                 self.status_label.setText(
                     f"✓ YOLO inference complete: {len(matched_detections)} instances detected (with tracking)"
@@ -7535,7 +7907,7 @@ class MainWindow(QMainWindow):
                 self._register_canvas_colors()
                 
                 # Mark frame as modified so annotations will be saved
-                self.current_frame_modified = True
+                self._mark_current_annotations_dirty()
                 
                 self.status_label.setText(
                     f"✓ YOLO inference complete: {len(detections)} instances detected"
@@ -7571,7 +7943,7 @@ class MainWindow(QMainWindow):
             )
             self.status_label.setText("Inference failed")
         finally:
-            # Return focus to canvas so spacebar works for hiding masks
+            # Return focus to canvas so spacebar can toggle masks
             self.canvas.setFocus()
     
     def run_yolo_bbox_inference(self):
@@ -7600,6 +7972,25 @@ class MainWindow(QMainWindow):
                 "Note: Hive and chamber masks are allowed."
             )
             return
+
+        existing_bbox_annotations = self._get_current_bee_bbox_annotations()
+        replacing_existing_bboxes = False
+        if existing_bbox_annotations:
+            reply = QMessageBox.warning(
+                self,
+                "Replace Existing Bounding Boxes?",
+                f"This frame already has {len(existing_bbox_annotations)} bee bounding box annotation(s).\n\n"
+                "Running YOLO BBox detection again will replace the current boxes on this frame. "
+                "If you only want to show hidden boxes, use the BBoxes checkbox or the per-instance "
+                "checkboxes in the Instances panel instead.\n\n"
+                "Replace the existing boxes with a fresh detection pass?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self.status_label.setText("BBox detection cancelled; existing boxes kept")
+                return
+            replacing_existing_bboxes = True
         
         try:
             # Get current frame path
@@ -7668,8 +8059,57 @@ class MainWindow(QMainWindow):
                 )
                 return
             
+            if replacing_existing_bboxes:
+                matched_detections, next_id = self._match_bbox_detections_to_existing_annotations(
+                    detections,
+                    existing_bbox_annotations
+                )
+
+                # Clear existing annotations and add replacement detections while
+                # preserving current IDs where boxes overlap.
+                self.canvas.set_annotations([])
+
+                bbox_annotations = []
+                for detection, track_id in matched_detections:
+                    if self.current_video_id not in self.video_mask_colors:
+                        self.video_mask_colors[self.current_video_id] = {}
+
+                    color = self.video_mask_colors[self.current_video_id].get(track_id)
+                    if color is None:
+                        color = tuple(np.random.randint(0, 255, 3).tolist())
+                        self.video_mask_colors[self.current_video_id][track_id] = color
+
+                    x1, y1, x2, y2 = detection.bbox
+                    bbox_xywh = [x1, y1, x2 - x1, y2 - y1]
+
+                    bbox_annotations.append({
+                        'mask_id': track_id,
+                        'instance_id': track_id,
+                        'bbox': bbox_xywh,
+                        'confidence': detection.confidence,
+                        'source': 'yolo_bbox',
+                        'bbox_only': True
+                    })
+
+                self.canvas.set_annotations(
+                    bbox_annotations,
+                    mask_colors=self.video_mask_colors.get(self.current_video_id, {})
+                )
+                self._register_canvas_colors()
+
+                if self.current_video_id:
+                    self.video_next_mask_id[self.current_video_id] = max(
+                        self.video_next_mask_id.get(self.current_video_id, next_id),
+                        next_id
+                    )
+
+                self._mark_current_annotations_dirty()
+                self.status_label.setText(
+                    f"✓ YOLO BBox replacement complete: {len(matched_detections)} instances detected"
+                )
+
             # Use tracker to match detections to existing annotations
-            if self.tracking_enabled and self.current_video_id:
+            elif self.tracking_enabled and self.current_video_id:
                 tracker = self._get_or_create_tracker(self.current_video_id)
                 
                 # Match detections to tracks
@@ -7726,7 +8166,7 @@ class MainWindow(QMainWindow):
                 self.video_next_mask_id[self.current_video_id] = tracker.next_track_id
                 
                 # Mark frame as modified so annotations will be saved
-                self.current_frame_modified = True
+                self._mark_current_annotations_dirty()
                 
                 self.status_label.setText(
                     f"✓ YOLO BBox inference complete: {len(matched_detections)} instances detected (with tracking)"
@@ -7763,7 +8203,7 @@ class MainWindow(QMainWindow):
                 self._register_canvas_colors()
                 
                 # Mark frame as modified so annotations will be saved
-                self.current_frame_modified = True
+                self._mark_current_annotations_dirty()
                 
                 self.status_label.setText(
                     f"✓ YOLO BBox inference complete: {len(detections)} instances detected"
@@ -7799,7 +8239,7 @@ class MainWindow(QMainWindow):
             )
             self.status_label.setText("Inference failed")
         finally:
-            # Return focus to canvas so spacebar works for hiding masks
+            # Return focus to canvas so spacebar can toggle masks
             self.canvas.setFocus()
     
     def run_hive_inference(self):
@@ -7986,7 +8426,7 @@ class MainWindow(QMainWindow):
             self._register_canvas_colors()
             
             # Mark frame as modified so annotations will be saved
-            self.current_frame_modified = True
+            self._mark_current_annotations_dirty()
             
             self.status_label.setText(
                 f"✓ {display_name} detection complete: {len(detections)} instance(s) detected"
@@ -8019,7 +8459,7 @@ class MainWindow(QMainWindow):
             )
             self.status_label.setText(f"{display_name} detection failed")
         finally:
-            # Return focus to canvas so spacebar works for hiding masks
+            # Return focus to canvas so spacebar can toggle masks
             self.canvas.setFocus()
     
     def track_from_last_frame(self):
@@ -8262,7 +8702,7 @@ class MainWindow(QMainWindow):
             self._register_canvas_colors()
             
             # Mark frame as modified so annotations will be saved
-            self.current_frame_modified = True
+            self._mark_current_annotations_dirty()
             
             self.update_instance_list_from_canvas()
             
@@ -9299,7 +9739,7 @@ class MainWindow(QMainWindow):
             )
             self.status_label.setText("Refinement failed")
         finally:
-            # Return focus to canvas so spacebar works for hiding masks
+            # Return focus to canvas so spacebar can toggle masks
             self.canvas.setFocus()
     
     def _get_instance_focused_prediction(self, mask_idx):
@@ -9986,46 +10426,63 @@ class MainWindow(QMainWindow):
             )
             self.status_label.setText("Refinement failed")
         finally:
-            # Return focus to canvas so spacebar works for hiding masks
+            # Return focus to canvas so spacebar can toggle masks
             self.canvas.setFocus()
             
     def closeEvent(self, event):
         """Handle window close event"""
-        # Ask for confirmation before closing
-        reply = QMessageBox.question(
-            self, "Close Application",
-            "Are you sure you want to close the application?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        should_save_current_frame = False
+        has_pending_canvas_edit = (
+            hasattr(self, 'canvas')
+            and self.canvas.editing_instance_id > 0
+            and self.canvas.editing_mask is not None
+            and np.any(self.canvas.editing_mask > 0)
         )
-        
-        if reply == QMessageBox.StandardButton.No:
-            event.ignore()
-            return
-        
-        # Automatically save current frame before closing
-        if hasattr(self, 'project_path') and self.project_path and hasattr(self, 'current_video_id') and self.current_video_id:
+        has_unsaved_annotation_changes = (
+            getattr(self, 'current_frame_modified', False)
+            or bool(getattr(self, 'dirty_frame_annotation_keys', set()))
+            or bool(getattr(self, 'dirty_video_annotation_ids', set()))
+            or has_pending_canvas_edit
+        )
+
+        if has_unsaved_annotation_changes:
+            reply = QMessageBox.question(
+                self,
+                "Save Changes Before Closing?",
+                "The current frame has unsaved annotation changes.\n\n"
+                "Save these changes before closing?",
+                QMessageBox.StandardButton.Save |
+                QMessageBox.StandardButton.Discard |
+                QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save
+            )
+
+            if reply == QMessageBox.StandardButton.Cancel:
+                event.ignore()
+                return
+            should_save_current_frame = reply == QMessageBox.StandardButton.Save
+        else:
+            reply = QMessageBox.question(
+                self, "Close Application",
+                "Are you sure you want to close the application?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+
+            if reply == QMessageBox.StandardButton.No:
+                event.ignore()
+                return
+
+        # Save current frame before closing only when requested. This keeps an
+        # accidental inference pass from being written just because the app exits.
+        if (should_save_current_frame and hasattr(self, 'project_path') and self.project_path
+                and hasattr(self, 'current_video_id') and self.current_video_id):
             try:
-                # Commit any pending edits
-                if hasattr(self, 'canvas') and self.canvas.editing_instance_id > 0:
-                    self.canvas.commit_editing()
-                
-                # Save current frame annotations
-                annotations = self.canvas.get_annotations()
-                if annotations:
-                    frame_idx_in_video = self._get_frame_idx_in_video(self.current_frame_idx)
-                    bee_annotations = [a for a in annotations
-                                       if a.get('category', 'bee') == 'bee']
-                    video_level_annotations = [a for a in annotations
-                                               if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
-                    self.annotation_manager.save_frame_annotations(
-                        self.project_path, self.current_video_id,
-                        frame_idx_in_video, bee_annotations
+                save_summary = self._save_annotation_sources(refresh_next_id=True)
+                if save_summary.get('saved_any'):
+                    print(
+                        f"Saved {save_summary['video_id']} frame "
+                        f"{save_summary['frame_idx']} before closing"
                     )
-                    # Always save chamber/hive/pollen video-level (even if empty, to delete files)
-                    self.annotation_manager.save_video_annotations(
-                        self.project_path, self.current_video_id, video_level_annotations
-                    )
-                    print(f"Saved frame {frame_idx_in_video} before closing")
             except Exception as e:
                 print(f"Warning: Failed to save current frame on close: {e}")
         
