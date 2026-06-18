@@ -1,5 +1,6 @@
 # Projects directory - user data
 projects/
+input_data/
 
 # Python
 __pycache__/
@@ -17,6 +18,11 @@ build/
 *.swp
 *.swo
 *~
+
+# Local notebooks and scratch outputs
+*.ipynb
+.ipynb_checkpoints/
+aruco test*.png
 
 # OS
 .DS_Store
