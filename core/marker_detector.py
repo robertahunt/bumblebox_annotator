@@ -44,6 +44,19 @@ class MarkerDetector:
         '7x7_250': cv2.aruco.DICT_7X7_250,
         '7x7_1000': cv2.aruco.DICT_7X7_1000,
     }
+
+    DEFAULT_ARUCO_PARAMS = {
+        'adaptiveThreshWinSizeMin': 5,
+        'adaptiveThreshWinSizeStep': 4,
+        'adaptiveThreshWinSizeMax': 23,
+        'adaptiveThreshConstant': 7,
+        'minMarkerPerimeterRate': 0.03,
+        'maxMarkerPerimeterRate': 4.0,
+        'polygonalApproxAccuracyRate': 0.06,
+        'minCornerDistanceRate': 0.05,
+        'minDistanceToBorder': 3,
+        'cornerRefinementMethod': 1,  # 0=none, 1=subpix, 2=contour
+    }
     
     def __init__(
         self,
@@ -100,10 +113,8 @@ class MarkerDetector:
                         self.ARUCO_DICTS[dict_name]
                     )
                     detector_params = cv2.aruco.DetectorParameters()
-                    # Adjust parameters for better detection
-                    #detector_params.adaptiveThreshConstant = 7
-                    #detector_params.minMarkerPerimeterRate = 0.03
-                    #detector_params.maxMarkerPerimeterRate = 4.0
+                    for param_name, value in self.DEFAULT_ARUCO_PARAMS.items():
+                        setattr(detector_params, param_name, value)
                     
                     self.aruco_detectors[dict_name] = cv2.aruco.ArucoDetector(
                         aruco_dict, detector_params

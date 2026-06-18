@@ -41,15 +41,31 @@ class SAM2Toolbar(QWidget):
         # First row: Model loading and tools
         row1 = QHBoxLayout()
         row1.setSpacing(10)
+
+        self.sam2_collapsed = False
+        self.sam2_expanded_widgets = []
+        self.collapse_btn = QToolButton()
+        self.collapse_btn.setText("Hide SAM2")
+        self.collapse_btn.setToolTip("Collapse or expand SAM2 controls")
+        self.collapse_btn.clicked.connect(self.toggle_collapsed)
+        row1.addWidget(self.collapse_btn)
+        
+        self.compact_status_label = QLabel()
+        self.compact_status_label.setStyleSheet("color: gray; font-style: italic;")
+        self.compact_status_label.hide()
+        row1.addWidget(self.compact_status_label)
         
         # SAM2 section label
-        row1.addWidget(QLabel("<b>SAM2:</b>"))
+        self.sam2_label = QLabel("<b>SAM2:</b>")
+        row1.addWidget(self.sam2_label)
+        self.sam2_expanded_widgets.append(self.sam2_label)
         
         # Load checkpoint button
         self.load_checkpoint_btn = QPushButton("Load Checkpoint...")
         self.load_checkpoint_btn.setToolTip("Load SAM2 checkpoint file (.pt)")
         self.load_checkpoint_btn.clicked.connect(self.load_checkpoint)
         row1.addWidget(self.load_checkpoint_btn)
+        self.sam2_expanded_widgets.append(self.load_checkpoint_btn)
         
         # Unload checkpoint button
         self.unload_checkpoint_btn = QPushButton("Unload")
@@ -57,36 +73,47 @@ class SAM2Toolbar(QWidget):
         self.unload_checkpoint_btn.clicked.connect(self.unload_checkpoint)
         self.unload_checkpoint_btn.setEnabled(False)
         row1.addWidget(self.unload_checkpoint_btn)
+        self.sam2_expanded_widgets.append(self.unload_checkpoint_btn)
         
         # Checkpoint status label
         self.checkpoint_status_label = QLabel("No model loaded")
         self.checkpoint_status_label.setStyleSheet("color: gray; font-style: italic;")
         row1.addWidget(self.checkpoint_status_label)
+        self.sam2_expanded_widgets.append(self.checkpoint_status_label)
+        self._update_compact_status()
         
         # Separator
-        row1.addWidget(self.create_separator())
+        self.tools_separator = self.create_separator()
+        row1.addWidget(self.tools_separator)
+        self.sam2_expanded_widgets.append(self.tools_separator)
         
         # Tool buttons (only enabled when model is loaded)
         self.button_group = QButtonGroup(self)
         self.button_group.setExclusive(True)  # Exclusive so buttons stay checked
         
-        row1.addWidget(QLabel("Tools:"))
+        self.tools_label = QLabel("Tools:")
+        row1.addWidget(self.tools_label)
+        self.sam2_expanded_widgets.append(self.tools_label)
         
         self.point_btn = self.create_tool_button("Point", "sam2_prompt")
         self.point_btn.setToolTip("SAM2 point prompting: Left-click for positive, Right-click for negative")
         self.point_btn.setEnabled(False)
         row1.addWidget(self.point_btn)
+        self.sam2_expanded_widgets.append(self.point_btn)
         
         self.box_btn = self.create_tool_button("Box", "sam2_box")
         self.box_btn.setToolTip("SAM2 box prompting: Click and drag to draw a bounding box")
         self.box_btn.setEnabled(False)
         row1.addWidget(self.box_btn)
+        self.sam2_expanded_widgets.append(self.box_btn)
         
         row1.addStretch()
         main_layout.addLayout(row1)
         
         # Second row: Actions and refinement
-        row2 = QHBoxLayout()
+        self.row2_widget = QWidget()
+        row2 = QHBoxLayout(self.row2_widget)
+        row2.setContentsMargins(0, 0, 0, 0)
         row2.setSpacing(10)
         
         row2.addWidget(QLabel("Actions:"))
@@ -131,7 +158,7 @@ class SAM2Toolbar(QWidget):
         row2.addWidget(self.finetune_btn)
         
         row2.addStretch()
-        main_layout.addLayout(row2)
+        main_layout.addWidget(self.row2_widget)
         
     def create_tool_button(self, text, tool_name):
         """Create a tool button"""
@@ -150,6 +177,36 @@ class SAM2Toolbar(QWidget):
         line.setFrameShape(QFrame.Shape.VLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
         return line
+
+    def _update_compact_status(self):
+        """Mirror the model status into the collapsed one-line view."""
+        if not hasattr(self, 'compact_status_label'):
+            return
+        self.compact_status_label.setText(
+            f"SAM2: {self.checkpoint_status_label.text()}"
+        )
+        self.compact_status_label.setStyleSheet(
+            self.checkpoint_status_label.styleSheet()
+        )
+
+    def _set_checkpoint_status(self, text, style_sheet):
+        """Set full and compact SAM2 checkpoint status labels together."""
+        self.checkpoint_status_label.setText(text)
+        self.checkpoint_status_label.setStyleSheet(style_sheet)
+        self._update_compact_status()
+
+    def toggle_collapsed(self):
+        """Collapse or expand the SAM2 controls."""
+        self.set_collapsed(not self.sam2_collapsed)
+
+    def set_collapsed(self, collapsed):
+        """Set compact SAM2 toolbar state."""
+        self.sam2_collapsed = collapsed
+        self.collapse_btn.setText("Show SAM2" if collapsed else "Hide SAM2")
+        self.compact_status_label.setVisible(collapsed)
+        for widget in self.sam2_expanded_widgets:
+            widget.setVisible(not collapsed)
+        self.row2_widget.setVisible(not collapsed)
     
     def on_tool_clicked(self, tool_name, checked):
         """Handle tool button click"""
@@ -177,8 +234,7 @@ class SAM2Toolbar(QWidget):
             from core.sam2_integrator import SAM2Integrator
             
             # Load the model
-            self.checkpoint_status_label.setText("Loading...")
-            self.checkpoint_status_label.setStyleSheet("color: orange;")
+            self._set_checkpoint_status("Loading...", "color: orange;")
             
             if show_dialogs:
                 QMessageBox.information(
@@ -200,8 +256,7 @@ class SAM2Toolbar(QWidget):
             
             # Update UI
             checkpoint_name = self.checkpoint_path.name
-            self.checkpoint_status_label.setText(f"✓ {checkpoint_name}")
-            self.checkpoint_status_label.setStyleSheet("color: green;")
+            self._set_checkpoint_status(f"✓ {checkpoint_name}", "color: green;")
             
             # Enable tool buttons and unload button
             self.point_btn.setEnabled(True)
@@ -233,8 +288,7 @@ class SAM2Toolbar(QWidget):
                 QMessageBox.critical(self, "Import Error", error_msg)
             else:
                 print(f"ERROR: {error_msg}")
-            self.checkpoint_status_label.setText("Import failed")
-            self.checkpoint_status_label.setStyleSheet("color: red;")
+            self._set_checkpoint_status("Import failed", "color: red;")
         except Exception as e:
             error_msg = f"Failed to load SAM2 checkpoint: {str(e)}"
             if show_dialogs:
@@ -242,8 +296,7 @@ class SAM2Toolbar(QWidget):
             else:
                 print(f"ERROR: {error_msg}")
             self.checkpoint_path = None
-            self.checkpoint_status_label.setText("Failed to load")
-            self.checkpoint_status_label.setStyleSheet("color: red;")
+            self._set_checkpoint_status("Failed to load", "color: red;")
     
     def on_clear_prompts(self):
         """Handle clear prompts button"""
@@ -298,8 +351,7 @@ class SAM2Toolbar(QWidget):
             
             # Reset UI state
             self.checkpoint_path = None
-            self.checkpoint_status_label.setText("No model loaded")
-            self.checkpoint_status_label.setStyleSheet("color: gray; font-style: italic;")
+            self._set_checkpoint_status("No model loaded", "color: gray; font-style: italic;")
             
             # Disable tool buttons
             self.point_btn.setEnabled(False)

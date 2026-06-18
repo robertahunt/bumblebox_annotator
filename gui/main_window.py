@@ -10,11 +10,12 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QDockWidget, QListWidget, QToolBar, QLabel, 
                              QApplication, QDialog, QPushButton, QScrollArea,
                              QInputDialog, QSlider, QProgressDialog, QCheckBox)
-from PyQt6.QtCore import Qt, pyqtSignal, QSettings, QThread, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QSettings, QThread, QTimer, QEvent
 from PyQt6.QtGui import QAction, QKeySequence, QActionGroup
 from pathlib import Path
 import queue
 import time
+import json
 
 from .canvas import ImageCanvas
 from .toolbar import AnnotationToolbar
@@ -360,7 +361,257 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_label = QLabel("Ready")
         self.status_bar.addPermanentWidget(self.status_label)
-        
+        self._init_done_counter_overlay()
+
+    def _init_done_counter_overlay(self):
+        """Create a small progress counter over the canvas viewport."""
+        settings = QSettings()
+        self.done_counter_session_count = 0
+        self.done_counter_total_count = settings.value(
+            'done_counter_total_count', 0, type=int
+        )
+        self.done_counter_session_durations = []
+        self.done_counter_total_durations = self._load_done_counter_durations(settings)
+        self.done_counter_elapsed_seconds = 0.0
+        self.done_counter_last_tick_time = None
+        self.done_counter_timer_running = False
+
+        self.done_counter_overlay = QWidget(self.canvas.viewport())
+        self.done_counter_overlay.setObjectName("doneCounterOverlay")
+        self.done_counter_overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.done_counter_overlay.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        overlay_layout = QHBoxLayout(self.done_counter_overlay)
+        overlay_layout.setContentsMargins(8, 8, 8, 8)
+        overlay_layout.setSpacing(8)
+
+        self.done_counter_timer_button = QPushButton("Start")
+        self.done_counter_timer_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.done_counter_timer_button.setToolTip("Start or stop the completion timer")
+        self.done_counter_timer_button.clicked.connect(self.on_done_counter_timer_toggled)
+        overlay_layout.addWidget(self.done_counter_timer_button)
+
+        self.done_counter_button = QPushButton("Done")
+        self.done_counter_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.done_counter_button.setToolTip("Mark one mask instance as finished")
+        self.done_counter_button.clicked.connect(self.on_done_counter_pressed)
+        overlay_layout.addWidget(self.done_counter_button)
+
+        label_layout = QVBoxLayout()
+        label_layout.setContentsMargins(0, 0, 0, 0)
+        label_layout.setSpacing(1)
+        self.done_counter_session_label = QLabel()
+        self.done_counter_total_label = QLabel()
+        self.done_counter_session_median_label = QLabel()
+        self.done_counter_total_median_label = QLabel()
+        self.done_counter_elapsed_label = QLabel()
+        for label in (
+            self.done_counter_session_label,
+            self.done_counter_total_label,
+            self.done_counter_session_median_label,
+            self.done_counter_total_median_label,
+            self.done_counter_elapsed_label,
+        ):
+            label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            label_layout.addWidget(label)
+        overlay_layout.addLayout(label_layout)
+
+        self.done_counter_overlay.setStyleSheet("""
+            QWidget#doneCounterOverlay {
+                background-color: rgba(24, 28, 34, 200);
+                border: 1px solid rgba(255, 255, 255, 80);
+                border-radius: 8px;
+            }
+            QLabel {
+                color: rgb(245, 247, 250);
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton {
+                background-color: rgb(255, 246, 170);
+                border: 1px solid rgba(20, 24, 30, 140);
+                border-radius: 5px;
+                color: rgb(20, 24, 30);
+                font-size: 13px;
+                font-weight: 700;
+                min-width: 58px;
+                min-height: 38px;
+            }
+            QPushButton:hover {
+                background-color: rgb(255, 252, 208);
+            }
+            QPushButton:pressed {
+                background-color: rgb(236, 219, 90);
+            }
+        """)
+
+        self._refresh_done_counter_labels()
+        self.done_counter_overlay.adjustSize()
+        self.done_counter_overlay.show()
+        self.canvas.viewport().installEventFilter(self)
+        self._position_done_counter_overlay()
+
+        self.done_counter_timer = QTimer(self)
+        self.done_counter_timer.setInterval(1000)
+        self.done_counter_timer.timeout.connect(self._refresh_done_counter_labels)
+
+    def _load_done_counter_durations(self, settings):
+        raw_value = settings.value('done_counter_durations_seconds', '[]')
+        if isinstance(raw_value, list):
+            values = raw_value
+        else:
+            try:
+                values = json.loads(raw_value or '[]')
+            except (TypeError, json.JSONDecodeError):
+                values = []
+
+        durations = []
+        for value in values:
+            try:
+                duration = float(value)
+            except (TypeError, ValueError):
+                continue
+            if duration >= 0:
+                durations.append(duration)
+        return durations
+
+    def _save_done_counter_durations(self):
+        settings = QSettings()
+        settings.setValue(
+            'done_counter_durations_seconds',
+            json.dumps(self.done_counter_total_durations)
+        )
+
+    def _position_done_counter_overlay(self):
+        if not hasattr(self, 'done_counter_overlay') or self.done_counter_overlay is None:
+            return
+        self.done_counter_overlay.adjustSize()
+        viewport_rect = self.canvas.viewport().rect()
+        x = viewport_rect.width() - self.done_counter_overlay.width() - 18
+        y = 18
+        x = max(8, x)
+        y = max(8, y)
+        self.done_counter_overlay.move(x, y)
+        self.done_counter_overlay.raise_()
+
+    def _format_done_counter_elapsed(self, seconds):
+        seconds = max(0, int(seconds))
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        if hours:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _median_done_counter_duration(self, durations):
+        if not durations:
+            return None
+        sorted_durations = sorted(durations)
+        count = len(sorted_durations)
+        midpoint = count // 2
+        if count % 2:
+            return sorted_durations[midpoint]
+        return (sorted_durations[midpoint - 1] + sorted_durations[midpoint]) / 2
+
+    def _current_done_counter_elapsed(self):
+        elapsed = self.done_counter_elapsed_seconds
+        if self.done_counter_timer_running and self.done_counter_last_tick_time is not None:
+            elapsed += max(0.0, time.monotonic() - self.done_counter_last_tick_time)
+        return elapsed
+
+    def _reset_done_counter_interval(self):
+        self.done_counter_elapsed_seconds = 0.0
+        self.done_counter_last_tick_time = (
+            time.monotonic() if self.done_counter_timer_running else None
+        )
+
+    def _refresh_done_counter_labels(self):
+        elapsed_seconds = self._current_done_counter_elapsed()
+        elapsed = (
+            self._format_done_counter_elapsed(elapsed_seconds)
+            if self.done_counter_timer_running or elapsed_seconds > 0
+            else "--"
+        )
+        session_median = self._median_done_counter_duration(
+            self.done_counter_session_durations
+        )
+        total_median = self._median_done_counter_duration(
+            self.done_counter_total_durations
+        )
+        self.done_counter_session_label.setText(
+            f"Session: {self.done_counter_session_count}"
+        )
+        self.done_counter_total_label.setText(
+            f"Total: {self.done_counter_total_count}"
+        )
+        self.done_counter_session_median_label.setText(
+            "Med S: " +
+            (self._format_done_counter_elapsed(session_median)
+             if session_median is not None else "--")
+        )
+        self.done_counter_total_median_label.setText(
+            "Med All: " +
+            (self._format_done_counter_elapsed(total_median)
+             if total_median is not None else "--")
+        )
+        if hasattr(self, 'done_counter_timer_button'):
+            self.done_counter_timer_button.setText(
+                "Stop" if self.done_counter_timer_running else "Start"
+            )
+        self.done_counter_elapsed_label.setText(f"Since: {elapsed}")
+        if hasattr(self, 'done_counter_overlay'):
+            self._position_done_counter_overlay()
+
+    def on_done_counter_timer_toggled(self):
+        if self.done_counter_timer_running:
+            if self.done_counter_last_tick_time is not None:
+                self.done_counter_elapsed_seconds += max(
+                    0.0,
+                    time.monotonic() - self.done_counter_last_tick_time
+                )
+            self.done_counter_last_tick_time = None
+            self.done_counter_timer_running = False
+            self.done_counter_timer.stop()
+            self.status_label.setText("Completion timer stopped")
+        else:
+            self.done_counter_last_tick_time = time.monotonic()
+            self.done_counter_timer_running = True
+            self.done_counter_timer.start()
+            self.status_label.setText("Completion timer started")
+
+        self._refresh_done_counter_labels()
+        self.canvas.setFocus()
+
+    def on_done_counter_pressed(self):
+        elapsed = self._current_done_counter_elapsed()
+        self.done_counter_session_count += 1
+        self.done_counter_total_count += 1
+        if elapsed > 0:
+            self.done_counter_session_durations.append(elapsed)
+            self.done_counter_total_durations.append(elapsed)
+        self._reset_done_counter_interval()
+
+        settings = QSettings()
+        settings.setValue('done_counter_total_count', self.done_counter_total_count)
+        self._save_done_counter_durations()
+
+        self._refresh_done_counter_labels()
+        timing_note = "" if elapsed > 0 else " (timer not running)"
+        self.status_label.setText(
+            f"Marked done: session {self.done_counter_session_count}, "
+            f"total {self.done_counter_total_count}{timing_note}"
+        )
+        self.canvas.setFocus()
+
+    def eventFilter(self, obj, event):
+        if (
+            hasattr(self, 'canvas') and
+            obj is self.canvas.viewport() and
+            event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
+        ):
+            self._position_done_counter_overlay()
+        return super().eventFilter(obj, event)
+
     def create_menus(self):
         """Create menu bar"""
         menubar = self.menuBar()
@@ -1845,7 +2096,7 @@ class MainWindow(QMainWindow):
         
         # Add checkbox to show/hide instance numbers
         self.show_labels_checkbox = QCheckBox("Show Instance Numbers")
-        self.show_labels_checkbox.setChecked(False)
+        self.show_labels_checkbox.setChecked(True)
         self.show_labels_checkbox.stateChanged.connect(self.on_show_labels_changed)
         layout.addWidget(self.show_labels_checkbox)
 
@@ -3483,6 +3734,12 @@ class MainWindow(QMainWindow):
         
         if self.sam2 and self.canvas.current_tool == 'sam2_prompt':
             try:
+                if self.canvas.selected_mask_idx <= 0 and self.canvas.active_sam2_mask_idx <= 0:
+                    self.canvas.clear_prompt_points()
+                    self.status_label.setText("Create or select an instance before using SAM2 prompts")
+                    self.canvas.setFocus()
+                    return
+
                 # Get all accumulated prompt points
                 prompts = self.canvas.get_prompt_points()
                 positive_points = prompts['positive']
@@ -3529,16 +3786,9 @@ class MainWindow(QMainWindow):
                     self.canvas.editing_mask = (mask > 0).astype(np.uint8) * 255
                     self.canvas._update_editing_visualization()
                 else:
-                    # Create new mask with new ID and start editing it
-                    mask_id = self.canvas.next_mask_id
-                    self.canvas.selected_mask_idx = mask_id
-                    self.canvas.selected_instance_category = self.canvas.current_annotation_type
-                    self.canvas.start_editing_instance(mask_id, category=self.canvas.current_annotation_type)
-                    self.canvas.editing_mask = (mask > 0).astype(np.uint8) * 255
-                    self.canvas._update_editing_visualization()
-                    self.canvas.active_sam2_mask_idx = mask_id
-                    # Increment next_mask_id since we used this one
-                    self.canvas.next_mask_id += 1
+                    self.status_label.setText("Create or select an instance before using SAM2 prompts")
+                    self.canvas.setFocus()
+                    return
                 
                 # Register color for this mask
                 self._register_canvas_colors()
@@ -3579,6 +3829,11 @@ class MainWindow(QMainWindow):
         # Handle SAM2 box prediction
         if self.sam2 and self.canvas.current_tool == 'sam2_box':
             try:
+                if self.canvas.selected_mask_idx <= 0 and self.canvas.active_sam2_mask_idx <= 0:
+                    self.status_label.setText("Create or select an instance before using SAM2 Box")
+                    self.canvas.setFocus()
+                    return
+
                 print("Calling SAM2 box prediction...")
                 
                 # Convert image to RGB for SAM2 if grayscale
@@ -3609,16 +3864,9 @@ class MainWindow(QMainWindow):
                     self.canvas.editing_mask = (mask > 0).astype(np.uint8) * 255
                     self.canvas._update_editing_visualization()
                 else:
-                    # Create new mask with new ID and start editing it
-                    mask_id = self.canvas.next_mask_id
-                    self.canvas.selected_mask_idx = mask_id
-                    self.canvas.selected_instance_category = self.canvas.current_annotation_type
-                    self.canvas.start_editing_instance(mask_id, category=self.canvas.current_annotation_type)
-                    self.canvas.editing_mask = (mask > 0).astype(np.uint8) * 255
-                    self.canvas._update_editing_visualization()
-                    self.canvas.active_sam2_mask_idx = mask_id
-                    # Increment next_mask_id since we used this one
-                    self.canvas.next_mask_id += 1
+                    self.status_label.setText("Create or select an instance before using SAM2 Box")
+                    self.canvas.setFocus()
+                    return
                 
                 # Register color for this mask
                 self._register_canvas_colors()
@@ -3704,10 +3952,6 @@ class MainWindow(QMainWindow):
         self._instance_list_updating = True
         self.instance_list.clear()
         
-        if self.canvas.combined_mask is None:
-            self._instance_list_updating = False
-            return
-
         # Preserve selection for the active/editing instance
         active_instance_id = (
             self.canvas.editing_instance_id
@@ -4267,6 +4511,16 @@ class MainWindow(QMainWindow):
             )
             print(f"Error removing ArUco association: {e}")
     
+    def _sync_annotation_type_control(self, category, preserve_active_edit=False):
+        """Keep the canvas active category in sync with the selected instance."""
+        if category not in {'bee', 'chamber', 'hive', 'pollen'}:
+            return
+
+        if preserve_active_edit:
+            self.canvas.current_annotation_type = category
+        else:
+            self.canvas.set_annotation_type(category, rebuild=False)
+
     def on_instance_changed(self, idx):
         """Handle instance selection change
         
@@ -4280,9 +4534,6 @@ class MainWindow(QMainWindow):
         # Only update when exactly one item is selected
         selected_items = self.instance_list.selectedItems()
         if len(selected_items) != 1:
-            return
-        
-        if self.canvas.combined_mask is None:
             return
         
         # Get the selected item and check its type
@@ -4306,11 +4557,7 @@ class MainWindow(QMainWindow):
         # Handle chamber/hive/pollen instance selection
         if item_type in ['chamber', 'hive', 'pollen']:
             # Switch to that annotation mode
-            mode_map = {'chamber': 'Chamber', 'hive': 'Hive', 'pollen': 'Pollen'}
-            self.toolbar.annotation_type_combo.blockSignals(True)
-            self.toolbar.annotation_type_combo.setCurrentText(mode_map[item_type])
-            self.toolbar.annotation_type_combo.blockSignals(False)
-            self.canvas.set_annotation_type(item_type, rebuild=False)
+            self._sync_annotation_type_control(item_type)
             
             # Select the instance
             instance_id = item_data.get('id')
@@ -4327,6 +4574,7 @@ class MainWindow(QMainWindow):
         if item_type == 'bee':
             instance_id = item_data.get('id')
             if instance_id is not None:
+                self._sync_annotation_type_control('bee')
                 self.canvas.set_selected_instance(instance_id, category='bee', zoom=False)
                 self.canvas.highlight_instance(instance_id, category='bee')
                 self.status_label.setText(f"Selected instance {instance_id} - Use Brush/Eraser to edit")
@@ -4353,6 +4601,8 @@ class MainWindow(QMainWindow):
         """Select the matching row when an instance is clicked on the canvas."""
         if getattr(self, '_instance_list_updating', False):
             return
+
+        self._sync_annotation_type_control(category, preserve_active_edit=True)
 
         matching_row = -1
         for row in range(self.instance_list.count()):
@@ -5453,52 +5703,68 @@ class MainWindow(QMainWindow):
             
     def delete_selected_instance(self):
         """Delete the currently selected instance"""
-        if self.canvas.selected_mask_idx >= 0:
-            self.canvas.clear_selected_instance()
+        selected_instances = self._get_selected_instance_keys()
+        if len(selected_instances) > 1:
+            self.delete_selected_instances()
+            return
+
+        if selected_instances:
+            instance_id, category = selected_instances[0]
+        elif self.canvas.selected_mask_idx > 0:
+            instance_id = self.canvas.selected_mask_idx
+            category = (
+                self.canvas.selected_instance_category or
+                self.canvas.annotation_metadata.get(instance_id, {}).get('category')
+            )
+        else:
+            self.status_label.setText("No instance selected")
+            return
+
+        if self.canvas.delete_instance(instance_id, category=category):
             self.update_instance_list_from_canvas()
-            self.status_label.setText("Instance deleted")
+            self.status_label.setText(f"{category.capitalize() if category else 'Instance'} {instance_id} deleted")
+        else:
+            self.status_label.setText("Selected instance was not found")
+
+    def _get_selected_instance_keys(self):
+        """Return selected sidebar instances as unique (id, category) pairs."""
+        selected_instances = []
+        seen = set()
+        for item in self.instance_list.selectedItems():
+            item_data = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if not item_data:
+                continue
+            instance_id = item_data.get('id')
+            category = item_data.get('type', 'bee')
+            if instance_id is None:
+                continue
+            key = (int(instance_id), category)
+            if key not in seen:
+                selected_instances.append(key)
+                seen.add(key)
+        return selected_instances
     
     def delete_selected_instances(self):
         """Delete multiple selected instances"""
-        selected_items = self.instance_list.selectedItems()
-        if not selected_items:
+        selected_instances = self._get_selected_instance_keys()
+        if not selected_instances:
             QMessageBox.warning(
                 self, "No Instances Selected",
                 "Please select one or more instances to delete."
             )
             return
-        
-        # Get the instance IDs from canvas
-        if self.canvas.combined_mask is None:
-            return
-        
-        canvas_instance_ids = np.unique(self.canvas.combined_mask)
-        canvas_instance_ids = canvas_instance_ids[canvas_instance_ids > 0].tolist()
-        
-        # Add editing instance if present
-        if self.canvas.editing_instance_id > 0 and self.canvas.editing_mask is not None:
-            if self.canvas.editing_instance_id not in canvas_instance_ids:
-                canvas_instance_ids.append(self.canvas.editing_instance_id)
-        
-        canvas_instance_ids = sorted(canvas_instance_ids)
-        
-        # Map selected rows to instance IDs
-        selected_rows = [self.instance_list.row(item) for item in selected_items]
-        instance_ids_to_delete = []
-        
-        for row in selected_rows:
-            if row < len(canvas_instance_ids):
-                instance_ids_to_delete.append(canvas_instance_ids[row])
-        
-        if not instance_ids_to_delete:
-            return
+
+        display_ids = [
+            f"{category} {instance_id}"
+            for instance_id, category in selected_instances
+        ]
         
         # Confirm deletion
         reply = QMessageBox.question(
             self,
             "Confirm Delete",
-            f"Delete {len(instance_ids_to_delete)} instance(s)?\n"
-            f"Instance IDs: {', '.join(map(str, instance_ids_to_delete))}",
+            f"Delete {len(selected_instances)} instance(s)?\n"
+            f"Instances: {', '.join(display_ids)}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
@@ -5506,24 +5772,21 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         
-        # Delete each instance
-        for instance_id in instance_ids_to_delete:
-            # If it's the editing instance, clear it
-            if instance_id == self.canvas.editing_instance_id:
-                self.canvas.discard_editing()
-            
-            # Remove from combined mask
-            if self.canvas.combined_mask is not None:
-                self.canvas.combined_mask[self.canvas.combined_mask == instance_id] = 0
-            
-            # Remove from annotation metadata
-            if instance_id in self.canvas.annotation_metadata:
-                del self.canvas.annotation_metadata[instance_id]
-        
-        # Rebuild visualization
-        self.canvas.rebuild_visualization()
+        deleted_count = 0
+        for instance_id, category in selected_instances:
+            if self.canvas.delete_instance(
+                instance_id,
+                category=category,
+                rebuild=False,
+                emit_changed=False
+            ):
+                deleted_count += 1
+
+        self.canvas.rebuild_visualizations()
+        if deleted_count > 0:
+            self.canvas.annotation_changed.emit()
         self.update_instance_list_from_canvas()
-        self.status_label.setText(f"{len(instance_ids_to_delete)} instance(s) deleted")
+        self.status_label.setText(f"{deleted_count} instance(s) deleted")
     
     def delete_all_instances(self):
         """Delete all bee instances in the current frame and remove annotation files"""
@@ -5770,7 +6033,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "SAM2 Error", f"SAM2 prediction failed: {str(e)}")
             self.status_label.setText(f"SAM2 refinement failed: {str(e)}")
             
-    def new_instance(self):
+    def new_instance(self, category=None):
         """Start annotating a new instance"""
         # Commit any pending edits
         if self.canvas.editing_instance_id > 0:
@@ -5786,8 +6049,12 @@ class MainWindow(QMainWindow):
         # Set as selected instance
         self.canvas.selected_mask_idx = new_instance_id
         
-        # Get current category from canvas
-        current_category = self.canvas.current_annotation_type
+        # Use the type chosen from the New Instance menu.
+        current_category = category or 'bee'
+        if current_category not in {'bee', 'chamber', 'hive', 'pollen'}:
+            current_category = 'bee'
+        self.canvas.current_annotation_type = current_category
+        self.canvas.selected_instance_category = current_category
         
         # Add to annotation metadata to make it appear in the list
         if new_instance_id not in self.canvas.annotation_metadata:
@@ -5811,14 +6078,22 @@ class MainWindow(QMainWindow):
                 import numpy as np
                 color = tuple(np.random.randint(0, 255, 3).tolist())
             self.canvas.mask_colors[new_instance_id] = color
+
+        self.canvas.set_instance_visible(new_instance_id, current_category, True, rebuild=False)
+
+        if self.canvas.current_tool in ['brush', 'eraser']:
+            self.canvas.start_editing_instance(new_instance_id, category=current_category)
+        else:
+            self.canvas.rebuild_visualizations()
         
         # Update list to show new instance
         self.update_instance_list_from_canvas()
         
         # Find and select the new instance in the list
         for i in range(self.instance_list.count()):
-            item_text = self.instance_list.item(i).text()
-            if f"Instance ID: {new_instance_id}" in item_text:
+            item = self.instance_list.item(i)
+            item_data = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if item_data and item_data.get('id') == new_instance_id and item_data.get('type') == current_category:
                 self.instance_list.setCurrentRow(i)
                 break
         

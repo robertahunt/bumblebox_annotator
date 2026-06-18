@@ -4,9 +4,9 @@ Annotation toolbar with tools and controls
 
 import math
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QToolButton, QButtonGroup,
-                             QSlider, QLabel, QSpinBox, QComboBox, QCheckBox)
+                             QSlider, QLabel, QSpinBox, QCheckBox, QMenu)
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QAction, QIcon
 
 
 class AnnotationToolbar(QWidget):
@@ -16,7 +16,7 @@ class AnnotationToolbar(QWidget):
     brush_size_changed = pyqtSignal(int)
     mask_opacity_changed = pyqtSignal(int)
     clear_instance_requested = pyqtSignal()
-    new_instance_requested = pyqtSignal()
+    new_instance_requested = pyqtSignal(str)
     delete_all_requested = pyqtSignal()
     detect_aruco_requested = pyqtSignal()
     clear_all_aruco_requested = pyqtSignal()
@@ -62,17 +62,6 @@ class AnnotationToolbar(QWidget):
         self.bbox_btn = self.create_tool_button("BBox", "bbox")
         self.bbox_btn.setToolTip("Draw or edit bounding box")
         row1.addWidget(self.bbox_btn)
-        
-        row1.addWidget(self.create_separator())
-        
-        # Annotation type selection
-        row1.addWidget(QLabel("Type:"))
-        self.annotation_type_combo = QComboBox()
-        self.annotation_type_combo.addItems(["Bee", "Hive", "Chamber", "Pollen"])
-        self.annotation_type_combo.setCurrentText("Bee")
-        self.annotation_type_combo.setToolTip("Select annotation type (video-level for Hive/Chamber/Pollen)")
-        self.annotation_type_combo.currentTextChanged.connect(self.on_annotation_type_changed)
-        row1.addWidget(self.annotation_type_combo)
         
         row1.addWidget(self.create_separator())
         
@@ -164,10 +153,24 @@ class AnnotationToolbar(QWidget):
         self.clear_instance_btn.setToolTip("Clear selected instance mask and points (C)")
         self.clear_instance_btn.clicked.connect(self.on_clear_instance)
         row2.addWidget(self.clear_instance_btn)
-        
+
         self.new_instance_btn = QToolButton()
         self.new_instance_btn.setText("New Instance")
-        self.new_instance_btn.clicked.connect(self.on_new_instance)
+        self.new_instance_btn.setToolTip("Choose object type for a new instance")
+        self.new_instance_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.new_instance_menu = QMenu(self.new_instance_btn)
+        for category, label in [
+            ('bee', 'Bee'),
+            ('hive', 'Hive'),
+            ('chamber', 'Chamber'),
+            ('pollen', 'Pollen')
+        ]:
+            action = QAction(label, self.new_instance_menu)
+            action.triggered.connect(
+                lambda checked=False, cat=category: self.new_instance_requested.emit(cat)
+            )
+            self.new_instance_menu.addAction(action)
+        self.new_instance_btn.setMenu(self.new_instance_menu)
         row2.addWidget(self.new_instance_btn)
         
         self.detect_aruco_btn = QToolButton()
@@ -259,10 +262,6 @@ class AnnotationToolbar(QWidget):
         """Handle clear instance button"""
         self.clear_instance_requested.emit()
         
-    def on_new_instance(self):
-        """Handle new instance button"""
-        self.new_instance_requested.emit()
-    
     def on_detect_aruco(self):
         """Handle detect ArUco button"""
         self.detect_aruco_requested.emit()
@@ -285,10 +284,12 @@ class AnnotationToolbar(QWidget):
     
     def on_annotation_type_changed(self, type_text):
         """Handle annotation type dropdown selection"""
-        # Convert display name to internal name
+        self.annotation_type_changed.emit(self._display_text_to_annotation_type(type_text))
+
+    def _display_text_to_annotation_type(self, type_text):
+        """Convert display text to internal annotation type."""
         type_map = {'Bee': 'bee', 'Hive': 'hive', 'Chamber': 'chamber', 'Pollen': 'pollen'}
-        annotation_type = type_map.get(type_text, 'bee')
-        self.annotation_type_changed.emit(annotation_type)
+        return type_map.get(type_text, 'bee')
     
     def on_annotation_type_visibility_changed(self, annotation_type, state):
         """Handle annotation type visibility checkbox"""
