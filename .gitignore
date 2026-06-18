@@ -23,6 +23,13 @@ build/
 Thumbs.db
 
 # Model checkpoints (large files)
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.safetensors
+sam2_checkpoints/
 checkpoints/*.pt
 checkpoints/*.pth
 !checkpoints/.gitkeep
