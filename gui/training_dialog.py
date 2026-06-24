@@ -506,8 +506,10 @@ class TrainingConfigDialog(QDialog):
                 "Select which annotation type to train on:\n"
                 "• Bee: Per-frame multi-instance bee annotations\n"
                 "• Chamber: Video-level chamber masks\n"
-                "• Hive: Video-level hive masks"
+                "• Hive: Video-level hive masks\n"
+                "• Pollen: Video-level pollen masks"
             )
+            self.model_type_combo.currentTextChanged.connect(self.on_model_type_changed)
             model_type_layout.addRow("Annotation Type:", self.model_type_combo)
             
             model_type_group.setLayout(model_type_layout)
@@ -779,7 +781,14 @@ class TrainingConfigDialog(QDialog):
             self.name_combo.addItems(['bee_segmentation_stage2', 'bee_segmentation_stage2_v2', 'bee_stage2'])
             self.name_combo.setCurrentText('bee_segmentation_stage2')
         else:
-            self.name_combo.addItems(['bee_segmentation', 'bee_segmentation2', 'bee_segmentation_v2'])
+            self.name_combo.addItems([
+                'bee_segmentation',
+                'pollen_segmentation',
+                'hive_segmentation',
+                'chamber_segmentation',
+                'bee_segmentation2',
+                'bee_segmentation_v2'
+            ])
             self.name_combo.setCurrentText('bee_segmentation')
         name_layout.addRow("Experiment Name:", self.name_combo)
         
@@ -798,6 +807,22 @@ class TrainingConfigDialog(QDialog):
         button_layout.addWidget(cancel_btn)
         
         layout.addLayout(button_layout)
+
+    def on_model_type_changed(self, type_text):
+        """Keep the default experiment name aligned with the selected model type."""
+        if self.stage2 or self.sahi or self.beehavesque or self.instance_focused:
+            return
+
+        defaults = {
+            'Bee': 'bee_segmentation',
+            'Pollen': 'pollen_segmentation',
+            'Hive': 'hive_segmentation',
+            'Chamber': 'chamber_segmentation',
+        }
+        known_defaults = set(defaults.values()) | {'bee_segmentation2', 'bee_segmentation_v2'}
+        current_name = self.name_combo.currentText()
+        if current_name in known_defaults:
+            self.name_combo.setCurrentText(defaults.get(type_text, 'bee_segmentation'))
         
     def get_config(self):
         """Get training configuration"""

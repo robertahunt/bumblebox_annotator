@@ -14,6 +14,7 @@ class AnnotationToolbar(QWidget):
     
     tool_changed = pyqtSignal(str)
     brush_size_changed = pyqtSignal(int)
+    brush_cursor_preview_changed = pyqtSignal(bool)
     mask_opacity_changed = pyqtSignal(int)
     clear_instance_requested = pyqtSignal()
     new_instance_requested = pyqtSignal(str)
@@ -128,6 +129,14 @@ class AnnotationToolbar(QWidget):
         self.brush_size_label = QLabel("10")
         self.brush_size_label.setMinimumWidth(25)
         row2.addWidget(self.brush_size_label)
+
+        self.brush_cursor_checkbox = QCheckBox("Brush cursor")
+        self.brush_cursor_checkbox.setChecked(True)
+        self.brush_cursor_checkbox.setToolTip(
+            "Show a brush-size cursor matching the stroke diameter"
+        )
+        self.brush_cursor_checkbox.stateChanged.connect(self.on_brush_cursor_preview_changed)
+        row2.addWidget(self.brush_cursor_checkbox)
         
         row2.addWidget(self.create_separator())
         
@@ -231,6 +240,10 @@ class AnnotationToolbar(QWidget):
         
         self.brush_size_label.setText(str(brush_size))
         self.brush_size_changed.emit(brush_size)
+
+    def on_brush_cursor_preview_changed(self, state):
+        """Handle brush cursor footprint checkbox changes."""
+        self.brush_cursor_preview_changed.emit(state == Qt.CheckState.Checked.value)
 
     def _brush_size_to_slider_value(self, brush_size):
         """Convert a brush size in pixels to the toolbar's log-scale slider value."""

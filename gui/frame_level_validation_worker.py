@@ -469,9 +469,8 @@ class FrameLevelValidationWorker(QThread):
                 
                 # Multiple checks to ensure we only get bees:
                 # 1. category_id must be 1
-                # 2. category_id must NOT be 2 (hive) or 3 (chamber)
-                # 3. category name (if available) must not be 'hive' or 'chamber'
-                if category_id == 1 and category_name not in ['hive', 'chamber']:
+                # 2. category name, if available, must be bee
+                if category_id == 1 and category_name in ['', 'bee']:
                     # COCO bbox format is [x, y, width, height]
                     # Convert to center format [cx, cy, w, h]
                     x, y, w, h = ann['bbox']
@@ -496,8 +495,8 @@ class FrameLevelValidationWorker(QThread):
             category = ann.get('category', 'bee')
             category_id = ann.get('category_id', 1)
             
-            # Explicitly skip hive (category_id=2) and chamber (category_id=3) annotations
-            if category in ['hive', 'chamber'] or category_id in [2, 3]:
+            # Explicitly skip non-bee categories.
+            if category in ['hive', 'chamber', 'pollen'] or category_id != 1:
                 continue
             
             # Only process bee annotations

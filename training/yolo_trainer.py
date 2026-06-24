@@ -119,6 +119,19 @@ class YOLOTrainingWorker(QThread):
         model_type = self.config.get('model_type', 'bee')
         train_count = sum(self._coco_to_yolo(json_file, yolo_dir, 'train', model_type) for json_file in train_jsons)
         val_count = sum(self._coco_to_yolo(json_file, yolo_dir, 'val', model_type) for json_file in val_jsons)
+
+        if train_count == 0:
+            raise ValueError(
+                f"No training images with {model_type} segmentation annotations were found. "
+                "Make sure this annotation type exists in the selected training videos, "
+                "then re-export COCO annotations before training."
+            )
+        if val_count == 0:
+            raise ValueError(
+                f"No validation images with {model_type} segmentation annotations were found. "
+                "Make sure this annotation type exists in the selected validation videos, "
+                "then re-export COCO annotations before training."
+            )
         
         # Create dataset YAML - single class model for the selected type
         dataset_yaml = yolo_dir / 'dataset.yaml'
@@ -144,19 +157,40 @@ class YOLOTrainingWorker(QThread):
             coco_json_path: Path to COCO JSON file
             output_dir: Output directory for YOLO format
             split: 'train' or 'val'
-            model_type: 'bee', 'chamber', or 'hive' - filters annotations to this type
+            model_type: 'bee', 'chamber', 'hive', or 'pollen' - filters annotations to this type
         """
         with open(coco_json_path, 'r') as f:
             coco = json.load(f)
         
-        # Map model type to COCO category ID
-        # Based on class_names = ['bee', 'hive', 'chamber'] in annotation.py
+        # Map model type to COCO category ID. Prefer the exported COCO
+        # categories so this stays correct if class order ever changes.
         category_map = {
-            'bee': 1,      # First class
-            'hive': 2,     # Second class
-            'chamber': 3   # Third class
+            cat.get('name'): cat.get('id')
+            for cat in coco.get('categories', [])
+            if cat.get('name') and cat.get('id') is not None
         }
-        target_category_id = category_map.get(model_type, 1)
+        if not category_map:
+            category_map = {
+                'bee': 1,
+                'hive': 2,
+                'chamber': 3,
+                'pollen': 4,
+            }
+        target_category_id = category_map.get(model_type)
+        if target_category_id is None:
+            valid_types = ', '.join(sorted(category_map)) or 'none'
+            known_model_types = {'bee', 'chamber', 'hive', 'pollen'}
+            if model_type in known_model_types:
+                raise ValueError(
+                    f"COCO file {Path(coco_json_path).name} does not define category "
+                    f"'{model_type}'. Categories found: {valid_types}. This usually "
+                    "means the COCO annotations were exported before that class was "
+                    "added to the project metadata. Re-export COCO annotations with "
+                    "Export COCO checked, then start training again."
+                )
+            raise ValueError(
+                f"Unknown model_type '{model_type}'. Expected one of: {valid_types}"
+            )
         
         # Create output directories
         images_dir = output_dir / 'images' / split

@@ -19,6 +19,7 @@ class SAM2Toolbar(QWidget):
     sam2_loaded = pyqtSignal(object)  # Signal when SAM2 is loaded (emits SAM2Integrator)
     finetune_requested = pyqtSignal()  # Signal when fine-tuning is requested
     run_on_bbox_requested = pyqtSignal()  # Signal to run SAM2 on selected instance's bbox
+    hide_checked_toolbars_requested = pyqtSignal()  # Signal to hide visible optional top toolbars
     
     def __init__(self, parent=None, checkpoint_path=None):
         super().__init__(parent)
@@ -45,9 +46,9 @@ class SAM2Toolbar(QWidget):
         self.sam2_collapsed = False
         self.sam2_expanded_widgets = []
         self.collapse_btn = QToolButton()
-        self.collapse_btn.setText("Hide SAM2")
-        self.collapse_btn.setToolTip("Collapse or expand SAM2 controls")
-        self.collapse_btn.clicked.connect(self.toggle_collapsed)
+        self.collapse_btn.setText("Hide Toolbars")
+        self.collapse_btn.setToolTip("Hide checked optional toolbars visible above the image")
+        self.collapse_btn.clicked.connect(self.hide_checked_toolbars_requested.emit)
         row1.addWidget(self.collapse_btn)
         
         self.compact_status_label = QLabel()

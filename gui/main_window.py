@@ -196,6 +196,7 @@ class MainWindow(QMainWindow):
         # Show saved message briefly, then clear
         self.status_label.setText(f"✓ Frame {frame_idx} saved")
         self.status_label.setStyleSheet("color: green; font-weight: bold;")
+        self._schedule_done_counter_update(saved_counts_dirty=True)
         # Auto-clear after 2 seconds
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(2000, self._clear_save_status)
@@ -216,6 +217,7 @@ class MainWindow(QMainWindow):
         self.canvas.point_clicked.connect(self.on_canvas_point_clicked)
         self.canvas.box_drawn.connect(self.on_canvas_box_drawn)
         self.canvas.masks_visibility_changed.connect(self.on_masks_visibility_changed)
+        self.canvas.bboxes_visibility_changed.connect(self.on_bboxes_visibility_changed)
         self.canvas.instance_visibility_changed.connect(self.on_instance_visibility_shortcut_changed)
         self.canvas.instance_visibility_toggle_blocked.connect(self.on_instance_visibility_shortcut_blocked)
         self.canvas.instance_selected.connect(self.on_canvas_instance_selected)
@@ -223,10 +225,11 @@ class MainWindow(QMainWindow):
         self.canvas.brush_size_unit_step_requested.connect(self.on_brush_size_unit_step_requested)
         self.canvas.brush_eraser_toggle_requested.connect(self.on_brush_eraser_toggle_requested)
         self.canvas.instance_switch_tap_progress.connect(self.on_instance_switch_tap_progress)
+        self.canvas.new_instance_requested.connect(self.new_instance)
         self.canvas.annotation_changed.connect(self.on_annotation_changed)
         self.canvas.annotation_changed.connect(self._schedule_instance_list_update)
         self.canvas.setToolTip(
-            "Space toggles segmentations | "
+            "Space toggles masks and boxes | "
             "Shift+Space toggles selected instance | Ctrl+/- zooms | +/- changes brush size | "
             "Middle-click toggles Brush/Eraser | Triple-tap another instance to switch while brushing | "
             "Press F to fit image to window"
@@ -236,6 +239,7 @@ class MainWindow(QMainWindow):
         self.toolbar = AnnotationToolbar(self)
         self.toolbar.tool_changed.connect(self.on_tool_changed)
         self.toolbar.brush_size_changed.connect(self.canvas.set_brush_size)
+        self.toolbar.brush_cursor_preview_changed.connect(self.canvas.set_brush_cursor_preview_enabled)
         self.toolbar.mask_opacity_changed.connect(self.canvas.set_mask_opacity)
         self.toolbar.clear_instance_requested.connect(self.clear_selected_instance)
         self.toolbar.new_instance_requested.connect(self.new_instance)
@@ -256,6 +260,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_annotation_type_visibility('hive', self.toolbar.show_hives_checkbox.isChecked(), rebuild=False)
         self.canvas.set_annotation_type_visibility('chamber', self.toolbar.show_chambers_checkbox.isChecked(), rebuild=False)
         self.canvas.set_annotation_type_visibility('pollen', self.toolbar.show_pollen_checkbox.isChecked(), rebuild=False)
+        self.canvas.set_brush_cursor_preview_enabled(self.toolbar.brush_cursor_checkbox.isChecked())
         
         # Create SAM2 toolbar
         if self.sam2_checkpoint:
@@ -269,6 +274,7 @@ class MainWindow(QMainWindow):
         self.sam2_toolbar.sam2_loaded.connect(self.on_sam2_loaded)
         self.sam2_toolbar.finetune_requested.connect(self.on_sam2_finetune_requested)
         self.sam2_toolbar.run_on_bbox_requested.connect(self.on_sam2_run_on_bbox)
+        self.sam2_toolbar.hide_checked_toolbars_requested.connect(self.hide_checked_visible_top_toolbars)
         
         # Create YOLO toolbar
         if self.coarse_yolo_checkpoint:
@@ -314,6 +320,13 @@ class MainWindow(QMainWindow):
         
         # Create frame navigation controls at the bottom
         nav_layout = QHBoxLayout()
+
+        self.prev_frame_button = QPushButton("◀ Previous")
+        self.prev_frame_button.setMaximumWidth(110)
+        self.prev_frame_button.setEnabled(False)
+        self.prev_frame_button.clicked.connect(self.prev_frame)
+        self.prev_frame_button.setToolTip("Go to previous frame (A or Up)")
+        nav_layout.addWidget(self.prev_frame_button)
         
         # Play/Pause button
         self.play_button = QPushButton("▶ Play")
@@ -321,6 +334,13 @@ class MainWindow(QMainWindow):
         self.play_button.clicked.connect(self.toggle_play)
         self.play_button.setToolTip("Play through frames automatically")
         nav_layout.addWidget(self.play_button)
+
+        self.next_frame_button = QPushButton("Next ▶")
+        self.next_frame_button.setMaximumWidth(110)
+        self.next_frame_button.setEnabled(False)
+        self.next_frame_button.clicked.connect(self.next_frame)
+        self.next_frame_button.setToolTip("Go to next frame (D or Down)")
+        nav_layout.addWidget(self.next_frame_button)
         
         # Frame slider
         self.frame_slider = QSlider(Qt.Orientation.Horizontal)
@@ -364,57 +384,35 @@ class MainWindow(QMainWindow):
         self._init_done_counter_overlay()
 
     def _init_done_counter_overlay(self):
-        """Create a small progress counter over the canvas viewport."""
-        settings = QSettings()
-        self.done_counter_session_count = 0
-        self.done_counter_total_count = settings.value(
-            'done_counter_total_count', 0, type=int
-        )
-        self.done_counter_session_durations = []
-        self.done_counter_total_durations = self._load_done_counter_durations(settings)
-        self.done_counter_elapsed_seconds = 0.0
-        self.done_counter_last_tick_time = None
-        self.done_counter_timer_running = False
+        """Create a small automatic instance counter over the canvas viewport."""
+        self.done_counter_categories = ('bee', 'hive', 'chamber', 'pollen')
+        self.done_counter_saved_counts = self._zero_annotation_counts()
+        self.done_counter_session_baseline_counts = self._zero_annotation_counts()
+        self.done_counter_saved_counts_dirty = True
 
         self.done_counter_overlay = QWidget(self.canvas.viewport())
         self.done_counter_overlay.setObjectName("doneCounterOverlay")
         self.done_counter_overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.done_counter_overlay.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        overlay_layout = QHBoxLayout(self.done_counter_overlay)
-        overlay_layout.setContentsMargins(8, 8, 8, 8)
-        overlay_layout.setSpacing(8)
+        overlay_layout = QVBoxLayout(self.done_counter_overlay)
+        overlay_layout.setContentsMargins(10, 8, 10, 8)
+        overlay_layout.setSpacing(2)
 
-        self.done_counter_timer_button = QPushButton("Start")
-        self.done_counter_timer_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.done_counter_timer_button.setToolTip("Start or stop the completion timer")
-        self.done_counter_timer_button.clicked.connect(self.on_done_counter_timer_toggled)
-        overlay_layout.addWidget(self.done_counter_timer_button)
+        self.done_counter_title_label = QLabel("Instances made")
+        self.done_counter_title_label.setObjectName("doneCounterTitle")
+        self.done_counter_summary_label = QLabel()
+        self.done_counter_category_labels = {}
 
-        self.done_counter_button = QPushButton("Done")
-        self.done_counter_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.done_counter_button.setToolTip("Mark one mask instance as finished")
-        self.done_counter_button.clicked.connect(self.on_done_counter_pressed)
-        overlay_layout.addWidget(self.done_counter_button)
-
-        label_layout = QVBoxLayout()
-        label_layout.setContentsMargins(0, 0, 0, 0)
-        label_layout.setSpacing(1)
-        self.done_counter_session_label = QLabel()
-        self.done_counter_total_label = QLabel()
-        self.done_counter_session_median_label = QLabel()
-        self.done_counter_total_median_label = QLabel()
-        self.done_counter_elapsed_label = QLabel()
-        for label in (
-            self.done_counter_session_label,
-            self.done_counter_total_label,
-            self.done_counter_session_median_label,
-            self.done_counter_total_median_label,
-            self.done_counter_elapsed_label,
-        ):
+        for label in (self.done_counter_title_label, self.done_counter_summary_label):
             label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            label_layout.addWidget(label)
-        overlay_layout.addLayout(label_layout)
+            overlay_layout.addWidget(label)
+
+        for category in self.done_counter_categories:
+            label = QLabel()
+            label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.done_counter_category_labels[category] = label
+            overlay_layout.addWidget(label)
 
         self.done_counter_overlay.setStyleSheet("""
             QWidget#doneCounterOverlay {
@@ -427,21 +425,8 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
                 font-weight: 600;
             }
-            QPushButton {
-                background-color: rgb(255, 246, 170);
-                border: 1px solid rgba(20, 24, 30, 140);
-                border-radius: 5px;
-                color: rgb(20, 24, 30);
-                font-size: 13px;
-                font-weight: 700;
-                min-width: 58px;
-                min-height: 38px;
-            }
-            QPushButton:hover {
-                background-color: rgb(255, 252, 208);
-            }
-            QPushButton:pressed {
-                background-color: rgb(236, 219, 90);
+            QLabel#doneCounterTitle {
+                color: rgb(255, 246, 170);
             }
         """)
 
@@ -451,36 +436,10 @@ class MainWindow(QMainWindow):
         self.canvas.viewport().installEventFilter(self)
         self._position_done_counter_overlay()
 
-        self.done_counter_timer = QTimer(self)
-        self.done_counter_timer.setInterval(1000)
-        self.done_counter_timer.timeout.connect(self._refresh_done_counter_labels)
-
-    def _load_done_counter_durations(self, settings):
-        raw_value = settings.value('done_counter_durations_seconds', '[]')
-        if isinstance(raw_value, list):
-            values = raw_value
-        else:
-            try:
-                values = json.loads(raw_value or '[]')
-            except (TypeError, json.JSONDecodeError):
-                values = []
-
-        durations = []
-        for value in values:
-            try:
-                duration = float(value)
-            except (TypeError, ValueError):
-                continue
-            if duration >= 0:
-                durations.append(duration)
-        return durations
-
-    def _save_done_counter_durations(self):
-        settings = QSettings()
-        settings.setValue(
-            'done_counter_durations_seconds',
-            json.dumps(self.done_counter_total_durations)
-        )
+        self.done_counter_update_timer = QTimer(self)
+        self.done_counter_update_timer.setSingleShot(True)
+        self.done_counter_update_timer.setInterval(300)
+        self.done_counter_update_timer.timeout.connect(self._refresh_done_counter_labels)
 
     def _position_done_counter_overlay(self):
         if not hasattr(self, 'done_counter_overlay') or self.done_counter_overlay is None:
@@ -494,114 +453,239 @@ class MainWindow(QMainWindow):
         self.done_counter_overlay.move(x, y)
         self.done_counter_overlay.raise_()
 
-    def _format_done_counter_elapsed(self, seconds):
-        seconds = max(0, int(seconds))
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-        if hours:
-            return f"{hours}:{minutes:02d}:{secs:02d}"
-        return f"{minutes:02d}:{secs:02d}"
+    def _zero_annotation_counts(self):
+        categories = getattr(self, 'done_counter_categories', ('bee', 'hive', 'chamber', 'pollen'))
+        return {category: 0 for category in categories}
 
-    def _median_done_counter_duration(self, durations):
-        if not durations:
-            return None
-        sorted_durations = sorted(durations)
-        count = len(sorted_durations)
-        midpoint = count // 2
-        if count % 2:
-            return sorted_durations[midpoint]
-        return (sorted_durations[midpoint - 1] + sorted_durations[midpoint]) / 2
+    def _add_annotation_counts(self, base_counts, delta_counts, sign=1):
+        counts = self._zero_annotation_counts()
+        for category in counts:
+            counts[category] = (
+                int(base_counts.get(category, 0)) +
+                sign * int(delta_counts.get(category, 0))
+            )
+        return counts
 
-    def _current_done_counter_elapsed(self):
-        elapsed = self.done_counter_elapsed_seconds
-        if self.done_counter_timer_running and self.done_counter_last_tick_time is not None:
-            elapsed += max(0.0, time.monotonic() - self.done_counter_last_tick_time)
-        return elapsed
+    def _read_annotation_records(self, json_path):
+        if not json_path or not Path(json_path).exists():
+            return []
+        try:
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Warning: failed to read annotation counts from {json_path}: {e}")
+            return []
 
-    def _reset_done_counter_interval(self):
-        self.done_counter_elapsed_seconds = 0.0
-        self.done_counter_last_tick_time = (
-            time.monotonic() if self.done_counter_timer_running else None
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get('annotations', [])
+        return []
+
+    def _count_annotation_records(self, records, bbox_only=False):
+        counts = self._zero_annotation_counts()
+        seen = set()
+
+        for index, annotation in enumerate(records or []):
+            if not isinstance(annotation, dict):
+                continue
+            if bbox_only and (
+                not annotation.get('bbox_only', False) or
+                annotation.get('from_mask', False)
+            ):
+                continue
+
+            category = annotation.get('category', 'bee')
+            if category not in counts:
+                continue
+
+            instance_id = annotation.get(
+                'mask_id',
+                annotation.get('instance_id', annotation.get('id'))
+            )
+            key = (category, instance_id) if instance_id is not None else (category, index)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            counts[category] += 1
+
+        return counts
+
+    def _saved_frame_annotation_counts(self, video_id, frame_idx):
+        counts = self._zero_annotation_counts()
+        if not self.project_path or video_id is None or frame_idx is None:
+            return counts
+
+        json_dir = Path(self.project_path) / 'annotations' / 'json' / str(video_id)
+        bbox_dir = Path(self.project_path) / 'annotations' / 'bbox' / str(video_id)
+        frame_name = f'frame_{int(frame_idx):06d}.json'
+
+        counts = self._add_annotation_counts(
+            counts,
+            self._count_annotation_records(self._read_annotation_records(json_dir / frame_name))
         )
+        counts = self._add_annotation_counts(
+            counts,
+            self._count_annotation_records(
+                self._read_annotation_records(bbox_dir / frame_name),
+                bbox_only=True
+            )
+        )
+        return counts
+
+    def _saved_video_annotation_counts(self, video_id):
+        if not self.project_path or not video_id:
+            return self._zero_annotation_counts()
+
+        json_path = (
+            Path(self.project_path) / 'annotations' / 'json' /
+            str(video_id) / 'video_annotations.json'
+        )
+        return self._count_annotation_records(self._read_annotation_records(json_path))
+
+    def _scan_saved_annotation_counts(self):
+        counts = self._zero_annotation_counts()
+        if not self.project_path:
+            return counts
+
+        project_path = Path(self.project_path)
+        json_root = project_path / 'annotations' / 'json'
+        bbox_root = project_path / 'annotations' / 'bbox'
+
+        if json_root.exists():
+            for video_dir in sorted(path for path in json_root.iterdir() if path.is_dir()):
+                for frame_json in sorted(video_dir.glob('frame_*.json')):
+                    counts = self._add_annotation_counts(
+                        counts,
+                        self._count_annotation_records(self._read_annotation_records(frame_json))
+                    )
+                video_json = video_dir / 'video_annotations.json'
+                counts = self._add_annotation_counts(
+                    counts,
+                    self._count_annotation_records(self._read_annotation_records(video_json))
+                )
+
+        if bbox_root.exists():
+            for video_dir in sorted(path for path in bbox_root.iterdir() if path.is_dir()):
+                for frame_json in sorted(video_dir.glob('frame_*.json')):
+                    counts = self._add_annotation_counts(
+                        counts,
+                        self._count_annotation_records(
+                            self._read_annotation_records(frame_json),
+                            bbox_only=True
+                        )
+                    )
+
+        return counts
+
+    def _live_canvas_annotation_counts(self):
+        counts = self._zero_annotation_counts()
+        if not hasattr(self, 'canvas') or self.canvas is None:
+            return counts
+
+        try:
+            entries = self.canvas.get_instance_entries()
+        except Exception as e:
+            print(f"Warning: failed to count live canvas instances: {e}")
+            return counts
+
+        for entry in entries:
+            category = entry.get('category', 'bee')
+            if category in counts:
+                counts[category] += 1
+        return counts
+
+    def _current_annotation_counts(self):
+        if getattr(self, 'done_counter_saved_counts_dirty', True):
+            self.done_counter_saved_counts = self._scan_saved_annotation_counts()
+            self.done_counter_saved_counts_dirty = False
+
+        counts = dict(getattr(self, 'done_counter_saved_counts', self._zero_annotation_counts()))
+
+        if self.project_path and self.current_video_id:
+            frame_idx = None
+            if self.current_frame_idx is not None and self.current_frame_idx >= 0:
+                try:
+                    frame_idx = self._get_frame_idx_in_video(self.current_frame_idx)
+                except Exception:
+                    frame_idx = self.current_frame_idx
+
+            if frame_idx is not None:
+                counts = self._add_annotation_counts(
+                    counts,
+                    self._saved_frame_annotation_counts(self.current_video_id, frame_idx),
+                    sign=-1
+                )
+
+            counts = self._add_annotation_counts(
+                counts,
+                self._saved_video_annotation_counts(self.current_video_id),
+                sign=-1
+            )
+            counts = self._add_annotation_counts(
+                counts,
+                self._live_canvas_annotation_counts()
+            )
+
+        return {
+            category: max(0, int(counts.get(category, 0)))
+            for category in self._zero_annotation_counts()
+        }
+
+    def _category_display_name(self, category):
+        return {
+            'bee': 'Bees',
+            'hive': 'Hives',
+            'chamber': 'Chambers',
+            'pollen': 'Pollen',
+        }.get(category, category.capitalize())
+
+    def _reset_done_counter_baseline(self):
+        self.done_counter_saved_counts_dirty = True
+        current_counts = self._current_annotation_counts()
+        self.done_counter_session_baseline_counts = dict(current_counts)
+        self._refresh_done_counter_labels()
+
+    def _schedule_done_counter_update(self, saved_counts_dirty=False):
+        if saved_counts_dirty:
+            self.done_counter_saved_counts_dirty = True
+
+        timer = getattr(self, 'done_counter_update_timer', None)
+        if timer is not None:
+            timer.start()
+        else:
+            self._refresh_done_counter_labels()
 
     def _refresh_done_counter_labels(self):
-        elapsed_seconds = self._current_done_counter_elapsed()
-        elapsed = (
-            self._format_done_counter_elapsed(elapsed_seconds)
-            if self.done_counter_timer_running or elapsed_seconds > 0
-            else "--"
+        counts = self._current_annotation_counts()
+        baseline_counts = getattr(
+            self,
+            'done_counter_session_baseline_counts',
+            self._zero_annotation_counts()
         )
-        session_median = self._median_done_counter_duration(
-            self.done_counter_session_durations
-        )
-        total_median = self._median_done_counter_duration(
-            self.done_counter_total_durations
-        )
-        self.done_counter_session_label.setText(
-            f"Session: {self.done_counter_session_count}"
-        )
-        self.done_counter_total_label.setText(
-            f"Total: {self.done_counter_total_count}"
-        )
-        self.done_counter_session_median_label.setText(
-            "Med S: " +
-            (self._format_done_counter_elapsed(session_median)
-             if session_median is not None else "--")
-        )
-        self.done_counter_total_median_label.setText(
-            "Med All: " +
-            (self._format_done_counter_elapsed(total_median)
-             if total_median is not None else "--")
-        )
-        if hasattr(self, 'done_counter_timer_button'):
-            self.done_counter_timer_button.setText(
-                "Stop" if self.done_counter_timer_running else "Start"
+        session_counts = {
+            category: max(0, counts.get(category, 0) - baseline_counts.get(category, 0))
+            for category in self._zero_annotation_counts()
+        }
+
+        project_total = sum(counts.values())
+        session_total = sum(session_counts.values())
+
+        if hasattr(self, 'done_counter_summary_label'):
+            self.done_counter_summary_label.setText(
+                f"Project: {project_total} (+{session_total} session)"
             )
-        self.done_counter_elapsed_label.setText(f"Since: {elapsed}")
+
+        if hasattr(self, 'done_counter_category_labels'):
+            for category, label in self.done_counter_category_labels.items():
+                label.setText(
+                    f"{self._category_display_name(category)}: "
+                    f"{counts.get(category, 0)} (+{session_counts.get(category, 0)})"
+                )
+
         if hasattr(self, 'done_counter_overlay'):
             self._position_done_counter_overlay()
-
-    def on_done_counter_timer_toggled(self):
-        if self.done_counter_timer_running:
-            if self.done_counter_last_tick_time is not None:
-                self.done_counter_elapsed_seconds += max(
-                    0.0,
-                    time.monotonic() - self.done_counter_last_tick_time
-                )
-            self.done_counter_last_tick_time = None
-            self.done_counter_timer_running = False
-            self.done_counter_timer.stop()
-            self.status_label.setText("Completion timer stopped")
-        else:
-            self.done_counter_last_tick_time = time.monotonic()
-            self.done_counter_timer_running = True
-            self.done_counter_timer.start()
-            self.status_label.setText("Completion timer started")
-
-        self._refresh_done_counter_labels()
-        self.canvas.setFocus()
-
-    def on_done_counter_pressed(self):
-        elapsed = self._current_done_counter_elapsed()
-        self.done_counter_session_count += 1
-        self.done_counter_total_count += 1
-        if elapsed > 0:
-            self.done_counter_session_durations.append(elapsed)
-            self.done_counter_total_durations.append(elapsed)
-        self._reset_done_counter_interval()
-
-        settings = QSettings()
-        settings.setValue('done_counter_total_count', self.done_counter_total_count)
-        self._save_done_counter_durations()
-
-        self._refresh_done_counter_labels()
-        timing_note = "" if elapsed > 0 else " (timer not running)"
-        self.status_label.setText(
-            f"Marked done: session {self.done_counter_session_count}, "
-            f"total {self.done_counter_total_count}{timing_note}"
-        )
-        self.canvas.setFocus()
 
     def eventFilter(self, obj, event):
         if (
@@ -839,6 +923,12 @@ class MainWindow(QMainWindow):
         self.hive_chamber_toolbar_action.setChecked(False)  # Hidden by default
         self.hive_chamber_toolbar_action.triggered.connect(self.toggle_hive_chamber_toolbar)
         toolbars_menu.addAction(self.hive_chamber_toolbar_action)
+
+        toolbars_menu.addSeparator()
+
+        hide_visible_toolbars_action = QAction("&Hide Checked Visible Toolbars", self)
+        hide_visible_toolbars_action.triggered.connect(self.hide_checked_visible_top_toolbars)
+        toolbars_menu.addAction(hide_visible_toolbars_action)
     
     def toggle_annotation_toolbar(self):
         """Toggle visibility of annotation toolbar"""
@@ -881,6 +971,35 @@ class MainWindow(QMainWindow):
             self.hive_chamber_toolbar.show()
         else:
             self.hive_chamber_toolbar.hide()
+
+    def _optional_top_toolbar_entries(self):
+        """Return optional top toolbars controlled by the Toolbars menu."""
+        return [
+            ("SAM2", self.sam2_toolbar, self.sam2_toolbar_action),
+            ("YOLO coarse", self.yolo_toolbar, self.yolo_toolbar_action),
+            (
+                "YOLO instance-focused",
+                self.yolo_instance_focused_toolbar,
+                self.yolo_instance_focused_toolbar_action
+            ),
+            ("YOLO bbox", self.yolo_bbox_toolbar, self.yolo_bbox_toolbar_action),
+            ("Hive/Chamber/Pollen", self.hive_chamber_toolbar, self.hive_chamber_toolbar_action),
+        ]
+
+    def hide_checked_visible_top_toolbars(self):
+        """Hide optional top toolbars that are both checked and currently visible."""
+        hidden_labels = []
+        for label, toolbar, action in self._optional_top_toolbar_entries():
+            if action.isChecked() and toolbar.isVisible():
+                action.setChecked(False)
+                toolbar.hide()
+                hidden_labels.append(label)
+
+        if hidden_labels:
+            self.status_label.setText(f"Hidden toolbars: {', '.join(hidden_labels)}")
+        else:
+            self.status_label.setText("No checked optional toolbars are currently visible")
+        self.canvas.setFocus()
     
     def toggle_video_sidebar(self):
         """Toggle visibility of video sidebar"""
@@ -2165,6 +2284,14 @@ class MainWindow(QMainWindow):
         # Clear instance mask and points
         clear_instance = QShortcut(QKeySequence(Qt.Key.Key_C), self)
         clear_instance.activated.connect(self.clear_selected_instance)
+
+        toggle_overlays = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        toggle_overlays.setContext(Qt.ShortcutContext.WindowShortcut)
+        toggle_overlays.activated.connect(self.on_space_toggle_annotation_overlays)
+
+        toggle_selected_instance = QShortcut(QKeySequence("Shift+Space"), self)
+        toggle_selected_instance.setContext(Qt.ShortcutContext.WindowShortcut)
+        toggle_selected_instance.activated.connect(self.on_shift_space_toggle_selected_instance)
     
     def _load_max_mask_id_from_metadata(self, video_id):
         """
@@ -2466,6 +2593,7 @@ class MainWindow(QMainWindow):
 
         if saved_files:
             self.coco_export_dirty = True
+            self._schedule_done_counter_update(saved_counts_dirty=True)
 
         current_key = self._frame_annotation_key()
         if target_video_id == self.current_video_id and frame_key == current_key:
@@ -2632,6 +2760,7 @@ class MainWindow(QMainWindow):
                 f"Project created: {self.project_path.name} "
                 f"(ready to add videos)"
             )
+            self._reset_done_counter_baseline()
             
     def open_project(self):
         """Open an existing project"""
@@ -2680,6 +2809,7 @@ class MainWindow(QMainWindow):
                 f"Project loaded: {self.project_path.name} "
                 f"({len(self.frames)} frames, {num_annotated_frames} annotated)"
             )
+            self._reset_done_counter_baseline()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load project: {str(e)}")
             import traceback
@@ -2798,6 +2928,7 @@ class MainWindow(QMainWindow):
                     self.status_label.setText(
                         f"✓ Loaded project: {num_frames} frames, {annotated_count} annotated"
                     )
+                    self._reset_done_counter_baseline()
                     return
                 except Exception as e:
                     QMessageBox.warning(
@@ -2843,6 +2974,7 @@ class MainWindow(QMainWindow):
                     self.load_frame(0)
                     
                 self.status_label.setText(f"✓ Created project: {len(self.frames)} frames extracted to {project_dir.name}")
+                self._reset_done_counter_baseline()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to extract frames: {str(e)}")
                 self.status_label.setText("Ready")
@@ -3124,6 +3256,16 @@ class MainWindow(QMainWindow):
         else:
             self.frame_slider.setMaximum(0)
             self.frame_slider.setEnabled(False)
+        self._update_frame_navigation_buttons()
+
+    def _update_frame_navigation_buttons(self):
+        """Enable frame navigation buttons based on the current filtered view."""
+        if not hasattr(self, 'prev_frame_button') or not hasattr(self, 'next_frame_button'):
+            return
+
+        has_frames = bool(self.frame_list_to_frames_map)
+        self.prev_frame_button.setEnabled(has_frames and self._get_prev_frame_index() is not None)
+        self.next_frame_button.setEnabled(has_frames and self._get_next_frame_index() is not None)
             
     def load_frame(self, idx):
         """Load a specific frame"""
@@ -3356,6 +3498,7 @@ class MainWindow(QMainWindow):
                 
                 # Save current project state for restoration
                 self._save_project_state()
+                self._update_frame_navigation_buttons()
                 
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to load frame: {str(e)}")
@@ -3503,16 +3646,43 @@ class MainWindow(QMainWindow):
         """Handle show segmentations checkbox change from toolbar"""
         self.canvas.set_show_segmentations(show)
         self._sync_segmentation_visibility_controls(show)
+        self.canvas.setFocus()
     
     def on_show_bboxes_changed(self, show):
         """Handle show bboxes checkbox change from toolbar"""
         self.canvas.set_show_bboxes(show)
         self._sync_bbox_visibility_controls(show)
+        self.canvas.setFocus()
     
     def on_menu_show_segmentations_changed(self, checked):
         """Handle show segmentations menu action change"""
         self.canvas.set_show_segmentations(checked)
         self._sync_segmentation_visibility_controls(checked)
+        self.canvas.setFocus()
+
+    def on_space_toggle_annotation_overlays(self):
+        """Toggle segmentation and bbox layers without changing class switches."""
+        self.canvas.toggle_annotation_overlays()
+        self._sync_segmentation_visibility_controls(self.canvas.show_segmentations)
+        self._sync_bbox_visibility_controls(self.canvas.show_bboxes)
+
+        visible_layers = []
+        if self.canvas.show_segmentations:
+            visible_layers.append("masks")
+        if self.canvas.show_bboxes:
+            visible_layers.append("boxes")
+
+        if visible_layers:
+            self.status_label.setText(f"Annotation overlays visible: {', '.join(visible_layers)}")
+        else:
+            self.status_label.setText("Annotation overlays hidden (press Spacebar to restore)")
+        self.canvas.setFocus()
+
+    def on_shift_space_toggle_selected_instance(self):
+        """Toggle the selected instance from a window-level shortcut."""
+        if not self.canvas.toggle_selected_instance_visibility():
+            self.status_label.setText("No selected instance to toggle")
+        self.canvas.setFocus()
 
     def _sync_segmentation_visibility_controls(self, visible):
         """Keep all segmentation visibility controls showing the same state."""
@@ -3532,6 +3702,7 @@ class MainWindow(QMainWindow):
         """Handle show bboxes menu action change"""
         self.canvas.set_show_bboxes(checked)
         self._sync_bbox_visibility_controls(checked)
+        self.canvas.setFocus()
 
     def _sync_bbox_visibility_controls(self, visible):
         """Keep all bounding-box visibility controls showing the same state."""
@@ -3562,6 +3733,7 @@ class MainWindow(QMainWindow):
         print(f"Annotation type '{annotation_type}' visibility set to: {visible}")
         # Update instance list to reflect visibility changes
         self.update_instance_list_from_canvas()
+        self.canvas.setFocus()
     
     def on_sam2_loaded(self, sam2_integrator):
         """Called when SAM2 model is loaded via the SAM2Toolbar"""
@@ -3897,6 +4069,10 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText("⚠ Segmentation masks hidden (press Spacebar to show)")
 
+    def on_bboxes_visibility_changed(self, visible):
+        """Handle bbox visibility changes from canvas shortcuts."""
+        self._sync_bbox_visibility_controls(visible)
+
     def on_instance_visibility_shortcut_changed(self, instance_id, category, visible):
         """Handle Shift+Space toggling the selected instance."""
         self.update_instance_list_from_canvas()
@@ -3914,6 +4090,7 @@ class MainWindow(QMainWindow):
     def on_annotation_changed(self):
         """Handle annotation changes - mark frame as modified"""
         self._mark_current_annotations_dirty()
+        self._schedule_done_counter_update()
     
     def on_show_labels_changed(self, state):
         """Handle show instance labels checkbox change"""
@@ -4052,6 +4229,7 @@ class MainWindow(QMainWindow):
             self.instance_list.blockSignals(False)
 
         self._instance_list_updating = False
+        self._schedule_done_counter_update()
 
     def _get_instance_to_aruco_map(self):
         """Build reverse map: instance ID -> ArUco ID for the current video."""
@@ -6067,24 +6245,14 @@ class MainWindow(QMainWindow):
         # Invalidate cached instance IDs so new instance appears in list
         self.canvas._cached_instance_ids = None
         
-        # Generate category-specific color for new instance
-        if new_instance_id not in self.canvas.mask_colors:
-            # Get color based on category
-            if current_category == 'chamber':
-                color = self.canvas.annotation_type_colors['chamber']  # Red
-            elif current_category == 'hive':
-                color = self.canvas.annotation_type_colors['hive']  # Yellow
-            else:  # bee
-                import numpy as np
-                color = tuple(np.random.randint(0, 255, 3).tolist())
-            self.canvas.mask_colors[new_instance_id] = color
+        # Generate category-specific color for new instance. Only bees get
+        # per-instance colors; chamber/hive/pollen use fixed category colors.
+        self.canvas.ensure_instance_color(new_instance_id, current_category)
 
         self.canvas.set_instance_visible(new_instance_id, current_category, True, rebuild=False)
 
-        if self.canvas.current_tool in ['brush', 'eraser']:
-            self.canvas.start_editing_instance(new_instance_id, category=current_category)
-        else:
-            self.canvas.rebuild_visualizations()
+        self.toolbar.set_tool('brush')
+        self.canvas.start_editing_instance(new_instance_id, category=current_category)
         
         # Update list to show new instance
         self.update_instance_list_from_canvas()
@@ -6097,14 +6265,7 @@ class MainWindow(QMainWindow):
                 self.instance_list.setCurrentRow(i)
                 break
         
-        # Update status based on current tool
-        current_tool = self.canvas.current_tool
-        if current_tool == 'bbox':
-            self.status_label.setText(f"Instance {new_instance_id} created - Click and drag to draw bounding box")
-        elif current_tool in ['brush', 'eraser']:
-            self.status_label.setText(f"Instance {new_instance_id} created - Use Brush to start drawing")
-        else:
-            self.status_label.setText(f"Instance {new_instance_id} created - Select a tool (Brush/BBox)")
+        self.status_label.setText(f"Instance {new_instance_id} created - Brush selected")
     
     def _register_canvas_colors(self):
         """Register current canvas mask colors for the current video"""
@@ -6115,12 +6276,17 @@ class MainWindow(QMainWindow):
         if self.current_video_id not in self.video_mask_colors:
             self.video_mask_colors[self.current_video_id] = {}
         
-        # Register colors from canvas (mask_colors is dict {instance_id: (r,g,b)})
+        # Register colors from canvas (mask_colors is dict {instance_id: (r,g,b)}).
+        # Fixed-color categories overwrite stale cached colors; bees keep their
+        # existing per-instance cached color when present.
         for mask_id, color in self.canvas.mask_colors.items():
-            if mask_id not in self.video_mask_colors[self.current_video_id]:
-                # Convert numpy array to tuple if needed
-                if isinstance(color, np.ndarray):
-                    color = tuple(int(c) for c in color)
+            category = self.canvas.annotation_metadata.get(mask_id, {}).get('category', 'bee')
+            color = self.canvas.ensure_instance_color(
+                mask_id,
+                category,
+                preferred_color=color
+            )
+            if category != 'bee' or mask_id not in self.video_mask_colors[self.current_video_id]:
                 self.video_mask_colors[self.current_video_id][mask_id] = color
 
     def propagate_to_next_selected(self):
@@ -6533,6 +6699,42 @@ class MainWindow(QMainWindow):
         """Handle training error - DISABLED (Detectron2 removed)"""
         # This method is no longer used
         pass
+
+    def _validate_coco_categories_for_model(self, coco_jsons, model_type):
+        """Return whether all COCO files define the selected training category."""
+        missing_files = []
+        for json_file in coco_jsons:
+            try:
+                with open(json_file, 'r') as f:
+                    coco_data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                missing_files.append(Path(json_file).name)
+                continue
+
+            category_names = {
+                category.get('name')
+                for category in coco_data.get('categories', [])
+                if category.get('name')
+            }
+            if model_type not in category_names:
+                missing_files.append(Path(json_file).name)
+
+        if not missing_files:
+            return True
+
+        shown_files = '\n'.join(missing_files[:5])
+        if len(missing_files) > 5:
+            shown_files += f"\n...and {len(missing_files) - 5} more"
+
+        QMessageBox.warning(
+            self,
+            "Stale COCO Annotations",
+            f"Some COCO files do not define the '{model_type}' category:\n\n"
+            f"{shown_files}\n\n"
+            "Restart the app if you have not since the latest code change, then "
+            "run training again with Export COCO Annotations checked."
+        )
+        return False
     
     def train_yolo_model(self):
         """Train YOLO coarse detection model"""
@@ -6567,8 +6769,8 @@ class MainWindow(QMainWindow):
         
         # Get current coarse YOLO model path
         current_model_path = None
-        if hasattr(self, 'yolo_toolbar') and hasattr(self.yolo_toolbar, 'checkpoint_path'):
-            current_model_path = self.yolo_toolbar.checkpoint_path
+        if hasattr(self, 'yolo_toolbar') and hasattr(self.yolo_toolbar, 'model_path'):
+            current_model_path = self.yolo_toolbar.model_path
         
         # Show configuration dialog
         config_dialog = TrainingConfigDialog(self, current_model_path)
@@ -6584,6 +6786,13 @@ class MainWindow(QMainWindow):
                 if not train_jsons or not val_jsons:
                     QMessageBox.warning(self, "Export Failed", "Failed to export annotations.")
                     return
+
+            model_type = config.get('model_type', 'bee')
+            if not self._validate_coco_categories_for_model(
+                train_jsons + val_jsons,
+                model_type
+            ):
+                return
             
             # Create progress dialog
             progress_dialog = TrainingProgressDialog(self)
@@ -6614,7 +6823,15 @@ class MainWindow(QMainWindow):
                         msg += f"  {key}: {value:.4f}\n"
                     msg += "\n"
                 
-                msg += "Would you like to load the new model into the coarse YOLO toolbar?"
+                model_type = config.get('model_type', 'bee')
+                target_labels = {
+                    'bee': 'coarse YOLO toolbar',
+                    'hive': 'Hive model slot',
+                    'chamber': 'Chamber model slot',
+                    'pollen': 'Pollen model slot',
+                }
+                target_label = target_labels.get(model_type, 'coarse YOLO toolbar')
+                msg += f"Would you like to load the new {model_type} model into the {target_label}?"
                 
                 reply = QMessageBox.question(
                     self,
@@ -6628,8 +6845,23 @@ class MainWindow(QMainWindow):
                     # Load the new model
                     from pathlib import Path
                     if Path(model_path).exists():
-                        self.yolo_toolbar._load_checkpoint_from_path(model_path, show_dialogs=False)
-                        self.status_label.setText(f"✓ Loaded trained model: {Path(model_path).name}")
+                        if model_type == 'hive':
+                            self.hive_chamber_toolbar._load_hive_checkpoint_from_path(model_path, show_dialogs=False)
+                            self.hive_chamber_toolbar.show()
+                            self.hive_chamber_toolbar_action.setChecked(True)
+                        elif model_type == 'chamber':
+                            self.hive_chamber_toolbar._load_chamber_checkpoint_from_path(model_path, show_dialogs=False)
+                            self.hive_chamber_toolbar.show()
+                            self.hive_chamber_toolbar_action.setChecked(True)
+                        elif model_type == 'pollen':
+                            self.hive_chamber_toolbar._load_pollen_checkpoint_from_path(model_path, show_dialogs=False)
+                            self.hive_chamber_toolbar.show()
+                            self.hive_chamber_toolbar_action.setChecked(True)
+                        else:
+                            self.yolo_toolbar._load_checkpoint_from_path(model_path, show_dialogs=False)
+                            self.yolo_toolbar.show()
+                            self.yolo_toolbar_action.setChecked(True)
+                        self.status_label.setText(f"✓ Loaded trained {model_type} model: {Path(model_path).name}")
                     else:
                         QMessageBox.warning(self, "Model Not Found", f"Model file not found: {model_path}")
             elif progress_dialog.training_failed:

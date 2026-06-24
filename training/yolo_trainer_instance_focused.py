@@ -210,9 +210,9 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
             
             # For each annotation, create an instance-focused crop
             for ann_idx, ann in enumerate(gt_anns):
-                # Skip chamber (category_id=3) and hive (category_id=2) annotations
+                # Only train the instance-focused bee model on bee annotations.
                 category_id = ann.get('category_id', 1)
-                if category_id in [2, 3]:  # hive=2, chamber=3
+                if category_id != 1:
                     continue
                 
                 bbox = ann['bbox']  # [x, y, width, height]
@@ -349,8 +349,7 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
                 # Save label (ONLY the primary instance)
                 label_path = output_label_dir / label_filename
                 with open(label_path, 'w') as f:
-                    # Only bee annotations (category_id=1) are included
-                    # YOLO uses 0-based indexing, so bee=0
+                    # YOLO uses 0-based indexing, so bee=0.
                     class_id = 0
                     yolo_label = [class_id] + yolo_polygon
                     f.write(' '.join(map(str, yolo_label)) + '\n')

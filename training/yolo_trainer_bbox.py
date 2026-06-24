@@ -168,9 +168,9 @@ class YOLOTrainingWorkerBBox(QThread):
                     with open(label_file, 'w') as f:
                         if image_id in annotations_by_image:
                             for ann in annotations_by_image[image_id]:
-                                # Skip chamber (category_id=3) and hive (category_id=2) annotations
+                                # Only train the bee bbox model on bee annotations.
                                 category_id = ann.get('category_id', 1)
-                                if category_id in [2, 3]:  # hive=2, chamber=3
+                                if category_id != 1:
                                     continue
                                 
                                 # Get bbox in COCO format [x, y, width, height]
@@ -186,8 +186,7 @@ class YOLOTrainingWorkerBBox(QThread):
                                 norm_width = w / img_width
                                 norm_height = h / img_height
                                 
-                                # Only bee annotations (category_id=1) are included
-                                # YOLO uses 0-based indexing, so bee=0
+                                # YOLO uses 0-based indexing, so bee=0.
                                 class_id = 0
                                 
                                 # Write YOLO annotation (class_id x_center y_center width height)

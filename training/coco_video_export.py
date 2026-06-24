@@ -26,7 +26,7 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
         project_path: Path to project directory
         video_ids: List of video IDs to export
         split_name: Name of split ('train' or 'val')
-        class_names: List of class names (default: ['bee'])
+        class_names: List of class names (default: bee, hive, chamber, pollen)
         image_width: Default image width
         image_height: Default image height
         progress_callback: Optional callback(current, total, video_name) for progress updates
@@ -35,8 +35,14 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
     Returns:
         List of paths to generated COCO JSON files (or None if cancelled)
     """
+    built_in_class_names = ['bee', 'hive', 'chamber', 'pollen']
     if class_names is None:
-        class_names = ['bee', 'hive', 'chamber', 'pollen']
+        class_names = list(built_in_class_names)
+    else:
+        class_names = list(class_names)
+        for class_name in built_in_class_names:
+            if class_name not in class_names:
+                class_names.append(class_name)
     
     project_path = Path(project_path)
     
@@ -56,6 +62,8 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
     # Create output directory for this split
     output_dir = project_path / 'annotations' / 'coco' / split_name
     output_dir.mkdir(parents=True, exist_ok=True)
+    for old_json in output_dir.glob('*.json'):
+        old_json.unlink()
     
     exported_files = []
     
@@ -130,7 +138,7 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                     print(f"Warning: Could not read frame {frame_path}: {e}")
                     continue
         
-        # Load video-level annotations (chamber and hive) that apply to all frames
+        # Load video-level annotations (chamber, hive, and pollen) that apply to all frames
         video_level_annotations = []
         video_annotations_json = video_json_dir / 'video_annotations.json'
         if video_annotations_json.exists():
@@ -148,7 +156,7 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                 
                 # Load per-category mask PNGs for video-level annotations
                 category_masks = {}
-                for category in ('chamber', 'hive'):
+                for category in ('chamber', 'hive', 'pollen'):
                     cat_png = video_png_dir / f'video_annotations_{category}.png'
                     if cat_png.exists():
                         category_masks[category] = cv2.imread(str(cat_png), cv2.IMREAD_UNCHANGED)
@@ -243,11 +251,11 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
             per_frame_annotations = mask_annotations + bbox_only_annotations
             
             # Skip frames with no per-frame annotations
-            # Video-level annotations (chamber/hive) are only added to frames that have bee annotations
+            # Video-level annotations are only added to frames that have per-frame annotations
             if not per_frame_annotations:
                 continue
             
-            # Add video-level annotations (chamber/hive) to frames that have bee annotations
+            # Add video-level annotations to frames that have per-frame annotations
             annotations = per_frame_annotations + video_level_annotations
             
             # Use the actual frame dimensions we determined earlier
@@ -491,7 +499,7 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
             'height': video_height
         })
         
-        # Load video-level annotations (chamber and hive) that apply to all frames
+        # Load video-level annotations (chamber, hive, and pollen) that apply to all frames
         video_level_annotations = []
         video_annotations_json = video_json_dir / 'video_annotations.json'
         if video_annotations_json.exists():
@@ -509,7 +517,7 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
                 
                 # Load per-category mask PNGs for video-level annotations
                 category_masks = {}
-                for category in ('chamber', 'hive'):
+                for category in ('chamber', 'hive', 'pollen'):
                     cat_png = video_png_dir / f'video_annotations_{category}.png'
                     if cat_png.exists():
                         category_masks[category] = cv2.imread(str(cat_png), cv2.IMREAD_UNCHANGED)
@@ -601,11 +609,12 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
             frame_height = video_height
             
             if not per_frame_annotations:
-                # Skip frames with no per-frame (bee) annotations
-                # Video-level annotations (chamber/hive) are only added to frames that have bee annotations
+                # Skip frames with no per-frame annotations. Video-level
+                # annotations are only added to frames that have per-frame
+                # annotations.
                 continue
             
-            # Add video-level annotations (chamber/hive) to frames that have bee annotations
+            # Add video-level annotations to frames that have per-frame annotations
             annotations = per_frame_annotations + video_level_annotations
             
             # Add image entry

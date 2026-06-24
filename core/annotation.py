@@ -172,12 +172,14 @@ def mask_to_polygon(mask):
 
 class AnnotationManager:
     """Manage annotations for a project with LRU cache"""
+
+    DEFAULT_CLASS_NAMES = ['bee', 'hive', 'chamber', 'pollen']
     
     def __init__(self, max_cache_size=20):
         self.project_info = {}
         self.frame_annotations = OrderedDict()  # LRU cache: frame_idx -> list of annotations
         self.max_cache_size = max_cache_size  # Maximum frames to keep in memory
-        self.class_names = ['bee', 'hive', 'chamber', 'pollen']  # Multi-category support
+        self.class_names = list(self.DEFAULT_CLASS_NAMES)  # Multi-category support
         self.unsaved_changes = False
         self.image_width = 0
         self.image_height = 0
@@ -206,7 +208,11 @@ class AnnotationManager:
             data = json.load(f)
             
         self.project_info = data.get('project_info', {})
-        self.class_names = data.get('classes', ['bee', 'hive', 'chamber', 'pollen'])
+        loaded_classes = data.get('classes', self.DEFAULT_CLASS_NAMES)
+        self.class_names = list(dict.fromkeys(
+            list(loaded_classes) +
+            [name for name in self.DEFAULT_CLASS_NAMES if name not in loaded_classes]
+        ))
         
         # Load frame annotations into LRU cache (only recent frames)
         self.frame_annotations = OrderedDict()
