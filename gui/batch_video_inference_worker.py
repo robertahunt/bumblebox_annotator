@@ -7,6 +7,7 @@ import gc
 import json
 import numpy as np
 import random
+import time
 import torch
 from pathlib import Path
 from datetime import datetime
@@ -27,6 +28,7 @@ class BatchVideoInferenceWorker(QThread):
     progress_updated = pyqtSignal(int, int)  # current, total
     log_message = pyqtSignal(str)
     inference_complete = pyqtSignal()
+    inference_stopped = pyqtSignal()
     inference_failed = pyqtSignal(str)
     
     def __init__(self, config: Dict):
@@ -48,6 +50,12 @@ class BatchVideoInferenceWorker(QThread):
         
         # Memory management: Track size of accumulated data
         self.accumulated_data_size_mb = 0
+        self.verbose_output = bool(self.config.get('verbose_output', False))
+
+    def _log_verbose(self, message: str):
+        """Emit detailed diagnostic output only when verbose mode is enabled."""
+        if self.verbose_output:
+            self.log_message.emit(message)
     
     def stop(self):
         """Request worker to stop"""
@@ -59,8 +67,10 @@ class BatchVideoInferenceWorker(QThread):
             self.log_message.emit("=== Batch Video Inference with Tracking ===")
             self.log_message.emit(f"Model type: {self.config.get('bee_model_type', 'bbox')}")
             self.log_message.emit(f"Distance method: {self.config.get('distance_method', 'contour')}")
+            self.log_message.emit(f"Spatial metrics: {'Enabled' if self.config.get('compute_spatial_metrics', True) else 'Disabled'}")
             self.log_message.emit(f"Tracking algorithm: {self.config['tracking_config']['algorithm']}")
             self.log_message.emit(f"ArUco detection: {'Enabled' if self.config['enable_aruco'] else 'Disabled'}")
+            self.log_message.emit(f"Verbose output: {'Enabled' if self.verbose_output else 'Disabled'}")
             self.log_message.emit(f"Output folder: {self.config['output_folder']}")
             self.log_message.emit("")
             
@@ -76,11 +86,12 @@ class BatchVideoInferenceWorker(QThread):
                 return
             
             self.log_message.emit(f"Found {len(video_files)} video(s) to process (randomized order)")
-            for i, vf in enumerate(video_files[:5], 1):  # Log first 5 videos
-                self.log_message.emit(f"  {i}. {vf.name}")
-            if len(video_files) > 5:
-                self.log_message.emit(f"  ... and {len(video_files) - 5} more")
-            self.log_message.emit(f"  CSV exports will occur after video 1 and every 10 videos thereafter")
+            if self.verbose_output:
+                for i, vf in enumerate(video_files[:5], 1):  # Log first 5 videos
+                    self.log_message.emit(f"  {i}. {vf.name}")
+                if len(video_files) > 5:
+                    self.log_message.emit(f"  ... and {len(video_files) - 5} more")
+                self.log_message.emit(f"  CSV exports will occur after video 1 and every 10 videos thereafter")
             self.log_message.emit("")
             
             # Load models
@@ -90,8 +101,12 @@ class BatchVideoInferenceWorker(QThread):
             bee_model = YOLO(self.config['bee_model_path'])
             self.log_message.emit(f"✓ Loaded bee model: {Path(self.config['bee_model_path']).name}")
             
-            hive_model = YOLO(self.config['hive_model_path'])
-            self.log_message.emit(f"✓ Loaded hive model: {Path(self.config['hive_model_path']).name}")
+            hive_model = None
+            if self.config.get('hive_model_path'):
+                hive_model = YOLO(self.config['hive_model_path'])
+                self.log_message.emit(f"✓ Loaded hive model: {Path(self.config['hive_model_path']).name}")
+            else:
+                self.log_message.emit("  (No hive model - hive distance metrics will be blank)")
             
             # Chamber model is optional
             chamber_model = None
@@ -104,7 +119,7 @@ class BatchVideoInferenceWorker(QThread):
             # Set models to eval mode to disable gradient tracking (memory optimization)
             if hasattr(bee_model, 'model') and hasattr(bee_model.model, 'eval'):
                 bee_model.model.eval()
-            if hasattr(hive_model, 'model') and hasattr(hive_model.model, 'eval'):
+            if hive_model and hasattr(hive_model, 'model') and hasattr(hive_model.model, 'eval'):
                 hive_model.model.eval()
             if chamber_model and hasattr(chamber_model, 'model') and hasattr(chamber_model.model, 'eval'):
                 chamber_model.model.eval()
@@ -137,6 +152,9 @@ class BatchVideoInferenceWorker(QThread):
                     tracker,
                     video_idx
                 )
+
+                if self.should_stop:
+                    break
                 
                 # Update progress after processing is complete
                 self.progress_updated.emit(video_idx, total_videos)
@@ -148,14 +166,14 @@ class BatchVideoInferenceWorker(QThread):
                     self._export_csvs(intermediate=True)
                     
                     # Aggressive GPU memory cleanup at checkpoint
-                    self.log_message.emit(f"  Running aggressive GPU memory cleanup at checkpoint...")
+                    self._log_verbose(f"  Running aggressive GPU memory cleanup at checkpoint...")
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                         torch.cuda.synchronize()  # Wait for all operations to complete
                         mem_allocated = torch.cuda.memory_allocated() / 1e9
                         mem_reserved = torch.cuda.memory_reserved() / 1e9
-                        self.log_message.emit(f"    GPU memory after checkpoint cleanup: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
+                        self._log_verbose(f"    GPU memory after checkpoint cleanup: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
                     
                     self.log_message.emit("")
                 
@@ -163,6 +181,12 @@ class BatchVideoInferenceWorker(QThread):
                     break
             
             if self.should_stop:
+                self.status_updated.emit("Exporting partial results...")
+                self.log_message.emit("\n⚠️ Processing stopped by user")
+                self.log_message.emit("=== Partial Export ===")
+                self._export_csvs(intermediate=False)
+                self.log_message.emit(f"Partial results saved to: {self.config['output_folder']}")
+                self.inference_stopped.emit()
                 return
             
             # Final export of all data to CSVs
@@ -176,8 +200,9 @@ class BatchVideoInferenceWorker(QThread):
             
         except Exception as e:
             import traceback
-            error_msg = f"Inference failed: {str(e)}\n{traceback.format_exc()}"
+            error_msg = f"Inference failed: {str(e)}"
             self.log_message.emit(f"\n❌ {error_msg}")
+            self._log_verbose(traceback.format_exc())
             self.inference_failed.emit(error_msg)
     
     def _discover_videos(self) -> List[Path]:
@@ -240,6 +265,41 @@ class BatchVideoInferenceWorker(QThread):
             raise ValueError(f"Unknown tracking algorithm: {algo}")
         
         return tracker
+
+    def _log_processor_timing(self, processor, wall_elapsed: float):
+        """Log a timing breakdown from the batch video processor."""
+        if not self.verbose_output:
+            return
+
+        timings = getattr(processor, 'timings', {})
+        timing_counts = getattr(processor, 'timing_counts', {})
+
+        if not timings:
+            self.log_message.emit("  Timing breakdown unavailable")
+            return
+
+        measured_total = sum(timings.values())
+        other_time = max(0.0, wall_elapsed - measured_total)
+        frame_count = max(1, getattr(processor, 'frame_count', 0))
+
+        self.log_message.emit(f"  Timing breakdown:")
+        self.log_message.emit(f"    - Wall-clock total: {wall_elapsed:.2f}s ({wall_elapsed / frame_count:.3f}s/frame)")
+        self.log_message.emit(f"    - Measured processing: {measured_total:.2f}s")
+
+        sorted_ops = sorted(timings.items(), key=lambda item: item[1], reverse=True)
+        for op_name, op_time in sorted_ops:
+            count = timing_counts.get(op_name, 0)
+            avg_ms = (op_time / count * 1000) if count else 0.0
+            pct = (op_time / wall_elapsed * 100) if wall_elapsed > 0 else 0.0
+            pretty_name = op_name.replace('_', ' ')
+            self.log_message.emit(f"    - {pretty_name}: {op_time:.2f}s ({pct:.1f}%), {avg_ms:.1f} ms/call")
+
+        if other_time > 0.01:
+            pct = (other_time / wall_elapsed * 100) if wall_elapsed > 0 else 0.0
+            self.log_message.emit(f"    - other/frame IO/finalization: {other_time:.2f}s ({pct:.1f}%)")
+
+        if torch.cuda.is_available():
+            self.log_message.emit("    Note: GPU timings can shift a little because CUDA work may be asynchronous.")
     
     def _process_video(self, video_path, bee_model, hive_model, chamber_model, tracker, video_idx):
         """Process a single video file"""
@@ -251,9 +311,9 @@ class BatchVideoInferenceWorker(QThread):
         
         # Log memory optimization setting
         if not visualization_enabled:
-            self.log_message.emit(f"  Memory optimization: Masks will NOT be stored (visualization disabled)")
+            self._log_verbose(f"  Memory optimization: Masks will NOT be stored (visualization disabled)")
         else:
-            self.log_message.emit(f"  Memory usage: Storing masks for visualization")
+            self._log_verbose(f"  Memory usage: Storing masks for visualization")
         
         # Create video processor
         processor = BatchVideoProcessor(
@@ -269,13 +329,37 @@ class BatchVideoInferenceWorker(QThread):
             output_folder=Path(self.config['output_folder']),
             distance_method=self.config.get('distance_method', 'contour'),
             bee_model_type=self.config.get('bee_model_type', 'bbox'),
-            store_masks=visualization_enabled  # Only store masks if visualization is enabled
+            compute_spatial_metrics=self.config.get('compute_spatial_metrics', True),
+            store_masks=visualization_enabled,  # Only store masks if visualization is enabled
+            log_callback=self.log_message.emit,
+            stop_callback=lambda: self.should_stop,
+            timing_log_interval=1,
+            cleanup_interval=25,
+            verbose_output=self.verbose_output
         )
         
         # Process video
+        process_start = time.perf_counter()
         success = processor.process()
+        process_elapsed = time.perf_counter() - process_start
         
         if not success:
+            if self.should_stop or getattr(processor, 'was_stopped', False):
+                self.log_message.emit(f"  ⚠️ Stopped while processing video: {video_path.name}")
+                # Keep the partial data collected before the stop.
+                self.all_bee_detections.extend(processor.get_bee_detections())
+                self.all_chamber_frame_data.extend(processor.get_chamber_frame_data())
+                for bee_id, trajectory in processor.get_bee_trajectories().items():
+                    self.all_bee_trajectories[(video_id, bee_id)] = trajectory
+                if visualization_enabled:
+                    self._generate_visualizations(video_path, video_id, processor, partial=True)
+                    self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
+                del processor
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return
+
             self.log_message.emit(f"  ❌ Failed to process video: {video_path}")
             self.log_message.emit(f"     Check that video file is valid and models are compatible")
             return
@@ -289,6 +373,7 @@ class BatchVideoInferenceWorker(QThread):
         self.log_message.emit(f"    - {num_detections} bee detections")
         self.log_message.emit(f"    - {num_trajectories} unique tracked bees")
         self.log_message.emit(f"    - {num_chamber_data} chamber frame records")
+        self._log_processor_timing(processor, process_elapsed)
         
         # Collect data BEFORE generating visualizations
         self.all_bee_detections.extend(processor.get_bee_detections())
@@ -306,44 +391,13 @@ class BatchVideoInferenceWorker(QThread):
             self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
         
         # Generate visualization if requested (BEFORE deleting processor)
-        if visualization_enabled:
-            self.log_message.emit(f"  Generating visualizations...")
-            
-            # Create visualizations subfolder
-            viz_base_folder = Path(self.config['output_folder']) / 'visualizations'
-            
-            try:
-                viz_gen = VisualizationGenerator(
-                    video_path=video_path,
-                    output_folder=viz_base_folder,
-                    video_id=video_id,
-                    bee_detections=processor.get_bee_detections(),
-                    chamber_frame_data=processor.get_chamber_frame_data(),
-                    chambers_by_frame=processor.get_chambers_by_frame(),
-                    hive_masks_by_frame=processor.get_hive_masks_by_frame(),
-                    bee_masks_by_frame=processor.get_bee_masks_by_frame()
-                )
-                
-                success = viz_gen.generate()
-                if success:
-                    num_frames = len(processor.get_bee_detections())
-                    self.log_message.emit(f"  ✓ Saved annotated frames to: visualizations/{video_id}/")
-                    self.log_message.emit(f"    Output folder: {viz_base_folder / video_id}")
-                else:
-                    self.log_message.emit(f"  ⚠️ Visualization generation returned False")
-                    
-                # Delete viz_gen to free memory
-                del viz_gen
-                    
-            except Exception as e:
-                self.log_message.emit(f"  ⚠️ Visualization error: {str(e)}")
-                import traceback
-                self.log_message.emit(traceback.format_exc())
-            
+        if visualization_enabled and not self.should_stop:
+            self._generate_visualizations(video_path, video_id, processor, partial=False)
             # Accumulate masks after visualization (so we still have averaged masks for CSV)
             self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
         else:
-            self.log_message.emit(f"  Skipping visualizations (checkbox not enabled)")
+            reason = "checkbox not enabled" if not visualization_enabled else "processing stopped"
+            self._log_verbose(f"  Skipping visualizations ({reason})")
         
         # Reset tracker state to prevent memory buildup across videos
         if hasattr(tracker, 'reset'):
@@ -351,18 +405,18 @@ class BatchVideoInferenceWorker(QThread):
         
         # Explicitly delete processor to free memory (especially mask storage)
         # CRITICAL: Must happen AFTER visualization generation
-        self.log_message.emit(f"  Freeing processor memory...")
+        self._log_verbose(f"  Freeing processor memory...")
         del processor
         
         # Clear GPU cache and run garbage collection to free memory
-        self.log_message.emit(f"  Cleaning up GPU memory...")
+        self._log_verbose(f"  Cleaning up GPU memory...")
         gc.collect()
         
         if torch.cuda.is_available():
             # Log GPU memory before cleanup
             mem_allocated = torch.cuda.memory_allocated() / 1e9  # GB
             mem_reserved = torch.cuda.memory_reserved() / 1e9  # GB
-            self.log_message.emit(f"    Before cleanup: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
+            self._log_verbose(f"    Before cleanup: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
             
             torch.cuda.empty_cache()
             
@@ -370,7 +424,44 @@ class BatchVideoInferenceWorker(QThread):
             mem_allocated_after = torch.cuda.memory_allocated() / 1e9  # GB
             mem_reserved_after = torch.cuda.memory_reserved() / 1e9  # GB
             freed = mem_reserved - mem_reserved_after
-            self.log_message.emit(f"    After cleanup: {mem_allocated_after:.2f} GB allocated, {mem_reserved_after:.2f} GB reserved (freed {freed:.2f} GB)")
+            self._log_verbose(f"    After cleanup: {mem_allocated_after:.2f} GB allocated, {mem_reserved_after:.2f} GB reserved (freed {freed:.2f} GB)")
+
+    def _generate_visualizations(self, video_path, video_id, processor, partial=False):
+        """Generate annotated frame visualizations for a completed or partial video."""
+        label = "partial visualizations" if partial else "visualizations"
+        self.log_message.emit(f"  Generating {label}...")
+
+        viz_base_folder = Path(self.config['output_folder']) / 'visualizations'
+
+        try:
+            viz_gen = VisualizationGenerator(
+                video_path=video_path,
+                output_folder=viz_base_folder,
+                video_id=video_id,
+                bee_detections=processor.get_bee_detections(),
+                chamber_frame_data=processor.get_chamber_frame_data(),
+                chambers_by_frame=processor.get_chambers_by_frame(),
+                hive_masks_by_frame=processor.get_hive_masks_by_frame(),
+                bee_masks_by_frame=processor.get_bee_masks_by_frame(),
+                max_frame=processor.frame_count if partial else None,
+                log_callback=self.log_message.emit,
+                verbose_output=self.verbose_output
+            )
+
+            success = viz_gen.generate()
+            output_folder = viz_base_folder / video_id
+            if success:
+                self.log_message.emit(f"  ✓ Saved annotated frames to: visualizations/{video_id}/")
+                self.log_message.emit(f"    Output folder: {output_folder}")
+            else:
+                self.log_message.emit(f"  ⚠️ Visualization generation returned False")
+
+            del viz_gen
+
+        except Exception as e:
+            self.log_message.emit(f"  ⚠️ Visualization error: {str(e)}")
+            import traceback
+            self._log_verbose(traceback.format_exc())
     
     def _accumulate_masks(self, video_id: str, hive_masks_by_frame: Dict, chambers_by_frame: Dict):
         """
@@ -444,7 +535,7 @@ class BatchVideoInferenceWorker(QThread):
         
         # Log memory usage if it's getting large
         if self.accumulated_data_size_mb > 100:  # Over 100 MB
-            self.log_message.emit(f"  ⚠️  Accumulated mask data: ~{self.accumulated_data_size_mb:.1f} MB in memory")
+            self._log_verbose(f"  ⚠️  Accumulated mask data: ~{self.accumulated_data_size_mb:.1f} MB in memory")
     
     def _export_csvs(self, intermediate: bool = False):
         """Export all CSV files
@@ -474,7 +565,8 @@ class BatchVideoInferenceWorker(QThread):
                 self.all_bee_trajectories,
                 self.all_chamber_frame_data,
                 self.accumulated_hive_masks,
-                self.accumulated_chamber_masks
+                self.accumulated_chamber_masks,
+                export_hive_detections=self.config.get('hive_model_path') is not None
             )
             
             # Log results
@@ -485,7 +577,7 @@ class BatchVideoInferenceWorker(QThread):
         except Exception as e:
             self.log_message.emit(f"  ❌ CSV export failed: {str(e)}")
             import traceback
-            self.log_message.emit(traceback.format_exc())
+            self._log_verbose(traceback.format_exc())
         
         # Summary statistics
         if not intermediate:

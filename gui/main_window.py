@@ -34,6 +34,7 @@ from .batch_inference_dialog import BatchInferenceConfigDialog, BatchInferencePr
 from .batch_inference_worker import BatchInferenceWorker
 from .batch_video_inference_dialog import BatchVideoInferenceConfigDialog, BatchVideoInferenceProgressDialog
 from .batch_video_inference_worker import BatchVideoInferenceWorker
+from .tracking_visualization_dialog import TrackingVisualizationConfigDialog, TrackingVisualizationWorker
 from .tracking_sequences_panel import TrackingSequencesPanel
 from .tracking_validation_dialog import TrackingValidationConfigDialog, TrackingValidationProgressDialog
 from .tracking_validation_worker import TrackingValidationWorker
@@ -144,6 +145,7 @@ class MainWindow(QMainWindow):
         self.frame_selected = []  # Track if frame is selected for train/val
         self.frame_list_to_frames_map = []  # Map list row to actual frame index
         self.project_path = None
+        self.recent_projects = []
         self.split_filter = 'all'  # 'all', 'train', 'val', 'test', or 'inference'
         self.video_next_mask_id = {}  # Track next_mask_id per video for unique IDs
         self.video_mask_colors = {}  # Track mask colors per video: {video_id: {mask_id: (r,g,b)}}
@@ -359,6 +361,9 @@ class MainWindow(QMainWindow):
         open_project_action.setShortcut(QKeySequence.StandardKey.Open)
         open_project_action.triggered.connect(self.open_project)
         file_menu.addAction(open_project_action)
+
+        self.recent_projects_menu = file_menu.addMenu("Recent Projects")
+        self.update_recent_projects_menu()
         
         file_menu.addSeparator()
         
@@ -438,7 +443,7 @@ class MainWindow(QMainWindow):
         train_yolo_bbox_action.triggered.connect(self.train_yolo_bbox_model)
         model_menu.addAction(train_yolo_bbox_action)
         
-        predict_action = QAction("Run &Inference", self)
+        predict_action = QAction("Create Tracking &Visualization Video...", self)
         predict_action.setShortcut("Ctrl+R")
         predict_action.triggered.connect(self.run_inference)
         model_menu.addAction(predict_action)
@@ -2059,6 +2064,7 @@ class MainWindow(QMainWindow):
                 f"Project created: {self.project_path.name} "
                 f"(ready to add videos)"
             )
+            self.add_recent_project(self.project_path)
             
     def open_project(self):
         """Open an existing project"""
@@ -2068,6 +2074,86 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.load_project(path)
+
+    def update_recent_projects_menu(self):
+        """Refresh the File > Recent Projects submenu."""
+        if not hasattr(self, 'recent_projects_menu'):
+            return
+
+        self.recent_projects_menu.clear()
+
+        existing_projects = []
+        for project in self.recent_projects:
+            project_path = Path(project)
+            if project_path.exists():
+                existing_projects.append(str(project_path))
+
+        if existing_projects != self.recent_projects:
+            self.recent_projects = existing_projects
+            self._save_recent_projects()
+
+        if not self.recent_projects:
+            empty_action = QAction("No Recent Projects", self)
+            empty_action.setEnabled(False)
+            self.recent_projects_menu.addAction(empty_action)
+            return
+
+        for project in self.recent_projects:
+            project_path = Path(project)
+            action = QAction(project_path.name, self)
+            action.setToolTip(str(project_path))
+            action.triggered.connect(
+                lambda checked=False, path=str(project_path): self.open_recent_project(path)
+            )
+            self.recent_projects_menu.addAction(action)
+
+        self.recent_projects_menu.addSeparator()
+
+        clear_action = QAction("Clear Recent Projects", self)
+        clear_action.triggered.connect(self.clear_recent_projects)
+        self.recent_projects_menu.addAction(clear_action)
+
+    def add_recent_project(self, path):
+        """Add a project path to the recent projects list."""
+        project_path = str(Path(path))
+        self.recent_projects = [
+            recent for recent in self.recent_projects
+            if str(Path(recent)) != project_path
+        ]
+        self.recent_projects.insert(0, project_path)
+        self.recent_projects = self.recent_projects[:10]
+        self._save_recent_projects()
+        self.update_recent_projects_menu()
+
+    def open_recent_project(self, path):
+        """Open a project from the recent projects menu."""
+        project_path = Path(path)
+        if not project_path.exists():
+            QMessageBox.warning(
+                self,
+                "Project Not Found",
+                f"Recent project no longer exists:\n{project_path}"
+            )
+            self.recent_projects = [
+                recent for recent in self.recent_projects
+                if str(Path(recent)) != str(project_path)
+            ]
+            self._save_recent_projects()
+            self.update_recent_projects_menu()
+            return
+
+        self.load_project(project_path)
+
+    def clear_recent_projects(self):
+        """Clear the recent projects menu."""
+        self.recent_projects = []
+        self._save_recent_projects()
+        self.update_recent_projects_menu()
+
+    def _save_recent_projects(self):
+        """Persist recent projects to application settings."""
+        settings = QSettings()
+        settings.setValue('recent_projects', self.recent_projects)
             
     def load_project(self, path):
         """Load a project from path"""
@@ -2107,6 +2193,7 @@ class MainWindow(QMainWindow):
                 f"Project loaded: {self.project_path.name} "
                 f"({len(self.frames)} frames, {num_annotated_frames} annotated)"
             )
+            self.add_recent_project(self.project_path)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load project: {str(e)}")
             import traceback
@@ -6008,9 +6095,38 @@ class MainWindow(QMainWindow):
                 )
             # else: training was stopped/cancelled, no action needed
     def run_inference(self):
-        """Run inference on current/all frames"""
-        # TODO: Implement inference
-        QMessageBox.information(self, "Inference", "Inference feature coming soon!")
+        """Create a tracked single-video MP4 visualization."""
+        config_dialog = TrackingVisualizationConfigDialog(self)
+        if not config_dialog.exec():
+            return
+
+        progress_dialog = BatchVideoInferenceProgressDialog(self)
+        progress_dialog.setWindowTitle("Tracking Visualization Video")
+        progress_dialog.current_video_label.setText("Single video")
+
+        worker = TrackingVisualizationWorker(config_dialog.config)
+
+        worker.status_updated.connect(progress_dialog.update_status)
+        worker.progress_updated.connect(progress_dialog.update_progress)
+        worker.log_message.connect(progress_dialog.append_log)
+        worker.visualization_complete.connect(
+            lambda output_path: self._on_tracking_visualization_complete(progress_dialog, output_path)
+        )
+        worker.visualization_stopped.connect(progress_dialog.processing_stopped)
+        worker.visualization_failed.connect(progress_dialog.processing_failed)
+        progress_dialog.stop_btn.clicked.connect(worker.stop)
+
+        worker.start()
+        progress_dialog.exec()
+
+        if worker.isRunning():
+            worker.stop()
+            worker.wait(5000)
+
+    def _on_tracking_visualization_complete(self, progress_dialog, output_path: str):
+        """Handle completion of single-video tracking visualization."""
+        progress_dialog.processing_complete()
+        self.status_label.setText(f"✓ Tracking visualization saved: {output_path}")
         
     def save_annotations(self):
         """Save current annotations and regenerate COCO datasets"""
@@ -6365,6 +6481,7 @@ class MainWindow(QMainWindow):
             worker.progress_updated.connect(progress_dialog.update_progress)
             worker.log_message.connect(progress_dialog.append_log)
             worker.inference_complete.connect(progress_dialog.processing_complete)
+            worker.inference_stopped.connect(progress_dialog.processing_stopped)
             worker.inference_failed.connect(progress_dialog.processing_failed)
             
             # Connect stop button
@@ -7383,6 +7500,14 @@ class MainWindow(QMainWindow):
         self.last_video_id = settings.value('last_video_id')
         self.last_frame_index = settings.value('last_frame_index', 0, type=int)
         self.last_frame_index_in_video = settings.value('last_frame_index_in_video', 0, type=int)
+
+        recent_projects = settings.value('recent_projects', [])
+        if recent_projects is None:
+            recent_projects = []
+        if isinstance(recent_projects, str):
+            recent_projects = [recent_projects]
+        self.recent_projects = [str(Path(path)) for path in recent_projects if path]
+        self.update_recent_projects_menu()
     
     def _save_project_state(self):
         """Save current project path, video ID, and frame index for restoration"""
@@ -8287,7 +8412,7 @@ class MainWindow(QMainWindow):
                 f"Error tracking from last frame:\n{str(e)}\n\n{error_msg}"
             )
             self.status_label.setText("Tracking failed")
-    
+
     def propagate_yolo_bbox(self):
         """Propagate YOLO bbox detections through video frames using Ultralytics ByteTrack"""
         # Check if model is loaded

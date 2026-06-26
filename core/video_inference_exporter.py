@@ -21,6 +21,20 @@ class VideoInferenceExporter:
         """
         self.output_folder = Path(output_folder)
         self.output_folder.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _format_optional_float(value, decimals: int = 2) -> str:
+        """Format a numeric value for CSV, leaving missing values blank."""
+        if value is None:
+            return ""
+        return f"{value:.{decimals}f}"
+
+    @staticmethod
+    def _format_optional_int(value) -> str:
+        """Format an integer value for CSV, leaving missing values blank."""
+        if value is None:
+            return ""
+        return str(value)
     
     def export_bee_detections(self, bee_detections: List[BeeDetectionData]):
         """
@@ -28,9 +42,9 @@ class VideoInferenceExporter:
         
         Columns: video_id, chamber_id, frame_number, bee_id, aruco_code, bbox_x, bbox_y, 
                  bbox_width, bbox_height, confidence, centroid_x, centroid_y, 
-                 distance_to_hive_pixels, num_bees_in_chamber, avg_distance_to_other_bees_pixels,
-                 distance_to_nearest_bee_pixels, avg_distance_to_nearest_2_bees_pixels,
-                 avg_distance_to_nearest_3_bees_pixels
+                 pred_polygon, distance_to_hive_pixels, num_bees_in_chamber,
+                 avg_distance_to_other_bees_pixels, distance_to_nearest_bee_pixels,
+                 avg_distance_to_nearest_2_bees_pixels, avg_distance_to_nearest_3_bees_pixels
         """
         csv_path = self.output_folder / 'bee_detections.csv'
         
@@ -38,7 +52,7 @@ class VideoInferenceExporter:
             fieldnames = [
                 'video_id', 'chamber_id', 'frame_number', 'bee_id', 'aruco_code',
                 'bbox_x', 'bbox_y', 'bbox_width', 'bbox_height', 'confidence',
-                'centroid_x', 'centroid_y', 'distance_to_hive_pixels',
+                'centroid_x', 'centroid_y', 'pred_polygon', 'distance_to_hive_pixels',
                 'num_bees_in_chamber', 'avg_distance_to_other_bees_pixels',
                 'distance_to_nearest_bee_pixels', 'avg_distance_to_nearest_2_bees_pixels',
                 'avg_distance_to_nearest_3_bees_pixels'
@@ -61,12 +75,13 @@ class VideoInferenceExporter:
                     'confidence': f"{detection.confidence:.4f}",
                     'centroid_x': f"{detection.centroid_x:.2f}",
                     'centroid_y': f"{detection.centroid_y:.2f}",
-                    'distance_to_hive_pixels': f"{detection.distance_to_hive_pixels:.2f}",
-                    'num_bees_in_chamber': detection.num_bees_in_chamber,
-                    'avg_distance_to_other_bees_pixels': f"{detection.avg_distance_to_other_bees_pixels:.2f}",
-                    'distance_to_nearest_bee_pixels': f"{detection.distance_to_nearest_bee_pixels:.2f}",
-                    'avg_distance_to_nearest_2_bees_pixels': f"{detection.avg_distance_to_nearest_2_bees_pixels:.2f}",
-                    'avg_distance_to_nearest_3_bees_pixels': f"{detection.avg_distance_to_nearest_3_bees_pixels:.2f}"
+                    'pred_polygon': detection.pred_polygon,
+                    'distance_to_hive_pixels': self._format_optional_float(detection.distance_to_hive_pixels),
+                    'num_bees_in_chamber': self._format_optional_int(detection.num_bees_in_chamber),
+                    'avg_distance_to_other_bees_pixels': self._format_optional_float(detection.avg_distance_to_other_bees_pixels),
+                    'distance_to_nearest_bee_pixels': self._format_optional_float(detection.distance_to_nearest_bee_pixels),
+                    'avg_distance_to_nearest_2_bees_pixels': self._format_optional_float(detection.avg_distance_to_nearest_2_bees_pixels),
+                    'avg_distance_to_nearest_3_bees_pixels': self._format_optional_float(detection.avg_distance_to_nearest_3_bees_pixels)
                 })
         
         return csv_path
@@ -269,7 +284,8 @@ class VideoInferenceExporter:
                    bee_trajectories: Dict[int, BeeTrajectory],
                    chamber_frame_data: List[ChamberFrameData],
                    accumulated_hive_masks: Dict,
-                   accumulated_chamber_masks: Dict) -> Dict[str, Path]:
+                   accumulated_chamber_masks: Dict,
+                   export_hive_detections: bool = True) -> Dict[str, Path]:
         """
         Export all CSV files
         
@@ -284,8 +300,12 @@ class VideoInferenceExporter:
         # Export bee velocity
         results['bee_velocity'] = self.export_bee_velocity(bee_trajectories)
         
-        # Export hive detections (averaged masks)
-        results['hive_detections'] = self.export_hive_detections(accumulated_hive_masks)
+        # Export hive detections (averaged masks) only when a hive model was provided
+        if export_hive_detections:
+            results['hive_detections'] = self.export_hive_detections(accumulated_hive_masks)
+        else:
+            stale_hive_csv = self.output_folder / 'hive_detections.csv'
+            stale_hive_csv.unlink(missing_ok=True)
         
         # Export chamber detections (averaged masks)
         results['chamber_detections'] = self.export_chamber_detections(accumulated_chamber_masks)

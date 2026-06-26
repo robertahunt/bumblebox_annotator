@@ -1,6 +1,4 @@
-"""
-Background worker for BeeHaveSquE pipeline validation
-"""
+"""Background worker for pipeline validation."""
 
 from PyQt6.QtCore import QThread, pyqtSignal
 import numpy as np
@@ -11,12 +9,12 @@ import cv2
 from typing import Dict, List, Tuple, Optional
 from scipy.optimize import linear_sum_assignment
 
-from core.inference_utils import create_temporal_image, run_beehavesque_soho
+from core.inference_utils import create_temporal_image
 from core.instance_tracker import InstanceTracker
 
 
 class ValidationWorker(QThread):
-    """Worker thread for running BeeHaveSquE pipeline validation"""
+    """Worker thread for running pipeline validation."""
     
     # Signals
     video_started = pyqtSignal(str, int, int, int)  # video_id, num_frames, video_num, total_videos
@@ -57,10 +55,8 @@ class ValidationWorker(QThread):
             for i, vid in enumerate(self.validation_videos, 1):
                 print(f"  {i}. {vid}")
             
-            print(f"\nSOHO Inference Parameters:")
-            print(f"  Slice size: {self.config.get('slice_size', 640)}x{self.config.get('slice_size', 640)} px")
-            print(f"  Overlap ratio: {self.config.get('overlap_ratio', 0.5):.2f} ({int(self.config.get('overlap_ratio', 0.5)*100)}%)")
-            print(f"  Edge filter: {self.config.get('edge_filter', 50)} px")
+            print(f"\nInference Parameters:")
+            print(f"  Temporal image: enabled (prev/current/next)")
             print(f"\nValidation Parameters:")
             print(f"  IoU threshold: {self.config.get('iou_threshold', 0.5):.2f}")
             print(f"  Confidence threshold: {self.config.get('conf_threshold', 0.5):.2f}")
@@ -140,7 +136,7 @@ class ValidationWorker(QThread):
             # Save summary text
             summary_file = results_folder / "summary.txt"
             with open(summary_file, 'w') as f:
-                f.write("BeeHaveSquE Pipeline Validation Results\n")
+                f.write("Pipeline Validation Results\n")
                 f.write("=" * 50 + "\n\n")
                 f.write(f"Timestamp: {timestamp}\n")
                 f.write(f"Videos validated: {len(all_video_metrics)}\n\n")
@@ -193,7 +189,7 @@ class ValidationWorker(QThread):
         # === STEP 1: Run inference on first frame and establish ID mapping ===
         first_frame_idx = val_frames[0]
         
-        # Run BeeHaveSquE SOHO on first frame (raw detections without IDs)
+        # Run inference on first frame (raw detections without IDs)
         raw_predictions_first = self._run_inference_on_frame(first_frame_idx)
         
         if not raw_predictions_first:
@@ -342,7 +338,7 @@ class ValidationWorker(QThread):
         return sorted(val_frames)
     
     def _run_inference_on_frame(self, frame_idx: int) -> List:
-        """Run BeeHaveSquE SOHO inference on a frame (frame_idx is video-local) - returns list of Detection objects"""
+        """Run model inference on a frame (frame_idx is video-local) and return Detection objects"""
         try:
             # Get frame path from current video frames
             frame_path = self.current_video_frames[frame_idx]
@@ -360,23 +356,22 @@ class ValidationWorker(QThread):
             # Get model from toolbar
             model = self.main_window.yolo_beehavesque_toolbar.get_model()
             
-            # Build SAHI params from config
-            sahi_params = {
-                'slice_height': self.config.get('slice_size', 640),
-                'slice_width': self.config.get('slice_size', 640),
-                'overlap_height_ratio': self.config.get('overlap_ratio', 0.5),
-                'overlap_width_ratio': self.config.get('overlap_ratio', 0.5),
-            }
-            
-            # Run SOHO inference with config parameters
-            # Use CPU for validation to avoid "Invalid device id" errors in background QThread
-            detections = run_beehavesque_soho(
-                model,
-                temporal_img,
-                sahi_params,
-                edge_filter=self.config.get('edge_filter', 50),
-                device='cpu'  # Force CPU in background worker to avoid CUDA threading issues
+            # Run direct inference on temporal image.
+            # Use CPU for validation to avoid CUDA device/thread issues in background QThread.
+            results = model.predict(
+                source=temporal_img,
+                conf=self.config.get('conf_threshold', 0.5),
+                iou=0.5,
+                retina_masks=True,
+                verbose=False,
+                device='cpu'
             )
+
+            if not results or len(results) == 0:
+                return []
+
+            result = results[0]
+            detections = self.main_window._yolo_results_to_detections(result, model)
             
             return detections
             

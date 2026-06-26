@@ -5,7 +5,8 @@ Frame-level validation dialog for analyzing predictions vs ground truth
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QGroupBox, QFormLayout, 
                              QDoubleSpinBox, QLineEdit, QFileDialog,
-                             QProgressBar, QTextEdit, QCheckBox)
+                             QProgressBar, QTextEdit, QCheckBox,
+                             QRadioButton, QButtonGroup, QComboBox)
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QFont
 from pathlib import Path
@@ -34,7 +35,7 @@ class FrameLevelValidationConfigDialog(QDialog):
             "This will:\n"
             "• Run inference on all validation frames with bee annotations\n"
             "• Match predictions to ground truth bounding boxes\n"
-            "• Optionally analyze hive and chamber predictions\n"
+            "• Optionally analyze hive, chamber, and pollen predictions\n"
             "• Generate detailed CSV reports\n"
         )
         desc_label.setWordWrap(True)
@@ -42,12 +43,41 @@ class FrameLevelValidationConfigDialog(QDialog):
         
         # Model selection group
         model_group = QGroupBox("Required Models")
-        model_layout = QFormLayout()
+        model_layout = QVBoxLayout()
         
-        # Bee BBox model (required)
+        # Model type selection
+        type_label = QLabel("Bee Detection Type:")
+        type_label.setStyleSheet("font-weight: bold;")
+        model_layout.addWidget(type_label)
+        
+        type_radio_layout = QHBoxLayout()
+        self.bbox_radio = QRadioButton("Bounding Box")
+        self.seg_radio = QRadioButton("Segmentation")
+        self.bbox_radio.setChecked(True)
+        self.bbox_radio.setToolTip("Use bounding box detection model")
+        self.seg_radio.setToolTip("Use segmentation model (includes masks, centroids, polygons)")
+        
+        self.model_type_group = QButtonGroup()
+        self.model_type_group.addButton(self.bbox_radio)
+        self.model_type_group.addButton(self.seg_radio)
+        
+        type_radio_layout.addWidget(self.bbox_radio)
+        type_radio_layout.addWidget(self.seg_radio)
+        type_radio_layout.addStretch()
+        model_layout.addLayout(type_radio_layout)
+        
+        # Connect radio buttons to update UI
+        self.bbox_radio.toggled.connect(self.update_distance_method_visibility)
+        self.seg_radio.toggled.connect(self.update_distance_method_visibility)
+        
+        # Bee model path
+        bee_model_label = QLabel("Bee Detection Model File:")
+        bee_model_label.setStyleSheet("font-weight: bold; margin-top: 5px;")
+        model_layout.addWidget(bee_model_label)
+        
         bbox_layout = QHBoxLayout()
         self.bbox_model_edit = QLineEdit()
-        self.bbox_model_edit.setPlaceholderText("Select YOLO bounding box detection model...")
+        self.bbox_model_edit.setPlaceholderText("Select YOLO model file...")
         self.bbox_model_edit.setReadOnly(True)
         bbox_layout.addWidget(self.bbox_model_edit)
         
@@ -55,7 +85,7 @@ class FrameLevelValidationConfigDialog(QDialog):
         self.bbox_browse_btn.clicked.connect(self.browse_bbox_model)
         bbox_layout.addWidget(self.bbox_browse_btn)
         
-        model_layout.addRow("Bee BBox Model:", bbox_layout)
+        model_layout.addLayout(bbox_layout)
         
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
@@ -80,6 +110,23 @@ class FrameLevelValidationConfigDialog(QDialog):
         hive_layout.addWidget(self.hive_clear_btn)
         
         optional_layout.addRow("Hive Model:", hive_layout)
+
+        # Pollen model (optional)
+        pollen_layout = QHBoxLayout()
+        self.pollen_model_edit = QLineEdit()
+        self.pollen_model_edit.setPlaceholderText("Optional: Select YOLO pollen segmentation model...")
+        self.pollen_model_edit.setReadOnly(True)
+        pollen_layout.addWidget(self.pollen_model_edit)
+
+        self.pollen_browse_btn = QPushButton("Browse...")
+        self.pollen_browse_btn.clicked.connect(self.browse_pollen_model)
+        pollen_layout.addWidget(self.pollen_browse_btn)
+
+        self.pollen_clear_btn = QPushButton("Clear")
+        self.pollen_clear_btn.clicked.connect(lambda: self.pollen_model_edit.clear())
+        pollen_layout.addWidget(self.pollen_clear_btn)
+
+        optional_layout.addRow("Pollen Model:", pollen_layout)
         
         # Chamber model (optional)
         chamber_layout = QHBoxLayout()
@@ -123,6 +170,29 @@ class FrameLevelValidationConfigDialog(QDialog):
         self.iou_threshold_spin.setToolTip("IoU threshold for matching predictions to ground truth")
         params_layout.addRow("Matching IoU Threshold:", self.iou_threshold_spin)
         
+        # Distance calculation method (for segmentation models only)
+        self.distance_method_label = QLabel("Distance Method:")
+        self.distance_method_combo = QComboBox()
+        self.distance_method_combo.addItems([
+            "contour (Fast & accurate)",
+            "bbox_filter (Fastest, recommended)",
+            "downsample (Very fast, approximate)",
+            "full (Slowest, exact)"
+        ])
+        self.distance_method_combo.setCurrentIndex(0)
+        self.distance_method_combo.setToolTip(
+            "Method for calculating distances between segmentation masks:\n"
+            "• contour: Edge pixels only (fast & accurate)\n"
+            "• bbox_filter: Smart filtering + contours (best balance)\n"
+            "• downsample: Reduced resolution (very fast)\n"
+            "• full: All pixels (slow but exact)"
+        )
+        params_layout.addRow(self.distance_method_label, self.distance_method_combo)
+        
+        # Initially hide distance method (bbox is default)
+        self.distance_method_label.hide()
+        self.distance_method_combo.hide()
+        
         params_group.setLayout(params_layout)
         layout.addWidget(params_group)
         
@@ -137,7 +207,7 @@ class FrameLevelValidationConfigDialog(QDialog):
         
         self.save_visualizations_check = QCheckBox("Save visualization images for all frames")
         self.save_visualizations_check.setChecked(True)
-        self.save_visualizations_check.setToolTip("Save images with color-coded bounding boxes (Green=Matched, Red=False Negative, Pink=False Positive) and hive/chamber outlines (Yellow=Hive, Blue=Chambers)")
+        self.save_visualizations_check.setToolTip("Save images with color-coded bounding boxes (Green=Matched, Red=False Negative, Pink=False Positive), hive/chamber/pollen outlines, and distance links")
         output_layout.addWidget(self.save_visualizations_check)
         
         output_group.setLayout(output_layout)
@@ -189,6 +259,18 @@ class FrameLevelValidationConfigDialog(QDialog):
         
         if file_path:
             self.hive_model_edit.setText(file_path)
+
+    def browse_pollen_model(self):
+        """Browse for YOLO pollen segmentation model"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select YOLO Pollen Segmentation Model",
+            str(Path.home()),
+            "PyTorch Model Files (*.pt);;All Files (*)"
+        )
+
+        if file_path:
+            self.pollen_model_edit.setText(file_path)
     
     def browse_chamber_model(self):
         """Browse for YOLO chamber segmentation model"""
@@ -202,27 +284,34 @@ class FrameLevelValidationConfigDialog(QDialog):
         if file_path:
             self.chamber_model_edit.setText(file_path)
     
+    def update_distance_method_visibility(self):
+        """Show/hide distance method controls based on model type selection"""
+        is_segmentation = self.seg_radio.isChecked()
+        self.distance_method_label.setVisible(is_segmentation)
+        self.distance_method_combo.setVisible(is_segmentation)
+    
     def validate_and_accept(self):
         """Validate inputs before accepting"""
         # Check that bbox model is provided
         if not self.bbox_model_edit.text():
             from PyQt6.QtWidgets import QMessageBox
+            model_type = "segmentation" if self.seg_radio.isChecked() else "bounding box"
             QMessageBox.warning(
                 self,
                 "Missing Required Model",
-                "Please select a YOLO bounding box detection model.\n\n"
+                f"Please select a YOLO {model_type} detection model.\n\n"
                 "This is required for analyzing bee predictions."
             )
             return
         
-        # Check that bbox model file exists
-        bbox_path = Path(self.bbox_model_edit.text())
-        if not bbox_path.exists():
+        # Check that model file exists
+        model_path = Path(self.bbox_model_edit.text())
+        if not model_path.exists():
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self,
                 "Model Not Found",
-                f"BBox model file not found:\n{bbox_path}"
+                f"Model file not found:\n{model_path}"
             )
             return
         
@@ -236,7 +325,17 @@ class FrameLevelValidationConfigDialog(QDialog):
                 f"Hive model file not found:\n{hive_path}"
             )
             return
-        
+
+        pollen_path = self.pollen_model_edit.text()
+        if pollen_path and not Path(pollen_path).exists():
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Model Not Found",
+                f"Pollen model file not found:\n{pollen_path}"
+            )
+            return
+
         chamber_path = self.chamber_model_edit.text()
         if chamber_path and not Path(chamber_path).exists():
             from PyQt6.QtWidgets import QMessageBox
@@ -252,12 +351,19 @@ class FrameLevelValidationConfigDialog(QDialog):
     
     def get_config(self):
         """Get validation configuration"""
+        # Extract distance method from combo box (format: "method_name (description)")
+        distance_method_text = self.distance_method_combo.currentText()
+        distance_method = distance_method_text.split(' ')[0]
+        
         return {
             'bbox_model_path': self.bbox_model_edit.text(),
+            'bee_model_type': 'segmentation' if self.seg_radio.isChecked() else 'bbox',
             'hive_model_path': self.hive_model_edit.text() or None,
+            'pollen_model_path': self.pollen_model_edit.text() or None,
             'chamber_model_path': self.chamber_model_edit.text() or None,
             'conf_threshold': self.conf_threshold_spin.value(),
             'iou_threshold': self.iou_threshold_spin.value(),
+            'distance_method': distance_method,
             'save_visualizations': self.save_visualizations_check.isChecked(),
             'debug_mode': self.debug_mode_check.isChecked()
         }

@@ -1,10 +1,8 @@
-"""
-Validation configuration and progress dialog for BeeHaveSquE pipeline validation
-"""
+"""Validation configuration and progress dialogs."""
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QProgressBar, QTextEdit, QGroupBox,
-                             QFormLayout, QDoubleSpinBox, QCheckBox, QSpinBox)
+                             QFormLayout, QDoubleSpinBox, QCheckBox)
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QFont
 import matplotlib.pyplot as plt
@@ -13,7 +11,7 @@ from matplotlib.figure import Figure
 
 
 class ValidationConfigDialog(QDialog):
-    """Dialog for configuring BeeHaveSquE pipeline validation"""
+    """Dialog for configuring pipeline validation."""
     
     def __init__(self, parent=None, model_path=None):
         super().__init__(parent)
@@ -32,7 +30,7 @@ class ValidationConfigDialog(QDialog):
         
         # Description
         desc_label = QLabel(
-            "This will test the complete BeeHaveSquE pipeline:\n"
+            "This will test the complete tracking pipeline:\n"
             "1. Run inference on first validation frame\n"
             "2. Match to ground truth (one-time ID mapping)\n"
             "3. Autonomously propagate through video using tracking\n"
@@ -75,38 +73,6 @@ class ValidationConfigDialog(QDialog):
         
         config_group.setLayout(config_layout)
         layout.addWidget(config_group)
-        
-        # SOHO Inference Parameters
-        soho_group = QGroupBox("SOHO Inference Parameters")
-        soho_layout = QFormLayout()
-        
-        # Slice size
-        self.slice_size_spin = QSpinBox()
-        self.slice_size_spin.setRange(256, 2048)
-        self.slice_size_spin.setValue(640)
-        self.slice_size_spin.setSingleStep(64)
-        self.slice_size_spin.setToolTip("Size of image slices for inference (square)")
-        soho_layout.addRow("Slice Size (px):", self.slice_size_spin)
-        
-        # Overlap ratio
-        self.overlap_ratio_spin = QDoubleSpinBox()
-        self.overlap_ratio_spin.setRange(0.0, 0.9)
-        self.overlap_ratio_spin.setValue(0.5)
-        self.overlap_ratio_spin.setSingleStep(0.1)
-        self.overlap_ratio_spin.setDecimals(2)
-        self.overlap_ratio_spin.setToolTip("Overlap ratio between adjacent slices (0.5 = 50% overlap)")
-        soho_layout.addRow("Overlap Ratio:", self.overlap_ratio_spin)
-        
-        # Edge filter
-        self.edge_filter_spin = QSpinBox()
-        self.edge_filter_spin.setRange(0, 200)
-        self.edge_filter_spin.setValue(50)
-        self.edge_filter_spin.setSingleStep(10)
-        self.edge_filter_spin.setToolTip("Filter detections within this many pixels from slice edges")
-        soho_layout.addRow("Edge Filter (px):", self.edge_filter_spin)
-        
-        soho_group.setLayout(soho_layout)
-        layout.addWidget(soho_group)
         
         # Metrics to compute
         metrics_group = QGroupBox("Metrics to Compute")
@@ -180,9 +146,6 @@ class ValidationConfigDialog(QDialog):
             'iou_threshold': self.iou_threshold_spin.value(),
             'conf_threshold': self.conf_threshold_spin.value(),
             'id_switch_iou': self.id_switch_iou_spin.value(),
-            'slice_size': self.slice_size_spin.value(),
-            'overlap_ratio': self.overlap_ratio_spin.value(),
-            'edge_filter': self.edge_filter_spin.value(),
             'compute_idf1': self.compute_idf1_check.isChecked(),
             'compute_map': self.compute_map_check.isChecked(),
             'save_visualizations': self.save_viz_check.isChecked(),
@@ -195,7 +158,7 @@ class ValidationProgressDialog(QDialog):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("BeeHaveSquE Pipeline Validation")
+        self.setWindowTitle("Pipeline Validation")
         self.setModal(True)
         self.setMinimumSize(900, 700)
         
