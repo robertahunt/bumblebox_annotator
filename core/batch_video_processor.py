@@ -605,7 +605,7 @@ class BatchVideoProcessor:
                         self._log(f"  Resized mask shape: {mask.shape}")
                 # Convert to binary mask (0 or 255 for marker detector compatibility)
                 mask = ((mask > 0.5).astype(np.uint8)) * 255
-            elif self.enable_aruco:
+            elif self.enable_aruco and self.bee_model_type != 'segmentation':
                 # Create rectangular mask from bounding box for ArUco detection
                 # This allows ArUco detection to work with detection-only models
                 frame_height, frame_width = yolo_result.orig_shape[:2]
@@ -625,6 +625,14 @@ class BatchVideoProcessor:
                 instance_id=None
             )
             detections.append(det)
+
+        if self.verbose_output and self.bee_model_type == 'segmentation':
+            missing_masks = sum(1 for det in detections if det.mask is None)
+            if missing_masks:
+                self._log(
+                    f"  ⚠ Frame {self.frame_count}: segmentation model returned "
+                    f"{missing_masks}/{len(detections)} detections without masks"
+                )
         
         return detections
     
@@ -843,7 +851,34 @@ class BatchVideoProcessor:
                 if self.store_masks:
                     if frame_number not in self.bee_masks_by_frame:
                         self.bee_masks_by_frame[frame_number] = {}
-                    self.bee_masks_by_frame[frame_number][bee.instance_id] = bee.mask
+                    
+                    # If current detection has no mask, try to preserve previous frame's mask
+                    # This handles cases where YOLO inconsistently produces masks for tracked bees
+                    if bee.mask is not None:
+                        self.bee_masks_by_frame[frame_number][bee.instance_id] = bee.mask
+                    else:
+                        # Look for mask in previous frame for same bee_id
+                        previous_mask = None
+                        for prev_frame in range(frame_number - 1, max(0, frame_number - 10), -1):
+                            if prev_frame in self.bee_masks_by_frame:
+                                prev_mask = self.bee_masks_by_frame[prev_frame].get(bee.instance_id)
+                                if prev_mask is not None:
+                                    previous_mask = prev_mask
+                                    break
+                        
+                        # Only store if we found a previous mask, otherwise don't store (or store None)
+                        # Storing None explicitly so we don't accidentally retrieve old values
+                        if previous_mask is not None:
+                            self.bee_masks_by_frame[frame_number][bee.instance_id] = previous_mask
+                        else:
+                            # No previous mask found - store None (this will fall back to bbox in visualization)
+                            self.bee_masks_by_frame[frame_number][bee.instance_id] = None
+
+                if self.verbose_output and self.store_masks and bee.mask is None:
+                    self._log(
+                        f"  ⚠ Frame {frame_number}: no segmentation mask stored for "
+                        f"bee ID {bee.instance_id}; visualization will use bbox if no previous mask exists"
+                    )
                 
                 # Update trajectory for velocity calculation
                 if bee.instance_id not in self.bee_trajectories:
@@ -1045,6 +1080,17 @@ class BatchVideoProcessor:
         if source_id in self.bee_frames:
             self.bee_frames[target_id].update(self.bee_frames[source_id])
             del self.bee_frames[source_id]
+
+        # Move stored visualization masks to the merged ID as well. Without this,
+        # retroactively renamed detections can point at target_id while the mask is
+        # still keyed under source_id, causing the visualizer to fall back to bbox.
+        for frame_masks in self.bee_masks_by_frame.values():
+            if source_id not in frame_masks:
+                continue
+
+            source_mask = frame_masks.pop(source_id)
+            if target_id not in frame_masks or frame_masks[target_id] is None:
+                frame_masks[target_id] = source_mask
         
         # Update bee_to_aruco mapping
         if source_id in self.bee_to_aruco:

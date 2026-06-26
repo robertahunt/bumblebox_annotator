@@ -37,7 +37,10 @@ class Track:
     def update(self, detection: Detection, frame_idx: int):
         """Update track with new detection"""
         self.bbox = detection.bbox
-        self.mask = detection.mask
+        # Only update mask if detection has one; preserve existing mask otherwise
+        # This handles cases where YOLO inconsistently produces masks for tracked objects
+        if detection.mask is not None:
+            self.mask = detection.mask
         self.last_seen_frame = frame_idx
         self.source_history.append(detection.source)
         if detection.confidence is not None:

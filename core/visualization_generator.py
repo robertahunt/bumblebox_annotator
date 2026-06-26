@@ -348,7 +348,11 @@ class VisualizationGenerator:
             
             # Draw segmentation mask if available
             mask = bee_masks.get(detection.bee_id)
-            if mask is not None and mask.shape[:2] == frame.shape[:2]:
+            if mask is not None:
+                if mask.shape[:2] != frame.shape[:2]:
+                    # Resize mask to match frame rather than falling back to bbox
+                    mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]),
+                                      interpolation=cv2.INTER_NEAREST)
                 self._draw_bubbly_mask(frame, mask, color, thickness)
             else:
                 # Draw bbox if no mask available
@@ -363,22 +367,28 @@ class VisualizationGenerator:
             if len(self.bee_trajectories[detection.bee_id]) > self.trajectory_max_length:
                 self.bee_trajectories[detection.bee_id].pop(0)
             
-            # Draw trajectory trail (line from previous position)
+            # Draw trajectory trail in science mode only.
             traj = self.bee_trajectories[detection.bee_id]
-            if len(traj) > 1:
-                # Draw line from previous position
+            if not self.pretty_mode and len(traj) > 1:
+                # Science mode: arrow between last two positions + trail dots
                 prev_pos = traj[-2]
-                if self.pretty_mode:
-                    cv2.line(frame, prev_pos, centroid, color, 2, lineType=cv2.LINE_AA)
-                else:
-                    cv2.arrowedLine(frame, prev_pos, centroid, color, 2, tipLength=0.3)
-                
-                # Draw full trail with fading
+                cv2.arrowedLine(frame, prev_pos, centroid, color, 2, tipLength=0.3)
                 for i in range(1, len(traj) - 1):
                     cv2.circle(frame, traj[i], 2, color, -1)
             
             # Draw current position dot
-            cv2.circle(frame, centroid, 5, color, -1)
+            if self.pretty_mode:
+                # Glowing dot: bright halo + core
+                halo_radius = 10
+                for r in range(halo_radius, 3, -1):
+                    t = (halo_radius - r) / (halo_radius - 3)
+                    alpha = 0.08 * (1 - t)
+                    glow_color = tuple(int(c * alpha) for c in color)
+                    cv2.circle(frame, centroid, r, glow_color, -1, lineType=cv2.LINE_AA)
+                cv2.circle(frame, centroid, 5, color, -1, lineType=cv2.LINE_AA)  # colored core
+                cv2.circle(frame, centroid, 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)  # bright white dot
+            else:
+                cv2.circle(frame, centroid, 5, color, -1)
             
             # Draw ID label with background
             label_y = y1 - 10 if y1 > 30 else y2 + 20

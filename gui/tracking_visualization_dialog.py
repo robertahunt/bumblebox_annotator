@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict
 
 import torch
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal, QSettings
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -46,8 +46,10 @@ class TrackingVisualizationConfigDialog(QDialog):
         self.setMinimumSize(700, 820)
         self.config = None
         self.default_output_dir = self._default_output_dir()
+        self.settings = QSettings("BeeWhere", "TrackingVisualization")
 
         self.init_ui()
+        self._restore_settings()
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -408,7 +410,34 @@ class TrackingVisualizationConfigDialog(QDialog):
             'visualization_mode': self.visualization_mode_combo.currentText().lower(),
             'verbose_output': self.verbose_output_check.isChecked(),
         }
+        
+        # Save settings for next time dialog is opened
+        self._save_settings()
+        
         super().accept()
+
+    def _restore_settings(self):
+        """Restore bee model path and model type from previous session."""
+        bee_model_path = self.settings.value("bee_model_path", "")
+        model_type = self.settings.value("bee_model_type", "bbox")
+        
+        if bee_model_path and Path(bee_model_path).exists():
+            self.bee_model_edit.setText(bee_model_path)
+        
+        if model_type == "segmentation":
+            self.seg_radio.setChecked(True)
+        else:
+            self.bbox_radio.setChecked(True)
+    
+    def _save_settings(self):
+        """Save bee model path and model type for next session."""
+        bee_model_path = self.bee_model_edit.text()
+        if bee_model_path:
+            self.settings.setValue("bee_model_path", bee_model_path)
+        
+        model_type = "segmentation" if self.seg_radio.isChecked() else "bbox"
+        self.settings.setValue("bee_model_type", model_type)
+        self.settings.sync()
 
 
 class TrackingVisualizationWorker(QThread):
