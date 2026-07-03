@@ -348,7 +348,111 @@ class BatchVideoInferenceConfigDialog(QDialog):
             "Detect ArUco/QR markers on individual bees for ID tracking.\n"
             "Note: Chamber ordering is based on YOLO chamber segmentation (left to right)."
         )
+        self.enable_aruco_check.stateChanged.connect(self._update_aruco_controls)
         aruco_layout.addWidget(self.enable_aruco_check)
+
+        aruco_form = QFormLayout()
+
+        self.aruco_dictionary_combo = QComboBox()
+        self.aruco_dictionary_combo.addItems([
+            "Auto 4x4 dictionaries",
+            "4x4_50",
+            "4x4_100",
+            "4x4_250",
+            "4x4_1000",
+            "5x5_50",
+            "5x5_100",
+            "5x5_250",
+            "5x5_1000",
+            "6x6_50",
+            "6x6_100",
+            "6x6_250",
+            "6x6_1000",
+            "7x7_50",
+            "7x7_100",
+            "7x7_250",
+            "7x7_1000",
+        ])
+        self.aruco_dictionary_combo.setCurrentText("Auto 4x4 dictionaries")
+        aruco_form.addRow("Dictionary:", self.aruco_dictionary_combo)
+
+        self.aruco_optimize_check = QCheckBox("Optimize parameter bank before each video")
+        self.aruco_optimize_check.setChecked(False)
+        self.aruco_optimize_check.setToolTip(
+            "Sample frames from each video, sweep ArUco detector parameters, and use a compact parameter bank during tracking."
+        )
+        self.aruco_optimize_check.stateChanged.connect(self._update_aruco_controls)
+        aruco_form.addRow("", self.aruco_optimize_check)
+
+        self.aruco_profile_combo = QComboBox()
+        self.aruco_profile_combo.addItems(["quick", "balanced", "deep", "daily"])
+        self.aruco_profile_combo.setCurrentText("daily")
+        aruco_form.addRow("Optimization profile:", self.aruco_profile_combo)
+
+        self.aruco_sample_frames_spin = QSpinBox()
+        self.aruco_sample_frames_spin.setRange(1, 500)
+        self.aruco_sample_frames_spin.setValue(12)
+        aruco_form.addRow("Sample frames/video:", self.aruco_sample_frames_spin)
+
+        self.aruco_max_combinations_spin = QSpinBox()
+        self.aruco_max_combinations_spin.setRange(1, 10000)
+        self.aruco_max_combinations_spin.setValue(750)
+        aruco_form.addRow("Max combinations:", self.aruco_max_combinations_spin)
+
+        self.aruco_bank_size_spin = QSpinBox()
+        self.aruco_bank_size_spin.setRange(1, 20)
+        self.aruco_bank_size_spin.setValue(5)
+        aruco_form.addRow("Parameter bank size:", self.aruco_bank_size_spin)
+
+        self.aruco_expected_tags_spin = QDoubleSpinBox()
+        self.aruco_expected_tags_spin.setRange(0, 10000)
+        self.aruco_expected_tags_spin.setDecimals(1)
+        self.aruco_expected_tags_spin.setValue(0)
+        self.aruco_expected_tags_spin.setToolTip("Use 0 to disable expected-count scoring.")
+        aruco_form.addRow("Expected visible tags:", self.aruco_expected_tags_spin)
+
+        tag_list_layout = QHBoxLayout()
+        self.aruco_tag_list_edit = QLineEdit()
+        self.aruco_tag_list_edit.setPlaceholderText("Optional tag allowlist file...")
+        self.aruco_tag_list_edit.setReadOnly(True)
+        tag_list_layout.addWidget(self.aruco_tag_list_edit)
+        self.aruco_tag_list_browse_btn = QPushButton("Browse...")
+        self.aruco_tag_list_browse_btn.clicked.connect(self.browse_aruco_tag_list)
+        tag_list_layout.addWidget(self.aruco_tag_list_browse_btn)
+        self.aruco_tag_list_clear_btn = QPushButton("Clear")
+        self.aruco_tag_list_clear_btn.clicked.connect(lambda: self.aruco_tag_list_edit.clear())
+        tag_list_layout.addWidget(self.aruco_tag_list_clear_btn)
+        aruco_form.addRow("Tag list:", tag_list_layout)
+
+        self.aruco_sweep_min_perimeter_edit = QLineEdit()
+        self.aruco_sweep_min_perimeter_edit.setPlaceholderText("e.g. 0.019153")
+        aruco_form.addRow("Sweep min perimeter:", self.aruco_sweep_min_perimeter_edit)
+
+        self.aruco_sweep_max_perimeter_edit = QLineEdit()
+        self.aruco_sweep_max_perimeter_edit.setPlaceholderText("e.g. 0.052808")
+        aruco_form.addRow("Sweep max perimeter:", self.aruco_sweep_max_perimeter_edit)
+
+        self.aruco_sweep_win_min_edit = QLineEdit()
+        self.aruco_sweep_win_min_edit.setPlaceholderText("e.g. 3")
+        aruco_form.addRow("Sweep thresh win min:", self.aruco_sweep_win_min_edit)
+
+        self.aruco_sweep_win_max_edit = QLineEdit()
+        self.aruco_sweep_win_max_edit.setPlaceholderText("e.g. 30,50,70,90,110,130,150")
+        aruco_form.addRow("Sweep thresh win max:", self.aruco_sweep_win_max_edit)
+
+        self.aruco_sweep_win_step_edit = QLineEdit()
+        self.aruco_sweep_win_step_edit.setPlaceholderText("e.g. 3")
+        aruco_form.addRow("Sweep thresh win step:", self.aruco_sweep_win_step_edit)
+
+        self.aruco_sweep_poly_edit = QLineEdit()
+        self.aruco_sweep_poly_edit.setPlaceholderText("e.g. 0.08")
+        aruco_form.addRow("Sweep polygon approx:", self.aruco_sweep_poly_edit)
+
+        self.aruco_sweep_constant_edit = QLineEdit()
+        self.aruco_sweep_constant_edit.setPlaceholderText("e.g. 3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19")
+        aruco_form.addRow("Sweep threshold constant:", self.aruco_sweep_constant_edit)
+
+        aruco_layout.addLayout(aruco_form)
         
         aruco_group.setLayout(aruco_layout)
         layout.addWidget(aruco_group)
@@ -423,6 +527,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
         # Initialize UI state to match default selections
         self._update_tracking_params("Centroid")  # Show Centroid params since that's the default
         self.update_distance_method_visibility()  # Update distance method visibility
+        self._update_aruco_controls()
     
     def _update_selection_controls(self):
         """Enable/disable folder vs file controls based on radio selection"""
@@ -449,6 +554,40 @@ class BatchVideoInferenceConfigDialog(QDialog):
         )
         self.distance_method_label.setEnabled(compute_spatial_metrics)
         self.distance_method_combo.setEnabled(compute_spatial_metrics)
+
+    def _update_aruco_controls(self):
+        """Enable/disable ArUco optimization controls."""
+        if not hasattr(self, 'enable_aruco_check'):
+            return
+
+        aruco_enabled = self.enable_aruco_check.isChecked()
+        optimize_enabled = aruco_enabled and self.aruco_optimize_check.isChecked()
+        base_controls = [
+            self.aruco_dictionary_combo,
+            self.aruco_optimize_check,
+            self.aruco_tag_list_edit,
+            self.aruco_tag_list_browse_btn,
+            self.aruco_tag_list_clear_btn,
+        ]
+        optimize_controls = [
+            self.aruco_profile_combo,
+            self.aruco_sample_frames_spin,
+            self.aruco_max_combinations_spin,
+            self.aruco_bank_size_spin,
+            self.aruco_expected_tags_spin,
+            self.aruco_sweep_min_perimeter_edit,
+            self.aruco_sweep_max_perimeter_edit,
+            self.aruco_sweep_win_min_edit,
+            self.aruco_sweep_win_max_edit,
+            self.aruco_sweep_win_step_edit,
+            self.aruco_sweep_poly_edit,
+            self.aruco_sweep_constant_edit,
+        ]
+
+        for control in base_controls:
+            control.setEnabled(aruco_enabled)
+        for control in optimize_controls:
+            control.setEnabled(optimize_enabled)
     
     def browse_input_folder(self):
         """Browse for input folder"""
@@ -523,6 +662,57 @@ class BatchVideoInferenceConfigDialog(QDialog):
         
         if folder:
             self.output_folder_edit.setText(folder)
+
+    def browse_aruco_tag_list(self):
+        """Browse for optional ArUco tag allowlist"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select ArUco Tag List",
+            str(Path.home()),
+            "Tag Lists (*.txt *.csv *.json);;All Files (*)"
+        )
+        if file_path:
+            self.aruco_tag_list_edit.setText(file_path)
+
+    def _parse_sweep_values(self, raw_text: str, label: str, value_type: str):
+        text = str(raw_text or "").strip()
+        if not text:
+            return []
+
+        values = []
+        for token in text.split(','):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                if value_type == "int":
+                    value = float(token)
+                    if not value.is_integer():
+                        raise ValueError
+                    values.append(int(value))
+                else:
+                    values.append(float(token))
+            except ValueError:
+                raise ValueError(f"{label} contains an invalid {value_type}: {token}")
+        return values
+
+    def _collect_aruco_sweep_overrides(self):
+        fields = [
+            ("minMarkerPerimeterRate", self.aruco_sweep_min_perimeter_edit, "float", "Sweep min perimeter"),
+            ("maxMarkerPerimeterRate", self.aruco_sweep_max_perimeter_edit, "float", "Sweep max perimeter"),
+            ("adaptiveThreshWinSizeMin", self.aruco_sweep_win_min_edit, "int", "Sweep threshold window min"),
+            ("adaptiveThreshWinSizeMax", self.aruco_sweep_win_max_edit, "int", "Sweep threshold window max"),
+            ("adaptiveThreshWinSizeStep", self.aruco_sweep_win_step_edit, "int", "Sweep threshold window step"),
+            ("polygonalApproxAccuracyRate", self.aruco_sweep_poly_edit, "float", "Sweep polygon approx"),
+            ("adaptiveThreshConstant", self.aruco_sweep_constant_edit, "int", "Sweep threshold constant"),
+        ]
+
+        overrides = {}
+        for key, widget, value_type, label in fields:
+            values = self._parse_sweep_values(widget.text(), label, value_type)
+            if values:
+                overrides[key] = values
+        return overrides
     
     def accept(self):
         """Validate and accept dialog"""
@@ -574,6 +764,32 @@ class BatchVideoInferenceConfigDialog(QDialog):
         output_folder = Path(self.output_folder_edit.text())
         if not output_folder.exists():
             output_folder.mkdir(parents=True, exist_ok=True)
+
+        tag_list_path = self.aruco_tag_list_edit.text().strip()
+        if tag_list_path and not Path(tag_list_path).exists():
+            QMessageBox.warning(self, "Invalid Path", "ArUco tag list file does not exist.")
+            return
+
+        aruco_dictionary_text = self.aruco_dictionary_combo.currentText()
+        aruco_dictionary_mode = 'auto_4x4' if aruco_dictionary_text.startswith("Auto") else 'single'
+        aruco_dictionary = '4x4_100' if aruco_dictionary_mode == 'auto_4x4' else aruco_dictionary_text
+
+        if self.enable_aruco_check.isChecked() and self.aruco_optimize_check.isChecked() and aruco_dictionary_mode == 'auto_4x4':
+            QMessageBox.warning(
+                self,
+                "Dictionary Required",
+                "Please choose a specific ArUco dictionary when parameter-bank optimization is enabled."
+            )
+            return
+
+        try:
+            aruco_sweep_overrides = self._collect_aruco_sweep_overrides()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid ArUco Sweep", str(exc))
+            return
+
+        expected_tags = self.aruco_expected_tags_spin.value()
+        expected_tags = expected_tags if expected_tags > 0 else None
         
         # Build tracking config based on selected algorithm
         tracking_algo = self.tracking_algo_combo.currentText()
@@ -621,6 +837,20 @@ class BatchVideoInferenceConfigDialog(QDialog):
             'nms_iou_threshold': self.nms_iou_spin.value(),
             'compute_spatial_metrics': self.compute_spatial_metrics_check.isChecked(),
             'enable_aruco': self.enable_aruco_check.isChecked(),
+            'aruco_dictionary': aruco_dictionary,
+            'aruco_dictionary_mode': aruco_dictionary_mode,
+            'tag_list_path': tag_list_path or None,
+            'allowed_tag_ids': [],
+            'aruco_optimization': {
+                'enabled': self.enable_aruco_check.isChecked() and self.aruco_optimize_check.isChecked(),
+                'dictionary': aruco_dictionary,
+                'profile': self.aruco_profile_combo.currentText(),
+                'sample_frames': self.aruco_sample_frames_spin.value(),
+                'max_combinations': self.aruco_max_combinations_spin.value(),
+                'bank_size': self.aruco_bank_size_spin.value(),
+                'expected_tags': expected_tags,
+                'sweep_overrides': aruco_sweep_overrides,
+            },
             'output_folder': str(output_folder),
             'save_visualizations': self.save_visualizations_check.isChecked(),
             'verbose_output': self.verbose_output_check.isChecked()

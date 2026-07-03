@@ -15,6 +15,11 @@ from typing import List, Dict, Optional
 from PyQt6.QtCore import QThread, pyqtSignal
 from ultralytics import YOLO
 
+from core.aruco_parameter_optimizer import (
+    load_tag_ids,
+    normalize_dictionary_name,
+    optimize_aruco_parameter_bank,
+)
 from core.batch_video_processor import BatchVideoProcessor
 from core.video_inference_exporter import VideoInferenceExporter
 from core.visualization_generator import VisualizationGenerator
@@ -70,6 +75,16 @@ class BatchVideoInferenceWorker(QThread):
             self.log_message.emit(f"Spatial metrics: {'Enabled' if self.config.get('compute_spatial_metrics', True) else 'Disabled'}")
             self.log_message.emit(f"Tracking algorithm: {self.config['tracking_config']['algorithm']}")
             self.log_message.emit(f"ArUco detection: {'Enabled' if self.config['enable_aruco'] else 'Disabled'}")
+            if self.config['enable_aruco']:
+                opt_cfg = self.config.get('aruco_optimization', {})
+                if opt_cfg.get('enabled', False):
+                    self.log_message.emit(
+                        "ArUco parameter bank optimization: "
+                        f"Enabled ({opt_cfg.get('sample_frames', 12)} sampled frames, "
+                        f"bank size {opt_cfg.get('bank_size', 5)})"
+                    )
+                else:
+                    self.log_message.emit("ArUco parameter bank optimization: Disabled")
             self.log_message.emit(f"Verbose output: {'Enabled' if self.verbose_output else 'Disabled'}")
             self.log_message.emit(f"Output folder: {self.config['output_folder']}")
             self.log_message.emit("")
@@ -142,6 +157,10 @@ class BatchVideoInferenceWorker(QThread):
                 
                 self.status_updated.emit(f"Processing video {video_idx}/{total_videos}: {video_path.name}")
                 self.log_message.emit(f"=== Video {video_idx}/{total_videos}: {video_path.name} ===")
+
+                aruco_runtime_config = self._prepare_aruco_runtime_config(video_path, video_idx, total_videos)
+                if self.should_stop:
+                    break
                 
                 # Process this video
                 self._process_video(
@@ -150,7 +169,8 @@ class BatchVideoInferenceWorker(QThread):
                     hive_model,
                     chamber_model,
                     tracker,
-                    video_idx
+                    video_idx,
+                    aruco_runtime_config
                 )
 
                 if self.should_stop:
@@ -266,6 +286,79 @@ class BatchVideoInferenceWorker(QThread):
         
         return tracker
 
+    def _load_allowed_tag_ids(self) -> Optional[List[int]]:
+        allowed = set()
+        for raw_id in self.config.get('allowed_tag_ids', []) or []:
+            try:
+                allowed.add(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+
+        tag_list_path = self.config.get('tag_list_path')
+        if tag_list_path:
+            allowed.update(load_tag_ids(tag_list_path))
+
+        return sorted(allowed) if allowed else None
+
+    def _prepare_aruco_runtime_config(self, video_path: Path, video_idx: int, total_videos: int) -> Dict:
+        if not self.config.get('enable_aruco', True):
+            return {}
+
+        allowed_tag_ids = self._load_allowed_tag_ids()
+        opt_cfg = self.config.get('aruco_optimization', {}) or {}
+        dictionary = normalize_dictionary_name(opt_cfg.get('dictionary', self.config.get('aruco_dictionary', '4x4_100')))
+        runtime_config = {
+            'aruco_dicts': [dictionary],
+            'aruco_params_bank': None,
+            'allowed_tag_ids': allowed_tag_ids,
+        }
+
+        if not opt_cfg.get('enabled', False):
+            if self.config.get('aruco_dictionary_mode', 'auto_4x4') == 'auto_4x4':
+                runtime_config['aruco_dicts'] = None
+            return runtime_config
+
+        self.status_updated.emit(f"Optimizing ArUco parameters {video_idx}/{total_videos}: {video_path.name}")
+        self.log_message.emit(f"  Optimizing ArUco parameter bank for {video_path.name}...")
+
+        def progress(done: int, total: int, latest: Dict):
+            if done == 1 or done == total or done % 100 == 0:
+                self.log_message.emit(
+                    "    "
+                    f"ArUco sweep {done}/{total}: "
+                    f"mean_detected={float(latest.get('mean_detected', 0.0)):.2f}, "
+                    f"score={float(latest.get('score', 0.0)):.3f}"
+                )
+
+        result = optimize_aruco_parameter_bank(
+            video_path=video_path,
+            output_dir=Path(self.config['output_folder']) / "aruco_optimization",
+            dictionary_name=dictionary,
+            profile=opt_cfg.get('profile', 'daily'),
+            sample_frames=int(opt_cfg.get('sample_frames', 12)),
+            max_combinations=int(opt_cfg.get('max_combinations', 750)),
+            bank_size=int(opt_cfg.get('bank_size', 5)),
+            expected_tags=opt_cfg.get('expected_tags'),
+            allowed_tag_ids=allowed_tag_ids,
+            sweep_overrides=opt_cfg.get('sweep_overrides') or None,
+            progress_callback=progress,
+            stop_requested=lambda: self.should_stop,
+        )
+
+        runtime_config['aruco_params_bank'] = result.parameter_bank
+        self.log_message.emit(
+            f"  ✓ Selected {len(result.parameter_bank)} ArUco parameter set(s); "
+            f"summary: {result.summary_json_path}"
+        )
+        if result.selected_candidates:
+            best = result.selected_candidates[0]
+            self.log_message.emit(
+                f"    Primary candidate: mean_detected={best.mean_detected:.2f}, "
+                f"coverage={best.coverage_frames}/{len(result.sampled_frame_indices)}, "
+                f"score={best.score:.3f}"
+            )
+        return runtime_config
+
     def _log_processor_timing(self, processor, wall_elapsed: float):
         """Log a timing breakdown from the batch video processor."""
         if not self.verbose_output:
@@ -301,10 +394,11 @@ class BatchVideoInferenceWorker(QThread):
         if torch.cuda.is_available():
             self.log_message.emit("    Note: GPU timings can shift a little because CUDA work may be asynchronous.")
     
-    def _process_video(self, video_path, bee_model, hive_model, chamber_model, tracker, video_idx):
+    def _process_video(self, video_path, bee_model, hive_model, chamber_model, tracker, video_idx, aruco_runtime_config=None):
         """Process a single video file"""
         video_id = video_path.stem  # Use filename without extension as video_id
         self.log_message.emit(f"  Processing: {video_path.name}")
+        aruco_runtime_config = aruco_runtime_config or {}
         
         # Check if visualization is enabled to decide whether to store masks
         visualization_enabled = self.config.get('save_visualizations', False)
@@ -335,7 +429,10 @@ class BatchVideoInferenceWorker(QThread):
             stop_callback=lambda: self.should_stop,
             timing_log_interval=1,
             cleanup_interval=25,
-            verbose_output=self.verbose_output
+            verbose_output=self.verbose_output,
+            aruco_dicts=aruco_runtime_config.get('aruco_dicts'),
+            aruco_params_bank=aruco_runtime_config.get('aruco_params_bank'),
+            allowed_tag_ids=aruco_runtime_config.get('allowed_tag_ids')
         )
         
         # Process video

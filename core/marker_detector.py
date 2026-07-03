@@ -48,6 +48,8 @@ class MarkerDetector:
     def __init__(
         self,
         aruco_dicts: Optional[List[str]] = None,
+        aruco_params: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
+        allowed_tag_ids: Optional[Union[List[int], set]] = None,
         min_confidence: float = 0.2,
         enable_aruco: bool = True,
         enable_qr: bool = True,
@@ -59,6 +61,8 @@ class MarkerDetector:
         
         Args:
             aruco_dicts: List of ArUco dictionary names to try (None = try common ones)
+            aruco_params: One params dict or a bank of params dicts for cv2.aruco.DetectorParameters
+            allowed_tag_ids: Optional allowlist of marker IDs to accept
             min_confidence: Minimum detection confidence threshold (0-1, default 0.2 for small markers)
             enable_aruco: Enable ArUco marker detection
             enable_qr: Enable QR code detection
@@ -66,6 +70,8 @@ class MarkerDetector:
         self.min_confidence = min_confidence
         self.enable_aruco = enable_aruco
         self.enable_qr = enable_qr
+        self.allowed_tag_ids = {int(tag_id) for tag_id in allowed_tag_ids} if allowed_tag_ids else None
+        self.aruco_param_bank = self._normalize_aruco_param_bank(aruco_params)
         self.debug = debug
         self.debug_folder = debug_folder
         self.debug_counter = 0  # Counter for unique debug filenames
@@ -91,7 +97,7 @@ class MarkerDetector:
         else:
             self.aruco_dicts_to_try = aruco_dicts
         
-        # Initialize ArUco detectors for each dictionary
+        # Initialize ArUco detectors for each dictionary and parameter set
         self.aruco_detectors = {}
         if self.enable_aruco:
             for dict_name in self.aruco_dicts_to_try:
@@ -99,20 +105,47 @@ class MarkerDetector:
                     aruco_dict = cv2.aruco.getPredefinedDictionary(
                         self.ARUCO_DICTS[dict_name]
                     )
-                    detector_params = cv2.aruco.DetectorParameters()
-                    # Adjust parameters for better detection
-                    #detector_params.adaptiveThreshConstant = 7
-                    #detector_params.minMarkerPerimeterRate = 0.03
-                    #detector_params.maxMarkerPerimeterRate = 4.0
-                    
-                    self.aruco_detectors[dict_name] = cv2.aruco.ArucoDetector(
-                        aruco_dict, detector_params
-                    )
+                    self.aruco_detectors[dict_name] = []
+                    for param_index, params in enumerate(self.aruco_param_bank):
+                        detector_params = self._create_detector_params(params)
+                        self.aruco_detectors[dict_name].append({
+                            'label': f'params_{param_index + 1}',
+                            'params': params,
+                            'detector': cv2.aruco.ArucoDetector(
+                                aruco_dict, detector_params
+                            )
+                        })
         
         # Initialize QR code detector
         self.qr_detector = None
         if self.enable_qr:
             self.qr_detector = cv2.QRCodeDetector()
+
+    def _normalize_aruco_param_bank(
+        self,
+        aruco_params: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]
+    ) -> List[Dict[str, Any]]:
+        if aruco_params is None:
+            return [{}]
+        if isinstance(aruco_params, dict):
+            return [dict(aruco_params)]
+        normalized = []
+        for params in aruco_params:
+            if isinstance(params, dict):
+                normalized.append(dict(params))
+        return normalized or [{}]
+
+    def _create_detector_params(self, params: Dict[str, Any]):
+        detector_params = cv2.aruco.DetectorParameters()
+        for key, value in params.items():
+            if hasattr(detector_params, key):
+                setattr(detector_params, key, value)
+        return detector_params
+
+    def _marker_id_allowed(self, marker_id: Union[int, np.integer]) -> bool:
+        if self.allowed_tag_ids is None:
+            return True
+        return int(marker_id) in self.allowed_tag_ids
     
     def set_debug_folder(self, folder_path: str):
         """Set or update the debug folder path
@@ -299,72 +332,73 @@ class MarkerDetector:
         best_confidence = 0.0
         valid_markers_count = 0  # Track how many valid markers found in mask
         
-        # Try each ArUco dictionary
-        for dict_name, detector in self.aruco_detectors.items():
-            try:
-                # Detect markers
-                corners, ids, rejected = detector.detectMarkers(roi_image)
+        # Try each ArUco dictionary and parameter-bank detector.
+        for dict_name, detector_entries in self.aruco_detectors.items():
+            for detector_entry in detector_entries:
+                detector = detector_entry['detector']
+                try:
+                    corners, ids, rejected = detector.detectMarkers(roi_image)
+                    
+                    if ids is not None and len(ids) > 0:
+                        # Check each detected marker
+                        for i, marker_id in enumerate(ids):
+                            marker_id_int = int(marker_id[0])
+                            if not self._marker_id_allowed(marker_id_int):
+                                continue
+
+                            marker_corners = corners[i][0]  # Shape: (4, 2)
+                            
+                            # Check if marker is within the mask region
+                            center_x = int(np.mean(marker_corners[:, 0]))
+                            center_y = int(np.mean(marker_corners[:, 1]))
+                            
+                            if (0 <= center_y < roi_mask.shape[0] and 
+                                0 <= center_x < roi_mask.shape[1] and
+                                roi_mask[center_y, center_x] > 0):
+                                
+                                valid_markers_count += 1
+                                
+                                # If rejecting multiple and we found more than one, return None
+                                if reject_multiple and valid_markers_count > 1:
+                                    if self.debug and instance_id is not None:
+                                        print(f"  [Instance {instance_id}] ✗ Multiple ArUco codes detected, rejecting")
+                                    return None
+                                
+                                # Normalize confidence (0-1)
+                                # Scale confidence so that even small markers (30x30) get reasonable scores
+                                # A 30x30 marker (area ~900) should get ~0.4 confidence
+                                # A 50x50 marker (area ~2500) should get ~0.7 confidence
+                                area = cv2.contourArea(marker_corners)
+                                confidence = min(1.0, np.sqrt(area) / 70.0)
+                                
+                                if confidence > best_confidence:
+                                    # Adjust corners to full image coordinates
+                                    full_corners = marker_corners.copy()
+                                    full_corners[:, 0] += offset_x
+                                    full_corners[:, 1] += offset_y
+                                    
+                                    center = (
+                                        float(center_x + offset_x),
+                                        float(center_y + offset_y)
+                                    )
+                                    
+                                    best_detection = MarkerDetection(
+                                        marker_type='aruco',
+                                        marker_id=marker_id_int,
+                                        confidence=confidence,
+                                        corners=full_corners,
+                                        dict_type=dict_name,
+                                        center=center
+                                    )
+                                    best_confidence = confidence
+                                    
+                                    # Early exit if we found a high-confidence marker (but only if not rejecting multiple)
+                                    if not reject_multiple and confidence > 0.9:
+                                        return best_detection
                 
-                if ids is not None and len(ids) > 0:
-                    # Check each detected marker
-                    for i, marker_id in enumerate(ids):
-                        marker_corners = corners[i][0]  # Shape: (4, 2)
-                        
-                        # Check if marker is within the mask region
-                        center_x = int(np.mean(marker_corners[:, 0]))
-                        center_y = int(np.mean(marker_corners[:, 1]))
-                        
-                        if (0 <= center_y < roi_mask.shape[0] and 
-                            0 <= center_x < roi_mask.shape[1] and
-                            roi_mask[center_y, center_x] > 0):
-                            
-                            valid_markers_count += 1
-                            
-                            # If rejecting multiple and we found more than one, return None
-                            if reject_multiple and valid_markers_count > 1:
-                                if self.debug and instance_id is not None:
-                                    print(f"  [Instance {instance_id}] ✗ Multiple ArUco codes detected, rejecting")
-                                return None
-                            
-                            # Calculate confidence based on corner clarity and size
-                            # Larger markers with clear corners = higher confidence
-                            area = cv2.contourArea(marker_corners)
-                            perimeter = cv2.arcLength(marker_corners, True)
-                            
-                            # Normalize confidence (0-1)
-                            # Scale confidence so that even small markers (30x30) get reasonable scores
-                            # A 30x30 marker (area ~900) should get ~0.4 confidence
-                            # A 50x50 marker (area ~2500) should get ~0.7 confidence
-                            confidence = min(1.0, np.sqrt(area) / 70.0)
-                            
-                            if confidence > best_confidence:
-                                # Adjust corners to full image coordinates
-                                full_corners = marker_corners.copy()
-                                full_corners[:, 0] += offset_x
-                                full_corners[:, 1] += offset_y
-                                
-                                center = (
-                                    float(center_x + offset_x),
-                                    float(center_y + offset_y)
-                                )
-                                
-                                best_detection = MarkerDetection(
-                                    marker_type='aruco',
-                                    marker_id=int(marker_id[0]),
-                                    confidence=confidence,
-                                    corners=full_corners,
-                                    dict_type=dict_name,
-                                    center=center
-                                )
-                                best_confidence = confidence
-                                
-                                # Early exit if we found a high-confidence marker (but only if not rejecting multiple)
-                                if not reject_multiple and confidence > 0.9:
-                                    return best_detection
-            
-            except Exception as e:
-                # Skip this dictionary if detection fails
-                continue
+                except Exception:
+                    # Skip this detector if detection fails
+                    continue
         
         return best_detection
     
@@ -505,9 +539,9 @@ class MarkerDetector:
             print("[MarkerDetector] Starting ArUco detection on full image...")
             print(f"[MarkerDetector] Input: {len(annotations)} total annotation(s)")
         
-        # Always print basic info for debugging
-        print(f"[ArUco Detection] Image shape: {image.shape if image is not None else 'None'}")
-        print(f"[ArUco Detection] Total annotations: {len(annotations)}")
+        if self.debug:
+            print(f"[ArUco Detection] Image shape: {image.shape if image is not None else 'None'}")
+            print(f"[ArUco Detection] Total annotations: {len(annotations)}")
         
         # Filter bee annotations and build lookup structures
         bee_annotations = []
@@ -534,7 +568,8 @@ class MarkerDetector:
         
         stats['total_bees'] = len(bee_annotations)
         
-        print(f"[ArUco Detection] Found {stats['total_bees']} bee annotation(s) to process")
+        if self.debug:
+            print(f"[ArUco Detection] Found {stats['total_bees']} bee annotation(s) to process")
         
         if stats['total_bees'] == 0:
             if self.debug:
@@ -544,46 +579,51 @@ class MarkerDetector:
         if self.debug:
             print(f"[MarkerDetector] Processing {stats['total_bees']} bee annotation(s)")
         
-        # Step 1: Run ArUco detection ONCE on full image (4x4 dictionaries only)
+        # Step 1: Run ArUco detection on the full image once per configured detector.
         all_markers = []  # List of (marker_id, center, corners, dict_name)
-        
-        # Only use 4x4 dictionaries as specified
-        dicts_to_try = ['4x4_50', '4x4_100', '4x4_250', '4x4_1000']
+        dicts_to_try = self.aruco_dicts_to_try
         
         if self.debug:
             print(f"[MarkerDetector] Available detectors: {list(self.aruco_detectors.keys())}")
             print(f"[MarkerDetector] Will try: {dicts_to_try}")
-        
-        print(f"[ArUco Detection] Available detectors: {list(self.aruco_detectors.keys())}")
+
+        aruco_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
         
         for dict_name in dicts_to_try:
             if dict_name not in self.aruco_detectors:
                 if self.debug:
                     print(f"  ✗ {dict_name}: detector not available")
                 continue
-            
-            detector = self.aruco_detectors[dict_name]
-            corners, ids, rejected = detector.detectMarkers(image)
-            
-            if ids is not None and len(ids) > 0:
-                if self.debug:
-                    print(f"  {dict_name}: Found {len(ids)} marker(s) - IDs: {ids.flatten().tolist()}")
+
+            for detector_entry in self.aruco_detectors[dict_name]:
+                detector = detector_entry['detector']
+                corners, ids, rejected = detector.detectMarkers(aruco_image)
                 
-                for i, marker_id in enumerate(ids):
-                    marker_corners = corners[i][0]  # Shape: (4, 2)
-                    center = marker_corners.mean(axis=0)
+                if ids is not None and len(ids) > 0:
+                    if self.debug:
+                        label = detector_entry.get('label', '')
+                        print(f"  {dict_name}/{label}: Found {len(ids)} marker(s) - IDs: {ids.flatten().tolist()}")
                     
-                    # Calculate confidence
-                    area = cv2.contourArea(marker_corners)
-                    confidence = min(1.0, np.sqrt(area) / 70.0)
-                    
-                    all_markers.append({
-                        'marker_id': int(marker_id[0]),
-                        'center': center,
-                        'corners': marker_corners,
-                        'dict_name': dict_name,
-                        'confidence': confidence
-                    })
+                    for i, marker_id in enumerate(ids):
+                        marker_id_int = int(marker_id[0])
+                        if not self._marker_id_allowed(marker_id_int):
+                            continue
+
+                        marker_corners = corners[i][0]  # Shape: (4, 2)
+                        center = marker_corners.mean(axis=0)
+                        
+                        # Calculate confidence
+                        area = cv2.contourArea(marker_corners)
+                        confidence = min(1.0, np.sqrt(area) / 70.0)
+                        
+                        all_markers.append({
+                            'marker_id': marker_id_int,
+                            'center': center,
+                            'corners': marker_corners,
+                            'dict_name': dict_name,
+                            'param_label': detector_entry.get('label', ''),
+                            'confidence': confidence
+                        })
         
         stats['total_markers'] = len(all_markers)
         
@@ -601,17 +641,17 @@ class MarkerDetector:
             
             # Check if we've seen this marker at this position before
             is_duplicate = False
-            for existing_center, existing_marker in seen_markers[marker_id]:
+            for idx, (existing_center, existing_marker) in enumerate(seen_markers[marker_id]):
                 # If centers are within 5 pixels, it's the same marker
                 dist = np.linalg.norm(center - existing_center)
                 if dist < 5.0:
                     # It's a duplicate - keep the one with higher confidence
                     if marker['confidence'] > existing_marker['confidence']:
                         # Replace with higher confidence version
-                        unique_markers.remove(existing_marker)
-                        unique_markers.append(marker)
-                        # Update the seen list
-                        idx = seen_markers[marker_id].index((existing_center, existing_marker))
+                        for unique_idx, unique_marker in enumerate(unique_markers):
+                            if unique_marker is existing_marker:
+                                unique_markers[unique_idx] = marker
+                                break
                         seen_markers[marker_id][idx] = (center, marker)
                     is_duplicate = True
                     break
@@ -626,11 +666,6 @@ class MarkerDetector:
             unique_ids = sorted(set(m['marker_id'] for m in unique_markers))
             print(f"[MarkerDetector] Unique marker IDs: {unique_ids}")
             print(f"[MarkerDetector] Matching markers to {len(bee_annotations)} bee instance(s)...")
-        else:
-            # Always print summary even when not in debug mode
-            if len(unique_markers) > 0:
-                unique_ids = sorted(set(m['marker_id'] for m in unique_markers))
-                print(f"[ArUco Detection] Detected {len(unique_markers)} unique marker(s) in full image: {unique_ids}")
         
         # Use deduplicated markers from here on
         all_markers = unique_markers

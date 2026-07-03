@@ -75,7 +75,10 @@ class BatchVideoProcessor:
                  compute_spatial_metrics: bool = True, store_masks: bool = False,
                  log_callback=None, stop_callback=None, timing_log_interval: int = 1,
                  cleanup_interval: int = 25, verbose_output: bool = False,
-                 max_frames: Optional[int] = None, high_quality_masks: bool = False):
+                 max_frames: Optional[int] = None, high_quality_masks: bool = False,
+                 aruco_dicts: Optional[List[str]] = None,
+                 aruco_params_bank: Optional[List[Dict]] = None,
+                 allowed_tag_ids: Optional[List[int]] = None):
         """
         Args:
             video_path: Path to video file
@@ -99,6 +102,9 @@ class BatchVideoProcessor:
             verbose_output: Whether to print detailed diagnostic/timing output
             max_frames: Optional maximum number of frames to process from the start
             high_quality_masks: Request full-resolution YOLO masks for prettier visualization
+            aruco_dicts: ArUco dictionaries to use for marker detection
+            aruco_params_bank: Parameter sets to try for each ArUco frame
+            allowed_tag_ids: Optional allowlist of ArUco tag IDs
         """
         self.video_path = video_path
         self.video_id = video_id
@@ -121,12 +127,17 @@ class BatchVideoProcessor:
         self.max_frames = max_frames
         self.high_quality_masks = high_quality_masks
         self.was_stopped = False
+        self.aruco_dicts = aruco_dicts
+        self.aruco_params_bank = aruco_params_bank
+        self.allowed_tag_ids = allowed_tag_ids
         
         # Initialize ArUco detector for bee ID tracking
         self.marker_detector = None
         if self.enable_aruco:
             self.marker_detector = MarkerDetector(
-                aruco_dicts=['4x4_50', '4x4_100', '4x4_250', '4x4_1000'],  # Only 4x4 codes
+                aruco_dicts=aruco_dicts or ['4x4_50', '4x4_100', '4x4_250', '4x4_1000'],
+                aruco_params=aruco_params_bank,
+                allowed_tag_ids=allowed_tag_ids,
                 enable_aruco=True,
                 enable_qr=False,  # Disable QR codes for performance
                 min_confidence=0.2,
