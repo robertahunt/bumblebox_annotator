@@ -1,0 +1,5 @@
+microcolony_pair,microcolony_ids,tag_ids,tag_count,treatments,source_workbook
+MCs-1-and-2,1;2,3;4;6;10;14;21;23;28;29;38;41;42;54;59;72;79,16,1:.5ppb;2:10ppb,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-3-and-4,3;4,5;11;12;16;20;22;26;35;40;46;67;68;69;70;73;78,16,3:100ppb;4:5ppb,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-5-and-6,5;6,1;19;25;27;31;32;44;45;47;48;51;56;66;71;76;77,16,5:20ppb;6:2.5ppb,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-7-and-8,7;8,2;8;9;13;15;18;33;43;50;52;53;55;57;58;59;74,16,7:1ppb;8:control,/home/august/Documents/Microcolony Metadata.xlsx

@@ -1,0 +1,13 @@
+microcolony_pair,microcolony_ids,tag_ids,tag_count,treatments,source_workbook
+MCs-1-and-2,1;2,3;4;6;10;14;21;23;28;29;38;41;42;54;59;72;79,16,1:.5ppb;2:10ppb,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-3-and-4,3;4,5;11;12;16;20;22;26;35;40;46;67;68;69;70;73;78,16,3:100ppb;4:5ppb,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-5-and-6,5;6,1;19;25;27;31;32;44;45;47;48;51;56;66;71;76;77,16,5:20ppb;6:2.5ppb,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-7-and-8,7;8,2;8;9;13;15;18;33;43;50;52;53;55;57;58;59;74,16,7:1ppb;8:control,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-9-and-10,9;10,6;11;14;18;19;24;30;40;41;48;49;50;58;59;66;68,16,,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-11-and-12,11;12,0;1;2;4;7;12;13;27;33;35;46;47;51;54;57;61,16,,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-13-and-14,13;14,15;16;22;23;25;32;34;36;38;39;45;52;53;55;64;69,16,,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-15-and-16,15;16,3;5;8;9;10;19;20;21;26;29;31;42;43;44;60;63;65,17,,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-17-and-18,17;18,1;5;6;10;15;20;22;24;32;41;42;44;55;60;61;65,16,,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-19-and-20,19;20,0;8;13;14;21;26;38;40;43;47;48;59;62;64;65;69,16,,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-21-and-22,21;22,3;11;12;18;19;30;33;34;35;39;46;49;50;52;56;63,16,,/home/august/Documents/Microcolony Metadata.xlsx
+MCs-23-and-24,23;24,2;4;9;16;25;27;28;29;31;36;45;51;53;55;57;58,16,,/home/august/Documents/Microcolony Metadata.xlsx

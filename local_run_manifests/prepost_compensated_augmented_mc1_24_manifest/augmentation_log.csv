@@ -1,0 +1,5 @@
+microcolony_pair,matched_treatment,period,desired_extra_videos,available_nonhourly_candidates,added_extra_videos,note
+MCs-13-and-14,0.5ppb,post,12,23,12,post compensation for blurry MC1/2: MC14 matches MC1 0.5ppb
+MCs-21-and-22,0.5ppb,post,12,23,12,post compensation for blurry MC1/2: MC21 matches MC1 0.5ppb
+MCs-15-and-16,10ppb,post,12,23,12,post compensation for blurry MC1/2: MC16 matches MC2 10ppb
+MCs-17-and-18,10ppb,post,12,23,12,post compensation for blurry MC1/2: MC17 matches MC2 10ppb

@@ -20,6 +20,8 @@ class VisualizationGenerator:
                  chambers_by_frame: Dict[int, Dict],
                  hive_masks_by_frame: Dict[int, Dict[int, Optional[np.ndarray]]],
                  bee_masks_by_frame: Dict[int, Dict[int, Optional[np.ndarray]]] = None,
+                 pollen_masks_by_frame: Dict[int, Dict[int, Optional[np.ndarray]]] = None,
+                 aruco_markers_by_frame: Dict[int, Dict[int, Dict]] = None,
                  max_frame: Optional[int] = None,
                  log_callback=None,
                  verbose_output: bool = False,
@@ -37,6 +39,8 @@ class VisualizationGenerator:
             chambers_by_frame: Chamber information per frame {frame_number -> {chamber_id -> chamber_info}}
             hive_masks_by_frame: Hive masks per frame per chamber
             bee_masks_by_frame: Bee masks per frame per bee_id (for segmentation visualization)
+            pollen_masks_by_frame: Pollen masks per frame per pollen_id
+            aruco_markers_by_frame: ArUco marker corners per frame per bee_id
             max_frame: Optional final frame number to visualize for partial/stopped runs
             log_callback: Optional callable for progress/warning messages
             verbose_output: Whether to print detailed visualization progress
@@ -53,6 +57,8 @@ class VisualizationGenerator:
         self.chambers_by_frame = chambers_by_frame
         self.hive_masks_by_frame = hive_masks_by_frame
         self.bee_masks_by_frame = bee_masks_by_frame if bee_masks_by_frame is not None else {}
+        self.pollen_masks_by_frame = pollen_masks_by_frame if pollen_masks_by_frame is not None else {}
+        self.aruco_markers_by_frame = aruco_markers_by_frame if aruco_markers_by_frame is not None else {}
         self.max_frame = max_frame
         self.log_callback = log_callback
         self.verbose_output = verbose_output
@@ -76,6 +82,7 @@ class VisualizationGenerator:
         # OpenCV uses BGR channel order.
         self.chamber_color = (230, 130, 40)
         self.hive_color = (0, 220, 255)
+        self.pollen_color = (255, 0, 255)
         
         # Organize detections by frame
         self.detections_by_frame = defaultdict(list)
@@ -106,6 +113,41 @@ class VisualizationGenerator:
         """Log detailed visualization progress only in verbose mode."""
         if self.verbose_output:
             self._log(message)
+
+    def annotate_live_frame(
+        self,
+        frame: np.ndarray,
+        frame_number: int,
+        bee_detections: List[BeeDetectionData],
+        chamber_frame_data: List[ChamberFrameData],
+        chambers: Dict[int, Dict],
+        hive_masks: Dict[int, Optional[np.ndarray]],
+        bee_masks: Optional[Dict[int, Optional[np.ndarray]]] = None,
+        pollen_masks: Optional[Dict[int, Optional[np.ndarray]]] = None,
+        aruco_markers: Optional[Dict[int, Dict]] = None,
+    ) -> np.ndarray:
+        """Annotate one in-memory frame without retaining full-frame masks afterward."""
+        self.detections_by_frame[frame_number] = list(bee_detections or [])
+        self.chamber_data_by_frame[frame_number] = {
+            row.chamber_id: row
+            for row in (chamber_frame_data or [])
+        }
+        self.chambers_by_frame[frame_number] = chambers or {}
+        self.hive_masks_by_frame[frame_number] = hive_masks or {}
+        self.bee_masks_by_frame[frame_number] = bee_masks or {}
+        self.pollen_masks_by_frame[frame_number] = pollen_masks or {}
+        self.aruco_markers_by_frame[frame_number] = aruco_markers or {}
+
+        try:
+            return self._annotate_frame(frame, frame_number)
+        finally:
+            self.detections_by_frame.pop(frame_number, None)
+            self.chamber_data_by_frame.pop(frame_number, None)
+            self.chambers_by_frame.pop(frame_number, None)
+            self.hive_masks_by_frame.pop(frame_number, None)
+            self.bee_masks_by_frame.pop(frame_number, None)
+            self.pollen_masks_by_frame.pop(frame_number, None)
+            self.aruco_markers_by_frame.pop(frame_number, None)
     
     def generate(self) -> bool:
         """
@@ -269,16 +311,20 @@ class VisualizationGenerator:
         # 2. Draw hive masks (lightly overlaid)
         hive_masks = self.hive_masks_by_frame.get(frame_number, {})
         self._draw_hive_masks(annotated, hive_masks)
+
+        # 3. Draw pollen masks
+        pollen_masks = self.pollen_masks_by_frame.get(frame_number, {})
+        self._draw_pollen_masks(annotated, pollen_masks)
         
-        # 3. Draw bee detections with IDs, ArUco codes, and tracking trails
+        # 4. Draw bee detections with IDs, ArUco codes, and tracking trails
         self._draw_bee_detections(annotated, detections, frame_number)
         
-        # 4. Draw chamber info panel
+        # 5. Draw chamber info panel
         if self.show_chamber_info and not self.pretty_mode:
             chamber_data = self.chamber_data_by_frame.get(frame_number, {})
             self._draw_chamber_info(annotated, chamber_data)
         
-        # 5. Draw status bar
+        # 6. Draw status bar
         if not self.pretty_mode:
             self._draw_status_bar(annotated, frame_number, len(detections))
         
@@ -316,6 +362,40 @@ class VisualizationGenerator:
                 overlay = frame.copy()
                 overlay[mask > 0] = overlay[mask > 0] * 0.7 + np.array(self.hive_color) * 0.3
                 cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+    def _draw_pollen_masks(self, frame: np.ndarray, pollen_masks: Dict[int, Optional[np.ndarray]]):
+        """Draw pollen masks as magenta contours and centroids."""
+        for pollen_id, mask in pollen_masks.items():
+            if mask is None:
+                continue
+            if mask.shape[:2] != frame.shape[:2]:
+                mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+            binary = (mask > 0).astype(np.uint8)
+            if not np.any(binary):
+                continue
+
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(frame, contours, -1, (20, 20, 20), 5, lineType=cv2.LINE_AA)
+            cv2.drawContours(frame, contours, -1, self.pollen_color, 2, lineType=cv2.LINE_AA)
+
+            coords = np.argwhere(binary > 0)
+            if len(coords) > 0:
+                cy, cx = coords.mean(axis=0)
+                cx, cy = int(cx), int(cy)
+                cv2.circle(frame, (cx, cy), 4, (20, 20, 20), -1, lineType=cv2.LINE_AA)
+                cv2.circle(frame, (cx, cy), 2, self.pollen_color, -1, lineType=cv2.LINE_AA)
+                if not self.pretty_mode:
+                    label = f"P{pollen_id}"
+                    cv2.putText(
+                        frame,
+                        label,
+                        (cx + 5, cy - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        self.pollen_color,
+                        2,
+                        lineType=cv2.LINE_AA,
+                    )
     
     def _draw_bee_detections(self, frame: np.ndarray, detections: List[BeeDetectionData],
                             frame_number: int):
@@ -327,6 +407,7 @@ class VisualizationGenerator:
         
         # Get bee masks for this frame (if available)
         bee_masks = self.bee_masks_by_frame.get(frame_number, {})
+        aruco_markers = self.aruco_markers_by_frame.get(frame_number, {})
         
         for detection in detections:
             # Bounding box
@@ -389,6 +470,10 @@ class VisualizationGenerator:
                 cv2.circle(frame, centroid, 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)  # bright white dot
             else:
                 cv2.circle(frame, centroid, 5, color, -1)
+
+            marker_info = aruco_markers.get(detection.bee_id)
+            if marker_info:
+                self._draw_aruco_marker(frame, marker_info, color)
             
             # Draw ID label with background
             label_y = y1 - 10 if y1 > 30 else y2 + 20
@@ -416,6 +501,55 @@ class VisualizationGenerator:
                              (x1 + text_w2 + 2, aruco_y + 2), (0, 0, 0), -1)
                 cv2.putText(frame, aruco_label, (x1, aruco_y), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    def _draw_aruco_marker(self, frame: np.ndarray, marker_info: Dict, color):
+        """Draw the actual detected ArUco tag quadrilateral."""
+        corners = marker_info.get('corners')
+        if corners is None:
+            return
+
+        points = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
+        if points.shape[0] < 4:
+            return
+
+        height, width = frame.shape[:2]
+        points[:, 0] = np.clip(points[:, 0], 0, width - 1)
+        points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+        pts = points.astype(np.int32)
+
+        marker_color = (0, 255, 255)
+        cv2.polylines(frame, [pts], True, (20, 20, 20), 7, lineType=cv2.LINE_AA)
+        cv2.polylines(frame, [pts], True, marker_color, 3, lineType=cv2.LINE_AA)
+
+        center = np.asarray(marker_info.get('center') or points.mean(axis=0), dtype=np.float32)
+        cx = int(np.clip(center[0], 0, width - 1))
+        cy = int(np.clip(center[1], 0, height - 1))
+        cv2.circle(frame, (cx, cy), 4, (20, 20, 20), -1, lineType=cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), 2, color, -1, lineType=cv2.LINE_AA)
+
+        aruco_code = str(marker_info.get('aruco_code', '')).strip()
+        if aruco_code and not self.pretty_mode:
+            label = f"A{aruco_code}"
+            label_x = int(np.clip(pts[:, 0].max() + 4, 0, max(0, width - 20)))
+            label_y = int(np.clip(pts[:, 1].min() - 4, 12, height - 4))
+            (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 2)
+            cv2.rectangle(
+                frame,
+                (label_x - 2, label_y - text_h - 2),
+                (min(width - 1, label_x + text_w + 2), label_y + 2),
+                (0, 0, 0),
+                -1
+            )
+            cv2.putText(
+                frame,
+                label,
+                (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                marker_color,
+                2,
+                lineType=cv2.LINE_AA
+            )
 
     def _bee_color(self, bee_id: int):
         """Return a stable visually pleasing BGR color for an instance ID."""

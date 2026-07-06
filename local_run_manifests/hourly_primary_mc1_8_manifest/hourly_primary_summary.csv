@@ -1,0 +1,9 @@
+microcolony_pair,microcolony_ids,exposure_date,source_date,relative_period,include_in_hourly_primary,selected_videos,missing_hours,day_status
+MCs-1-and-2,1;2,2026-02-23,2026-02-22;2026-02-23,pre_exposure_folder,true,16,09;10;11;12;13;14;15;16,partial_day
+MCs-1-and-2,1;2,2026-02-23,2026-02-26,post_exposure_folder,true,24,,full_24_hours
+MCs-3-and-4,3;4,2026-02-23,2026-02-22,pre_exposure_folder,true,24,,full_24_hours
+MCs-3-and-4,3;4,2026-02-23,2026-02-26,post_exposure_folder,true,24,,full_24_hours
+MCs-5-and-6,5;6,2026-02-23,2026-02-22,pre_exposure_folder,true,4,00;01;02;03;04;05;06;07;08;09;10;11;12;13;14;15;16;21;22;23,partial_day
+MCs-5-and-6,5;6,2026-02-23,2026-02-26,post_exposure_folder,true,24,,full_24_hours
+MCs-7-and-8,7;8,2026-02-23,2026-02-22,pre_exposure_folder,true,7,00;01;02;03;04;05;06;07;08;09;10;11;12;13;14;15;16,partial_day
+MCs-7-and-8,7;8,2026-02-23,2026-02-26,post_exposure_folder,true,24,,full_24_hours

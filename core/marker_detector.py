@@ -50,6 +50,7 @@ class MarkerDetector:
         aruco_dicts: Optional[List[str]] = None,
         aruco_params: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         allowed_tag_ids: Optional[Union[List[int], set]] = None,
+        excluded_tag_ids: Optional[Union[List[int], set]] = None,
         min_confidence: float = 0.2,
         enable_aruco: bool = True,
         enable_qr: bool = True,
@@ -63,6 +64,7 @@ class MarkerDetector:
             aruco_dicts: List of ArUco dictionary names to try (None = try common ones)
             aruco_params: One params dict or a bank of params dicts for cv2.aruco.DetectorParameters
             allowed_tag_ids: Optional allowlist of marker IDs to accept
+            excluded_tag_ids: Optional blocklist of marker IDs to reject
             min_confidence: Minimum detection confidence threshold (0-1, default 0.2 for small markers)
             enable_aruco: Enable ArUco marker detection
             enable_qr: Enable QR code detection
@@ -71,6 +73,7 @@ class MarkerDetector:
         self.enable_aruco = enable_aruco
         self.enable_qr = enable_qr
         self.allowed_tag_ids = {int(tag_id) for tag_id in allowed_tag_ids} if allowed_tag_ids else None
+        self.excluded_tag_ids = {int(tag_id) for tag_id in excluded_tag_ids} if excluded_tag_ids else set()
         self.aruco_param_bank = self._normalize_aruco_param_bank(aruco_params)
         self.debug = debug
         self.debug_folder = debug_folder
@@ -143,6 +146,8 @@ class MarkerDetector:
         return detector_params
 
     def _marker_id_allowed(self, marker_id: Union[int, np.integer]) -> bool:
+        if int(marker_id) in self.excluded_tag_ids:
+            return False
         if self.allowed_tag_ids is None:
             return True
         return int(marker_id) in self.allowed_tag_ids
@@ -751,9 +756,8 @@ class MarkerDetector:
                 if reject_multiple:
                     stats['rejected_multiple'] += 1
                     marker_ids = [m['marker_id'] for m in markers]
-                    # Always print rejection info (not just in debug mode) to alert user
-                    print(f"  [Instance {instance_id}] ✗ REJECTED: {len(markers)} markers detected (IDs: {marker_ids})")
                     if self.debug:
+                        print(f"  [Instance {instance_id}] ✗ REJECTED: {len(markers)} markers detected (IDs: {marker_ids})")
                         for m in markers:
                             print(f"    - ArUco {m['marker_id']} at ({m['center'][0]:.1f}, {m['center'][1]:.1f}), conf={m['confidence']:.2f}")
                 else:

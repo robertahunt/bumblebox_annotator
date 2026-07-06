@@ -9,7 +9,9 @@ cover different sampled-frame conditions.
 from __future__ import annotations
 
 import csv
+import concurrent.futures
 import json
+import os
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -102,6 +104,8 @@ class ArucoCandidate:
     mean_filtered: float
     mean_rejected: float
     std_detected: float
+    stability: float
+    unique_ids: int
     coverage_frames: int
     eval_fps: float
     runtime_seconds: float
@@ -117,6 +121,7 @@ class ArucoOptimizationResult:
     sampled_frame_indices: List[int]
     parameter_combinations_total: int
     combinations_evaluated: int
+    workers: int
     output_dir: str
     summary_json_path: str
     candidates_csv_path: str
@@ -158,7 +163,15 @@ def load_tag_ids(path: str | Path) -> Set[int]:
     if isinstance(payload, list):
         return {int(item) for item in payload}
     if isinstance(payload, dict):
-        for key in ("tag_ids", "allowed_tag_ids", "ids", "tags"):
+        for key in (
+            "tag_ids",
+            "allowed_tag_ids",
+            "excluded_tag_ids",
+            "exclude_tag_ids",
+            "blocked_tag_ids",
+            "ids",
+            "tags",
+        ):
             value = payload.get(key)
             if isinstance(value, list):
                 return {int(item) for item in value}
@@ -195,7 +208,8 @@ def sample_video_frames(video_path: Path, sample_count: int) -> Tuple[List[np.nd
         ok, frame = cap.read()
         if not ok or frame is None:
             continue
-        frames.append(frame)
+        gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frames.append(gray)
         used_indices.append(frame_index)
         if total_frames <= 0 and len(frames) >= sample_count:
             break
@@ -253,9 +267,63 @@ def build_parameter_grid(
     if not grid:
         raise RuntimeError("ArUco parameter grid is empty after validation.")
 
-    if max_combinations is not None and int(max_combinations) > 0 and len(grid) > int(max_combinations):
-        grid = grid[: int(max_combinations)]
+    grid = _limit_parameter_grid(grid, max_combinations)
     return grid
+
+
+def _limit_parameter_grid(
+    param_grid: Sequence[Dict[str, float | int]],
+    max_combinations: Optional[int],
+) -> List[Dict[str, float | int]]:
+    """Evenly thin the deterministic grid so capped sweeps keep broad coverage."""
+    grid = list(param_grid)
+    if max_combinations is None or int(max_combinations) <= 0:
+        return grid
+
+    max_count = int(max_combinations)
+    if len(grid) <= max_count:
+        return grid
+    if max_count == 1:
+        return [grid[0]]
+
+    selected_indices = []
+    used = set()
+    span = len(grid) - 1
+    for idx in range(max_count):
+        selected = int(round((idx * span) / float(max_count - 1)))
+        while selected in used and selected < len(grid) - 1:
+            selected += 1
+        while selected in used and selected > 0:
+            selected -= 1
+        if selected in used:
+            continue
+        used.add(selected)
+        selected_indices.append(selected)
+
+    cursor = 0
+    while len(selected_indices) < max_count and cursor < len(grid):
+        if cursor not in used:
+            selected_indices.append(cursor)
+            used.add(cursor)
+        cursor += 1
+
+    return [grid[index] for index in sorted(selected_indices[:max_count])]
+
+
+def _resolve_worker_count(requested_workers: Optional[int], total_candidates: int) -> int:
+    """Resolve requested optimizer worker count to a bounded positive integer."""
+    if total_candidates <= 0:
+        return 1
+
+    if requested_workers is not None:
+        workers = int(requested_workers)
+        if workers <= 0:
+            raise ValueError("workers must be >= 1")
+    else:
+        cpu_count = os.cpu_count() or 1
+        workers = cpu_count if cpu_count <= 2 else min(12, cpu_count - 1)
+
+    return max(1, min(workers, total_candidates))
 
 
 def _detector_params_from_dict(params: Dict[str, float | int]) -> cv2.aruco.DetectorParameters:
@@ -279,6 +347,7 @@ def _evaluate_candidate(
     frames: Sequence[np.ndarray],
     dictionary_key: str,
     allowed_tag_ids: Optional[Set[int]],
+    excluded_tag_ids: Optional[Set[int]],
     expected_tags: Optional[float],
 ) -> ArucoCandidate:
     detector_params = _detector_params_from_dict(params)
@@ -289,6 +358,9 @@ def _evaluate_candidate(
     decoded_counts = []
     filtered_counts = []
     rejected_counts = []
+    stability_scores = []
+    unique_ids = set()
+    previous_ids = set()
     start = time.perf_counter()
 
     for frame in frames:
@@ -303,6 +375,9 @@ def _evaluate_candidate(
             for corner, raw_marker_id in zip(corners, ids.flatten().tolist()):
                 marker_id = int(raw_marker_id)
                 decoded += 1
+                if excluded_tag_ids is not None and marker_id in excluded_tag_ids:
+                    filtered += 1
+                    continue
                 if allowed_tag_ids is not None and marker_id not in allowed_tag_ids:
                     filtered += 1
                     continue
@@ -319,6 +394,11 @@ def _evaluate_candidate(
         decoded_counts.append(decoded)
         filtered_counts.append(filtered)
         rejected_counts.append(len(rejected) if rejected is not None else 0)
+        unique_ids.update(valid_ids)
+
+        union = previous_ids | valid_ids
+        stability_scores.append(len(previous_ids & valid_ids) / len(union) if union else 1.0)
+        previous_ids = valid_ids
 
     runtime = max(1e-9, time.perf_counter() - start)
     mean_detected = float(np.mean(detected_counts)) if detected_counts else 0.0
@@ -326,12 +406,14 @@ def _evaluate_candidate(
     mean_filtered = float(np.mean(filtered_counts)) if filtered_counts else 0.0
     mean_rejected = float(np.mean(rejected_counts)) if rejected_counts else 0.0
     std_detected = float(np.std(detected_counts)) if detected_counts else 0.0
+    stability = float(np.mean(stability_scores)) if stability_scores else 0.0
     coverage_target = 1.0 if not expected_tags else max(1.0, min(float(expected_tags), mean_detected or float(expected_tags)))
     coverage_frames = sum(1 for count in detected_counts if count >= coverage_target)
     eval_fps = len(frames) / runtime
 
     score = mean_detected
     score += 0.15 * coverage_frames
+    score += 0.10 * stability
     score += 0.05 * min(eval_fps, 90.0) / 90.0
     score -= 0.01 * std_detected
     score -= 0.005 * mean_rejected
@@ -348,6 +430,8 @@ def _evaluate_candidate(
         mean_filtered=mean_filtered,
         mean_rejected=mean_rejected,
         std_detected=std_detected,
+        stability=stability,
+        unique_ids=len(unique_ids),
         coverage_frames=int(coverage_frames),
         eval_fps=float(eval_fps),
         runtime_seconds=float(runtime),
@@ -373,7 +457,7 @@ def _select_parameter_bank(candidates: List[ArucoCandidate], bank_size: int) -> 
 
     ranked = sorted(
         candidates,
-        key=lambda item: (item.score, item.mean_detected, item.coverage_frames, -item.mean_rejected, item.eval_fps),
+        key=lambda item: (item.score, item.mean_detected, item.stability, item.coverage_frames, -item.mean_rejected, item.eval_fps),
         reverse=True,
     )
 
@@ -420,7 +504,9 @@ def optimize_aruco_parameter_bank(
     bank_size: int = 5,
     expected_tags: Optional[float] = None,
     allowed_tag_ids: Optional[Iterable[int]] = None,
+    excluded_tag_ids: Optional[Iterable[int]] = None,
     sweep_overrides: Optional[Dict[str, Sequence[float | int]]] = None,
+    workers: Optional[int] = None,
     progress_callback: Optional[ProgressCallback] = None,
     stop_requested: Optional[StopCallback] = None,
 ) -> ArucoOptimizationResult:
@@ -429,28 +515,70 @@ def optimize_aruco_parameter_bank(
     frames, frame_indices, _total_frames = sample_video_frames(resolved_video, max(1, int(sample_frames)))
     grid = build_parameter_grid(profile, sweep_overrides=sweep_overrides, max_combinations=max_combinations)
     allowed_ids = {int(item) for item in allowed_tag_ids} if allowed_tag_ids else None
+    excluded_ids = {int(item) for item in excluded_tag_ids} if excluded_tag_ids else None
 
     evaluated = []
     total = len(grid)
-    for index, params in enumerate(grid, start=1):
-        if stop_requested and stop_requested():
-            break
-        candidate = _evaluate_candidate(
-            params=params,
-            frames=frames,
-            dictionary_key=dictionary_key,
-            allowed_tag_ids=allowed_ids,
-            expected_tags=expected_tags,
-        )
+    resolved_workers = _resolve_worker_count(workers, total)
+    completed = 0
+
+    def should_stop() -> bool:
+        return bool(stop_requested and stop_requested())
+
+    def register_candidate(candidate: ArucoCandidate):
+        nonlocal completed
         evaluated.append(candidate)
-        if progress_callback and (index == 1 or index == total or index % 25 == 0):
-            progress_callback(index, total, asdict(candidate))
+        completed += 1
+        if progress_callback:
+            progress_callback(completed, total, asdict(candidate))
+
+    if resolved_workers == 1:
+        for params in grid:
+            if should_stop():
+                break
+            candidate = _evaluate_candidate(
+                params=params,
+                frames=frames,
+                dictionary_key=dictionary_key,
+                allowed_tag_ids=allowed_ids,
+                excluded_tag_ids=excluded_ids,
+                expected_tags=expected_tags,
+            )
+            register_candidate(candidate)
+    else:
+        cursor = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=resolved_workers) as executor:
+            while cursor < total:
+                if should_stop():
+                    break
+
+                batch = grid[cursor : cursor + resolved_workers]
+                cursor += len(batch)
+                futures = [
+                    executor.submit(
+                        _evaluate_candidate,
+                        params=params,
+                        frames=frames,
+                        dictionary_key=dictionary_key,
+                        allowed_tag_ids=allowed_ids,
+                        excluded_tag_ids=excluded_ids,
+                        expected_tags=expected_tags,
+                    )
+                    for params in batch
+                ]
+
+                for future in concurrent.futures.as_completed(futures):
+                    candidate = future.result()
+                    register_candidate(candidate)
+
+                if should_stop():
+                    break
 
     if not evaluated:
         raise RuntimeError("ArUco optimization stopped before any candidates completed.")
 
     evaluated.sort(
-        key=lambda item: (item.score, item.mean_detected, item.coverage_frames, -item.mean_rejected, item.eval_fps),
+        key=lambda item: (item.score, item.mean_detected, item.stability, item.coverage_frames, -item.mean_rejected, item.eval_fps),
         reverse=True,
     )
     for rank, candidate in enumerate(evaluated, start=1):
@@ -472,6 +600,8 @@ def optimize_aruco_parameter_bank(
                 "mean_filtered",
                 "mean_rejected",
                 "std_detected",
+                "stability",
+                "unique_ids",
                 "coverage_frames",
                 "eval_fps",
                 "runtime_seconds",
@@ -490,6 +620,8 @@ def optimize_aruco_parameter_bank(
                     "mean_filtered": f"{candidate.mean_filtered:.6f}",
                     "mean_rejected": f"{candidate.mean_rejected:.6f}",
                     "std_detected": f"{candidate.std_detected:.6f}",
+                    "stability": f"{candidate.stability:.6f}",
+                    "unique_ids": candidate.unique_ids,
                     "coverage_frames": candidate.coverage_frames,
                     "eval_fps": f"{candidate.eval_fps:.6f}",
                     "runtime_seconds": f"{candidate.runtime_seconds:.6f}",
@@ -506,6 +638,7 @@ def optimize_aruco_parameter_bank(
         sampled_frame_indices=frame_indices,
         parameter_combinations_total=total,
         combinations_evaluated=len(evaluated),
+        workers=resolved_workers,
         output_dir=str(run_dir),
         summary_json_path=str(run_dir / "optimization_summary.json"),
         candidates_csv_path=str(candidates_csv),

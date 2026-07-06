@@ -1,0 +1,9 @@
+pair,reason,current_pre,raw_pre,target_pre,requested,added
+MCs-1-and-2,pre_fill_to_24_if_possible,16,94,24,8,8
+MCs-5-and-6,pre_fill_to_24_if_possible,4,22,22,18,18
+MCs-7-and-8,pre_fill_to_24_if_possible,7,41,24,17,17
+MCs-11-and-12,pre_fill_to_24_if_possible,0,0,0,0,0
+MCs-15-and-16,pre_fill_to_24_if_possible,0,0,0,0,0
+MCs-13-and-14,blur_compensation_0.5ppb,,47,extra,12,12
+MCs-21-and-22,blur_compensation_0.5ppb,,47,extra,12,12
+MCs-17-and-18,blur_compensation_10ppb,,47,extra,23,23

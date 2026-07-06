@@ -2,15 +2,21 @@
 Dialog for batch video inference with tracking and ArUco detection
 """
 
+import csv
+import hashlib
+import os
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QGroupBox, QFormLayout, 
                              QDoubleSpinBox, QSpinBox, QLineEdit, QFileDialog,
                              QProgressBar, QTextEdit, QCheckBox, QMessageBox,
                              QComboBox, QRadioButton, QButtonGroup, QScrollArea, QWidget)
-from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtCore import Qt, pyqtSlot, QSettings
 from PyQt6.QtGui import QFont
 from pathlib import Path
 from datetime import datetime
+
+
+DEFAULT_POLLEN_MODEL_PATH = "/home/august/Dropbox/bee_annotator/projects/test_august_june25/models/pollen_segmentation_jun23/weights/best.pt"
 
 
 class BatchVideoInferenceConfigDialog(QDialog):
@@ -25,6 +31,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
         
         self.config = None
         self.selected_files = []
+        self.settings = QSettings("BumbleBoxAnnotator", "BatchVideoInference")
         
         self.init_ui()
         
@@ -38,10 +45,16 @@ class BatchVideoInferenceConfigDialog(QDialog):
             "Process videos with bee detection, tracking, ArUco detection, and spatial analysis.<br><br>"
             "<b>Outputs:</b><br>"
             "• bee_detections.csv - Per-frame bee data with spatial metrics<br>"
+            "• bee_interactions.csv - Pairwise mask-contact events<br>"
+            "• aruco_observations.csv - Physical ArUco sightings and acceptance decisions<br>"
+            "• bee_identity_events.csv - ArUco identity assignments, confirmations, reidentifications, and rejections<br>"
+            "• bee_identity_segments.csv - Track stretches scored by ArUco identity support<br>"
+            "• pollen_detections.csv - Per-frame pollen counts/pixels by chamber when a pollen model is provided<br>"
             "• bee_velocity.csv - Average velocity and frame transitions per bee<br>"
             "• hive_detections.csv - Averaged hive pixels and centroid per chamber (when hive model is provided)<br>"
             "• chamber_detections.csv - Averaged chamber pixels and centroid per chamber<br>"
-            "• Optional: Annotated frame images with tracking trails"
+            "• temporal_hive_priors.csv - Stable chamber-normalized hive perimeter (when temporal prior is enabled)<br>"
+            "• Optional: Annotated MP4 videos or frame images with tracking trails"
         )
         desc_label.setWordWrap(True)
         main_layout.addWidget(desc_label)
@@ -95,8 +108,20 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.files_browse_btn.clicked.connect(self.browse_input_files)
         self.files_browse_btn.setEnabled(False)
         files_layout.addWidget(self.files_browse_btn)
+
+        self.files_list_btn = QPushButton("Load List...")
+        self.files_list_btn.clicked.connect(self.browse_input_file_list)
+        self.files_list_btn.setEnabled(False)
+        files_layout.addWidget(self.files_list_btn)
         
         video_layout.addLayout(files_layout)
+
+        self.preserve_file_order_check = QCheckBox("Preserve selected file/list order")
+        self.preserve_file_order_check.setEnabled(False)
+        self.preserve_file_order_check.setToolTip(
+            "Use for ordered manifests; otherwise videos are sorted for temporal priors or randomized."
+        )
+        video_layout.addWidget(self.preserve_file_order_check)
         
         # Connect radio buttons to enable/disable fields
         self.folder_radio.toggled.connect(self._update_selection_controls)
@@ -171,8 +196,46 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.hive_clear_btn = QPushButton("Clear")
         self.hive_clear_btn.clicked.connect(lambda: self.hive_model_edit.clear())
         hive_layout.addWidget(self.hive_clear_btn)
+        self.hive_model_edit.textChanged.connect(self._update_temporal_hive_controls)
         
         optional_layout.addRow("Hive Model:", hive_layout)
+
+        self.temporal_hive_prior_check = QCheckBox("Use chamber-aligned temporal hive prior")
+        self.temporal_hive_prior_check.setChecked(True)
+        self.temporal_hive_prior_check.setToolTip(
+            "Build a rolling hive probability map in normalized chamber coordinates.\n"
+            "Bee rows get on_temporal_hive and overlap metrics using the prior before the current frame is added."
+        )
+        self.temporal_hive_prior_check.stateChanged.connect(self._update_temporal_hive_controls)
+        optional_layout.addRow("", self.temporal_hive_prior_check)
+
+        self.temporal_hive_window_spin = QDoubleSpinBox()
+        self.temporal_hive_window_spin.setRange(0.1, 24.0)
+        self.temporal_hive_window_spin.setValue(8.0)
+        self.temporal_hive_window_spin.setSingleStep(0.5)
+        self.temporal_hive_window_spin.setDecimals(1)
+        self.temporal_hive_window_spin.setSuffix(" h")
+        self.temporal_hive_window_spin.setToolTip(
+            "Effective time window for the rolling prior. Filename timestamps are used when they can be parsed."
+        )
+        optional_layout.addRow("Temporal prior window:", self.temporal_hive_window_spin)
+
+        # Pollen model
+        pollen_layout = QHBoxLayout()
+        self.pollen_model_edit = QLineEdit()
+        self.pollen_model_edit.setPlaceholderText("Optional: Select YOLO pollen segmentation model...")
+        self.pollen_model_edit.setReadOnly(True)
+        pollen_layout.addWidget(self.pollen_model_edit)
+
+        self.pollen_browse_btn = QPushButton("Browse...")
+        self.pollen_browse_btn.clicked.connect(self.browse_pollen_model)
+        pollen_layout.addWidget(self.pollen_browse_btn)
+
+        self.pollen_clear_btn = QPushButton("Clear")
+        self.pollen_clear_btn.clicked.connect(lambda: self.pollen_model_edit.clear())
+        pollen_layout.addWidget(self.pollen_clear_btn)
+
+        optional_layout.addRow("Pollen Model:", pollen_layout)
         
         # Chamber model
         chamber_layout = QHBoxLayout()
@@ -334,6 +397,17 @@ class BatchVideoInferenceConfigDialog(QDialog):
             "Mask methods fall back to centroid distance when masks are unavailable."
         )
         detection_layout.addRow(self.distance_method_label, self.distance_method_combo)
+
+        self.pixel_size_mm_spin = QDoubleSpinBox()
+        self.pixel_size_mm_spin.setRange(0.0, 100.0)
+        self.pixel_size_mm_spin.setValue(0.0)
+        self.pixel_size_mm_spin.setSingleStep(0.01)
+        self.pixel_size_mm_spin.setDecimals(4)
+        self.pixel_size_mm_spin.setSuffix(" mm/px")
+        self.pixel_size_mm_spin.setToolTip(
+            "Optional physical calibration. Leave at 0 to export only pixel units."
+        )
+        detection_layout.addRow("Pixel size:", self.pixel_size_mm_spin)
         
         detection_group.setLayout(detection_layout)
         layout.addWidget(detection_group)
@@ -399,6 +473,16 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.aruco_max_combinations_spin.setValue(750)
         aruco_form.addRow("Max combinations:", self.aruco_max_combinations_spin)
 
+        cpu_count = os.cpu_count() or 1
+        default_workers = cpu_count if cpu_count <= 2 else min(12, cpu_count - 1)
+        self.aruco_workers_spin = QSpinBox()
+        self.aruco_workers_spin.setRange(1, max(1, cpu_count))
+        self.aruco_workers_spin.setValue(max(1, default_workers))
+        self.aruco_workers_spin.setToolTip(
+            "Number of parallel worker threads for ArUco parameter optimization."
+        )
+        aruco_form.addRow("Optimization workers:", self.aruco_workers_spin)
+
         self.aruco_bank_size_spin = QSpinBox()
         self.aruco_bank_size_spin.setRange(1, 20)
         self.aruco_bank_size_spin.setValue(5)
@@ -415,6 +499,10 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.aruco_tag_list_edit = QLineEdit()
         self.aruco_tag_list_edit.setPlaceholderText("Optional tag allowlist file...")
         self.aruco_tag_list_edit.setReadOnly(True)
+        self.aruco_tag_list_edit.setToolTip(
+            "Use a simple tag list for one batch-wide allowlist, or a CSV with "
+            "microcolony_pair and tag_ids columns for per-MC-pair allowlists."
+        )
         tag_list_layout.addWidget(self.aruco_tag_list_edit)
         self.aruco_tag_list_browse_btn = QPushButton("Browse...")
         self.aruco_tag_list_browse_btn.clicked.connect(self.browse_aruco_tag_list)
@@ -422,34 +510,47 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.aruco_tag_list_clear_btn = QPushButton("Clear")
         self.aruco_tag_list_clear_btn.clicked.connect(lambda: self.aruco_tag_list_edit.clear())
         tag_list_layout.addWidget(self.aruco_tag_list_clear_btn)
-        aruco_form.addRow("Tag list:", tag_list_layout)
+        aruco_form.addRow("Allow tags:", tag_list_layout)
+
+        exclude_tag_list_layout = QHBoxLayout()
+        self.aruco_exclude_tag_list_edit = QLineEdit()
+        self.aruco_exclude_tag_list_edit.setPlaceholderText("Optional tag exclude list file...")
+        self.aruco_exclude_tag_list_edit.setReadOnly(True)
+        exclude_tag_list_layout.addWidget(self.aruco_exclude_tag_list_edit)
+        self.aruco_exclude_tag_list_browse_btn = QPushButton("Browse...")
+        self.aruco_exclude_tag_list_browse_btn.clicked.connect(self.browse_aruco_exclude_tag_list)
+        exclude_tag_list_layout.addWidget(self.aruco_exclude_tag_list_browse_btn)
+        self.aruco_exclude_tag_list_clear_btn = QPushButton("Clear")
+        self.aruco_exclude_tag_list_clear_btn.clicked.connect(lambda: self.aruco_exclude_tag_list_edit.clear())
+        exclude_tag_list_layout.addWidget(self.aruco_exclude_tag_list_clear_btn)
+        aruco_form.addRow("Exclude tags:", exclude_tag_list_layout)
 
         self.aruco_sweep_min_perimeter_edit = QLineEdit()
-        self.aruco_sweep_min_perimeter_edit.setPlaceholderText("e.g. 0.019153")
+        self.aruco_sweep_min_perimeter_edit.setText("0.019153")
         aruco_form.addRow("Sweep min perimeter:", self.aruco_sweep_min_perimeter_edit)
 
         self.aruco_sweep_max_perimeter_edit = QLineEdit()
-        self.aruco_sweep_max_perimeter_edit.setPlaceholderText("e.g. 0.052808")
+        self.aruco_sweep_max_perimeter_edit.setText("0.052808")
         aruco_form.addRow("Sweep max perimeter:", self.aruco_sweep_max_perimeter_edit)
 
         self.aruco_sweep_win_min_edit = QLineEdit()
-        self.aruco_sweep_win_min_edit.setPlaceholderText("e.g. 3")
+        self.aruco_sweep_win_min_edit.setText("3")
         aruco_form.addRow("Sweep thresh win min:", self.aruco_sweep_win_min_edit)
 
         self.aruco_sweep_win_max_edit = QLineEdit()
-        self.aruco_sweep_win_max_edit.setPlaceholderText("e.g. 30,50,70,90,110,130,150")
+        self.aruco_sweep_win_max_edit.setText("30,50,70,90,110,130,150")
         aruco_form.addRow("Sweep thresh win max:", self.aruco_sweep_win_max_edit)
 
         self.aruco_sweep_win_step_edit = QLineEdit()
-        self.aruco_sweep_win_step_edit.setPlaceholderText("e.g. 3")
+        self.aruco_sweep_win_step_edit.setText("3")
         aruco_form.addRow("Sweep thresh win step:", self.aruco_sweep_win_step_edit)
 
         self.aruco_sweep_poly_edit = QLineEdit()
-        self.aruco_sweep_poly_edit.setPlaceholderText("e.g. 0.08")
+        self.aruco_sweep_poly_edit.setText("0.08")
         aruco_form.addRow("Sweep polygon approx:", self.aruco_sweep_poly_edit)
 
         self.aruco_sweep_constant_edit = QLineEdit()
-        self.aruco_sweep_constant_edit.setPlaceholderText("e.g. 3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19")
+        self.aruco_sweep_constant_edit.setText("3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19")
         aruco_form.addRow("Sweep threshold constant:", self.aruco_sweep_constant_edit)
 
         aruco_layout.addLayout(aruco_form)
@@ -475,18 +576,78 @@ class BatchVideoInferenceConfigDialog(QDialog):
         output_folder_layout.addWidget(self.output_browse_btn)
         
         output_layout.addLayout(output_folder_layout)
+
+        self.resume_completed_check = QCheckBox("Resume batch: skip completed videos")
+        self.resume_completed_check.setChecked(False)
+        self.resume_completed_check.setToolTip(
+            "Use batch_video_status.csv in the output folder to skip videos that were fully exported.\n"
+            "When the temporal hive prior is enabled, skipped videos are replayed in a lightweight prior-only mode."
+        )
+        output_layout.addWidget(self.resume_completed_check)
+
+        self.resume_ignore_config_mismatch_check = QCheckBox("Allow resume despite configuration changes")
+        self.resume_ignore_config_mismatch_check.setChecked(False)
+        self.resume_ignore_config_mismatch_check.setToolTip(
+            "For this run only, treat completed rows in batch_video_status.csv as reusable even if the saved "
+            "batch configuration differs.\n"
+            "Use this only when the changed settings do not matter for the already-exported CSV rows."
+        )
+        output_layout.addWidget(self.resume_ignore_config_mismatch_check)
         
-        self.save_visualizations_check = QCheckBox("Generate annotated frame visualizations")
+        self.save_visualizations_check = QCheckBox("Generate annotated visualizations")
         self.save_visualizations_check.setChecked(False)
         self.save_visualizations_check.setToolTip(
-            "Create annotated frame images with:\n"
+            "Create annotated videos or frame images with:\n"
             "• Bee bounding boxes with IDs and ArUco codes\n"
             "• Tracking trails\n"
             "• Chamber boundaries\n"
-            "• Hive segmentation\n"
-            "Saved under output_folder/visualizations/<video_id>/"
+            "• Hive segmentation"
         )
+        self.save_visualizations_check.stateChanged.connect(self._update_visualization_controls)
+        self.resume_completed_check.stateChanged.connect(self._update_visualization_controls)
         output_layout.addWidget(self.save_visualizations_check)
+
+        viz_form = QFormLayout()
+        viz_form.setContentsMargins(20, 0, 0, 0)
+
+        self.visualization_format_combo = QComboBox()
+        self.visualization_format_combo.addItems(["MP4 video", "Frame images"])
+        self.visualization_format_combo.setCurrentText("MP4 video")
+        self.visualization_format_combo.setToolTip(
+            "MP4 videos are saved under output_folder/annotated_videos/.\n"
+            "Frame images are saved under output_folder/visualizations/<video_id>/."
+        )
+        viz_form.addRow("Visualization format:", self.visualization_format_combo)
+
+        self.visualization_interval_spin = QSpinBox()
+        self.visualization_interval_spin.setRange(1, 10000)
+        self.visualization_interval_spin.setValue(1)
+        self.visualization_interval_spin.setSuffix(" video(s)")
+        self.visualization_interval_spin.setToolTip(
+            "Generate a visualization for every Nth video in the batch."
+        )
+        viz_form.addRow("Visualize every:", self.visualization_interval_spin)
+
+        self.visualization_max_frames_spin = QSpinBox()
+        self.visualization_max_frames_spin.setRange(0, 10000)
+        self.visualization_max_frames_spin.setValue(25)
+        self.visualization_max_frames_spin.setSpecialValueText("All frames")
+        self.visualization_max_frames_spin.setSuffix(" frame(s)")
+        self.visualization_max_frames_spin.setToolTip(
+            "Limit annotated clips to the first N frames while still analyzing the full video. "
+            "Use All frames only when memory allows."
+        )
+        viz_form.addRow("Frames per visualization:", self.visualization_max_frames_spin)
+
+        self.skip_completed_visualizations_check = QCheckBox("Skip visualizations for completed videos")
+        self.skip_completed_visualizations_check.setChecked(True)
+        self.skip_completed_visualizations_check.setToolTip(
+            "When resume mode is enabled, keep already-completed videos skipped even if visualization settings changed.\n"
+            "Turn this off if you want to reprocess completed videos to backfill annotated media."
+        )
+        viz_form.addRow("", self.skip_completed_visualizations_check)
+
+        output_layout.addLayout(viz_form)
 
         self.verbose_output_check = QCheckBox("Verbose output")
         self.verbose_output_check.setChecked(False)
@@ -523,11 +684,191 @@ class BatchVideoInferenceConfigDialog(QDialog):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             default_output = self.parent_window.project_path / 'batch_video_inference' / timestamp
             self.output_folder_edit.setText(str(default_output))
+
+        self._restore_last_settings()
         
         # Initialize UI state to match default selections
-        self._update_tracking_params("Centroid")  # Show Centroid params since that's the default
+        self._update_tracking_params(self.tracking_algo_combo.currentText())
         self.update_distance_method_visibility()  # Update distance method visibility
+        self._update_selection_controls()
         self._update_aruco_controls()
+        self._update_temporal_hive_controls()
+        self._update_visualization_controls()
+
+    def _setting_bool(self, key, default=False):
+        value = self.settings.value(key, default)
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _setting_int(self, key, default):
+        value = self.settings.value(key, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _setting_float(self, key, default):
+        value = self.settings.value(key, default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _setting_text(self, key, default=""):
+        value = self.settings.value(key, default)
+        return "" if value is None else str(value)
+
+    def _set_combo_text(self, combo, text):
+        index = combo.findText(str(text))
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _show_selected_files(self):
+        if not self.selected_files:
+            self.input_files_edit.clear()
+        elif len(self.selected_files) == 1:
+            self.input_files_edit.setText(self.selected_files[0])
+        else:
+            self.input_files_edit.setText(f"{len(self.selected_files)} files selected")
+
+    def _restore_last_settings(self):
+        """Restore the last successful batch-inference configuration."""
+        if self.settings.contains("video/folder_mode"):
+            folder_mode = self._setting_bool("video/folder_mode", True)
+            self.folder_radio.setChecked(folder_mode)
+            self.files_radio.setChecked(not folder_mode)
+
+        self.input_folder_edit.setText(self._setting_text("video/input_folder", self.input_folder_edit.text()))
+        selected_files_text = self._setting_text("video/selected_files", "")
+        self.selected_files = [line for line in selected_files_text.splitlines() if line.strip()]
+        self._show_selected_files()
+        self.preserve_file_order_check.setChecked(self._setting_bool("video/preserve_file_order", False))
+
+        bee_model_type = self._setting_text("models/bee_model_type", "bbox")
+        self.seg_radio.setChecked(bee_model_type == "segmentation")
+        self.bbox_radio.setChecked(bee_model_type != "segmentation")
+        self.bee_model_edit.setText(self._setting_text("models/bee_model_path", self.bee_model_edit.text()))
+        self.hive_model_edit.setText(self._setting_text("models/hive_model_path", self.hive_model_edit.text()))
+        self.pollen_model_edit.setText(self._setting_text("models/pollen_model_path", DEFAULT_POLLEN_MODEL_PATH))
+        self.chamber_model_edit.setText(self._setting_text("models/chamber_model_path", self.chamber_model_edit.text()))
+        self.temporal_hive_prior_check.setChecked(self._setting_bool("models/use_temporal_hive_prior", True))
+        self.temporal_hive_window_spin.setValue(self._setting_float("models/temporal_hive_window_hours", 8.0))
+
+        self._set_combo_text(self.tracking_algo_combo, self._setting_text("tracking/algorithm", self.tracking_algo_combo.currentText()))
+        self.bt_high_conf_spin.setValue(self._setting_float("tracking/bt_high_confidence", 0.5))
+        self.bt_high_iou_spin.setValue(self._setting_float("tracking/bt_high_iou", 0.6))
+        self.bt_low_iou_spin.setValue(self._setting_float("tracking/bt_low_iou", 0.3))
+        self.bt_max_lost_spin.setValue(self._setting_int("tracking/bt_max_frames_lost", 10))
+        self.bt_mask_iou_check.setChecked(self._setting_bool("tracking/bt_use_mask_iou", True))
+        self.siou_threshold_spin.setValue(self._setting_float("tracking/siou_threshold", 0.5))
+        self.siou_mask_iou_check.setChecked(self._setting_bool("tracking/siou_use_mask_iou", True))
+        self.cent_max_dist_spin.setValue(self._setting_int("tracking/centroid_max_distance", 200))
+        self.cent_max_missing_spin.setValue(self._setting_int("tracking/centroid_max_frames_missing", 1))
+
+        self.confidence_spin.setValue(self._setting_float("detection/confidence_threshold", 0.5))
+        self.nms_iou_spin.setValue(self._setting_float("detection/nms_iou_threshold", 0.45))
+        self.compute_spatial_metrics_check.setChecked(self._setting_bool("detection/compute_spatial_metrics", True))
+        self._set_combo_text(self.distance_method_combo, self._setting_text("detection/distance_method", self.distance_method_combo.currentText()))
+        self.pixel_size_mm_spin.setValue(self._setting_float("detection/pixel_size_mm", 0.0))
+
+        self.enable_aruco_check.setChecked(self._setting_bool("aruco/enabled", True))
+        self._set_combo_text(self.aruco_dictionary_combo, self._setting_text("aruco/dictionary", self.aruco_dictionary_combo.currentText()))
+        self.aruco_optimize_check.setChecked(self._setting_bool("aruco/optimize", False))
+        self._set_combo_text(self.aruco_profile_combo, self._setting_text("aruco/profile", self.aruco_profile_combo.currentText()))
+        self.aruco_sample_frames_spin.setValue(self._setting_int("aruco/sample_frames", 12))
+        self.aruco_max_combinations_spin.setValue(self._setting_int("aruco/max_combinations", 750))
+        self.aruco_workers_spin.setValue(self._setting_int("aruco/workers", self.aruco_workers_spin.value()))
+        self.aruco_bank_size_spin.setValue(self._setting_int("aruco/bank_size", 5))
+        self.aruco_expected_tags_spin.setValue(self._setting_float("aruco/expected_tags", 0.0))
+        self.aruco_tag_list_edit.setText(self._setting_text("aruco/tag_list_path", ""))
+        self.aruco_exclude_tag_list_edit.setText(self._setting_text("aruco/exclude_tag_list_path", ""))
+        self.aruco_sweep_min_perimeter_edit.setText(self._setting_text("aruco/sweep_min_perimeter", self.aruco_sweep_min_perimeter_edit.text()))
+        self.aruco_sweep_max_perimeter_edit.setText(self._setting_text("aruco/sweep_max_perimeter", self.aruco_sweep_max_perimeter_edit.text()))
+        self.aruco_sweep_win_min_edit.setText(self._setting_text("aruco/sweep_win_min", self.aruco_sweep_win_min_edit.text()))
+        self.aruco_sweep_win_max_edit.setText(self._setting_text("aruco/sweep_win_max", self.aruco_sweep_win_max_edit.text()))
+        self.aruco_sweep_win_step_edit.setText(self._setting_text("aruco/sweep_win_step", self.aruco_sweep_win_step_edit.text()))
+        self.aruco_sweep_poly_edit.setText(self._setting_text("aruco/sweep_polygon", self.aruco_sweep_poly_edit.text()))
+        self.aruco_sweep_constant_edit.setText(self._setting_text("aruco/sweep_constant", self.aruco_sweep_constant_edit.text()))
+
+        saved_output = self._setting_text("output/folder", "")
+        if saved_output:
+            self.output_folder_edit.setText(saved_output)
+        self.resume_completed_check.setChecked(self._setting_bool("output/resume_completed_videos", False))
+        self.save_visualizations_check.setChecked(self._setting_bool("output/save_visualizations", False))
+        self._set_combo_text(self.visualization_format_combo, self._setting_text("output/visualization_format", "MP4 video"))
+        self.visualization_interval_spin.setValue(self._setting_int("output/visualization_interval", 1))
+        self.visualization_max_frames_spin.setValue(self._setting_int("output/visualization_max_frames", 25))
+        self.skip_completed_visualizations_check.setChecked(
+            self._setting_bool("output/skip_completed_visualizations", True)
+        )
+        self.verbose_output_check.setChecked(self._setting_bool("output/verbose", False))
+
+    def _save_last_settings(self):
+        """Persist the last successful batch-inference configuration."""
+        self.settings.setValue("video/folder_mode", self.folder_radio.isChecked())
+        self.settings.setValue("video/input_folder", self.input_folder_edit.text())
+        self.settings.setValue("video/selected_files", "\n".join(self.selected_files))
+        self.settings.setValue("video/preserve_file_order", self.preserve_file_order_check.isChecked())
+
+        self.settings.setValue("models/bee_model_type", "segmentation" if self.seg_radio.isChecked() else "bbox")
+        self.settings.setValue("models/bee_model_path", self.bee_model_edit.text())
+        self.settings.setValue("models/hive_model_path", self.hive_model_edit.text())
+        self.settings.setValue("models/pollen_model_path", self.pollen_model_edit.text())
+        self.settings.setValue("models/chamber_model_path", self.chamber_model_edit.text())
+        self.settings.setValue("models/use_temporal_hive_prior", self.temporal_hive_prior_check.isChecked())
+        self.settings.setValue("models/temporal_hive_window_hours", self.temporal_hive_window_spin.value())
+
+        self.settings.setValue("tracking/algorithm", self.tracking_algo_combo.currentText())
+        self.settings.setValue("tracking/bt_high_confidence", self.bt_high_conf_spin.value())
+        self.settings.setValue("tracking/bt_high_iou", self.bt_high_iou_spin.value())
+        self.settings.setValue("tracking/bt_low_iou", self.bt_low_iou_spin.value())
+        self.settings.setValue("tracking/bt_max_frames_lost", self.bt_max_lost_spin.value())
+        self.settings.setValue("tracking/bt_use_mask_iou", self.bt_mask_iou_check.isChecked())
+        self.settings.setValue("tracking/siou_threshold", self.siou_threshold_spin.value())
+        self.settings.setValue("tracking/siou_use_mask_iou", self.siou_mask_iou_check.isChecked())
+        self.settings.setValue("tracking/centroid_max_distance", self.cent_max_dist_spin.value())
+        self.settings.setValue("tracking/centroid_max_frames_missing", self.cent_max_missing_spin.value())
+
+        self.settings.setValue("detection/confidence_threshold", self.confidence_spin.value())
+        self.settings.setValue("detection/nms_iou_threshold", self.nms_iou_spin.value())
+        self.settings.setValue("detection/compute_spatial_metrics", self.compute_spatial_metrics_check.isChecked())
+        self.settings.setValue("detection/distance_method", self.distance_method_combo.currentText())
+        self.settings.setValue("detection/pixel_size_mm", self.pixel_size_mm_spin.value())
+
+        self.settings.setValue("aruco/enabled", self.enable_aruco_check.isChecked())
+        self.settings.setValue("aruco/dictionary", self.aruco_dictionary_combo.currentText())
+        self.settings.setValue("aruco/optimize", self.aruco_optimize_check.isChecked())
+        self.settings.setValue("aruco/profile", self.aruco_profile_combo.currentText())
+        self.settings.setValue("aruco/sample_frames", self.aruco_sample_frames_spin.value())
+        self.settings.setValue("aruco/max_combinations", self.aruco_max_combinations_spin.value())
+        self.settings.setValue("aruco/workers", self.aruco_workers_spin.value())
+        self.settings.setValue("aruco/bank_size", self.aruco_bank_size_spin.value())
+        self.settings.setValue("aruco/expected_tags", self.aruco_expected_tags_spin.value())
+        self.settings.setValue("aruco/tag_list_path", self.aruco_tag_list_edit.text())
+        self.settings.setValue("aruco/exclude_tag_list_path", self.aruco_exclude_tag_list_edit.text())
+        self.settings.setValue("aruco/sweep_min_perimeter", self.aruco_sweep_min_perimeter_edit.text())
+        self.settings.setValue("aruco/sweep_max_perimeter", self.aruco_sweep_max_perimeter_edit.text())
+        self.settings.setValue("aruco/sweep_win_min", self.aruco_sweep_win_min_edit.text())
+        self.settings.setValue("aruco/sweep_win_max", self.aruco_sweep_win_max_edit.text())
+        self.settings.setValue("aruco/sweep_win_step", self.aruco_sweep_win_step_edit.text())
+        self.settings.setValue("aruco/sweep_polygon", self.aruco_sweep_poly_edit.text())
+        self.settings.setValue("aruco/sweep_constant", self.aruco_sweep_constant_edit.text())
+
+        self.settings.setValue("output/folder", self.output_folder_edit.text())
+        self.settings.setValue("output/resume_completed_videos", self.resume_completed_check.isChecked())
+        self.settings.setValue("output/save_visualizations", self.save_visualizations_check.isChecked())
+        self.settings.setValue("output/visualization_format", self.visualization_format_combo.currentText())
+        self.settings.setValue("output/visualization_interval", self.visualization_interval_spin.value())
+        self.settings.setValue("output/visualization_max_frames", self.visualization_max_frames_spin.value())
+        self.settings.setValue(
+            "output/skip_completed_visualizations",
+            self.skip_completed_visualizations_check.isChecked()
+        )
+        self.settings.setValue("output/verbose", self.verbose_output_check.isChecked())
+        self.settings.sync()
     
     def _update_selection_controls(self):
         """Enable/disable folder vs file controls based on radio selection"""
@@ -538,6 +879,8 @@ class BatchVideoInferenceConfigDialog(QDialog):
         
         self.input_files_edit.setEnabled(not folder_mode)
         self.files_browse_btn.setEnabled(not folder_mode)
+        self.files_list_btn.setEnabled(not folder_mode)
+        self.preserve_file_order_check.setEnabled(not folder_mode)
     
     def _update_tracking_params(self, algo_name):
         """Show/hide tracking parameters based on selected algorithm"""
@@ -568,11 +911,15 @@ class BatchVideoInferenceConfigDialog(QDialog):
             self.aruco_tag_list_edit,
             self.aruco_tag_list_browse_btn,
             self.aruco_tag_list_clear_btn,
+            self.aruco_exclude_tag_list_edit,
+            self.aruco_exclude_tag_list_browse_btn,
+            self.aruco_exclude_tag_list_clear_btn,
         ]
         optimize_controls = [
             self.aruco_profile_combo,
             self.aruco_sample_frames_spin,
             self.aruco_max_combinations_spin,
+            self.aruco_workers_spin,
             self.aruco_bank_size_spin,
             self.aruco_expected_tags_spin,
             self.aruco_sweep_min_perimeter_edit,
@@ -588,6 +935,34 @@ class BatchVideoInferenceConfigDialog(QDialog):
             control.setEnabled(aruco_enabled)
         for control in optimize_controls:
             control.setEnabled(optimize_enabled)
+
+    def _update_temporal_hive_controls(self):
+        """Enable temporal prior controls only when a hive model is selected."""
+        if not hasattr(self, 'temporal_hive_prior_check'):
+            return
+
+        has_hive_model = bool(self.hive_model_edit.text().strip())
+        self.temporal_hive_prior_check.setEnabled(has_hive_model)
+        self.temporal_hive_window_spin.setEnabled(
+            has_hive_model and self.temporal_hive_prior_check.isChecked()
+        )
+
+    def _update_visualization_controls(self):
+        """Enable visualization options only when annotated outputs are requested."""
+        if not hasattr(self, 'save_visualizations_check'):
+            return
+
+        enabled = self.save_visualizations_check.isChecked()
+        self.visualization_format_combo.setEnabled(enabled)
+        self.visualization_interval_spin.setEnabled(enabled)
+        self.visualization_max_frames_spin.setEnabled(enabled)
+        self.skip_completed_visualizations_check.setEnabled(
+            enabled and self.resume_completed_check.isChecked()
+        )
+        resume_enabled = self.resume_completed_check.isChecked()
+        self.resume_ignore_config_mismatch_check.setEnabled(resume_enabled)
+        if not resume_enabled:
+            self.resume_ignore_config_mismatch_check.setChecked(False)
     
     def browse_input_folder(self):
         """Browse for input folder"""
@@ -611,10 +986,88 @@ class BatchVideoInferenceConfigDialog(QDialog):
         
         if files:
             self.selected_files = files
-            if len(files) == 1:
-                self.input_files_edit.setText(files[0])
-            else:
-                self.input_files_edit.setText(f"{len(files)} files selected")
+            self._show_selected_files()
+
+    def browse_input_file_list(self):
+        """Load an ordered video list from a text or CSV manifest."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Ordered Video List",
+            str(Path.home()),
+            "Video Lists (*.txt *.csv);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        list_path = Path(file_path)
+        try:
+            video_paths = self._read_video_file_list(list_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Invalid Video List", str(exc))
+            return
+
+        if not video_paths:
+            QMessageBox.warning(self, "Invalid Video List", "No video paths were found in the selected list.")
+            return
+
+        missing_paths = [path for path in video_paths if not Path(path).exists()]
+        if missing_paths:
+            preview = "\n".join(str(path) for path in missing_paths[:5])
+            extra = "" if len(missing_paths) <= 5 else f"\n... and {len(missing_paths) - 5} more"
+            QMessageBox.warning(
+                self,
+                "Missing Videos",
+                f"{len(missing_paths)} listed video(s) could not be found:\n{preview}{extra}"
+            )
+            return
+
+        self.selected_files = video_paths
+        self.files_radio.setChecked(True)
+        self.preserve_file_order_check.setChecked(True)
+        self._show_selected_files()
+
+    def _read_video_file_list(self, list_path: Path):
+        """Read paths from a plain text list or known manifest CSV columns."""
+        if list_path.suffix.lower() == ".csv":
+            with list_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                fieldnames = reader.fieldnames or []
+                column = next(
+                    (
+                        name for name in (
+                            "source_video_path",
+                            "video_path",
+                            "selected_video_path",
+                            "symlink_path",
+                            "path",
+                        )
+                        if name in fieldnames
+                    ),
+                    None,
+                )
+                if column:
+                    raw_paths = [row.get(column, "").strip() for row in reader if row.get(column, "").strip()]
+                else:
+                    handle.seek(0)
+                    raw_paths = self._plain_file_list_lines(handle.read())
+        else:
+            raw_paths = self._plain_file_list_lines(list_path.read_text(encoding="utf-8-sig"))
+
+        video_paths = []
+        for raw_path in raw_paths:
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute():
+                path = list_path.parent / path
+            video_paths.append(str(path))
+        return video_paths
+
+    def _plain_file_list_lines(self, text: str):
+        return [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
     
     def browse_bee_model(self):
         """Browse for bee detection model"""
@@ -639,6 +1092,18 @@ class BatchVideoInferenceConfigDialog(QDialog):
         
         if model_path:
             self.hive_model_edit.setText(model_path)
+
+    def browse_pollen_model(self):
+        """Browse for pollen segmentation model"""
+        model_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Pollen Segmentation Model",
+            str(Path.home()),
+            "YOLO Models (*.pt *.onnx);;All Files (*)"
+        )
+
+        if model_path:
+            self.pollen_model_edit.setText(model_path)
     
     def browse_chamber_model(self):
         """Browse for chamber segmentation model"""
@@ -673,6 +1138,17 @@ class BatchVideoInferenceConfigDialog(QDialog):
         )
         if file_path:
             self.aruco_tag_list_edit.setText(file_path)
+
+    def browse_aruco_exclude_tag_list(self):
+        """Browse for optional ArUco tag blocklist"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select ArUco Exclude Tag List",
+            str(Path.home()),
+            "Tag Lists (*.txt *.csv *.json);;All Files (*)"
+        )
+        if file_path:
+            self.aruco_exclude_tag_list_edit.setText(file_path)
 
     def _parse_sweep_values(self, raw_text: str, label: str, value_type: str):
         text = str(raw_text or "").strip()
@@ -748,6 +1224,14 @@ class BatchVideoInferenceConfigDialog(QDialog):
             if not hive_model_path.exists():
                 QMessageBox.warning(self, "Invalid Path", "Hive model does not exist.")
                 return
+
+        # Pollen model is optional
+        pollen_model_path = None
+        if self.pollen_model_edit.text():
+            pollen_model_path = Path(self.pollen_model_edit.text())
+            if not pollen_model_path.exists():
+                QMessageBox.warning(self, "Invalid Path", "Pollen model does not exist.")
+                return
         
         # Chamber model is optional
         chamber_model_path = None
@@ -768,6 +1252,11 @@ class BatchVideoInferenceConfigDialog(QDialog):
         tag_list_path = self.aruco_tag_list_edit.text().strip()
         if tag_list_path and not Path(tag_list_path).exists():
             QMessageBox.warning(self, "Invalid Path", "ArUco tag list file does not exist.")
+            return
+
+        exclude_tag_list_path = self.aruco_exclude_tag_list_edit.text().strip()
+        if exclude_tag_list_path and not Path(exclude_tag_list_path).exists():
+            QMessageBox.warning(self, "Invalid Path", "ArUco exclude tag list file does not exist.")
             return
 
         aruco_dictionary_text = self.aruco_dictionary_combo.currentText()
@@ -824,38 +1313,65 @@ class BatchVideoInferenceConfigDialog(QDialog):
         distance_method = distance_method_text.split(' ')[0]  # Extract first word (e.g., "contour" from "contour (Fast & accurate)")
         
         # Build config
+        preserve_file_order = self.preserve_file_order_check.isChecked() and not self.folder_radio.isChecked()
+        use_temporal_hive_prior = bool(hive_model_path) and self.temporal_hive_prior_check.isChecked()
         self.config = {
             'video_source': video_source,
             'folder_mode': self.folder_radio.isChecked(),
+            'preserve_file_order': preserve_file_order,
             'bee_model_path': str(bee_model_path),
             'bee_model_type': bee_model_type,
             'distance_method': distance_method,
             'hive_model_path': str(hive_model_path) if hive_model_path else None,
+            'pollen_model_path': str(pollen_model_path) if pollen_model_path else None,
             'chamber_model_path': str(chamber_model_path) if chamber_model_path else None,
+            'use_temporal_hive_prior': use_temporal_hive_prior,
+            'temporal_hive_window_hours': self.temporal_hive_window_spin.value(),
+            'temporal_hive_resolution': 256,
             'tracking_config': tracking_config,
             'confidence_threshold': self.confidence_spin.value(),
             'nms_iou_threshold': self.nms_iou_spin.value(),
             'compute_spatial_metrics': self.compute_spatial_metrics_check.isChecked(),
+            'pixel_size_mm': self.pixel_size_mm_spin.value() if self.pixel_size_mm_spin.value() > 0 else None,
             'enable_aruco': self.enable_aruco_check.isChecked(),
             'aruco_dictionary': aruco_dictionary,
             'aruco_dictionary_mode': aruco_dictionary_mode,
             'tag_list_path': tag_list_path or None,
+            'exclude_tag_list_path': exclude_tag_list_path or None,
             'allowed_tag_ids': [],
+            'excluded_tag_ids': [],
             'aruco_optimization': {
                 'enabled': self.enable_aruco_check.isChecked() and self.aruco_optimize_check.isChecked(),
                 'dictionary': aruco_dictionary,
                 'profile': self.aruco_profile_combo.currentText(),
                 'sample_frames': self.aruco_sample_frames_spin.value(),
                 'max_combinations': self.aruco_max_combinations_spin.value(),
+                'workers': self.aruco_workers_spin.value(),
                 'bank_size': self.aruco_bank_size_spin.value(),
                 'expected_tags': expected_tags,
                 'sweep_overrides': aruco_sweep_overrides,
             },
             'output_folder': str(output_folder),
+            'resume_completed_videos': self.resume_completed_check.isChecked(),
+            'resume_ignore_config_mismatch': self.resume_ignore_config_mismatch_check.isChecked(),
             'save_visualizations': self.save_visualizations_check.isChecked(),
+            'visualization_format': (
+                'video' if self.visualization_format_combo.currentText().startswith("MP4") else 'frames'
+            ),
+            'visualization_interval': self.visualization_interval_spin.value(),
+            'visualization_max_frames': self.visualization_max_frames_spin.value(),
+            'skip_completed_visualizations': self.skip_completed_visualizations_check.isChecked(),
             'verbose_output': self.verbose_output_check.isChecked()
         }
-        
+        if preserve_file_order:
+            order_payload = "\n".join(str(path) for path in video_source)
+            self.config['selected_file_order_signature'] = hashlib.sha256(
+                order_payload.encode("utf-8")
+            ).hexdigest()[:16]
+            if use_temporal_hive_prior:
+                self.config['temporal_context_include_date'] = True
+
+        self._save_last_settings()
         super().accept()
 
 

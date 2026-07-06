@@ -536,6 +536,7 @@ class TrackingVisualizationWorker(QThread):
                 chambers_by_frame=processor.get_chambers_by_frame(),
                 hive_masks_by_frame=processor.get_hive_masks_by_frame(),
                 bee_masks_by_frame=processor.get_bee_masks_by_frame(),
+                aruco_markers_by_frame=processor.get_aruco_markers_by_frame(),
                 max_frame=processor.frame_count,
                 log_callback=self.log_message.emit,
                 verbose_output=self.verbose_output,
