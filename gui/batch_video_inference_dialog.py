@@ -39,8 +39,9 @@ class BatchVideoInferenceConfigDialog(QDialog):
             "<b>Outputs:</b><br>"
             "• bee_detections.csv - Per-frame bee data with spatial metrics<br>"
             "• bee_velocity.csv - Average velocity and frame transitions per bee<br>"
-            "• hive_detections.csv - Averaged hive pixels and centroid per chamber (when hive model is provided)<br>"
-            "• chamber_detections.csv - Averaged chamber pixels and centroid per chamber<br>"
+            "• hive_detections.csv - Averaged hive pixels, centroid, and polygon per hive instance (when hive model is provided)<br>"
+            "• pollen_detections.csv - Averaged pollen pixels, centroid, and polygon per pollen instance (when pollen model is provided)<br>"
+            "• chamber_detections.csv - Averaged chamber pixels, centroid, and polygon per chamber instance<br>"
             "• Optional: Annotated frame images with tracking trails"
         )
         desc_label.setWordWrap(True)
@@ -173,6 +174,23 @@ class BatchVideoInferenceConfigDialog(QDialog):
         hive_layout.addWidget(self.hive_clear_btn)
         
         optional_layout.addRow("Hive Model:", hive_layout)
+
+        # Pollen model
+        pollen_layout = QHBoxLayout()
+        self.pollen_model_edit = QLineEdit()
+        self.pollen_model_edit.setPlaceholderText("Optional: Select YOLO pollen segmentation model...")
+        self.pollen_model_edit.setReadOnly(True)
+        pollen_layout.addWidget(self.pollen_model_edit)
+
+        self.pollen_browse_btn = QPushButton("Browse...")
+        self.pollen_browse_btn.clicked.connect(self.browse_pollen_model)
+        pollen_layout.addWidget(self.pollen_browse_btn)
+
+        self.pollen_clear_btn = QPushButton("Clear")
+        self.pollen_clear_btn.clicked.connect(lambda: self.pollen_model_edit.clear())
+        pollen_layout.addWidget(self.pollen_clear_btn)
+
+        optional_layout.addRow("Pollen Model:", pollen_layout)
         
         # Chamber model
         chamber_layout = QHBoxLayout()
@@ -384,6 +402,13 @@ class BatchVideoInferenceConfigDialog(QDialog):
         )
         output_layout.addWidget(self.save_visualizations_check)
 
+        self.high_resolution_polygons_check = QCheckBox("Output high resolution polygons")
+        self.high_resolution_polygons_check.setChecked(False)
+        self.high_resolution_polygons_check.setToolTip(
+            "Use lighter polygon simplification in CSV outputs. Files will be larger, but contours will preserve more detail."
+        )
+        output_layout.addWidget(self.high_resolution_polygons_check)
+
         self.verbose_output_check = QCheckBox("Verbose output")
         self.verbose_output_check.setChecked(False)
         self.verbose_output_check.setToolTip(
@@ -500,6 +525,18 @@ class BatchVideoInferenceConfigDialog(QDialog):
         
         if model_path:
             self.hive_model_edit.setText(model_path)
+
+    def browse_pollen_model(self):
+        """Browse for pollen segmentation model"""
+        model_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Pollen Segmentation Model",
+            str(Path.home()),
+            "YOLO Models (*.pt *.onnx);;All Files (*)"
+        )
+
+        if model_path:
+            self.pollen_model_edit.setText(model_path)
     
     def browse_chamber_model(self):
         """Browse for chamber segmentation model"""
@@ -558,6 +595,14 @@ class BatchVideoInferenceConfigDialog(QDialog):
             if not hive_model_path.exists():
                 QMessageBox.warning(self, "Invalid Path", "Hive model does not exist.")
                 return
+
+        # Pollen model is optional.
+        pollen_model_path = None
+        if self.pollen_model_edit.text():
+            pollen_model_path = Path(self.pollen_model_edit.text())
+            if not pollen_model_path.exists():
+                QMessageBox.warning(self, "Invalid Path", "Pollen model does not exist.")
+                return
         
         # Chamber model is optional
         chamber_model_path = None
@@ -615,6 +660,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
             'bee_model_type': bee_model_type,
             'distance_method': distance_method,
             'hive_model_path': str(hive_model_path) if hive_model_path else None,
+            'pollen_model_path': str(pollen_model_path) if pollen_model_path else None,
             'chamber_model_path': str(chamber_model_path) if chamber_model_path else None,
             'tracking_config': tracking_config,
             'confidence_threshold': self.confidence_spin.value(),
@@ -623,6 +669,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
             'enable_aruco': self.enable_aruco_check.isChecked(),
             'output_folder': str(output_folder),
             'save_visualizations': self.save_visualizations_check.isChecked(),
+            'high_resolution_polygons': self.high_resolution_polygons_check.isChecked(),
             'verbose_output': self.verbose_output_check.isChecked()
         }
         

@@ -6,7 +6,8 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QGroupBox, QFormLayout, 
                              QDoubleSpinBox, QLineEdit, QFileDialog,
                              QProgressBar, QTextEdit, QCheckBox,
-                             QRadioButton, QButtonGroup, QComboBox)
+                             QRadioButton, QButtonGroup, QComboBox,
+                             QSpinBox)
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QFont
 from pathlib import Path
@@ -53,22 +54,32 @@ class FrameLevelValidationConfigDialog(QDialog):
         type_radio_layout = QHBoxLayout()
         self.bbox_radio = QRadioButton("Bounding Box")
         self.seg_radio = QRadioButton("Segmentation")
+        self.bbox_sam2_radio = QRadioButton("BBox + SAM2")
+        self.bbox_instance_focused_radio = QRadioButton("BBox + Instance-Focused YOLO")
         self.bbox_radio.setChecked(True)
         self.bbox_radio.setToolTip("Use bounding box detection model")
         self.seg_radio.setToolTip("Use segmentation model (includes masks, centroids, polygons)")
+        self.bbox_sam2_radio.setToolTip("Run a bbox model first, then prompt SAM2 with each bbox")
+        self.bbox_instance_focused_radio.setToolTip("Run a bbox model first, then segment each bbox crop with an instance-focused YOLO model")
         
         self.model_type_group = QButtonGroup()
         self.model_type_group.addButton(self.bbox_radio)
         self.model_type_group.addButton(self.seg_radio)
+        self.model_type_group.addButton(self.bbox_sam2_radio)
+        self.model_type_group.addButton(self.bbox_instance_focused_radio)
         
         type_radio_layout.addWidget(self.bbox_radio)
         type_radio_layout.addWidget(self.seg_radio)
+        type_radio_layout.addWidget(self.bbox_sam2_radio)
+        type_radio_layout.addWidget(self.bbox_instance_focused_radio)
         type_radio_layout.addStretch()
         model_layout.addLayout(type_radio_layout)
         
         # Connect radio buttons to update UI
         self.bbox_radio.toggled.connect(self.update_distance_method_visibility)
         self.seg_radio.toggled.connect(self.update_distance_method_visibility)
+        self.bbox_sam2_radio.toggled.connect(self.update_distance_method_visibility)
+        self.bbox_instance_focused_radio.toggled.connect(self.update_distance_method_visibility)
         
         # Bee model path
         bee_model_label = QLabel("Bee Detection Model File:")
@@ -86,6 +97,50 @@ class FrameLevelValidationConfigDialog(QDialog):
         bbox_layout.addWidget(self.bbox_browse_btn)
         
         model_layout.addLayout(bbox_layout)
+
+        # SAM2 model path (only for two-step BBox + SAM2)
+        self.sam2_model_label = QLabel("SAM2 Checkpoint File:")
+        self.sam2_model_label.setStyleSheet("font-weight: bold; margin-top: 5px;")
+        model_layout.addWidget(self.sam2_model_label)
+
+        sam2_layout = QHBoxLayout()
+        self.sam2_model_edit = QLineEdit()
+        self.sam2_model_edit.setPlaceholderText("Select SAM2 checkpoint file...")
+        self.sam2_model_edit.setReadOnly(True)
+        sam2_layout.addWidget(self.sam2_model_edit)
+
+        self.sam2_browse_btn = QPushButton("Browse...")
+        self.sam2_browse_btn.clicked.connect(self.browse_sam2_model)
+        sam2_layout.addWidget(self.sam2_browse_btn)
+
+        model_layout.addLayout(sam2_layout)
+        self.sam2_model_widgets = [
+            self.sam2_model_label,
+            self.sam2_model_edit,
+            self.sam2_browse_btn,
+        ]
+
+        # Instance-focused model path (only for two-step BBox + Instance-Focused YOLO)
+        self.instance_focused_model_label = QLabel("Instance-Focused YOLO Model File:")
+        self.instance_focused_model_label.setStyleSheet("font-weight: bold; margin-top: 5px;")
+        model_layout.addWidget(self.instance_focused_model_label)
+
+        instance_focused_layout = QHBoxLayout()
+        self.instance_focused_model_edit = QLineEdit()
+        self.instance_focused_model_edit.setPlaceholderText("Select instance-focused YOLO segmentation model...")
+        self.instance_focused_model_edit.setReadOnly(True)
+        instance_focused_layout.addWidget(self.instance_focused_model_edit)
+
+        self.instance_focused_browse_btn = QPushButton("Browse...")
+        self.instance_focused_browse_btn.clicked.connect(self.browse_instance_focused_model)
+        instance_focused_layout.addWidget(self.instance_focused_browse_btn)
+
+        model_layout.addLayout(instance_focused_layout)
+        self.instance_focused_model_widgets = [
+            self.instance_focused_model_label,
+            self.instance_focused_model_edit,
+            self.instance_focused_browse_btn,
+        ]
         
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
@@ -192,6 +247,18 @@ class FrameLevelValidationConfigDialog(QDialog):
         # Initially hide distance method (bbox is default)
         self.distance_method_label.hide()
         self.distance_method_combo.hide()
+
+        # Instance-focused crop margin
+        self.crop_margin_label = QLabel("Instance Crop Margin:")
+        self.crop_margin_spin = QSpinBox()
+        self.crop_margin_spin.setRange(0, 500)
+        self.crop_margin_spin.setValue(50)
+        self.crop_margin_spin.setSingleStep(10)
+        self.crop_margin_spin.setSuffix(" px")
+        self.crop_margin_spin.setToolTip("Pixels added around each first-stage bbox before running the instance-focused model")
+        params_layout.addRow(self.crop_margin_label, self.crop_margin_spin)
+        self.crop_margin_label.hide()
+        self.crop_margin_spin.hide()
         
         params_group.setLayout(params_layout)
         layout.addWidget(params_group)
@@ -209,6 +276,13 @@ class FrameLevelValidationConfigDialog(QDialog):
         self.save_visualizations_check.setChecked(True)
         self.save_visualizations_check.setToolTip("Save images with color-coded bounding boxes (Green=Matched, Red=False Negative, Pink=False Positive), hive/chamber/pollen outlines, and distance links")
         output_layout.addWidget(self.save_visualizations_check)
+
+        self.high_resolution_polygons_check = QCheckBox("Output high resolution polygons")
+        self.high_resolution_polygons_check.setChecked(False)
+        self.high_resolution_polygons_check.setToolTip(
+            "Use lighter polygon simplification in CSV outputs. Files will be larger, but contours will preserve more detail."
+        )
+        output_layout.addWidget(self.high_resolution_polygons_check)
         
         output_group.setLayout(output_layout)
         layout.addWidget(output_group)
@@ -235,6 +309,7 @@ class FrameLevelValidationConfigDialog(QDialog):
         button_layout.addWidget(self.cancel_btn)
         
         layout.addLayout(button_layout)
+        self.update_distance_method_visibility()
         
     def browse_bbox_model(self):
         """Browse for YOLO bbox detection model"""
@@ -247,6 +322,30 @@ class FrameLevelValidationConfigDialog(QDialog):
         
         if file_path:
             self.bbox_model_edit.setText(file_path)
+
+    def browse_sam2_model(self):
+        """Browse for SAM2 checkpoint"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select SAM2 Checkpoint",
+            str(Path.home()),
+            "PyTorch Model Files (*.pt);;All Files (*)"
+        )
+
+        if file_path:
+            self.sam2_model_edit.setText(file_path)
+
+    def browse_instance_focused_model(self):
+        """Browse for YOLO instance-focused segmentation model"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Instance-Focused YOLO Model",
+            str(Path.home()),
+            "PyTorch Model Files (*.pt);;All Files (*)"
+        )
+
+        if file_path:
+            self.instance_focused_model_edit.setText(file_path)
     
     def browse_hive_model(self):
         """Browse for YOLO hive segmentation model"""
@@ -286,21 +385,69 @@ class FrameLevelValidationConfigDialog(QDialog):
     
     def update_distance_method_visibility(self):
         """Show/hide distance method controls based on model type selection"""
-        is_segmentation = self.seg_radio.isChecked()
-        self.distance_method_label.setVisible(is_segmentation)
-        self.distance_method_combo.setVisible(is_segmentation)
+        is_mask_mode = self.seg_radio.isChecked() or self.bbox_sam2_radio.isChecked() or self.bbox_instance_focused_radio.isChecked()
+        is_bbox_sam2 = self.bbox_sam2_radio.isChecked()
+        is_bbox_instance_focused = self.bbox_instance_focused_radio.isChecked()
+
+        self.distance_method_label.setVisible(is_mask_mode)
+        self.distance_method_combo.setVisible(is_mask_mode)
+        self.crop_margin_label.setVisible(is_bbox_instance_focused)
+        self.crop_margin_spin.setVisible(is_bbox_instance_focused)
+
+        for widget in self.sam2_model_widgets:
+            widget.setVisible(is_bbox_sam2)
+        for widget in self.instance_focused_model_widgets:
+            widget.setVisible(is_bbox_instance_focused)
     
     def validate_and_accept(self):
         """Validate inputs before accepting"""
         # Check that bbox model is provided
         if not self.bbox_model_edit.text():
             from PyQt6.QtWidgets import QMessageBox
-            model_type = "segmentation" if self.seg_radio.isChecked() else "bounding box"
+            model_type = self._selected_model_type_label().lower()
             QMessageBox.warning(
                 self,
                 "Missing Required Model",
                 f"Please select a YOLO {model_type} detection model.\n\n"
                 "This is required for analyzing bee predictions."
+            )
+            return
+
+        sam2_path = self.sam2_model_edit.text()
+        if self.bbox_sam2_radio.isChecked() and not sam2_path:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Missing Required Model",
+                "Please select a SAM2 checkpoint for BBox + SAM2 validation."
+            )
+            return
+
+        if sam2_path and not Path(sam2_path).exists():
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Model Not Found",
+                f"SAM2 checkpoint not found:\n{sam2_path}"
+            )
+            return
+
+        instance_focused_path = self.instance_focused_model_edit.text()
+        if self.bbox_instance_focused_radio.isChecked() and not instance_focused_path:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Missing Required Model",
+                "Please select an instance-focused YOLO model for BBox + Instance-Focused YOLO validation."
+            )
+            return
+
+        if instance_focused_path and not Path(instance_focused_path).exists():
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Model Not Found",
+                f"Instance-focused YOLO model file not found:\n{instance_focused_path}"
             )
             return
         
@@ -348,6 +495,25 @@ class FrameLevelValidationConfigDialog(QDialog):
         
         # All validation passed
         self.accept()
+
+    def _selected_model_type(self):
+        """Return the internal bee model type key for the selected radio button."""
+        if self.seg_radio.isChecked():
+            return 'segmentation'
+        if self.bbox_sam2_radio.isChecked():
+            return 'bbox_sam2'
+        if self.bbox_instance_focused_radio.isChecked():
+            return 'bbox_instance_focused'
+        return 'bbox'
+
+    def _selected_model_type_label(self):
+        """Return a display label for the selected bee model type."""
+        return {
+            'bbox': 'Bounding Box',
+            'segmentation': 'Segmentation',
+            'bbox_sam2': 'BBox + SAM2',
+            'bbox_instance_focused': 'BBox + Instance-Focused YOLO',
+        }[self._selected_model_type()]
     
     def get_config(self):
         """Get validation configuration"""
@@ -357,7 +523,10 @@ class FrameLevelValidationConfigDialog(QDialog):
         
         return {
             'bbox_model_path': self.bbox_model_edit.text(),
-            'bee_model_type': 'segmentation' if self.seg_radio.isChecked() else 'bbox',
+            'bee_model_type': self._selected_model_type(),
+            'sam2_checkpoint_path': self.sam2_model_edit.text() or None,
+            'instance_focused_model_path': self.instance_focused_model_edit.text() or None,
+            'instance_crop_margin': self.crop_margin_spin.value(),
             'hive_model_path': self.hive_model_edit.text() or None,
             'pollen_model_path': self.pollen_model_edit.text() or None,
             'chamber_model_path': self.chamber_model_edit.text() or None,
@@ -365,6 +534,7 @@ class FrameLevelValidationConfigDialog(QDialog):
             'iou_threshold': self.iou_threshold_spin.value(),
             'distance_method': distance_method,
             'save_visualizations': self.save_visualizations_check.isChecked(),
+            'high_resolution_polygons': self.high_resolution_polygons_check.isChecked(),
             'debug_mode': self.debug_mode_check.isChecked()
         }
 

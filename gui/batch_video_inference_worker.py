@@ -45,6 +45,12 @@ class BatchVideoInferenceWorker(QThread):
         # Accumulated masks for averaging
         # Format: {(video_id, chamber_id): {'accumulated_mask': np.ndarray, 'frame_count': int, 'shape': tuple}}
         self.accumulated_hive_masks = {}
+        # Format: {(video_id, chamber_id, hive_instance_id): {'accumulated_mask': np.ndarray, 'frame_count': int, 'shape': tuple}}
+        self.accumulated_hive_instance_masks = {}
+        # Format: {(video_id, chamber_id): {'accumulated_mask': np.ndarray, 'frame_count': int, 'shape': tuple}}
+        self.accumulated_pollen_masks = {}
+        # Format: {(video_id, chamber_id, pollen_instance_id): {'accumulated_mask': np.ndarray, 'frame_count': int, 'shape': tuple}}
+        self.accumulated_pollen_instance_masks = {}
         # Format: {(video_id, chamber_id): {'accumulated_mask': np.ndarray, 'frame_count': int, 'shape': tuple}}
         self.accumulated_chamber_masks = {}
         
@@ -56,6 +62,10 @@ class BatchVideoInferenceWorker(QThread):
         """Emit detailed diagnostic output only when verbose mode is enabled."""
         if self.verbose_output:
             self.log_message.emit(message)
+
+    def _polygon_epsilon(self) -> float:
+        """Return contour simplification epsilon percentage for CSV polygons."""
+        return 0.01 if self.config.get('high_resolution_polygons', False) else 2.0
     
     def stop(self):
         """Request worker to stop"""
@@ -107,6 +117,13 @@ class BatchVideoInferenceWorker(QThread):
                 self.log_message.emit(f"✓ Loaded hive model: {Path(self.config['hive_model_path']).name}")
             else:
                 self.log_message.emit("  (No hive model - hive distance metrics will be blank)")
+
+            pollen_model = None
+            if self.config.get('pollen_model_path'):
+                pollen_model = YOLO(self.config['pollen_model_path'])
+                self.log_message.emit(f"✓ Loaded pollen model: {Path(self.config['pollen_model_path']).name}")
+            else:
+                self.log_message.emit("  (No pollen model - pollen_detections.csv will not be produced)")
             
             # Chamber model is optional
             chamber_model = None
@@ -121,6 +138,8 @@ class BatchVideoInferenceWorker(QThread):
                 bee_model.model.eval()
             if hive_model and hasattr(hive_model, 'model') and hasattr(hive_model.model, 'eval'):
                 hive_model.model.eval()
+            if pollen_model and hasattr(pollen_model, 'model') and hasattr(pollen_model.model, 'eval'):
+                pollen_model.model.eval()
             if chamber_model and hasattr(chamber_model, 'model') and hasattr(chamber_model.model, 'eval'):
                 chamber_model.model.eval()
             
@@ -148,6 +167,7 @@ class BatchVideoInferenceWorker(QThread):
                     video_path, 
                     bee_model, 
                     hive_model,
+                    pollen_model,
                     chamber_model,
                     tracker,
                     video_idx
@@ -301,17 +321,25 @@ class BatchVideoInferenceWorker(QThread):
         if torch.cuda.is_available():
             self.log_message.emit("    Note: GPU timings can shift a little because CUDA work may be asynchronous.")
     
-    def _process_video(self, video_path, bee_model, hive_model, chamber_model, tracker, video_idx):
+    def _process_video(self, video_path, bee_model, hive_model, pollen_model, chamber_model, tracker, video_idx):
         """Process a single video file"""
         video_id = video_path.stem  # Use filename without extension as video_id
         self.log_message.emit(f"  Processing: {video_path.name}")
         
-        # Check if visualization is enabled to decide whether to store masks
+        # Check if visualization or CSV geometry exports need masks.
         visualization_enabled = self.config.get('save_visualizations', False)
+        mask_export_enabled = any([
+            self.config.get('hive_model_path') is not None,
+            self.config.get('pollen_model_path') is not None,
+            self.config.get('chamber_model_path') is not None
+        ])
+        store_masks = visualization_enabled or mask_export_enabled
         
         # Log memory optimization setting
-        if not visualization_enabled:
+        if not store_masks:
             self._log_verbose(f"  Memory optimization: Masks will NOT be stored (visualization disabled)")
+        elif not visualization_enabled:
+            self._log_verbose(f"  Memory usage: Storing masks for CSV geometry exports")
         else:
             self._log_verbose(f"  Memory usage: Storing masks for visualization")
         
@@ -321,6 +349,7 @@ class BatchVideoInferenceWorker(QThread):
             video_id=video_id,
             bee_model=bee_model,
             hive_model=hive_model,
+            pollen_model=pollen_model,
             chamber_model=chamber_model,
             tracker=tracker,
             confidence_threshold=self.config['confidence_threshold'],
@@ -330,12 +359,14 @@ class BatchVideoInferenceWorker(QThread):
             distance_method=self.config.get('distance_method', 'contour'),
             bee_model_type=self.config.get('bee_model_type', 'bbox'),
             compute_spatial_metrics=self.config.get('compute_spatial_metrics', True),
-            store_masks=visualization_enabled,  # Only store masks if visualization is enabled
+            store_masks=store_masks,
+            store_bee_masks=visualization_enabled,
             log_callback=self.log_message.emit,
             stop_callback=lambda: self.should_stop,
             timing_log_interval=1,
             cleanup_interval=25,
-            verbose_output=self.verbose_output
+            verbose_output=self.verbose_output,
+            polygon_epsilon=self._polygon_epsilon()
         )
         
         # Process video
@@ -351,9 +382,17 @@ class BatchVideoInferenceWorker(QThread):
                 self.all_chamber_frame_data.extend(processor.get_chamber_frame_data())
                 for bee_id, trajectory in processor.get_bee_trajectories().items():
                     self.all_bee_trajectories[(video_id, bee_id)] = trajectory
+                if store_masks:
+                    self._accumulate_masks(
+                        video_id,
+                        processor.get_hive_masks_by_frame(),
+                        processor.get_hive_instance_masks_by_frame(),
+                        processor.get_pollen_masks_by_frame(),
+                        processor.get_pollen_instance_masks_by_frame(),
+                        processor.get_chambers_by_frame()
+                    )
                 if visualization_enabled:
                     self._generate_visualizations(video_path, video_id, processor, partial=True)
-                    self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
                 del processor
                 gc.collect()
                 if torch.cuda.is_available():
@@ -384,17 +423,28 @@ class BatchVideoInferenceWorker(QThread):
             composite_key = (video_id, bee_id)
             self.all_bee_trajectories[composite_key] = trajectory
         
-        # Accumulate masks for averaging (only if visualization disabled)
-        # If visualization enabled, we'll handle masks during viz generation
-        visualization_enabled = self.config.get('save_visualizations', False)
-        if not visualization_enabled:
-            self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
+        if not visualization_enabled and store_masks:
+            self._accumulate_masks(
+                video_id,
+                processor.get_hive_masks_by_frame(),
+                processor.get_hive_instance_masks_by_frame(),
+                processor.get_pollen_masks_by_frame(),
+                processor.get_pollen_instance_masks_by_frame(),
+                processor.get_chambers_by_frame()
+            )
         
         # Generate visualization if requested (BEFORE deleting processor)
         if visualization_enabled and not self.should_stop:
             self._generate_visualizations(video_path, video_id, processor, partial=False)
             # Accumulate masks after visualization (so we still have averaged masks for CSV)
-            self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
+            self._accumulate_masks(
+                video_id,
+                processor.get_hive_masks_by_frame(),
+                processor.get_hive_instance_masks_by_frame(),
+                processor.get_pollen_masks_by_frame(),
+                processor.get_pollen_instance_masks_by_frame(),
+                processor.get_chambers_by_frame()
+            )
         else:
             reason = "checkbox not enabled" if not visualization_enabled else "processing stopped"
             self._log_verbose(f"  Skipping visualizations ({reason})")
@@ -463,20 +513,26 @@ class BatchVideoInferenceWorker(QThread):
             import traceback
             self._log_verbose(traceback.format_exc())
     
-    def _accumulate_masks(self, video_id: str, hive_masks_by_frame: Dict, chambers_by_frame: Dict):
+    def _accumulate_masks(self, video_id: str, hive_masks_by_frame: Dict,
+                          hive_instance_masks_by_frame: Dict,
+                          pollen_masks_by_frame: Dict,
+                          pollen_instance_masks_by_frame: Dict,
+                          chambers_by_frame: Dict):
         """
-        Accumulate hive and chamber masks across frames for averaging
+        Accumulate hive, pollen, and chamber masks across frames for averaging
         
         Args:
             video_id: Video identifier
             hive_masks_by_frame: Dict[frame_number -> Dict[chamber_id -> mask]]
+            hive_instance_masks_by_frame: Dict[frame_number -> Dict[chamber_id -> List[mask]]]
+            pollen_masks_by_frame: Dict[frame_number -> Dict[chamber_id -> mask]]
+            pollen_instance_masks_by_frame: Dict[frame_number -> Dict[chamber_id -> List[mask]]]
             chambers_by_frame: Dict[frame_number -> Dict[chamber_id -> chamber_info]]
         
-        Note: If visualization is disabled, these dictionaries will be empty (store_masks=False)
-        and this function will do nothing, which is the intended behavior for memory efficiency.
+        Note: These dictionaries are populated when visualizations or CSV geometry exports need masks.
         """
         # Skip if no data (visualization disabled)
-        if not hive_masks_by_frame and not chambers_by_frame:
+        if not hive_masks_by_frame and not hive_instance_masks_by_frame and not pollen_masks_by_frame and not pollen_instance_masks_by_frame and not chambers_by_frame:
             return
         
         # Accumulate hive masks
@@ -501,6 +557,68 @@ class BatchVideoInferenceWorker(QThread):
                 # Add this frame's mask
                 self.accumulated_hive_masks[key]['accumulated_mask'] += mask.astype(np.float32)
                 self.accumulated_hive_masks[key]['frame_count'] += 1
+
+        # Accumulate separate hive instances by sorted per-chamber instance index.
+        for frame_number, hive_instances in hive_instance_masks_by_frame.items():
+            for chamber_id, masks in hive_instances.items():
+                for instance_idx, mask in enumerate(masks, 1):
+                    if mask is None:
+                        continue
+
+                    key = (video_id, chamber_id, instance_idx)
+
+                    if key not in self.accumulated_hive_instance_masks:
+                        self.accumulated_hive_instance_masks[key] = {
+                            'accumulated_mask': np.zeros_like(mask, dtype=np.float32),
+                            'frame_count': 0,
+                            'shape': mask.shape
+                        }
+                        mask_size_mb = mask.nbytes / (1024 * 1024)
+                        self.accumulated_data_size_mb += mask_size_mb
+
+                    self.accumulated_hive_instance_masks[key]['accumulated_mask'] += mask.astype(np.float32)
+                    self.accumulated_hive_instance_masks[key]['frame_count'] += 1
+
+        # Accumulate pollen masks
+        for frame_number, pollen_masks in pollen_masks_by_frame.items():
+            for chamber_id, mask in pollen_masks.items():
+                if mask is None:
+                    continue
+
+                key = (video_id, chamber_id)
+
+                if key not in self.accumulated_pollen_masks:
+                    self.accumulated_pollen_masks[key] = {
+                        'accumulated_mask': np.zeros_like(mask, dtype=np.float32),
+                        'frame_count': 0,
+                        'shape': mask.shape
+                    }
+                    mask_size_mb = mask.nbytes / (1024 * 1024)
+                    self.accumulated_data_size_mb += mask_size_mb
+
+                self.accumulated_pollen_masks[key]['accumulated_mask'] += mask.astype(np.float32)
+                self.accumulated_pollen_masks[key]['frame_count'] += 1
+
+        # Accumulate separate pollen instances by sorted per-chamber instance index.
+        for frame_number, pollen_instances in pollen_instance_masks_by_frame.items():
+            for chamber_id, masks in pollen_instances.items():
+                for instance_idx, mask in enumerate(masks, 1):
+                    if mask is None:
+                        continue
+
+                    key = (video_id, chamber_id, instance_idx)
+
+                    if key not in self.accumulated_pollen_instance_masks:
+                        self.accumulated_pollen_instance_masks[key] = {
+                            'accumulated_mask': np.zeros_like(mask, dtype=np.float32),
+                            'frame_count': 0,
+                            'shape': mask.shape
+                        }
+                        mask_size_mb = mask.nbytes / (1024 * 1024)
+                        self.accumulated_data_size_mb += mask_size_mb
+
+                    self.accumulated_pollen_instance_masks[key]['accumulated_mask'] += mask.astype(np.float32)
+                    self.accumulated_pollen_instance_masks[key]['frame_count'] += 1
         
         # Accumulate chamber masks
         for frame_number, chambers in chambers_by_frame.items():
@@ -556,7 +674,7 @@ class BatchVideoInferenceWorker(QThread):
             return
         
         # Create exporter
-        exporter = VideoInferenceExporter(output_folder)
+        exporter = VideoInferenceExporter(output_folder, polygon_epsilon=self._polygon_epsilon())
         
         # Export all CSVs
         try:
@@ -565,8 +683,12 @@ class BatchVideoInferenceWorker(QThread):
                 self.all_bee_trajectories,
                 self.all_chamber_frame_data,
                 self.accumulated_hive_masks,
+                self.accumulated_hive_instance_masks,
+                self.accumulated_pollen_masks,
+                self.accumulated_pollen_instance_masks,
                 self.accumulated_chamber_masks,
-                export_hive_detections=self.config.get('hive_model_path') is not None
+                export_hive_detections=self.config.get('hive_model_path') is not None,
+                export_pollen_detections=self.config.get('pollen_model_path') is not None
             )
             
             # Log results

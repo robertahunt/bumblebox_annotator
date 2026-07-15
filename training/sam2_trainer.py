@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
+from .carbon_tracking import CarbonTrainingRun
 
 try:
     from sam2.build_sam import build_sam2
@@ -56,6 +57,7 @@ class SAM2TrainingWorker(QThread):
         self.should_stop = False
         self.data = []  # List of training data entries
         self.val_data = []  # List of validation data entries
+        self._last_carbon_metrics = {}
         
         # Setup data augmentation pipeline
         self._setup_augmentation()
@@ -158,13 +160,30 @@ class SAM2TrainingWorker(QThread):
             
             # Step 4: Training loop
             self.stage_update.emit("Starting training...")
-            model_path = self._train_model(predictor, optimizer, scaler, scheduler)
+            training_name = self.config.get('name', 'sam2_finetuned')
+            carbon_run = CarbonTrainingRun(
+                self.project_path,
+                model_kind="sam2_finetune",
+                training_name=training_name,
+                config=self.config,
+            )
+            carbon_run.start()
+            try:
+                model_path = self._train_model(predictor, optimizer, scaler, scheduler)
+                status = "cancelled" if self.should_stop else "completed"
+                carbon_run.finish(status=status, model_path=model_path)
+                self._last_carbon_metrics = carbon_run.metrics_for_final_report()
+            except Exception as exc:
+                carbon_run.finish(status="failed", error=f"{type(exc).__name__}: {exc}")
+                self._last_carbon_metrics = carbon_run.metrics_for_final_report()
+                raise
             
             if self.should_stop:
                 return
             
             # Step 5: Complete
             final_metrics = {"training_steps": self.config.get('num_steps', 25000)}
+            final_metrics.update(self._last_carbon_metrics)
             self.training_complete.emit(str(model_path), final_metrics)
             
         except Exception as e:

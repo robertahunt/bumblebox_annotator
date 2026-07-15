@@ -216,6 +216,13 @@ class BatchInferenceConfigDialog(QDialog):
         self.save_visualizations_check.setChecked(True)
         self.save_visualizations_check.setToolTip("Save images with color-coded bounding boxes, hive/chamber/pollen outlines, and distance links")
         output_layout.addWidget(self.save_visualizations_check)
+
+        self.high_resolution_polygons_check = QCheckBox("Output high resolution polygons")
+        self.high_resolution_polygons_check.setChecked(False)
+        self.high_resolution_polygons_check.setToolTip(
+            "Use lighter polygon simplification in CSV outputs. Files will be larger, but contours will preserve more detail."
+        )
+        output_layout.addWidget(self.high_resolution_polygons_check)
         
         self.debug_mode_check = QCheckBox("Debug mode (process first image only)")
         self.debug_mode_check.setChecked(False)
@@ -364,6 +371,7 @@ class BatchInferenceConfigDialog(QDialog):
             'distance_method': distance_method,
             'save_annotations': self.save_annotations_check.isChecked(),
             'save_visualizations': self.save_visualizations_check.isChecked(),
+            'high_resolution_polygons': self.high_resolution_polygons_check.isChecked(),
             'debug_mode': self.debug_mode_check.isChecked()
         }
         

@@ -156,6 +156,12 @@ def closest_points_between_masks(mask1: np.ndarray, mask2: np.ndarray,
     """
     import cv2
 
+    overlap = np.logical_and(mask1 > 0, mask2 > 0)
+    if np.any(overlap):
+        y, x = np.argwhere(overlap)[0]
+        point = (float(x), float(y))
+        return point, point, 0.0
+
     if method == 'bbox_filter':
         bbox1 = bbox_from_mask(mask1)
         bbox2 = bbox_from_mask(mask2)
@@ -372,6 +378,31 @@ def mask_centroid(mask: np.ndarray) -> Tuple[float, float]:
     return (centroid_x, centroid_y)
 
 
+def mask_to_simplified_polygons(mask: np.ndarray, epsilon_percent: float = 2.0) -> List[List[List[float]]]:
+    """
+    Convert a binary mask to simplified external polygon contours.
+
+    Returns one polygon for each external contour, sorted largest area first.
+    """
+    import cv2
+
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+
+    polygons = []
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    for contour in contours:
+        if cv2.contourArea(contour) <= 0:
+            continue
+
+        epsilon = (epsilon_percent / 100.0) * cv2.arcLength(contour, True)
+        simplified = cv2.approxPolyDP(contour, epsilon, True)
+        polygons.append(simplified.reshape(-1, 2).tolist())
+
+    return polygons
+
+
 def mask_to_simplified_polygon(mask: np.ndarray, epsilon_percent: float = 2.0) -> List[List[float]]:
     """
     Convert a binary mask to a simplified polygon contour
@@ -383,25 +414,8 @@ def mask_to_simplified_polygon(mask: np.ndarray, epsilon_percent: float = 2.0) -
     Returns:
         List of [x, y] coordinate pairs, or empty list if no contours found
     """
-    import cv2
-    
-    # Find contours
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        return []
-    
-    # Get largest contour
-    largest_contour = max(contours, key=cv2.contourArea)
-    
-    # Simplify polygon using Douglas-Peucker algorithm
-    epsilon = (epsilon_percent / 100.0) * cv2.arcLength(largest_contour, True)
-    simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
-    
-    # Convert to list of [x, y] pairs
-    polygon = simplified.reshape(-1, 2).tolist()
-    
-    return polygon
+    polygons = mask_to_simplified_polygons(mask, epsilon_percent=epsilon_percent)
+    return polygons[0] if polygons else []
 
 
 def polygon_to_string(polygon: List[List[float]]) -> str:
@@ -423,3 +437,25 @@ def polygon_to_string(polygon: List[List[float]]) -> str:
         coords.append(f"{point[1]:.2f}")
     
     return " ".join(coords)
+
+
+def polygons_to_string(polygons: List[List[List[float]]], separator: str = "|") -> str:
+    """
+    Convert multiple polygons to one CSV-safe string.
+
+    Each polygon uses the polygon_to_string format. Multiple polygons are joined
+    with a pipe by default.
+    """
+    if not polygons:
+        return ""
+
+    polygon_strings = [polygon_to_string(polygon) for polygon in polygons]
+    polygon_strings = [polygon for polygon in polygon_strings if polygon]
+    return separator.join(polygon_strings)
+
+
+def mask_to_polygons_string(mask: np.ndarray, epsilon_percent: float = 2.0,
+                            separator: str = "|") -> str:
+    """Convert all external contours in a mask to one CSV-safe polygon string."""
+    polygons = mask_to_simplified_polygons(mask, epsilon_percent=epsilon_percent)
+    return polygons_to_string(polygons, separator=separator)

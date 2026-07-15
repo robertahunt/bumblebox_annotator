@@ -4,9 +4,91 @@ Annotation toolbar with tools and controls
 
 import math
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QToolButton, QButtonGroup,
-                             QSlider, QLabel, QSpinBox, QComboBox, QCheckBox)
-from PyQt6.QtCore import Qt, pyqtSignal
+                             QSlider, QLabel, QSpinBox, QComboBox, QCheckBox, QLayout)
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QRect, QSize
 from PyQt6.QtGui import QIcon
+
+
+class FlowLayout(QLayout):
+    """Simple wrapping layout for toolbar controls."""
+
+    def __init__(self, parent=None, margin=0, hspacing=5, vspacing=5):
+        super().__init__(parent)
+        self.item_list = []
+        self.hspacing = hspacing
+        self.vspacing = vspacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item):
+        self.item_list.append(item)
+
+    def count(self):
+        return len(self.item_list)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self.item_list):
+            return self.item_list[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self.item_list):
+            return self.item_list.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self.item_list:
+            size = size.expandedTo(item.minimumSize())
+
+        left, top, right, bottom = self.getContentsMargins()
+        size += QSize(left + right, top + bottom)
+        return size
+
+    def _do_layout(self, rect, test_only=False):
+        left, top, right, bottom = self.getContentsMargins()
+        effective_rect = rect.adjusted(left, top, -right, -bottom)
+        x = effective_rect.x()
+        y = effective_rect.y()
+        line_height = 0
+
+        for item in self.item_list:
+            widget = item.widget()
+            if widget is not None and not widget.isVisible():
+                continue
+
+            space_x = self.hspacing
+            space_y = self.vspacing
+            next_x = x + item.sizeHint().width() + space_x
+
+            if next_x - space_x > effective_rect.right() and line_height > 0:
+                x = effective_rect.x()
+                y = y + line_height + space_y
+                next_x = x + item.sizeHint().width() + space_x
+                line_height = 0
+
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), item.sizeHint()))
+
+            x = next_x
+            line_height = max(line_height, item.sizeHint().height())
+
+        return y + line_height - rect.y() + bottom
 
 
 class AnnotationToolbar(QWidget):
@@ -19,6 +101,7 @@ class AnnotationToolbar(QWidget):
     new_instance_requested = pyqtSignal()
     delete_all_requested = pyqtSignal()
     detect_aruco_requested = pyqtSignal()
+    load_aruco_csv_requested = pyqtSignal()
     clear_all_aruco_requested = pyqtSignal()
     show_segmentations_changed = pyqtSignal(bool)
     show_bboxes_changed = pyqtSignal(bool)
@@ -37,8 +120,7 @@ class AnnotationToolbar(QWidget):
         main_layout.setSpacing(5)
         
         # First row: Tool selection buttons
-        row1 = QHBoxLayout()
-        row1.setSpacing(5)
+        row1 = FlowLayout(hspacing=5, vspacing=4)
         
         # Tool buttons
         self.button_group = QButtonGroup(self)
@@ -119,15 +201,17 @@ class AnnotationToolbar(QWidget):
         self.bbox_checkbox.stateChanged.connect(self.on_show_bboxes_changed)
         row1.addWidget(self.bbox_checkbox)
         
-        row1.addStretch()
         main_layout.addLayout(row1)
         
         # Second row: Controls and action buttons
-        row2 = QHBoxLayout()
-        row2.setSpacing(5)
+        row2 = FlowLayout(hspacing=5, vspacing=4)
         
         # Brush size control (log_2 scale up to 300)
-        row2.addWidget(QLabel("Brush Size:"))
+        brush_group = QWidget()
+        brush_layout = QHBoxLayout(brush_group)
+        brush_layout.setContentsMargins(0, 0, 0, 0)
+        brush_layout.setSpacing(5)
+        brush_layout.addWidget(QLabel("Brush Size:"))
         self.brush_size_slider = QSlider(Qt.Orientation.Horizontal)
         self.brush_size_slider.setMinimum(0)
         self.brush_size_slider.setMaximum(100)
@@ -135,27 +219,33 @@ class AnnotationToolbar(QWidget):
         self.brush_size_slider.setValue(20)
         self.brush_size_slider.setMinimumWidth(120)
         self.brush_size_slider.valueChanged.connect(self.on_brush_size_changed)
-        row2.addWidget(self.brush_size_slider)
+        brush_layout.addWidget(self.brush_size_slider)
         
         self.brush_size_label = QLabel("10")
         self.brush_size_label.setMinimumWidth(25)
-        row2.addWidget(self.brush_size_label)
+        brush_layout.addWidget(self.brush_size_label)
+        row2.addWidget(brush_group)
         
         row2.addWidget(self.create_separator())
         
         # Mask opacity control
-        row2.addWidget(QLabel("Opacity:"))
+        opacity_group = QWidget()
+        opacity_layout = QHBoxLayout(opacity_group)
+        opacity_layout.setContentsMargins(0, 0, 0, 0)
+        opacity_layout.setSpacing(5)
+        opacity_layout.addWidget(QLabel("Opacity:"))
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setMinimum(10)
         self.opacity_slider.setMaximum(255)
         self.opacity_slider.setValue(64)
         self.opacity_slider.setMinimumWidth(120)
         self.opacity_slider.valueChanged.connect(self.on_opacity_changed)
-        row2.addWidget(self.opacity_slider)
+        opacity_layout.addWidget(self.opacity_slider)
         
         self.opacity_label = QLabel("25%")
         self.opacity_label.setMinimumWidth(35)
-        row2.addWidget(self.opacity_label)
+        opacity_layout.addWidget(self.opacity_label)
+        row2.addWidget(opacity_group)
         
         row2.addWidget(self.create_separator())
         
@@ -177,6 +267,13 @@ class AnnotationToolbar(QWidget):
         self.detect_aruco_btn.setStyleSheet("QToolButton { color: blue; font-weight: bold; }")
         self.detect_aruco_btn.clicked.connect(self.on_detect_aruco)
         row2.addWidget(self.detect_aruco_btn)
+
+        self.load_aruco_csv_btn = QToolButton()
+        self.load_aruco_csv_btn.setText("Load ArUco CSV")
+        self.load_aruco_csv_btn.setToolTip("Load ArUco/tag detections from a CSV for the current frame")
+        self.load_aruco_csv_btn.setStyleSheet("QToolButton { color: blue; font-weight: bold; }")
+        self.load_aruco_csv_btn.clicked.connect(self.on_load_aruco_csv)
+        row2.addWidget(self.load_aruco_csv_btn)
         
         self.clear_aruco_btn = QToolButton()
         self.clear_aruco_btn.setText("Clear ArUco")
@@ -192,7 +289,6 @@ class AnnotationToolbar(QWidget):
         self.delete_all_btn.clicked.connect(self.on_delete_all)
         row2.addWidget(self.delete_all_btn)
         
-        row2.addStretch()
         main_layout.addLayout(row2)
         
     def create_tool_button(self, text, tool_name):
@@ -247,6 +343,10 @@ class AnnotationToolbar(QWidget):
     def on_detect_aruco(self):
         """Handle detect ArUco button"""
         self.detect_aruco_requested.emit()
+
+    def on_load_aruco_csv(self):
+        """Handle load ArUco CSV button"""
+        self.load_aruco_csv_requested.emit()
     
     def on_clear_all_aruco(self):
         """Handle clear all ArUco button"""
