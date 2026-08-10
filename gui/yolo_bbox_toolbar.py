@@ -2,10 +2,12 @@
 YOLO bounding box detection toolbar for running trained bbox detection models
 """
 
-from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QToolButton, QPushButton,
+from PyQt6.QtWidgets import (QWidget, QToolButton, QPushButton,
                              QLabel, QFileDialog, QMessageBox)
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
+
+from .toolbar import FlowLayout
 
 
 class YOLOBBoxToolbar(QWidget):
@@ -29,9 +31,7 @@ class YOLOBBoxToolbar(QWidget):
         
     def init_ui(self):
         """Initialize UI"""
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(10)
+        layout = FlowLayout(self, margin=5, hspacing=10, vspacing=4)
         
         # YOLO Model section label
         layout.addWidget(QLabel("<b>Use YOLO BBox Detection to Find Bees:</b>"))
@@ -77,7 +77,6 @@ class YOLOBBoxToolbar(QWidget):
         self.propagate_btn.clicked.connect(self.on_propagate_requested)
         layout.addWidget(self.propagate_btn)
         
-        layout.addStretch()
         
     def create_separator(self):
         """Create a vertical separator"""

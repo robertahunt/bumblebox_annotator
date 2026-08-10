@@ -69,7 +69,11 @@ class FlowLayout(QLayout):
 
         for item in self.item_list:
             widget = item.widget()
-            if widget is not None and not widget.isVisible():
+            # isVisible() is false while an ancestor (including the main
+            # window) is hidden, which makes pre-show size negotiation report
+            # a zero-height toolbar. Only skip controls explicitly hidden by
+            # the toolbar itself.
+            if widget is not None and widget.isHidden():
                 continue
 
             space_x = self.hspacing

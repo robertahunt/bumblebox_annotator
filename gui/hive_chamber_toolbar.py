@@ -2,10 +2,12 @@
 Hive and Chamber YOLO inference toolbar for running trained hive/chamber models
 """
 
-from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QToolButton, QPushButton,
+from PyQt6.QtWidgets import (QWidget, QToolButton, QPushButton,
                              QLabel, QFileDialog, QMessageBox, QFrame)
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
+
+from .toolbar import FlowLayout
 
 
 class HiveChamberToolbar(QWidget):
@@ -39,9 +41,7 @@ class HiveChamberToolbar(QWidget):
         
     def init_ui(self):
         """Initialize UI"""
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(10)
+        layout = FlowLayout(self, margin=5, hspacing=10, vspacing=4)
         
         # Section label
         layout.addWidget(QLabel("<b>Hive/Chamber/Pollen Detection:</b>"))
@@ -124,7 +124,6 @@ class HiveChamberToolbar(QWidget):
         self.both_inference_btn.clicked.connect(self.on_both_inference_requested)
         layout.addWidget(self.both_inference_btn)
         
-        layout.addStretch()
         
     def create_separator(self):
         """Create a vertical separator"""
