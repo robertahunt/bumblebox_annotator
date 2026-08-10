@@ -14,8 +14,8 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from utils.validation_metrics import (
     distance_to_mask, point_in_chamber, bbox_from_mask,
-    mask_centroid, mask_to_simplified_polygon, polygon_to_string,
-    distance_between_masks
+    mask_centroid, mask_to_polygons_string,
+    distance_between_masks, closest_points_between_masks
 )
 
 
@@ -41,6 +41,11 @@ class BatchInferenceWorker(QThread):
         self.total_bees = 0
         self.total_chambers = 0
         self.total_hives = 0
+        self.total_pollen = 0
+
+    def _polygon_epsilon(self) -> float:
+        """Return contour simplification epsilon percentage for CSV polygons."""
+        return 0.01 if self.config.get('high_resolution_polygons', False) else 2.0
         
     def run(self):
         """Main execution"""
@@ -63,10 +68,12 @@ class BatchInferenceWorker(QThread):
                 'bee_model_type': self.config.get('bee_model_type', 'bbox'),
                 'distance_method': self.config.get('distance_method', 'bbox_filter'),
                 'hive_model': str(self.config['hive_model']) if self.config['hive_model'] else None,
+                'pollen_model': str(self.config.get('pollen_model')) if self.config.get('pollen_model') else None,
                 'chamber_model': str(self.config['chamber_model']) if self.config['chamber_model'] else None,
                 'conf_threshold': self.config['conf_threshold'],
                 'save_annotations': self.config['save_annotations'],
                 'save_visualizations': self.config['save_visualizations'],
+                'high_resolution_polygons': self.config.get('high_resolution_polygons', False),
                 'debug_mode': self.config['debug_mode'],
                 'timestamp': timestamp
             }
@@ -107,6 +114,11 @@ class BatchInferenceWorker(QThread):
             if self.config['hive_model']:
                 hive_model = YOLO(str(self.config['hive_model']))
                 self.log_message.emit(f"✓ Loaded hive segmentation model: {self.config['hive_model'].name}")
+
+            pollen_model = None
+            if self.config.get('pollen_model'):
+                pollen_model = YOLO(str(self.config['pollen_model']))
+                self.log_message.emit(f"✓ Loaded pollen segmentation model: {self.config['pollen_model'].name}")
             
             chamber_model = None
             if self.config['chamber_model']:
@@ -116,6 +128,7 @@ class BatchInferenceWorker(QThread):
             # Open CSV files
             bee_csv_path = results_folder / "bee_detections.csv"
             hive_csv_path = results_folder / "hive_detections.csv"
+            pollen_csv_path = results_folder / "pollen_detections.csv"
             chamber_csv_path = results_folder / "chamber_detections.csv"
             summary_csv_path = results_folder / "image_summary.csv"
             
@@ -128,7 +141,7 @@ class BatchInferenceWorker(QThread):
                 'pred_centroid_x', 'pred_centroid_y',
                 'pred_polygon',
                 'pred_confidence',
-                'pred_chamber_id', 'pred_hive_distance',
+                'pred_chamber_id', 'pred_hive_distance', 'pred_pollen_distance',
                 'pred_nearest_bee_distance', 'pred_avg_chamber_bee_distance'
             ])
             bee_csv.flush()  # Ensure header is written immediately
@@ -138,8 +151,11 @@ class BatchInferenceWorker(QThread):
             summary_writer.writerow([
                 'image_path', 'chamber_id',
                 'bumblebox_number', 'datetime',
-                'pred_bee_count', 
+                'pred_bee_count',
+                'pred_pollen_count',
+                'pred_pollen_pixels',
                 'pred_avg_hive_distance', 
+                'pred_avg_pollen_distance',
                 'pred_avg_nearest_bee_distance',
                 'pred_avg_chamber_bee_distance'
             ])
@@ -152,10 +168,24 @@ class BatchInferenceWorker(QThread):
                 hive_csv = open(hive_csv_path, 'w', newline='')
                 hive_writer = csv.writer(hive_csv)
                 hive_writer.writerow([
-                    'image_path', 'chamber_id', 'pred_hive_pixels'
+                    'image_path', 'chamber_id', 'hive_instance_id',
+                    'pred_hive_pixels', 'pred_hive_polygon'
                 ])
                 hive_csv.flush()  # Ensure header is written immediately
                 self.log_message.emit("✓ Hive CSV created with headers")
+
+            pollen_csv = None
+            pollen_writer = None
+            if pollen_model:
+                self.log_message.emit("Creating pollen_detections.csv with headers...")
+                pollen_csv = open(pollen_csv_path, 'w', newline='')
+                pollen_writer = csv.writer(pollen_csv)
+                pollen_writer.writerow([
+                    'image_path', 'chamber_id', 'pollen_instance_id',
+                    'pred_pollen_pixels', 'pred_pollen_polygon'
+                ])
+                pollen_csv.flush()
+                self.log_message.emit("✓ Pollen CSV created with headers")
             
             chamber_csv = None
             chamber_writer = None
@@ -164,7 +194,8 @@ class BatchInferenceWorker(QThread):
                 chamber_csv = open(chamber_csv_path, 'w', newline='')
                 chamber_writer = csv.writer(chamber_csv)
                 chamber_writer.writerow([
-                    'image_path', 'chamber_id', 'chamber_pixels'
+                    'image_path', 'chamber_id', 'chamber_instance_id', 'chamber_pixels',
+                    'chamber_centroid_x', 'chamber_centroid_y', 'chamber_polygon'
                 ])
                 chamber_csv.flush()  # Ensure header is written immediately
                 self.log_message.emit("✓ Chamber CSV created with headers")
@@ -187,10 +218,10 @@ class BatchInferenceWorker(QThread):
                 # Process this image
                 self._process_image(
                     img_path, relative_path,
-                    bbox_model, hive_model, chamber_model,
-                    bee_writer, hive_writer, chamber_writer,
+                    bbox_model, hive_model, pollen_model, chamber_model,
+                    bee_writer, hive_writer, pollen_writer, chamber_writer,
                     summary_writer,
-                    bee_csv, hive_csv, chamber_csv, summary_csv,
+                    bee_csv, hive_csv, pollen_csv, chamber_csv, summary_csv,
                     results_folder
                 )
                 
@@ -225,6 +256,9 @@ class BatchInferenceWorker(QThread):
             if hive_csv:
                 hive_csv.flush()
                 hive_csv.close()
+            if pollen_csv:
+                pollen_csv.flush()
+                pollen_csv.close()
             if chamber_csv:
                 chamber_csv.flush()
                 chamber_csv.close()
@@ -232,7 +266,7 @@ class BatchInferenceWorker(QThread):
             # Sort CSV files by image path and chamber ID
             self.status_updated.emit("Sorting results...")
             self.log_message.emit("\nSorting CSV files by image path and chamber ID...")
-            self._sort_csv_files(results_folder, hive_model is not None, chamber_model is not None)
+            self._sort_csv_files(results_folder, hive_model is not None, pollen_model is not None, chamber_model is not None)
             self.log_message.emit("✓ CSV files sorted")
             
             # Generate summary
@@ -256,10 +290,10 @@ class BatchInferenceWorker(QThread):
         return sorted(root_folder.rglob("*.png"))
     
     def _process_image(self, img_path: Path, relative_path: Path,
-                      bbox_model, hive_model, chamber_model,
-                      bee_writer, hive_writer, chamber_writer,
+                      bbox_model, hive_model, pollen_model, chamber_model,
+                      bee_writer, hive_writer, pollen_writer, chamber_writer,
                       summary_writer,
-                      bee_csv, hive_csv, chamber_csv, summary_csv,
+                      bee_csv, hive_csv, pollen_csv, chamber_csv, summary_csv,
                       results_folder: Path):
         """Process a single image"""
         try:
@@ -281,10 +315,17 @@ class BatchInferenceWorker(QThread):
             self.total_bees += len(pred_bees)
             
             # Run hive prediction if model available
-            pred_hive_mask = self._predict_hive(image_rgb, hive_model) if hive_model else None
-            if pred_hive_mask is not None and np.any(pred_hive_mask > 0):
-                self.total_hives += 1
-                self.log_message.emit(f"  Detected hive")
+            pred_hive_instances = self._predict_hive_instances(image_rgb, hive_model) if hive_model else []
+            pred_hive_mask = self._combine_instance_masks(pred_hive_instances, image.shape[:2]) if hive_model else None
+            if pred_hive_instances:
+                self.total_hives += len(pred_hive_instances)
+                self.log_message.emit(f"  Detected {len(pred_hive_instances)} hive instance(s)")
+
+            # Run pollen prediction if model available
+            pred_pollen_balls = self._predict_pollen_balls(image_rgb, pollen_model) if pollen_model else []
+            if pred_pollen_balls:
+                self.total_pollen += len(pred_pollen_balls)
+                self.log_message.emit(f"  Detected {len(pred_pollen_balls)} pollen ball(s)")
             
             # Run chamber prediction if model available
             pred_chamber_masks = self._predict_chambers(image_rgb, chamber_model) if chamber_model else None
@@ -293,17 +334,26 @@ class BatchInferenceWorker(QThread):
                 self.total_chambers += len(pred_chamber_masks)
             
             # Write bee detections
-            self._write_bees(str(relative_path), pred_bees, pred_hive_mask, pred_chamber_masks, bee_writer)
+            self._write_bees(str(relative_path), pred_bees, pred_hive_mask, pred_pollen_balls, pred_chamber_masks, bee_writer)
             bee_csv.flush()  # Flush after each image
             
             # Write hive results
             if hive_writer is not None:
                 if pred_hive_mask is not None and np.any(pred_hive_mask > 0):
                     self.log_message.emit(f"  Writing hive results to CSV")
-                    self._write_hive_results(str(relative_path), pred_hive_mask, pred_chamber_masks, hive_writer)
+                    self._write_hive_results(str(relative_path), pred_hive_instances, pred_chamber_masks, hive_writer)
                     hive_csv.flush()  # Flush after each write
                 else:
                     self.log_message.emit(f"  Skipping hive CSV write - mask empty or None")
+
+            # Write pollen results
+            if pollen_writer is not None:
+                if pred_pollen_balls:
+                    self.log_message.emit(f"  Writing pollen results to CSV")
+                    self._write_pollen_results(str(relative_path), pred_pollen_balls, pred_chamber_masks, pollen_writer)
+                    pollen_csv.flush()
+                else:
+                    self.log_message.emit(f"  Skipping pollen CSV write - no pollen detected")
             
             # Write chamber results
             if chamber_writer is not None:
@@ -317,7 +367,7 @@ class BatchInferenceWorker(QThread):
             # Write image summary
             self._write_image_summary(
                 str(relative_path),
-                pred_bees, pred_hive_mask, pred_chamber_masks,
+                pred_bees, pred_hive_mask, pred_pollen_balls, pred_chamber_masks,
                 summary_writer
             )
             summary_csv.flush()  # Flush after each write
@@ -326,14 +376,14 @@ class BatchInferenceWorker(QThread):
             if self.config['save_annotations']:
                 self._save_annotations(
                     img_path, relative_path, results_folder,
-                    pred_bees, pred_hive_mask, pred_chamber_masks
+                    pred_bees, pred_hive_mask, pred_pollen_balls, pred_chamber_masks
                 )
             
             # Save visualization if enabled
             if self.config['save_visualizations']:
                 self._save_visualization(
                     image, relative_path, results_folder,
-                    pred_bees, pred_hive_mask, pred_chamber_masks
+                    pred_bees, pred_hive_mask, pred_pollen_balls, pred_chamber_masks
                 )
             
         except Exception as e:
@@ -379,8 +429,8 @@ class BatchInferenceWorker(QThread):
                     # Extract bounding box from mask
                     center_x, center_y, width, height = bbox_from_mask(mask)
                     
-                    # Simplify polygon
-                    polygon = mask_to_simplified_polygon(mask, epsilon_percent=2.0)
+                    # Store all external polygons for this instance.
+                    polygon = mask_to_polygons_string(mask, epsilon_percent=self._polygon_epsilon())
                     
                     bees.append({
                         'bbox': (center_x, center_y, width, height),
@@ -424,10 +474,25 @@ class BatchInferenceWorker(QThread):
         
         return bees
     
-    def _predict_hive(self, frame: np.ndarray, model) -> Optional[np.ndarray]:
-        """Run YOLO segmentation prediction for hive"""
+    def _combine_instance_masks(self, instances: List[Dict], frame_shape: Tuple[int, int]) -> np.ndarray:
+        """Combine instance dict masks into one binary mask."""
+        h, w = frame_shape
+        combined_mask = np.zeros((h, w), dtype=np.uint8)
+
+        for instance in instances:
+            mask = instance.get('mask')
+            if mask is None:
+                continue
+            if mask.shape[:2] != (h, w):
+                mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            combined_mask = np.maximum(combined_mask, (mask > 0).astype(np.uint8) * 255)
+
+        return combined_mask
+
+    def _predict_hive_instances(self, frame: np.ndarray, model) -> List[Dict]:
+        """Run YOLO segmentation prediction for hive instances."""
         if model is None:
-            return None
+            return []
         
         results = model.predict(
             frame,
@@ -436,19 +501,67 @@ class BatchInferenceWorker(QThread):
             verbose=False
         )
         
-        # Combine all hive masks
+        hive_instances = []
         if len(results) > 0 and results[0].masks is not None:
             masks = results[0].masks.data.cpu().numpy()
-            h, w = frame.shape[:2]
-            combined_mask = np.zeros((h, w), dtype=np.uint8)
-            
-            for mask in masks:
+            boxes = results[0].boxes
+
+            for i, mask_data in enumerate(masks):
                 # With retina_masks=True, masks are already at original image size
-                combined_mask = np.maximum(combined_mask, (mask > 0.5).astype(np.uint8) * 255)
-            
-            return combined_mask
-        
-        return None
+                mask = (mask_data > 0.5).astype(np.uint8) * 255
+                hive_instances.append({
+                    'hive_id': i + 1,
+                    'mask': mask,
+                    'polygon': mask_to_polygons_string(mask, epsilon_percent=self._polygon_epsilon()),
+                    'confidence': float(boxes.conf[i].cpu().numpy()) if boxes is not None and boxes.conf is not None else None
+                })
+
+        return hive_instances
+
+    def _predict_hive(self, frame: np.ndarray, model) -> Optional[np.ndarray]:
+        """Run YOLO segmentation prediction for hive and return one combined mask."""
+        if model is None:
+            return None
+        return self._combine_instance_masks(self._predict_hive_instances(frame, model), frame.shape[:2])
+
+    def _predict_pollen_balls(self, frame: np.ndarray, model) -> List[Dict]:
+        """Run YOLO segmentation prediction for pollen balls as separate instances."""
+        if model is None:
+            return []
+
+        results = model.predict(
+            frame,
+            conf=self.config['conf_threshold'],
+            retina_masks=True,
+            verbose=False
+        )
+
+        pollen_balls = []
+        if len(results) > 0 and results[0].masks is not None:
+            masks = results[0].masks.data.cpu().numpy()
+            boxes = results[0].boxes
+
+            for i, mask_data in enumerate(masks):
+                cls_id = int(boxes.cls[i].cpu().numpy()) if boxes.cls is not None else 0
+                if cls_id != 0:
+                    continue
+
+                conf = float(boxes.conf[i].cpu().numpy())
+                mask = (mask_data > 0.5).astype(np.uint8) * 255
+                centroid_x, centroid_y = mask_centroid(mask)
+                bbox = bbox_from_mask(mask)
+                polygon = mask_to_polygons_string(mask, epsilon_percent=self._polygon_epsilon())
+
+                pollen_balls.append({
+                    'bbox': bbox,
+                    'centroid': (centroid_x, centroid_y),
+                    'polygon': polygon,
+                    'mask': mask,
+                    'confidence': conf,
+                    'pollen_id': i + 1
+                })
+
+        return pollen_balls
     
     def _predict_chambers(self, frame: np.ndarray, model) -> Optional[Dict[int, np.ndarray]]:
         """Run YOLO segmentation prediction for chambers"""
@@ -508,8 +621,7 @@ class BatchInferenceWorker(QThread):
             
             # If chamber filtering is requested, check if other bee is in same chamber
             if chamber_id is not None and chamber_masks is not None:
-                check_point = (other_bee['bbox'][0], other_bee['bbox'][1])
-                other_chamber_id = point_in_chamber(check_point, chamber_masks)
+                other_chamber_id = point_in_chamber(other_bee['centroid'], chamber_masks)
                 if other_chamber_id != chamber_id:
                     continue  # Skip bees in different chambers
             
@@ -527,6 +639,142 @@ class BatchInferenceWorker(QThread):
             min_dist = min(min_dist, dist)
         
         return min_dist if min_dist != np.inf else None
+
+    def _mask_to_chamber(self, mask: Optional[np.ndarray], chamber_id: Optional[int], chamber_masks) -> Optional[np.ndarray]:
+        """Restrict a binary mask to one chamber when chamber information is available."""
+        if mask is None or not np.any(mask > 0):
+            return None
+
+        if chamber_id is None or not chamber_masks:
+            return mask
+
+        chamber_mask = chamber_masks.get(chamber_id)
+        if chamber_mask is None:
+            return mask
+
+        masked = mask.copy()
+        masked[chamber_mask == 0] = 0
+        return masked if np.any(masked > 0) else None
+
+    def _mask_in_chamber(self, mask: Optional[np.ndarray], chamber_id: Optional[int], chamber_masks) -> bool:
+        """Return True when a mask belongs to the requested chamber."""
+        if chamber_id is None or not chamber_masks:
+            return True
+
+        chamber_mask = chamber_masks.get(chamber_id)
+        if chamber_mask is None:
+            return True
+
+        if mask is not None and np.any(mask > 0):
+            return bool(np.logical_and(mask > 0, chamber_mask > 0).any())
+
+        return False
+
+    def _closest_point_to_mask(self, point: Tuple[float, float],
+                               mask: np.ndarray) -> Tuple[Optional[Tuple[float, float]], float]:
+        """Return nearest foreground pixel in mask to point and its distance."""
+        if mask is None or not np.any(mask > 0):
+            return None, np.inf
+
+        pixels = np.argwhere(mask > 0)
+        coords = pixels[:, ::-1].astype(np.float32)
+        point_arr = np.asarray(point, dtype=np.float32)
+        dists = np.sqrt(np.sum((coords - point_arr) ** 2, axis=1))
+        idx = int(np.argmin(dists))
+        return (float(coords[idx, 0]), float(coords[idx, 1])), float(dists[idx])
+
+    def _calculate_chamber_hive_distance(self, bee: Dict, hive_mask: Optional[np.ndarray],
+                                         chamber_id: Optional[int] = None,
+                                         chamber_masks=None) -> Optional[float]:
+        """Calculate bee-to-hive distance using only hive pixels in the bee's chamber."""
+        chamber_hive_mask = self._mask_to_chamber(hive_mask, chamber_id, chamber_masks)
+        if chamber_hive_mask is None:
+            return None
+
+        is_seg_bee = (
+            self.config.get('bee_model_type', 'bbox') == 'segmentation'
+            and bee.get('is_segmentation', False)
+            and bee.get('mask') is not None
+        )
+
+        if is_seg_bee:
+            return distance_between_masks(bee['mask'], chamber_hive_mask, method='contour')
+
+        return distance_to_mask(bee['centroid'], chamber_hive_mask)
+
+    def _nearest_hive_connection(self, bee: Dict, hive_mask: Optional[np.ndarray],
+                                 chamber_id: Optional[int] = None,
+                                 chamber_masks=None) -> Optional[Tuple[Tuple[float, float], Tuple[float, float], float]]:
+        """Get nearest hive connection points for a bee within its chamber."""
+        chamber_hive_mask = self._mask_to_chamber(hive_mask, chamber_id, chamber_masks)
+        if chamber_hive_mask is None:
+            return None
+
+        is_seg_bee = (
+            self.config.get('bee_model_type', 'bbox') == 'segmentation'
+            and bee.get('is_segmentation', False)
+            and bee.get('mask') is not None
+        )
+
+        if is_seg_bee:
+            p1, p2, dist = closest_points_between_masks(bee['mask'], chamber_hive_mask, method='contour')
+        else:
+            p1 = bee['centroid']
+            p2, dist = self._closest_point_to_mask(bee['centroid'], chamber_hive_mask)
+
+        if p1 is None or p2 is None or not np.isfinite(dist):
+            return None
+        return p1, p2, dist
+
+    def _nearest_pollen_connection(self, bee: Dict, pollen_balls: List[Dict],
+                                   chamber_id: Optional[int] = None,
+                                   chamber_masks=None) -> Optional[Tuple[Tuple[float, float], Tuple[float, float], float]]:
+        """Get nearest pollen ball connection points for a bee within its chamber."""
+        if not pollen_balls:
+            return None
+
+        is_seg_bee = (
+            self.config.get('bee_model_type', 'bbox') == 'segmentation'
+            and bee.get('is_segmentation', False)
+            and bee.get('mask') is not None
+        )
+        distance_method = self.config.get('distance_method', 'contour')
+
+        best = None
+        best_dist = np.inf
+        for pollen in pollen_balls:
+            pollen_mask = pollen.get('mask')
+            if pollen_mask is None or not np.any(pollen_mask > 0):
+                continue
+
+            if not self._mask_in_chamber(pollen_mask, chamber_id, chamber_masks):
+                continue
+
+            if is_seg_bee:
+                dist = distance_between_masks(bee['mask'], pollen_mask, method=distance_method)
+                p1, p2, _ = closest_points_between_masks(bee['mask'], pollen_mask, method='contour')
+            else:
+                p1 = bee['centroid']
+                p2, dist = self._closest_point_to_mask(bee['centroid'], pollen_mask)
+
+            if dist < best_dist and np.isfinite(dist) and p1 is not None and p2 is not None:
+                best_dist = dist
+                best = (p1, p2, dist)
+
+        return best
+
+    def _calculate_pollen_distance(self, bee: Dict, pollen_balls: List[Dict],
+                                   chamber_id: Optional[int] = None,
+                                   chamber_masks=None) -> Optional[float]:
+        """Calculate distance from bee to nearest pollen ball in its chamber."""
+        conn = self._nearest_pollen_connection(bee, pollen_balls, chamber_id, chamber_masks)
+        return conn[2] if conn is not None else None
+
+    def _mask_polygon_string(self, mask: Optional[np.ndarray]) -> str:
+        """Convert all external contours in a binary mask to the CSV polygon format."""
+        if mask is None or not np.any(mask > 0):
+            return ''
+        return mask_to_polygons_string(mask, epsilon_percent=self._polygon_epsilon())
     
     def _calculate_avg_chamber_bee_distance(self, bee_idx: int, all_bees: List[Dict], 
                                            chamber_id: Optional[int], chamber_masks) -> Optional[float]:
@@ -548,9 +796,8 @@ class BatchInferenceWorker(QThread):
             if i == bee_idx:
                 continue  # Skip self
             
-            # Check if other bee is in the same chamber (using bbox center for chamber check)
-            check_point = (other_bee['bbox'][0], other_bee['bbox'][1])
-            other_chamber_id = point_in_chamber(check_point, chamber_masks)
+            # Check if other bee is in the same chamber
+            other_chamber_id = point_in_chamber(other_bee['centroid'], chamber_masks)
             
             if other_chamber_id == chamber_id:
                 # Calculate distance to this chamber mate (using centroid)
@@ -564,16 +811,17 @@ class BatchInferenceWorker(QThread):
         return None  # No other bees in same chamber
     
     def _write_bees(self, image_path: str, pred_bees: List[Dict],
-                   pred_hive_mask, pred_chamber_masks, writer):
+                   pred_hive_mask, pred_pollen_balls: List[Dict], pred_chamber_masks, writer):
         """Write bee detections to CSV"""
         for bee_idx, bee in enumerate(pred_bees):
             # Get chamber ID
-            chamber_id = point_in_chamber((bee['bbox'][0], bee['bbox'][1]), pred_chamber_masks) if pred_chamber_masks else None
+            chamber_id = point_in_chamber(bee['centroid'], pred_chamber_masks) if pred_chamber_masks else None
             
             # Get hive distance
-            hive_dist = None
-            if pred_hive_mask is not None and np.any(pred_hive_mask > 0):
-                hive_dist = distance_to_mask((bee['bbox'][0], bee['bbox'][1]), pred_hive_mask)
+            hive_dist = self._calculate_chamber_hive_distance(bee, pred_hive_mask, chamber_id, pred_chamber_masks)
+
+            # Get nearest pollen distance (within same chamber if chambers available)
+            pollen_dist = self._calculate_pollen_distance(bee, pred_pollen_balls, chamber_id, pred_chamber_masks)
             
             # Get nearest bee distance (within same chamber if chambers available)
             nearest_dist = self._calculate_nearest_bee_distance(bee_idx, pred_bees, chamber_id, pred_chamber_masks)
@@ -581,51 +829,86 @@ class BatchInferenceWorker(QThread):
             # Get average chamber bee distance
             chamber_dist = self._calculate_avg_chamber_bee_distance(bee_idx, pred_bees, chamber_id, pred_chamber_masks)
             
-            # Convert polygon to string format for CSV
-            polygon_str = polygon_to_string(bee['polygon']) if bee['polygon'] is not None else ''
-            
             writer.writerow([
                 image_path,
                 bee_idx + 1,  # instance_id (1-indexed)
                 bee['bbox'][0], bee['bbox'][1], bee['bbox'][2], bee['bbox'][3],
                 bee['centroid'][0], bee['centroid'][1],
-                polygon_str,
+                bee.get('polygon') or '',
                 bee['confidence'],
                 chamber_id if chamber_id is not None else '',
                 hive_dist if hive_dist is not None and hive_dist != np.inf else '',
+                pollen_dist if pollen_dist is not None and pollen_dist != np.inf else '',
                 nearest_dist if nearest_dist is not None else '',
                 chamber_dist if chamber_dist is not None else ''
             ])
     
-    def _write_hive_results(self, image_path: str, pred_mask, pred_chamber_masks, writer):
-        """Write hive analysis to CSV, split by chamber if available"""
-        # If we have chamber masks, write one row per chamber
-        if pred_chamber_masks and len(pred_chamber_masks) > 0:
-            for chamber_id, chamber_mask in pred_chamber_masks.items():
-                # Mask the hive to only this chamber's region
-                pred_masked = pred_mask.copy()
-                pred_masked[chamber_mask == 0] = 0
-                
-                # Calculate metrics for this chamber
-                pred_pixels = int(np.sum(pred_masked > 0))
-                
-                writer.writerow([
-                    image_path, chamber_id, pred_pixels
-                ])
-        else:
-            # No chamber masks available, write single row for whole image
-            pred_pixels = int(np.sum(pred_mask > 0))
-            
+    def _instance_chamber_id(self, instance: Dict, chamber_masks) -> str:
+        """Return the chamber id with maximum overlap for an instance mask, or blank."""
+        if not chamber_masks:
+            return ''
+
+        mask = instance.get('mask')
+        if mask is None:
+            return ''
+
+        best_chamber_id = ''
+        best_overlap = 0
+        for chamber_id, chamber_mask in chamber_masks.items():
+            overlap = int(np.logical_and(mask > 0, chamber_mask > 0).sum())
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_chamber_id = chamber_id
+
+        if best_chamber_id != '':
+            return best_chamber_id
+
+        centroid = instance.get('centroid')
+        if centroid is None:
+            centroid = mask_centroid(mask)
+        chamber_id = point_in_chamber(centroid, chamber_masks)
+        return chamber_id if chamber_id is not None else ''
+
+    def _write_hive_results(self, image_path: str, pred_hives: List[Dict], pred_chamber_masks, writer):
+        """Write one hive CSV row per predicted hive instance."""
+        for hive_idx, hive in enumerate(pred_hives, start=1):
+            mask = hive.get('mask')
+            if mask is None:
+                continue
+
             writer.writerow([
-                image_path, '', pred_pixels
+                image_path,
+                self._instance_chamber_id(hive, pred_chamber_masks),
+                hive.get('hive_id', hive_idx),
+                int(np.sum(mask > 0)),
+                hive.get('polygon', '')
+            ])
+
+    def _write_pollen_results(self, image_path: str, pred_pollen_balls: List[Dict],
+                              pred_chamber_masks, writer):
+        """Write one pollen CSV row per predicted pollen instance."""
+        for pollen_idx, pollen in enumerate(pred_pollen_balls, start=1):
+            mask = pollen.get('mask')
+            if mask is None:
+                continue
+
+            writer.writerow([
+                image_path,
+                self._instance_chamber_id(pollen, pred_chamber_masks),
+                pollen.get('pollen_id', pollen_idx),
+                int(np.sum(mask > 0)),
+                pollen.get('polygon', '')
             ])
     
     def _write_chamber_results(self, image_path: str, pred_masks: Dict[int, np.ndarray], writer):
         """Write chamber analysis to CSV"""
         for chamber_id, mask in pred_masks.items():
             pixels = int(np.sum(mask > 0))
+            centroid_x, centroid_y = mask_centroid(mask)
+            polygon = self._mask_polygon_string(mask)
             writer.writerow([
-                image_path, chamber_id, pixels
+                image_path, chamber_id, chamber_id, pixels,
+                centroid_x, centroid_y, polygon
             ])
     
     def _parse_filename(self, image_path: str):
@@ -655,7 +938,7 @@ class BatchInferenceWorker(QThread):
         return '', ''
     
     def _write_image_summary(self, image_path: str, pred_bees: List[Dict],
-                            pred_hive_mask, pred_chamber_masks, writer):
+                            pred_hive_mask, pred_pollen_balls: List[Dict], pred_chamber_masks, writer):
         """Write per-image summary statistics to CSV"""
         
         # Parse filename for metadata
@@ -667,9 +950,22 @@ class BatchInferenceWorker(QThread):
         self.log_message.emit(f"  Writing image summary ({rows_to_write} row(s)) to CSV")
         
         # Helper function to calculate statistics for a list of bees
-        def calculate_bee_stats(bees, hive_mask, chamber_masks=None, is_chamber_filtered=False):
+        def pollen_pixels(pollen_balls):
+            return int(sum(np.sum(pollen.get('mask') > 0) for pollen in pollen_balls if pollen.get('mask') is not None))
+
+        def filter_pollen_to_chamber(pollen_balls, chamber_id, chamber_masks):
+            if not chamber_masks:
+                return pollen_balls
+            return [
+                pollen for pollen in pollen_balls
+                if self._mask_in_chamber(pollen.get('mask'), chamber_id, chamber_masks)
+            ]
+
+        def calculate_bee_stats(bees, hive_mask, pollen_balls, chamber_masks=None,
+                                is_chamber_filtered=False, fixed_chamber_id=None):
             count = len(bees)
             avg_hive_dist = None
+            avg_pollen_dist = None
             avg_bee_dist = None
             avg_chamber_bee_dist = None
             
@@ -677,11 +973,27 @@ class BatchInferenceWorker(QThread):
             if count > 0 and hive_mask is not None and np.any(hive_mask > 0):
                 hive_dists = []
                 for bee in bees:
-                    dist = distance_to_mask((bee['bbox'][0], bee['bbox'][1]), hive_mask)
-                    if dist != np.inf:
+                    cid = fixed_chamber_id if fixed_chamber_id is not None else (
+                        point_in_chamber(bee['centroid'], chamber_masks) if chamber_masks else None
+                    )
+                    dist = self._calculate_chamber_hive_distance(bee, hive_mask, cid, chamber_masks)
+                    if dist is not None and dist != np.inf:
                         hive_dists.append(dist)
                 if hive_dists:
                     avg_hive_dist = np.mean(hive_dists)
+
+            # Calculate average nearest pollen distance
+            if count > 0 and pollen_balls:
+                pollen_dists = []
+                for bee in bees:
+                    cid = fixed_chamber_id if fixed_chamber_id is not None else (
+                        point_in_chamber(bee['centroid'], chamber_masks) if chamber_masks else None
+                    )
+                    dist = self._calculate_pollen_distance(bee, pollen_balls, cid, chamber_masks)
+                    if dist is not None and dist != np.inf:
+                        pollen_dists.append(dist)
+                if pollen_dists:
+                    avg_pollen_dist = np.mean(pollen_dists)
             
             # Calculate average nearest bee distance
             if count > 1:
@@ -692,7 +1004,7 @@ class BatchInferenceWorker(QThread):
                     if is_chamber_filtered:
                         dist = self._calculate_nearest_bee_distance(i, bees)
                     elif chamber_masks:
-                        bee_center = (bees[i]['bbox'][0], bees[i]['bbox'][1])
+                        bee_center = bees[i]['centroid']
                         bee_chamber_id = point_in_chamber(bee_center, chamber_masks)
                         dist = self._calculate_nearest_bee_distance(i, bees, bee_chamber_id, chamber_masks)
                     else:
@@ -708,11 +1020,11 @@ class BatchInferenceWorker(QThread):
                     # Bees are already filtered to one chamber
                     chamber_dists = []
                     for i in range(count):
-                        bee_center = (bees[i]['bbox'][0], bees[i]['bbox'][1])
+                        bee_center = bees[i]['centroid']
                         dists_to_others = []
                         for j in range(count):
                             if i != j:
-                                other_center = (bees[j]['bbox'][0], bees[j]['bbox'][1])
+                                other_center = bees[j]['centroid']
                                 dist = np.sqrt((bee_center[0] - other_center[0])**2 + (bee_center[1] - other_center[1])**2)
                                 dists_to_others.append(dist)
                         if dists_to_others:
@@ -723,7 +1035,7 @@ class BatchInferenceWorker(QThread):
                     # For whole-image: calculate avg chamber bee distance for each bee
                     chamber_dists = []
                     for i in range(count):
-                        bee_center = (bees[i]['bbox'][0], bees[i]['bbox'][1])
+                        bee_center = bees[i]['centroid']
                         chamber_id = point_in_chamber(bee_center, chamber_masks)
                         dist = self._calculate_avg_chamber_bee_distance(i, bees, chamber_id, chamber_masks)
                         if dist is not None:
@@ -731,7 +1043,7 @@ class BatchInferenceWorker(QThread):
                     if chamber_dists:
                         avg_chamber_bee_dist = np.mean(chamber_dists)
             
-            return count, avg_hive_dist, avg_bee_dist, avg_chamber_bee_dist
+            return count, avg_hive_dist, avg_pollen_dist, avg_bee_dist, avg_chamber_bee_dist
         
         # If we have chamber masks, write per-chamber rows
         if pred_chamber_masks and len(pred_chamber_masks) > 0:
@@ -739,38 +1051,46 @@ class BatchInferenceWorker(QThread):
                 # Filter pred bees to this chamber
                 pred_chamber_bees = [
                     bee for bee in pred_bees
-                    if point_in_chamber((bee['bbox'][0], bee['bbox'][1]), pred_chamber_masks) == chamber_id
+                    if point_in_chamber(bee['centroid'], pred_chamber_masks) == chamber_id
                 ]
+                pred_chamber_pollen = filter_pollen_to_chamber(pred_pollen_balls, chamber_id, pred_chamber_masks)
                 
                 # Calculate statistics for this chamber
-                count, avg_hive, avg_bee, avg_chamber = calculate_bee_stats(
-                    pred_chamber_bees, pred_hive_mask, pred_chamber_masks, is_chamber_filtered=True)
+                count, avg_hive, avg_pollen, avg_bee, avg_chamber = calculate_bee_stats(
+                    pred_chamber_bees, pred_hive_mask, pred_chamber_pollen, pred_chamber_masks,
+                    is_chamber_filtered=True, fixed_chamber_id=chamber_id)
                 
                 # Write chamber row
                 writer.writerow([
                     image_path, chamber_id,
                     bumblebox_number, datetime_str,
                     count,
+                    len(pred_chamber_pollen),
+                    pollen_pixels(pred_chamber_pollen),
                     avg_hive if avg_hive is not None else '',
+                    avg_pollen if avg_pollen is not None else '',
                     avg_bee if avg_bee is not None else '',
                     avg_chamber if avg_chamber is not None else ''
                 ])
         
         # Always write whole-image summary row
-        count, avg_hive, avg_bee, avg_chamber = calculate_bee_stats(
-            pred_bees, pred_hive_mask, pred_chamber_masks, is_chamber_filtered=False)
+        count, avg_hive, avg_pollen, avg_bee, avg_chamber = calculate_bee_stats(
+            pred_bees, pred_hive_mask, pred_pollen_balls, pred_chamber_masks, is_chamber_filtered=False)
         
         writer.writerow([
             image_path, '',  # Empty chamber_id for whole-image
             bumblebox_number, datetime_str,
             count,
+            len(pred_pollen_balls),
+            pollen_pixels(pred_pollen_balls),
             avg_hive if avg_hive is not None else '',
+            avg_pollen if avg_pollen is not None else '',
             avg_bee if avg_bee is not None else '',
             avg_chamber if avg_chamber is not None else ''
         ])
     
     def _save_annotations(self, img_path: Path, relative_path: Path, results_folder: Path,
-                         pred_bees: List[Dict], pred_hive_mask, pred_chamber_masks):
+                         pred_bees: List[Dict], pred_hive_mask, pred_pollen_balls: List[Dict], pred_chamber_masks):
         """Save annotations in PNG+JSON format"""
         # Create annotations folder preserving directory structure
         ann_folder = results_folder / "annotations" / relative_path.parent
@@ -803,8 +1123,8 @@ class BatchInferenceWorker(QThread):
             with open(frame_json_path, 'w') as f:
                 json.dump(bee_annotations, f, indent=2)
         
-        # Save hive/chamber masks if available
-        if pred_hive_mask is not None or pred_chamber_masks:
+        # Save hive/chamber/pollen masks if available
+        if pred_hive_mask is not None or pred_chamber_masks or pred_pollen_balls:
             png_folder = ann_folder / "png"
             png_folder.mkdir(parents=True, exist_ok=True)
             
@@ -822,6 +1142,27 @@ class BatchInferenceWorker(QThread):
                     'mask_id': 1,
                     'bbox_only': False
                 })
+
+            if pred_pollen_balls:
+                h, w = pred_pollen_balls[0]['mask'].shape[:2]
+                combined_pollen_mask = np.zeros((h, w), dtype=np.uint8)
+
+                for pollen_idx, pollen in enumerate(pred_pollen_balls, start=1):
+                    mask = pollen.get('mask')
+                    if mask is None:
+                        continue
+                    combined_pollen_mask[mask > 0] = pollen_idx
+
+                pollen_png = png_folder / f"{img_path.stem}_pollen.png"
+                cv2.imwrite(str(pollen_png), combined_pollen_mask)
+
+                for pollen_idx, _ in enumerate(pred_pollen_balls, start=1):
+                    video_annotations.append({
+                        'category': 'pollen',
+                        'category_id': 4,
+                        'mask_id': pollen_idx,
+                        'bbox_only': False
+                    })
             
             if pred_chamber_masks:
                 # Combine chamber masks into single multi-instance PNG
@@ -850,8 +1191,8 @@ class BatchInferenceWorker(QThread):
                     json.dump(video_annotations, f, indent=2)
     
     def _save_visualization(self, image: np.ndarray, relative_path: Path, results_folder: Path,
-                           pred_bees: List[Dict], pred_hive_mask, pred_chamber_masks):
-        """Save visualization with color-coded bee boxes and hive/chamber outlines"""
+                           pred_bees: List[Dict], pred_hive_mask, pred_pollen_balls: List[Dict], pred_chamber_masks):
+        """Save visualization with color-coded bee boxes and hive/chamber/pollen outlines"""
         try:
             # Create visualizations folder
             vis_folder = results_folder / "visualizations" / relative_path.parent
@@ -865,6 +1206,21 @@ class BatchInferenceWorker(QThread):
             if pred_hive_mask is not None and np.any(pred_hive_mask > 0):
                 contours, _ = cv2.findContours(pred_hive_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(vis_img, contours, -1, hive_color, 3)
+
+            # Draw pollen masks
+            pollen_color = (255, 0, 255)  # Magenta in BGR
+            for pollen in pred_pollen_balls or []:
+                mask = pollen.get('mask')
+                if mask is None or not np.any(mask > 0):
+                    continue
+                contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(vis_img, contours, -1, pollen_color, 2)
+                centroid = pollen.get('centroid')
+                if centroid:
+                    cx, cy = int(centroid[0]), int(centroid[1])
+                    cv2.circle(vis_img, (cx, cy), 3, pollen_color, -1)
+                    cv2.putText(vis_img, "P", (cx + 5, cy - 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, pollen_color, 1)
             
             # Draw chamber masks as blue outlines with chamber IDs
             chamber_color = (255, 0, 0)  # Blue in BGR
@@ -924,6 +1280,31 @@ class BatchInferenceWorker(QThread):
                     label = f"#{instance_id} {conf:.2f}"
                     cv2.putText(vis_img, label, (x1, y1-5),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, bee_color, 2)
+
+            def _draw_connection(conn, line_color):
+                if conn is None:
+                    return
+                p1, p2, _ = conn
+                a = (int(round(p1[0])), int(round(p1[1])))
+                b = (int(round(p2[0])), int(round(p2[1])))
+                cv2.line(vis_img, a, b, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.line(vis_img, a, b, line_color, 2, cv2.LINE_AA)
+                cv2.circle(vis_img, a, 4, (0, 0, 0), -1)
+                cv2.circle(vis_img, a, 3, line_color, -1)
+                cv2.circle(vis_img, b, 4, (0, 0, 0), -1)
+                cv2.circle(vis_img, b, 3, line_color, -1)
+
+            # Draw chamber-aware hive and pollen distance links.
+            for bee in pred_bees:
+                chamber_id = point_in_chamber(bee['centroid'], pred_chamber_masks) if pred_chamber_masks else None
+                _draw_connection(
+                    self._nearest_hive_connection(bee, pred_hive_mask, chamber_id, pred_chamber_masks),
+                    hive_color
+                )
+                _draw_connection(
+                    self._nearest_pollen_connection(bee, pred_pollen_balls, chamber_id, pred_chamber_masks),
+                    pollen_color
+                )
             
             # Add legend
             legend_y = 30
@@ -933,12 +1314,17 @@ class BatchInferenceWorker(QThread):
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, bee_color, 2)
             
             if pred_hive_mask is not None and np.any(pred_hive_mask > 0):
-                cv2.putText(vis_img, "Yellow = Hive", (10, legend_y + 60),
+                cv2.putText(vis_img, "Yellow = Hive/links", (10, legend_y + 60),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, hive_color, 2)
-            
+
+            legend_offset = 90 if (pred_hive_mask is not None and np.any(pred_hive_mask > 0)) else 60
+            if pred_pollen_balls:
+                cv2.putText(vis_img, f"Magenta = Pollen/links ({len(pred_pollen_balls)})", (10, legend_y + legend_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, pollen_color, 2)
+                legend_offset += 30
+
             if pred_chamber_masks and len(pred_chamber_masks) > 0:
-                offset = 90 if (pred_hive_mask is not None and np.any(pred_hive_mask > 0)) else 60
-                cv2.putText(vis_img, f"Blue = Chambers ({len(pred_chamber_masks)})", (10, legend_y + offset),
+                cv2.putText(vis_img, f"Blue = Chambers ({len(pred_chamber_masks)})", (10, legend_y + legend_offset),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, chamber_color, 2)
             
             # Save image
@@ -948,7 +1334,7 @@ class BatchInferenceWorker(QThread):
         except Exception as e:
             self.log_message.emit(f"  Warning: Failed to save visualization: {str(e)}")
     
-    def _sort_csv_files(self, results_folder: Path, has_hive: bool, has_chamber: bool):
+    def _sort_csv_files(self, results_folder: Path, has_hive: bool, has_pollen: bool, has_chamber: bool):
         """Sort CSV files by image path and chamber ID"""
         try:
             # Sort bee_detections.csv by image_path
@@ -982,16 +1368,18 @@ class BatchInferenceWorker(QThread):
                     
                     # Only sort and rewrite if there are data rows
                     if rows:
-                        # Sort by image_path (column 0), then chamber_id (column 1)
+                        # Sort by image_path, chamber_id, then hive_instance_id
                         # Empty chamber_id should come last for each image
                         def sort_key(row):
-                            if len(row) < 2:
-                                return (row[0] if row else '', float('inf'))
+                            if len(row) < 3:
+                                return (row[0] if row else '', float('inf'), float('inf'))
                             img_path = row[0]
                             chamber_id = row[1]
+                            instance_id = row[2]
                             # Use inf for empty chamber_id to put it last
                             chamber_num = float('inf') if chamber_id == '' else (int(chamber_id) if chamber_id.isdigit() else float('inf'))
-                            return (img_path, chamber_num)
+                            instance_num = int(instance_id) if instance_id.isdigit() else float('inf')
+                            return (img_path, chamber_num, instance_num)
                         
                         rows.sort(key=sort_key)
                         
@@ -999,8 +1387,37 @@ class BatchInferenceWorker(QThread):
                             writer = csv.writer(f)
                             writer.writerow(header)
                             writer.writerows(rows)
+                else:
+                    self.log_message.emit("  Hive CSV has no data rows, skipping sort")
+
+            # Sort pollen_detections.csv by image_path, then chamber_id
+            if has_pollen:
+                pollen_csv_path = results_folder / "pollen_detections.csv"
+                if pollen_csv_path.exists():
+                    with open(pollen_csv_path, 'r', newline='') as f:
+                        reader = csv.reader(f)
+                        header = next(reader)
+                        rows = list(reader)
+
+                    if rows:
+                        def sort_key(row):
+                            if len(row) < 3:
+                                return (row[0] if row else '', float('inf'), float('inf'))
+                            img_path = row[0]
+                            chamber_id = row[1]
+                            instance_id = row[2]
+                            chamber_num = float('inf') if chamber_id == '' else (int(chamber_id) if chamber_id.isdigit() else float('inf'))
+                            instance_num = int(instance_id) if instance_id.isdigit() else float('inf')
+                            return (img_path, chamber_num, instance_num)
+
+                        rows.sort(key=sort_key)
+
+                        with open(pollen_csv_path, 'w', newline='') as f:
+                            writer = csv.writer(f)
+                            writer.writerow(header)
+                            writer.writerows(rows)
                     else:
-                        self.log_message.emit("  Hive CSV has no data rows, skipping sort")
+                        self.log_message.emit("  Pollen CSV has no data rows, skipping sort")
             
             # Sort chamber_detections.csv by image_path, then chamber_id
             if has_chamber:
@@ -1013,13 +1430,14 @@ class BatchInferenceWorker(QThread):
                     
                     # Only sort and rewrite if there are data rows
                     if rows:
-                        # Sort by image_path (column 0), then chamber_id (column 1)
+                        # Sort by image_path, chamber_id, then chamber_instance_id
                         def sort_key(row):
-                            if len(row) < 2:
-                                return (row[0] if row else '', 0)
+                            if len(row) < 3:
+                                return (row[0] if row else '', 0, 0)
                             img_path = row[0]
                             chamber_id = int(row[1]) if row[1].isdigit() else 0
-                            return (img_path, chamber_id)
+                            instance_id = int(row[2]) if row[2].isdigit() else chamber_id
+                            return (img_path, chamber_id, instance_id)
                         
                         rows.sort(key=sort_key)
                         
@@ -1082,6 +1500,8 @@ class BatchInferenceWorker(QThread):
             f.write(f"  Bee detection: {self.config['bbox_model'].name}\n")
             if self.config['hive_model']:
                 f.write(f"  Hive segmentation: {self.config['hive_model'].name}\n")
+            if self.config.get('pollen_model'):
+                f.write(f"  Pollen segmentation: {self.config['pollen_model'].name}\n")
             if self.config['chamber_model']:
                 f.write(f"  Chamber segmentation: {self.config['chamber_model'].name}\n")
             f.write("\n")
@@ -1092,12 +1512,16 @@ class BatchInferenceWorker(QThread):
                 f.write(f"  Total chambers detected: {self.total_chambers}\n")
             if self.config['hive_model']:
                 f.write(f"  Images with hive: {self.total_hives}\n")
+            if self.config.get('pollen_model'):
+                f.write(f"  Total pollen balls detected: {self.total_pollen}\n")
             f.write("\n")
             
             f.write("Output Files:\n")
             f.write(f"  - bee_detections.csv: All bee detections\n")
             if self.config['hive_model']:
                 f.write(f"  - hive_detections.csv: Hive detection results\n")
+            if self.config.get('pollen_model'):
+                f.write(f"  - pollen_detections.csv: Pollen detection results\n")
             if self.config['chamber_model']:
                 f.write(f"  - chamber_detections.csv: Chamber detection results\n")
             f.write(f"  - image_summary.csv: Per-image statistics\n")

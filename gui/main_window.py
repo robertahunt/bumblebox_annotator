@@ -5,6 +5,7 @@ Main application window
 import numpy as np
 import cv2
 import torch
+import csv
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QSplitter, QFileDialog, QMessageBox, QStatusBar,
                              QDockWidget, QListWidget, QToolBar, QLabel, 
@@ -15,6 +16,7 @@ from PyQt6.QtGui import QAction, QKeySequence, QActionGroup
 from pathlib import Path
 import queue
 import time
+from collections import defaultdict
 
 from .canvas import ImageCanvas
 from .toolbar import AnnotationToolbar
@@ -34,15 +36,17 @@ from .batch_inference_dialog import BatchInferenceConfigDialog, BatchInferencePr
 from .batch_inference_worker import BatchInferenceWorker
 from .batch_video_inference_dialog import BatchVideoInferenceConfigDialog, BatchVideoInferenceProgressDialog
 from .batch_video_inference_worker import BatchVideoInferenceWorker
+from .tracking_visualization_dialog import TrackingVisualizationConfigDialog, TrackingVisualizationWorker
 from .tracking_sequences_panel import TrackingSequencesPanel
 from .tracking_validation_dialog import TrackingValidationConfigDialog, TrackingValidationProgressDialog
 from .tracking_validation_worker import TrackingValidationWorker
+from .project_overview_dialog import ProjectOverviewDialog
 from core.video_processor import VideoProcessor
 from core.annotation import AnnotationManager
 from core.project_manager import ProjectManager
 from core.instance_tracker import InstanceTracker, Detection, Track
 from core.frame_cache import FrameCache, PreloadWorker
-from core.marker_detector import MarkerDetector
+from core.marker_detector import MarkerDetector, MarkerDetection
 from core.tracking_sequence_manager import TrackingSequenceManager
 from training.coco_video_export import export_coco_per_video
 from training.yolo_trainer import YOLOTrainingWorker
@@ -144,6 +148,7 @@ class MainWindow(QMainWindow):
         self.frame_selected = []  # Track if frame is selected for train/val
         self.frame_list_to_frames_map = []  # Map list row to actual frame index
         self.project_path = None
+        self.recent_projects = []
         self.split_filter = 'all'  # 'all', 'train', 'val', 'test', or 'inference'
         self.video_next_mask_id = {}  # Track next_mask_id per video for unique IDs
         self.video_mask_colors = {}  # Track mask colors per video: {video_id: {mask_id: (r,g,b)}}
@@ -224,6 +229,7 @@ class MainWindow(QMainWindow):
         self.toolbar.clear_instance_requested.connect(self.clear_selected_instance)
         self.toolbar.new_instance_requested.connect(self.new_instance)
         self.toolbar.detect_aruco_requested.connect(self.on_detect_aruco_in_bees)
+        self.toolbar.load_aruco_csv_requested.connect(self.on_load_aruco_csv_in_bees)
         self.toolbar.clear_all_aruco_requested.connect(self.on_clear_all_aruco_tracking)
         self.toolbar.delete_all_requested.connect(self.delete_all_instances)
         self.toolbar.show_segmentations_changed.connect(self.on_show_segmentations_changed)
@@ -359,6 +365,9 @@ class MainWindow(QMainWindow):
         open_project_action.setShortcut(QKeySequence.StandardKey.Open)
         open_project_action.triggered.connect(self.open_project)
         file_menu.addAction(open_project_action)
+
+        self.recent_projects_menu = file_menu.addMenu("Recent Projects")
+        self.update_recent_projects_menu()
         
         file_menu.addSeparator()
         
@@ -438,7 +447,7 @@ class MainWindow(QMainWindow):
         train_yolo_bbox_action.triggered.connect(self.train_yolo_bbox_model)
         model_menu.addAction(train_yolo_bbox_action)
         
-        predict_action = QAction("Run &Inference", self)
+        predict_action = QAction("Create Tracking &Visualization Video...", self)
         predict_action.setShortcut("Ctrl+R")
         predict_action.triggered.connect(self.run_inference)
         model_menu.addAction(predict_action)
@@ -481,6 +490,13 @@ class MainWindow(QMainWindow):
         
         # View menu
         view_menu = menubar.addMenu("&View")
+
+        project_overview_action = QAction("Project &Overview...", self)
+        project_overview_action.setToolTip("Show project dataset, annotation, tracking, and carbon statistics")
+        project_overview_action.triggered.connect(self.show_project_overview)
+        view_menu.addAction(project_overview_action)
+
+        view_menu.addSeparator()
         
         # Toggle video sidebar
         self.toggle_video_sidebar_action = QAction("Hide Video &List", self)
@@ -612,6 +628,15 @@ class MainWindow(QMainWindow):
             self.hive_chamber_toolbar.show()
         else:
             self.hive_chamber_toolbar.hide()
+
+    def show_project_overview(self):
+        """Show project-level dataset, annotation, tracking, and carbon statistics."""
+        if not self.project_path:
+            QMessageBox.warning(self, "No Project", "Please open a project first.")
+            return
+
+        dialog = ProjectOverviewDialog(self.project_path, self.project_manager, self)
+        dialog.exec()
     
     def toggle_video_sidebar(self):
         """Toggle visibility of video sidebar"""
@@ -1361,13 +1386,17 @@ class MainWindow(QMainWindow):
         from PyQt6.QtWidgets import QMenu
         menu = QMenu()
         
+        load_aruco_csv_video_action = menu.addAction("Load ArUco CSV for Annotated Frames...")
+        menu.addSeparator()
         delete_annotations_action = menu.addAction("Delete All Annotations...")
         menu.addSeparator()
         delete_video_action = menu.addAction("Delete Video...")
         
         action = menu.exec(self.video_list.mapToGlobal(position))
         
-        if action == delete_annotations_action:
+        if action == load_aruco_csv_video_action:
+            self.on_load_aruco_csv_for_video(video_id)
+        elif action == delete_annotations_action:
             self.delete_video_annotations(video_id)
         elif action == delete_video_action:
             self.delete_video(video_id)
@@ -2059,6 +2088,7 @@ class MainWindow(QMainWindow):
                 f"Project created: {self.project_path.name} "
                 f"(ready to add videos)"
             )
+            self.add_recent_project(self.project_path)
             
     def open_project(self):
         """Open an existing project"""
@@ -2068,6 +2098,86 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.load_project(path)
+
+    def update_recent_projects_menu(self):
+        """Refresh the File > Recent Projects submenu."""
+        if not hasattr(self, 'recent_projects_menu'):
+            return
+
+        self.recent_projects_menu.clear()
+
+        existing_projects = []
+        for project in self.recent_projects:
+            project_path = Path(project)
+            if project_path.exists():
+                existing_projects.append(str(project_path))
+
+        if existing_projects != self.recent_projects:
+            self.recent_projects = existing_projects
+            self._save_recent_projects()
+
+        if not self.recent_projects:
+            empty_action = QAction("No Recent Projects", self)
+            empty_action.setEnabled(False)
+            self.recent_projects_menu.addAction(empty_action)
+            return
+
+        for project in self.recent_projects:
+            project_path = Path(project)
+            action = QAction(project_path.name, self)
+            action.setToolTip(str(project_path))
+            action.triggered.connect(
+                lambda checked=False, path=str(project_path): self.open_recent_project(path)
+            )
+            self.recent_projects_menu.addAction(action)
+
+        self.recent_projects_menu.addSeparator()
+
+        clear_action = QAction("Clear Recent Projects", self)
+        clear_action.triggered.connect(self.clear_recent_projects)
+        self.recent_projects_menu.addAction(clear_action)
+
+    def add_recent_project(self, path):
+        """Add a project path to the recent projects list."""
+        project_path = str(Path(path))
+        self.recent_projects = [
+            recent for recent in self.recent_projects
+            if str(Path(recent)) != project_path
+        ]
+        self.recent_projects.insert(0, project_path)
+        self.recent_projects = self.recent_projects[:10]
+        self._save_recent_projects()
+        self.update_recent_projects_menu()
+
+    def open_recent_project(self, path):
+        """Open a project from the recent projects menu."""
+        project_path = Path(path)
+        if not project_path.exists():
+            QMessageBox.warning(
+                self,
+                "Project Not Found",
+                f"Recent project no longer exists:\n{project_path}"
+            )
+            self.recent_projects = [
+                recent for recent in self.recent_projects
+                if str(Path(recent)) != str(project_path)
+            ]
+            self._save_recent_projects()
+            self.update_recent_projects_menu()
+            return
+
+        self.load_project(project_path)
+
+    def clear_recent_projects(self):
+        """Clear the recent projects menu."""
+        self.recent_projects = []
+        self._save_recent_projects()
+        self.update_recent_projects_menu()
+
+    def _save_recent_projects(self):
+        """Persist recent projects to application settings."""
+        settings = QSettings()
+        settings.setValue('recent_projects', self.recent_projects)
             
     def load_project(self, path):
         """Load a project from path"""
@@ -2107,6 +2217,7 @@ class MainWindow(QMainWindow):
                 f"Project loaded: {self.project_path.name} "
                 f"({len(self.frames)} frames, {num_annotated_frames} annotated)"
             )
+            self.add_recent_project(self.project_path)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load project: {str(e)}")
             import traceback
@@ -3549,14 +3660,43 @@ class MainWindow(QMainWindow):
             annotations,
             reject_multiple=True
         )
-        
-        # Process detections and handle ID reassignment
+
+        report = self._apply_aruco_detections_to_current_frame(
+            detections,
+            annotations,
+            bee_count,
+            aruco_tracking,
+            source_label="ArUco Detection",
+            no_markers_text=(
+                f"No ArUco markers were detected on the {bee_count} bee instance(s)."
+            ),
+            extra_no_marker_reasons=[
+                "ArUco codes are not visible or too small",
+                "Multiple codes detected in the same bee (rejected)",
+                "ArUco codes are outside the annotation regions",
+            ],
+        )
+
+    def _apply_aruco_detections_to_current_frame(
+        self,
+        detections,
+        annotations,
+        bee_count,
+        aruco_tracking,
+        source_label="ArUco Detection",
+        no_markers_text=None,
+        extra_no_marker_reasons=None,
+        pre_skipped_conflicts=None,
+        show_dialog=True,
+    ):
+        """Apply instance->ArUco detections to current-frame annotations and video tracking."""
         markers_found = 0
         reassignments = []  # Track (old_id, new_id, aruco_id) for reporting
         new_trackings = []  # Track new ArUco codes
         preservations = []  # Track (preserved_id, new_id) when moving existing instances
         tracking_updates = []  # Track ArUco tracking updates for preserved instances
-        skipped_conflicts = []  # Track skipped detections due to conflicts
+        skipped_conflicts = list(pre_skipped_conflicts or [])  # Track skipped detections due to conflicts
+        detected_markers = []  # Track raw detections in this frame as (aruco_id, instance_id)
         
         # Build reverse map of video-level tracking: instance_id -> aruco_id
         instance_to_aruco = {}  # instance_id -> aruco_id (video-wide)
@@ -3583,6 +3723,7 @@ class MainWindow(QMainWindow):
                 detection = detections[instance_id]
                 aruco_id = detection.marker_id
                 aruco_id_str = str(aruco_id)
+                detected_markers.append((aruco_id, instance_id))
                 
                 # Check if this instance already has a different ArUco code assigned (video-level)
                 if instance_id in instance_to_aruco and instance_to_aruco[instance_id] != aruco_id:
@@ -3686,51 +3827,635 @@ class MainWindow(QMainWindow):
         # Show result dialog with detailed info
         if markers_found > 0:
             msg_parts = [f"Found {markers_found} ArUco marker(s) on {bee_count} bee instance(s)."]
+
+            if detected_markers:
+                msg_parts.append(f"\n\nDetected in current frame:")
+                for aruco_id, inst_id in sorted(detected_markers, key=lambda x: (int(x[0]), int(x[1]))):
+                    msg_parts.append(f"  - ArUco {aruco_id}: Instance {inst_id}")
             
             if new_trackings:
-                msg_parts.append(f"\n\n✓ New ArUco codes tracked:")
+                msg_parts.append(f"\n\nNew ArUco codes tracked:")
                 for aruco_id, inst_id in new_trackings:
-                    msg_parts.append(f"  • ArUco {aruco_id} → Instance {inst_id}")
+                    msg_parts.append(f"  - ArUco {aruco_id} -> Instance {inst_id}")
             
             if reassignments:
-                msg_parts.append(f"\n\n✓ Instances reassigned based on existing tracking:")
+                msg_parts.append(f"\n\nInstances reassigned based on existing tracking:")
                 for old_id, new_id, aruco_id in reassignments:
-                    msg_parts.append(f"  • Instance {old_id} → {new_id} (ArUco {aruco_id})")
+                    msg_parts.append(f"  - Instance {old_id} -> {new_id} (ArUco {aruco_id})")
             
             if preservations:
-                msg_parts.append(f"\n\n✓ Existing instances preserved (moved to new IDs):")
+                msg_parts.append(f"\n\nExisting instances preserved (moved to new IDs):")
                 for old_id, new_id in preservations:
-                    msg_parts.append(f"  • Instance {old_id} → {new_id}")
+                    msg_parts.append(f"  - Instance {old_id} -> {new_id}")
             
             if tracking_updates:
-                msg_parts.append(f"\n\n✓ ArUco tracking updated for preserved instances:")
+                msg_parts.append(f"\n\nArUco tracking updated for preserved instances:")
                 for aruco_id, inst_id in tracking_updates:
-                    msg_parts.append(f"  • ArUco {aruco_id} → Instance {inst_id}")
+                    msg_parts.append(f"  - ArUco {aruco_id} -> Instance {inst_id}")
             
             if skipped_conflicts:
-                msg_parts.append(f"\n\n⚠ Skipped {len(skipped_conflicts)} conflicting detection(s):")
+                msg_parts.append(f"\n\nSkipped {len(skipped_conflicts)} conflicting detection(s):")
                 for inst_id, aruco, reason in skipped_conflicts:
-                    msg_parts.append(f"  • Instance {inst_id}: ArUco {aruco} ({reason})")
+                    msg_parts.append(f"  - Instance {inst_id}: ArUco {aruco} ({reason})")
+
+            if aruco_tracking:
+                msg_parts.append(f"\n\nCurrent video ArUco mapping:")
+                for aruco_str, inst_id in sorted(aruco_tracking.items(), key=lambda x: int(x[0])):
+                    msg_parts.append(f"  - {aruco_str}: {inst_id}")
             
             msg_parts.append("\n\nArUco IDs are now tracked across the entire video.")
             msg_parts.append("Instances with 0 or multiple codes were skipped.")
             
-            QMessageBox.information(self, "ArUco Detection Complete", "".join(msg_parts))
+            message_title = f"{source_label} Complete"
+            message_text = "".join(msg_parts)
         else:
             # Build message for no markers case
-            msg_parts = [f"No ArUco markers were detected on the {bee_count} bee instance(s)."]
+            msg_parts = [
+                no_markers_text or f"No ArUco markers were detected on the {bee_count} bee instance(s)."
+            ]
+
+            if detected_markers:
+                msg_parts.append(f"\n\nDetected in current frame:")
+                for aruco_id, inst_id in sorted(detected_markers, key=lambda x: (int(x[0]), int(x[1]))):
+                    msg_parts.append(f"  - ArUco {aruco_id}: Instance {inst_id}")
             
             if skipped_conflicts:
-                msg_parts.append(f"\n\n⚠ {len(skipped_conflicts)} detection(s) skipped due to conflicts:")
+                msg_parts.append(f"\n\n{len(skipped_conflicts)} detection(s) skipped due to conflicts:")
                 for inst_id, aruco, reason in skipped_conflicts:
-                    msg_parts.append(f"  • Instance {inst_id}: ArUco {aruco} ({reason})")
-            
-            msg_parts.append(f"\n\nPossible reasons:")
-            msg_parts.append(f"• ArUco codes are not visible or too small")
-            msg_parts.append(f"• Multiple codes detected in the same bee (rejected)")
-            msg_parts.append(f"• ArUco codes are outside the annotation regions")
-            
-            QMessageBox.information(self, "No ArUco Markers Found", "".join(msg_parts))
+                    msg_parts.append(f"  - Instance {inst_id}: ArUco {aruco} ({reason})")
+
+            if aruco_tracking:
+                msg_parts.append(f"\n\nCurrent video ArUco mapping:")
+                for aruco_str, inst_id in sorted(aruco_tracking.items(), key=lambda x: int(x[0])):
+                    msg_parts.append(f"  - {aruco_str}: {inst_id}")
+
+            if extra_no_marker_reasons:
+                msg_parts.append(f"\n\nPossible reasons:")
+                for reason in extra_no_marker_reasons:
+                    msg_parts.append(f"- {reason}")
+
+            message_title = f"No {source_label} Applied"
+            message_text = "".join(msg_parts)
+
+        if show_dialog:
+            QMessageBox.information(self, message_title, message_text)
+
+        return {
+            'markers_found': markers_found,
+            'detected_markers': detected_markers,
+            'new_trackings': new_trackings,
+            'reassignments': reassignments,
+            'preservations': preservations,
+            'tracking_updates': tracking_updates,
+            'skipped_conflicts': skipped_conflicts,
+            'message_title': message_title,
+            'message_text': message_text,
+        }
+
+    def on_load_aruco_csv_in_bees(self):
+        """Load ArUco/tag detections from CSV and apply them to current bee annotations."""
+        csv_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select ArUco/Tag CSV",
+            str(self.project_path) if self.project_path else "",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not csv_path:
+            return
+
+        self._apply_aruco_csv_to_current_frame(Path(csv_path), show_dialog=True)
+
+    def _apply_aruco_csv_to_current_frame(self, csv_path: Path, show_dialog=True):
+        """Apply ArUco/tag CSV rows to the currently loaded frame."""
+        if not hasattr(self.canvas, 'current_image') or self.canvas.current_image is None:
+            if show_dialog:
+                QMessageBox.information(
+                    self, "No Frame",
+                    "No frame is currently loaded."
+                )
+            return {'status': 'no_frame', 'markers_found': 0}
+
+        if not self.current_video_id:
+            if show_dialog:
+                QMessageBox.information(
+                    self, "No Video",
+                    "No video is currently loaded. ArUco tracking requires a video context."
+                )
+            return {'status': 'no_video', 'markers_found': 0}
+
+        annotations = self.canvas.get_annotations()
+        if not annotations:
+            if show_dialog:
+                QMessageBox.information(
+                    self, "No Annotations",
+                    "No annotations to analyze. Create some annotations first."
+                )
+            return {'status': 'no_annotations', 'markers_found': 0}
+
+        bee_count = sum(1 for ann in annotations if ann.get('category', 'bee') == 'bee')
+        if bee_count == 0:
+            if show_dialog:
+                QMessageBox.information(
+                    self, "No Bee Instances",
+                    "No bee instances found in the current frame.\n\n"
+                    "This tool only processes bee annotations."
+                )
+            return {'status': 'no_bees', 'markers_found': 0}
+
+        records, skipped_rows = self._load_aruco_csv_records_for_current_frame(Path(csv_path))
+        if not records:
+            message = (
+                f"No usable ArUco/tag rows were found for the current frame.\n\n"
+                f"Skipped rows: {skipped_rows}"
+            )
+            if show_dialog:
+                QMessageBox.information(self, "No CSV Tags for Current Frame", message)
+            return {
+                'status': 'no_records',
+                'markers_found': 0,
+                'records': 0,
+                'skipped_rows': skipped_rows,
+                'message_title': 'No CSV Tags for Current Frame',
+                'message_text': message,
+            }
+
+        detections, match_stats, pre_skipped_conflicts = self._match_csv_aruco_records_to_bees(
+            records,
+            annotations
+        )
+
+        _, aruco_tracking = self.annotation_manager.load_video_annotations(
+            self.project_path, self.current_video_id
+        )
+
+        no_marker_text = (
+            f"Loaded {len(records)} CSV tag row(s), but none could be applied to the "
+            f"{bee_count} bee instance(s)."
+        )
+        reasons = [
+            "Tag centers did not overlap a bee annotation",
+            "A tag overlapped multiple bee annotations",
+            "Multiple real tag codes were found in one bee instance",
+            "The same tag code appeared on multiple bee instances in this frame",
+        ]
+
+        report = self._apply_aruco_detections_to_current_frame(
+            detections,
+            annotations,
+            bee_count,
+            aruco_tracking,
+            source_label="ArUco CSV Load",
+            no_markers_text=no_marker_text,
+            extra_no_marker_reasons=reasons,
+            pre_skipped_conflicts=pre_skipped_conflicts,
+            show_dialog=show_dialog,
+        )
+        report.update({
+            'status': 'processed',
+            'records': len(records),
+            'skipped_rows': skipped_rows,
+            'assigned_candidates': len(detections),
+            'match_stats': match_stats,
+        })
+
+        print(
+            "[ArUco CSV] "
+            f"rows={len(records)}, skipped_rows={skipped_rows}, "
+            f"assigned_candidates={len(detections)}, "
+            f"matched_bbox={match_stats.get('matched_bbox', 0)}, "
+            f"matched_mask={match_stats.get('matched_mask', 0)}, "
+            f"no_overlap={match_stats.get('no_overlap', 0)}, "
+            f"ambiguous={match_stats.get('ambiguous', 0)}, "
+            f"multi_code_instances={match_stats.get('multi_code_instances', 0)}, "
+            f"duplicate_codes={match_stats.get('duplicate_codes', 0)}, "
+            f"noid={match_stats.get('noid', 0)}"
+        )
+
+        return report
+
+    def on_load_aruco_csv_for_video(self, video_id):
+        """Run ArUco/tag CSV loading on all annotated frames in a video."""
+        if not self.project_path or not video_id:
+            return
+
+        csv_path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Select ArUco/Tag CSV for {video_id}",
+            str(self.project_path) if self.project_path else "",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not csv_path:
+            return
+        csv_path = Path(csv_path)
+
+        if self.current_video_id == video_id and self.current_frame_modified:
+            self._save_current_frame_annotations_blocking()
+
+        if self.current_video_id != video_id:
+            self.load_video_frames(video_id)
+
+        if not self.frames:
+            QMessageBox.information(
+                self,
+                "No Frames",
+                f"No frames are loaded for video '{video_id}'."
+            )
+            return
+
+        annotated_frame_indices = []
+        for list_idx, _ in enumerate(self.frames):
+            frame_idx_in_video = self._get_frame_idx_in_video(list_idx)
+            annotations = self.annotation_manager.load_frame_annotations(
+                self.project_path, video_id, frame_idx_in_video
+            )
+            if any(ann.get('category', 'bee') == 'bee' for ann in annotations):
+                annotated_frame_indices.append(list_idx)
+
+        if not annotated_frame_indices:
+            QMessageBox.information(
+                self,
+                "No Annotated Frames",
+                f"No frames with bee annotations were found for video '{video_id}'."
+            )
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Load ArUco CSV for Video",
+            f"Run CSV tag loading on {len(annotated_frame_indices)} annotated frame(s) in '{video_id}'?\n\n"
+            "A result pop-up will be shown after each frame.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        totals = {
+            'frames_processed': 0,
+            'frames_with_markers': 0,
+            'markers_found': 0,
+            'records': 0,
+            'skipped_rows': 0,
+            'skipped_conflicts': 0,
+            'no_records': 0,
+            'errors': 0,
+        }
+
+        progress = QProgressDialog(
+            f"Loading ArUco CSV for {video_id}...",
+            "Cancel",
+            0,
+            len(annotated_frame_indices),
+            self
+        )
+        progress.setWindowTitle("Load ArUco CSV for Video")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(200)
+
+        for i, frame_list_idx in enumerate(annotated_frame_indices, 1):
+            if progress.wasCanceled():
+                break
+
+            frame_idx_in_video = self._get_frame_idx_in_video(frame_list_idx)
+            progress.setValue(i - 1)
+            progress.setLabelText(
+                f"Processing frame {frame_idx_in_video} ({i}/{len(annotated_frame_indices)})..."
+            )
+            QApplication.processEvents()
+
+            try:
+                self.load_frame(frame_list_idx)
+                QApplication.processEvents()
+
+                report = self._apply_aruco_csv_to_current_frame(csv_path, show_dialog=False)
+                totals['frames_processed'] += 1
+                totals['markers_found'] += int(report.get('markers_found', 0))
+                totals['records'] += int(report.get('records', 0) or 0)
+                totals['skipped_rows'] += int(report.get('skipped_rows', 0) or 0)
+                totals['skipped_conflicts'] += len(report.get('skipped_conflicts', []) or [])
+                if report.get('markers_found', 0) > 0:
+                    totals['frames_with_markers'] += 1
+                if report.get('status') == 'no_records':
+                    totals['no_records'] += 1
+
+                if self.current_frame_modified:
+                    self._save_current_frame_annotations_blocking()
+
+                QMessageBox.information(
+                    self,
+                    f"Frame {frame_idx_in_video}: {report.get('message_title', 'ArUco CSV Load')}",
+                    report.get('message_text', 'Frame processed.')
+                )
+            except Exception as e:
+                totals['errors'] += 1
+                QMessageBox.warning(
+                    self,
+                    f"Frame {frame_idx_in_video}: CSV Load Error",
+                    f"Failed to process frame {frame_idx_in_video}:\n{e}"
+                )
+
+        progress.setValue(len(annotated_frame_indices))
+        self.update_video_list()
+        self.update_frame_list()
+        self.update_instance_list_from_canvas()
+
+        QMessageBox.information(
+            self,
+            "ArUco CSV Video Load Complete",
+            f"Video: {video_id}\n\n"
+            f"Annotated frames considered: {len(annotated_frame_indices)}\n"
+            f"Frames processed: {totals['frames_processed']}\n"
+            f"Frames with applied markers: {totals['frames_with_markers']}\n"
+            f"Markers applied: {totals['markers_found']}\n"
+            f"CSV rows considered: {totals['records']}\n"
+            f"Frames with no matching CSV rows: {totals['no_records']}\n"
+            f"Skipped/conflicting detections: {totals['skipped_conflicts']}\n"
+            f"Skipped malformed rows: {totals['skipped_rows']}\n"
+            f"Errors: {totals['errors']}"
+        )
+
+    def _save_current_frame_annotations_blocking(self):
+        """Save current frame annotations immediately, split by frame/video-level categories."""
+        if not self.project_path or not self.current_video_id:
+            return False
+
+        annotations = self.canvas.get_annotations()
+        bee_annotations = [
+            ann for ann in annotations
+            if ann.get('category', 'bee') == 'bee'
+        ]
+        video_level_annotations = [
+            ann for ann in annotations
+            if ann.get('category', 'bee') in ('chamber', 'hive', 'pollen')
+        ]
+        frame_idx_in_video = self._get_frame_idx_in_video(self.current_frame_idx)
+
+        self.annotation_manager.save_frame_annotations(
+            self.project_path,
+            self.current_video_id,
+            frame_idx_in_video,
+            bee_annotations
+        )
+        self.annotation_manager.save_video_annotations(
+            self.project_path,
+            self.current_video_id,
+            video_level_annotations
+        )
+        self.annotation_manager.set_frame_annotations(
+            self.current_frame_idx,
+            bee_annotations,
+            video_id=self.current_video_id
+        )
+        self.annotation_manager.unsaved_changes = False
+        self.current_frame_modified = False
+        return True
+
+    def _load_aruco_csv_records_for_current_frame(self, csv_path):
+        """Read external ArUco/tag CSV rows relevant to the current frame."""
+        current_frame_number = self._get_frame_idx_in_video(self.current_frame_idx)
+        current_frame_stem = ""
+        if 0 <= self.current_frame_idx < len(self.frames):
+            current_frame = self.frames[self.current_frame_idx]
+            if isinstance(current_frame, (Path, str)):
+                current_frame_stem = Path(current_frame).stem
+
+        records = []
+        skipped_rows = 0
+        with open(csv_path, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return records, 0
+
+            for row in reader:
+                record = self._aruco_csv_record_from_row(row, csv_path)
+                if not record:
+                    skipped_rows += 1
+                    continue
+
+                frame_number = record.get('frame_number')
+                image_stem = record.get('image_stem')
+                video_id = record.get('video_id')
+
+                has_frame_filter = frame_number is not None
+                has_path_filter = bool(image_stem)
+                has_video_filter = bool(video_id)
+
+                if has_video_filter and video_id != self.current_video_id:
+                    continue
+                if has_frame_filter and frame_number != current_frame_number:
+                    continue
+                if has_path_filter and current_frame_stem and image_stem != current_frame_stem:
+                    continue
+
+                records.append(record)
+
+        return records, skipped_rows
+
+    def _aruco_csv_record_from_row(self, row, csv_path):
+        """Normalize one CSV row into a marker record."""
+        code = self._row_value(row, ('tag_id', 'ID', 'aruco_id', 'aruco_code', 'marker_id'))
+        if code.upper() == 'X' or csv_path.stem.lower().endswith('_noid'):
+            code = 'noID'
+        if code == "":
+            return None
+
+        x_value = self._row_value(
+            row,
+            ('center_x', 'centroidX', 'aruco_centroidX', 'centerX', 'x')
+        )
+        y_value = self._row_value(
+            row,
+            ('center_y', 'centroidY', 'aruco_centroidY', 'centerY', 'y')
+        )
+        if x_value == "" or y_value == "":
+            return None
+
+        x = self._parse_optional_float(x_value)
+        y = self._parse_optional_float(y_value)
+        if x is None or y is None:
+            return None
+
+        frame_number = self._parse_optional_int(
+            self._row_value(row, ('frame', 'frame_number', 'frame_idx', 'frame_index', 'image_index'))
+        )
+        path_value = self._row_value(
+            row,
+            ('image_path', 'relative_image_path', 'filename', 'file')
+        )
+        video_id = self._row_value(row, ('video_id', 'video', 'source_video'))
+        image_stem = Path(path_value).stem if path_value else ""
+
+        return {
+            'code': str(code).strip(),
+            'x': x,
+            'y': y,
+            'frame_number': frame_number,
+            'video_id': video_id,
+            'image_stem': image_stem,
+            'source_csv': str(csv_path),
+        }
+
+    def _match_csv_aruco_records_to_bees(self, records, annotations):
+        """Match CSV marker centers to current bee annotations."""
+        bee_annotations = []
+        for ann in annotations:
+            if ann.get('category', 'bee') != 'bee':
+                continue
+            instance_id = ann.get('mask_id', ann.get('instance_id', 0))
+            bbox = ann.get('bbox')
+            if not instance_id or not bbox or len(bbox) != 4:
+                continue
+            bee_annotations.append({
+                'instance_id': int(instance_id),
+                'bbox': bbox,
+                'mask': ann.get('mask'),
+                'has_mask': ann.get('mask') is not None,
+            })
+
+        stats = {
+            'matched_mask': 0,
+            'matched_bbox': 0,
+            'no_overlap': 0,
+            'ambiguous': 0,
+            'multi_code_instances': 0,
+            'duplicate_codes': 0,
+            'noid': 0,
+        }
+        markers_by_instance = defaultdict(list)
+        skipped_conflicts = []
+
+        for record in records:
+            matched = []
+            for bee_ann in bee_annotations:
+                match_type = self._csv_marker_match_type(record['x'], record['y'], bee_ann)
+                if match_type:
+                    matched.append((bee_ann['instance_id'], match_type))
+
+            if not matched:
+                stats['no_overlap'] += 1
+                skipped_conflicts.append(('CSV row', record['code'], 'no overlapping bee instance'))
+                continue
+            if len({instance_id for instance_id, _ in matched}) > 1:
+                stats['ambiguous'] += 1
+                skipped_conflicts.append(('CSV row', record['code'], 'overlaps multiple bee instances'))
+                continue
+
+            instance_id, match_type = matched[0]
+            if match_type == 'mask':
+                stats['matched_mask'] += 1
+            else:
+                stats['matched_bbox'] += 1
+            markers_by_instance[instance_id].append(record)
+
+        detections = {}
+        code_to_instances = defaultdict(set)
+        for instance_id, instance_records in markers_by_instance.items():
+            unique_codes = sorted({record['code'] for record in instance_records})
+            real_codes = [code for code in unique_codes if code != 'noID']
+
+            if len(real_codes) == 0:
+                stats['noid'] += len(instance_records)
+                continue
+            if len(real_codes) > 1:
+                stats['multi_code_instances'] += 1
+                skipped_conflicts.append((instance_id, ", ".join(real_codes), 'multiple codes in one bee'))
+                continue
+
+            code = real_codes[0]
+            marker_record = next(record for record in instance_records if record['code'] == code)
+            detection = self._marker_detection_from_csv_record(marker_record)
+            if detection is None:
+                skipped_conflicts.append((instance_id, code, 'invalid marker code'))
+                continue
+            detections[instance_id] = detection
+            code_to_instances[str(code)].add(instance_id)
+
+        duplicate_codes = {
+            code: instance_ids
+            for code, instance_ids in code_to_instances.items()
+            if len(instance_ids) > 1
+        }
+        for code, instance_ids in duplicate_codes.items():
+            stats['duplicate_codes'] += 1
+            for instance_id in instance_ids:
+                detections.pop(instance_id, None)
+                skipped_conflicts.append((instance_id, code, 'same code on multiple bee instances'))
+
+        return detections, stats, skipped_conflicts
+
+    def _csv_marker_match_type(self, x, y, bee_ann):
+        """Return mask or bbox when a CSV marker center matches a bee annotation."""
+        bbox = bee_ann['bbox']
+        x1, y1, width, height = bbox
+        x2 = x1 + width
+        y2 = y1 + height
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            return None
+
+        if bee_ann['has_mask']:
+            mask = bee_ann['mask']
+            xi = int(round(x))
+            yi = int(round(y))
+            if 0 <= yi < mask.shape[0] and 0 <= xi < mask.shape[1] and mask[yi, xi] > 0:
+                return 'mask'
+
+        return 'bbox'
+
+    def _marker_detection_from_csv_record(self, record):
+        """Convert a normalized CSV marker record to MarkerDetection."""
+        code = record.get('code')
+        if code == 'noID':
+            return None
+        try:
+            marker_id = int(float(code))
+        except (TypeError, ValueError):
+            return None
+
+        x = float(record['x'])
+        y = float(record['y'])
+        corners = np.array(
+            [[x, y], [x, y], [x, y], [x, y]],
+            dtype=np.float32
+        )
+        return MarkerDetection(
+            marker_type='aruco',
+            marker_id=marker_id,
+            confidence=1.0,
+            corners=corners,
+            dict_type='external_csv',
+            center=(x, y)
+        )
+
+    def _row_value(self, row, candidates):
+        """Get a CSV row value using case-insensitive candidate column names."""
+        lower_to_key = {str(key).lower(): key for key in row.keys()}
+        for candidate in candidates:
+            key = lower_to_key.get(str(candidate).lower())
+            if key is not None:
+                value = row.get(key, "")
+                if value is None:
+                    return ""
+                value = str(value).strip()
+                if value.lower() in {'nan', 'none', 'null'}:
+                    return ""
+                return value
+        return ""
+
+    def _parse_optional_float(self, value):
+        if value == "" or value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_optional_int(self, value):
+        if value == "" or value is None:
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
     
     def on_clear_all_aruco_tracking(self):
         """Clear all ArUco tracking for the current video"""
@@ -6008,9 +6733,38 @@ class MainWindow(QMainWindow):
                 )
             # else: training was stopped/cancelled, no action needed
     def run_inference(self):
-        """Run inference on current/all frames"""
-        # TODO: Implement inference
-        QMessageBox.information(self, "Inference", "Inference feature coming soon!")
+        """Create a tracked single-video MP4 visualization."""
+        config_dialog = TrackingVisualizationConfigDialog(self)
+        if not config_dialog.exec():
+            return
+
+        progress_dialog = BatchVideoInferenceProgressDialog(self)
+        progress_dialog.setWindowTitle("Tracking Visualization Video")
+        progress_dialog.current_video_label.setText("Single video")
+
+        worker = TrackingVisualizationWorker(config_dialog.config)
+
+        worker.status_updated.connect(progress_dialog.update_status)
+        worker.progress_updated.connect(progress_dialog.update_progress)
+        worker.log_message.connect(progress_dialog.append_log)
+        worker.visualization_complete.connect(
+            lambda output_path: self._on_tracking_visualization_complete(progress_dialog, output_path)
+        )
+        worker.visualization_stopped.connect(progress_dialog.processing_stopped)
+        worker.visualization_failed.connect(progress_dialog.processing_failed)
+        progress_dialog.stop_btn.clicked.connect(worker.stop)
+
+        worker.start()
+        progress_dialog.exec()
+
+        if worker.isRunning():
+            worker.stop()
+            worker.wait(5000)
+
+    def _on_tracking_visualization_complete(self, progress_dialog, output_path: str):
+        """Handle completion of single-video tracking visualization."""
+        progress_dialog.processing_complete()
+        self.status_label.setText(f"✓ Tracking visualization saved: {output_path}")
         
     def save_annotations(self):
         """Save current annotations and regenerate COCO datasets"""
@@ -6365,6 +7119,7 @@ class MainWindow(QMainWindow):
             worker.progress_updated.connect(progress_dialog.update_progress)
             worker.log_message.connect(progress_dialog.append_log)
             worker.inference_complete.connect(progress_dialog.processing_complete)
+            worker.inference_stopped.connect(progress_dialog.processing_stopped)
             worker.inference_failed.connect(progress_dialog.processing_failed)
             
             # Connect stop button
@@ -7383,6 +8138,14 @@ class MainWindow(QMainWindow):
         self.last_video_id = settings.value('last_video_id')
         self.last_frame_index = settings.value('last_frame_index', 0, type=int)
         self.last_frame_index_in_video = settings.value('last_frame_index_in_video', 0, type=int)
+
+        recent_projects = settings.value('recent_projects', [])
+        if recent_projects is None:
+            recent_projects = []
+        if isinstance(recent_projects, str):
+            recent_projects = [recent_projects]
+        self.recent_projects = [str(Path(path)) for path in recent_projects if path]
+        self.update_recent_projects_menu()
     
     def _save_project_state(self):
         """Save current project path, video ID, and frame index for restoration"""
@@ -8287,7 +9050,7 @@ class MainWindow(QMainWindow):
                 f"Error tracking from last frame:\n{str(e)}\n\n{error_msg}"
             )
             self.status_label.setText("Tracking failed")
-    
+
     def propagate_yolo_bbox(self):
         """Propagate YOLO bbox detections through video frames using Ultralytics ByteTrack"""
         # Check if model is loaded

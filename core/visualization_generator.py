@@ -19,7 +19,14 @@ class VisualizationGenerator:
                  chamber_frame_data: List[ChamberFrameData],
                  chambers_by_frame: Dict[int, Dict],
                  hive_masks_by_frame: Dict[int, Dict[int, Optional[np.ndarray]]],
-                 bee_masks_by_frame: Dict[int, Dict[int, Optional[np.ndarray]]] = None):
+                 bee_masks_by_frame: Dict[int, Dict[int, Optional[np.ndarray]]] = None,
+                 max_frame: Optional[int] = None,
+                 log_callback=None,
+                 verbose_output: bool = False,
+                 show_chambers: bool = True,
+                 show_chamber_info: bool = True,
+                 bubble_outlines: bool = True,
+                 visualization_mode: str = "science"):
         """
         Args:
             video_path: Path to input video
@@ -30,6 +37,13 @@ class VisualizationGenerator:
             chambers_by_frame: Chamber information per frame {frame_number -> {chamber_id -> chamber_info}}
             hive_masks_by_frame: Hive masks per frame per chamber
             bee_masks_by_frame: Bee masks per frame per bee_id (for segmentation visualization)
+            max_frame: Optional final frame number to visualize for partial/stopped runs
+            log_callback: Optional callable for progress/warning messages
+            verbose_output: Whether to print detailed visualization progress
+            show_chambers: Whether to draw chamber boundaries/labels
+            show_chamber_info: Whether to draw chamber metrics panel
+            bubble_outlines: Whether to smooth masks and draw rounded outline halos
+            visualization_mode: "pretty" for clean presentation, "science" for diagnostic overlays
         """
         self.video_path = video_path
         self.video_id = video_id
@@ -39,6 +53,29 @@ class VisualizationGenerator:
         self.chambers_by_frame = chambers_by_frame
         self.hive_masks_by_frame = hive_masks_by_frame
         self.bee_masks_by_frame = bee_masks_by_frame if bee_masks_by_frame is not None else {}
+        self.max_frame = max_frame
+        self.log_callback = log_callback
+        self.verbose_output = verbose_output
+        self.show_chambers = show_chambers
+        self.show_chamber_info = show_chamber_info
+        self.bubble_outlines = bubble_outlines
+        self.visualization_mode = visualization_mode
+        self.pretty_mode = visualization_mode == "pretty"
+        self.bee_palette = [
+            (68, 119, 170),   # blue
+            (102, 204, 238),  # cyan
+            (34, 136, 51),    # green
+            (204, 187, 68),   # ochre
+            (238, 102, 119),  # coral
+            (170, 51, 119),   # plum
+            (187, 187, 187),  # soft gray
+            (0, 153, 136),    # teal
+            (238, 119, 51),   # orange
+            (136, 34, 85),    # wine
+        ]
+        # OpenCV uses BGR channel order.
+        self.chamber_color = (230, 130, 40)
+        self.hive_color = (0, 220, 255)
         
         # Organize detections by frame
         self.detections_by_frame = defaultdict(list)
@@ -57,6 +94,18 @@ class VisualizationGenerator:
         # Track which bee IDs have been seen to color new vs existing
         self.seen_bee_ids: Set[int] = set()
         self.new_ids_in_frame: Set[int] = set()
+
+    def _log(self, message: str):
+        """Log through the GUI worker when available, otherwise print."""
+        if self.log_callback:
+            self.log_callback(message)
+        else:
+            print(message)
+
+    def _log_verbose(self, message: str):
+        """Log detailed visualization progress only in verbose mode."""
+        if self.verbose_output:
+            self._log(message)
     
     def generate(self) -> bool:
         """
@@ -67,15 +116,15 @@ class VisualizationGenerator:
         """
         # Create output folder
         self.output_folder.mkdir(parents=True, exist_ok=True)
-        print(f"[VizGen] Created output folder: {self.output_folder}")
+        self._log_verbose(f"[VizGen] Created output folder: {self.output_folder}")
         
         cap = cv2.VideoCapture(str(self.video_path))
         if not cap.isOpened():
-            print(f"[VizGen] ERROR: Failed to open video: {self.video_path}")
+            self._log(f"[VizGen] ERROR: Failed to open video: {self.video_path}")
             return False
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        print(f"[VizGen] Video opened successfully. Total frames: {total_frames}")
+        self._log_verbose(f"[VizGen] Video opened successfully. Total frames: {total_frames}")
         
         frame_number = 0
         first_frame = None
@@ -87,6 +136,8 @@ class VisualizationGenerator:
                 break
             
             frame_number += 1
+            if self.max_frame is not None and frame_number > self.max_frame:
+                break
             
             # Save first frame for summary images
             if frame_number == 1:
@@ -96,9 +147,9 @@ class VisualizationGenerator:
             try:
                 annotated = self._annotate_frame(frame, frame_number)
             except Exception as e:
-                print(f"[VizGen] ERROR annotating frame {frame_number}: {str(e)}")
+                self._log(f"[VizGen] ERROR annotating frame {frame_number}: {str(e)}")
                 import traceback
-                traceback.print_exc()
+                self._log_verbose(traceback.format_exc())
                 annotated = frame.copy()  # Use original frame if annotation fails
             
             # Save frame as image
@@ -107,25 +158,92 @@ class VisualizationGenerator:
             if success:
                 frames_written += 1
             else:
-                print(f"[VizGen] WARNING: Failed to write frame {frame_number}")
+                self._log(f"[VizGen] WARNING: Failed to write frame {frame_number}")
             
             # Log progress every 100 frames
             if frame_number % 100 == 0:
-                print(f"[VizGen] Progress: {frame_number}/{total_frames} frames processed")
+                self._log_verbose(f"[VizGen] Progress: {frame_number}/{total_frames} frames processed")
         
         cap.release()
         
-        print(f"[VizGen] Finished processing. {frames_written} frames written to {self.output_folder}")
+        self._log_verbose(f"[VizGen] Finished processing. {frames_written} frames written to {self.output_folder}")
         
         # Generate summary images
         if first_frame is not None:
             try:
                 self._generate_summary_images(first_frame)
-                print(f"[VizGen] Summary images generated")
+                self._log_verbose(f"[VizGen] Summary images generated")
             except Exception as e:
-                print(f"[VizGen] WARNING: Failed to generate summary images: {str(e)}")
+                self._log(f"[VizGen] WARNING: Failed to generate summary images: {str(e)}")
         
         return frames_written > 0  # Return True only if we wrote at least one frame
+
+    def generate_video(self, output_path: Path, fps: Optional[float] = None) -> bool:
+        """
+        Generate one annotated MP4/AVI visualization video.
+
+        Args:
+            output_path: Video path to write
+            fps: Optional output FPS. Uses source video FPS when omitted.
+
+        Returns:
+            True if at least one annotated frame was written, False otherwise.
+        """
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cap = cv2.VideoCapture(str(self.video_path))
+        if not cap.isOpened():
+            self._log(f"[VizGen] ERROR: Failed to open video: {self.video_path}")
+            return False
+
+        source_fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps is None or fps <= 0:
+            fps = source_fps if source_fps and source_fps > 0 else 10.0
+
+        writer = None
+        frames_written = 0
+        frame_number = 0
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame_number += 1
+                if self.max_frame is not None and frame_number > self.max_frame:
+                    break
+
+                try:
+                    annotated = self._annotate_frame(frame, frame_number)
+                except Exception as e:
+                    self._log(f"[VizGen] ERROR annotating frame {frame_number}: {str(e)}")
+                    import traceback
+                    self._log_verbose(traceback.format_exc())
+                    annotated = frame.copy()
+
+                if writer is None:
+                    height, width = annotated.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+                    if not writer.isOpened():
+                        self._log(f"[VizGen] ERROR: Failed to create video writer: {output_path}")
+                        return False
+
+                writer.write(annotated)
+                frames_written += 1
+
+                if frame_number % 100 == 0:
+                    self._log_verbose(f"[VizGen] Video progress: {frame_number} frames processed")
+
+        finally:
+            cap.release()
+            if writer is not None:
+                writer.release()
+
+        self._log_verbose(f"[VizGen] Wrote {frames_written} frames to {output_path}")
+        return frames_written > 0
     
     def _annotate_frame(self, frame: np.ndarray, frame_number: int) -> np.ndarray:
         """Annotate a single frame"""
@@ -143,9 +261,10 @@ class VisualizationGenerator:
                 self.new_ids_in_frame.add(detection.bee_id)
                 self.seen_bee_ids.add(detection.bee_id)
         
-        # 1. Draw chamber boundaries (if chambers detected)
-        chambers = self.chambers_by_frame.get(frame_number, {})
-        self._draw_chambers(annotated, chambers)
+        # 1. Draw chamber boundaries (if real chambers were detected)
+        if self.show_chambers:
+            chambers = self.chambers_by_frame.get(frame_number, {})
+            self._draw_chambers(annotated, chambers)
         
         # 2. Draw hive masks (lightly overlaid)
         hive_masks = self.hive_masks_by_frame.get(frame_number, {})
@@ -155,11 +274,13 @@ class VisualizationGenerator:
         self._draw_bee_detections(annotated, detections, frame_number)
         
         # 4. Draw chamber info panel
-        chamber_data = self.chamber_data_by_frame.get(frame_number, {})
-        self._draw_chamber_info(annotated, chamber_data)
+        if self.show_chamber_info and not self.pretty_mode:
+            chamber_data = self.chamber_data_by_frame.get(frame_number, {})
+            self._draw_chamber_info(annotated, chamber_data)
         
         # 5. Draw status bar
-        self._draw_status_bar(annotated, frame_number, len(detections))
+        if not self.pretty_mode:
+            self._draw_status_bar(annotated, frame_number, len(detections))
         
         return annotated
     
@@ -172,7 +293,7 @@ class VisualizationGenerator:
             if bbox is not None:
                 # Draw bounding box
                 x1, y1, x2, y2 = [int(v) for v in bbox]
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 3)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), self.chamber_color, 3)
                 
                 # Draw chamber ID label
                 if centroid is not None:
@@ -185,7 +306,7 @@ class VisualizationGenerator:
                                 (cx + text_w//2 + 5, cy + 5), (0, 0, 0), -1)
                     
                     cv2.putText(frame, label, (cx - text_w//2, cy), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.chamber_color, 2)
     
     def _draw_hive_masks(self, frame: np.ndarray, hive_masks: Dict[int, Optional[np.ndarray]]):
         """Draw hive masks as semi-transparent overlay"""
@@ -193,13 +314,13 @@ class VisualizationGenerator:
             if mask is not None and mask.shape[:2] == frame.shape[:2]:
                 # Create colored overlay (yellow for hive)
                 overlay = frame.copy()
-                overlay[mask > 0] = overlay[mask > 0] * 0.7 + np.array([0, 200, 200]) * 0.3
+                overlay[mask > 0] = overlay[mask > 0] * 0.7 + np.array(self.hive_color) * 0.3
                 cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
     
     def _draw_bee_detections(self, frame: np.ndarray, detections: List[BeeDetectionData],
                             frame_number: int):
         """Draw bee bounding boxes/masks, IDs, tracking trails"""
-        # Define colors: new IDs in bright green, existing in other colors by chamber
+        # Define colors: science mode marks new IDs; pretty mode uses stable ID colors.
         new_id_color = (0, 255, 0)  # Bright green for new IDs
         chamber_colors = [(255, 100, 100), (100, 100, 255), (255, 255, 100), 
                          (255, 100, 255), (100, 255, 255), (200, 150, 100)]
@@ -214,8 +335,11 @@ class VisualizationGenerator:
             x2 = int(detection.bbox_x + detection.bbox_width)
             y2 = int(detection.bbox_y + detection.bbox_height)
             
-            # Choose color: new IDs get bright green, existing get chamber color
-            if detection.bee_id in self.new_ids_in_frame:
+            # Choose color.
+            if self.pretty_mode:
+                color = self._bee_color(detection.bee_id)
+                thickness = 2
+            elif detection.bee_id in self.new_ids_in_frame:
                 color = new_id_color
                 thickness = 4  # Thicker for new IDs
             else:
@@ -224,21 +348,16 @@ class VisualizationGenerator:
             
             # Draw segmentation mask if available
             mask = bee_masks.get(detection.bee_id)
-            if mask is not None and mask.shape[:2] == frame.shape[:2]:
-                # Create colored overlay for this instance
-                colored_mask = np.zeros_like(frame, dtype=np.uint8)
-                colored_mask[mask > 0] = color
-                # Blend with frame
-                alpha = 0.4
-                frame[mask > 0] = cv2.addWeighted(frame[mask > 0], 1 - alpha, 
-                                                  colored_mask[mask > 0], alpha, 0)
-                # Draw mask contour
-                contours, _ = cv2.findContours((mask > 0).astype(np.uint8), 
-                                              cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(frame, contours, -1, color, thickness)
+            if mask is not None:
+                if mask.shape[:2] != frame.shape[:2]:
+                    # Resize mask to match frame rather than falling back to bbox
+                    mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]),
+                                      interpolation=cv2.INTER_NEAREST)
+                self._draw_bubbly_mask(frame, mask, color, thickness)
             else:
                 # Draw bbox if no mask available
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (30, 30, 30), thickness + 4)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness + 1)
             
             # Update trajectory
             centroid = (int(detection.centroid_x), int(detection.centroid_y))
@@ -248,25 +367,36 @@ class VisualizationGenerator:
             if len(self.bee_trajectories[detection.bee_id]) > self.trajectory_max_length:
                 self.bee_trajectories[detection.bee_id].pop(0)
             
-            # Draw trajectory trail (line from previous position)
+            # Draw trajectory trail in science mode only.
             traj = self.bee_trajectories[detection.bee_id]
-            if len(traj) > 1:
-                # Draw line from previous position
+            if not self.pretty_mode and len(traj) > 1:
+                # Science mode: arrow between last two positions + trail dots
                 prev_pos = traj[-2]
                 cv2.arrowedLine(frame, prev_pos, centroid, color, 2, tipLength=0.3)
-                
-                # Draw full trail with fading
                 for i in range(1, len(traj) - 1):
                     cv2.circle(frame, traj[i], 2, color, -1)
             
             # Draw current position dot
-            cv2.circle(frame, centroid, 5, color, -1)
+            if self.pretty_mode:
+                # Glowing dot: bright halo + core
+                halo_radius = 10
+                for r in range(halo_radius, 3, -1):
+                    t = (halo_radius - r) / (halo_radius - 3)
+                    alpha = 0.08 * (1 - t)
+                    glow_color = tuple(int(c * alpha) for c in color)
+                    cv2.circle(frame, centroid, r, glow_color, -1, lineType=cv2.LINE_AA)
+                cv2.circle(frame, centroid, 5, color, -1, lineType=cv2.LINE_AA)  # colored core
+                cv2.circle(frame, centroid, 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)  # bright white dot
+            else:
+                cv2.circle(frame, centroid, 5, color, -1)
             
             # Draw ID label with background
             label_y = y1 - 10 if y1 > 30 else y2 + 20
             
             # Bee ID
-            if detection.bee_id in self.new_ids_in_frame:
+            if self.pretty_mode:
+                label = f"Bee {detection.bee_id}"
+            elif detection.bee_id in self.new_ids_in_frame:
                 label = f"ID:{detection.bee_id} (NEW)"
             else:
                 label = f"ID:{detection.bee_id}"
@@ -286,6 +416,47 @@ class VisualizationGenerator:
                              (x1 + text_w2 + 2, aruco_y + 2), (0, 0, 0), -1)
                 cv2.putText(frame, aruco_label, (x1, aruco_y), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    def _bee_color(self, bee_id: int):
+        """Return a stable visually pleasing BGR color for an instance ID."""
+        rgb = self.bee_palette[int(bee_id) % len(self.bee_palette)]
+        return (int(rgb[2]), int(rgb[1]), int(rgb[0]))
+
+    def _draw_bubbly_mask(self, frame: np.ndarray, mask: np.ndarray, color, thickness: int):
+        """Draw a smoother, rounded bee mask with a subtle fill and halo."""
+        binary = (mask > 0).astype(np.uint8)
+        if not np.any(binary):
+            return
+
+        if self.bubble_outlines:
+            kernel_size = 5
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            smooth_mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+            smooth_mask = cv2.morphologyEx(smooth_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            soft = cv2.GaussianBlur(smooth_mask.astype(np.float32), (7, 7), 0)
+            smooth_mask = (soft > 0.35).astype(np.uint8)
+            contour_mode = cv2.CHAIN_APPROX_TC89_KCOS
+        else:
+            smooth_mask = binary
+            contour_mode = cv2.CHAIN_APPROX_SIMPLE
+
+        # Translucent color fill.
+        fill_alpha = 0.28
+        color_arr = np.array(color, dtype=np.float32)
+        pixels = smooth_mask > 0
+        frame[pixels] = frame[pixels] * (1 - fill_alpha) + color_arr * fill_alpha
+
+        contours, _ = cv2.findContours(smooth_mask, cv2.RETR_EXTERNAL, contour_mode)
+        if not contours:
+            return
+
+        # Dark halo first, then a soft white rim, then the colored outline.
+        halo_thickness = max(thickness + 5, 7)
+        rim_thickness = max(thickness + 2, 4)
+        outline_thickness = max(thickness + 1, 3)
+        cv2.drawContours(frame, contours, -1, (20, 20, 20), halo_thickness, lineType=cv2.LINE_AA)
+        cv2.drawContours(frame, contours, -1, (245, 245, 245), rim_thickness, lineType=cv2.LINE_AA)
+        cv2.drawContours(frame, contours, -1, color, outline_thickness, lineType=cv2.LINE_AA)
     
     def _draw_chamber_info(self, frame: np.ndarray, chamber_data: Dict[int, ChamberFrameData]):
         """Draw chamber information panel (hive pixels, etc.)"""
@@ -319,7 +490,8 @@ class VisualizationGenerator:
         y_offset = 50
         for chamber_id in sorted(chamber_data.keys()):
             data = chamber_data[chamber_id]
-            text = f"Chamber {chamber_id}: {data.hive_pixels} px"
+            hive_pixels = "" if data.hive_pixels is None else f"{data.hive_pixels} px"
+            text = f"Chamber {chamber_id}: {hive_pixels}"
             cv2.putText(frame, text, (panel_x + 15, panel_y + y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
             y_offset += 25

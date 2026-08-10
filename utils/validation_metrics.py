@@ -138,6 +138,88 @@ def point_in_chamber(point: Tuple[float, float],
     return None
 
 
+def closest_points_between_masks(mask1: np.ndarray, mask2: np.ndarray,
+                                method: str = 'contour') -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]], float]:
+    """Return nearest points between two masks and their distance.
+
+    Args:
+        mask1: Binary mask (H, W) with values > 0 indicating foreground
+        mask2: Binary mask (H, W) with values > 0 indicating foreground
+        method: Point extraction strategy for distance computation
+            - 'contour': Contour points only
+            - 'downsample': Downsampled foreground pixels
+            - 'full': All foreground pixels
+            - 'bbox_filter': Fast pre-check, then contour points
+
+    Returns:
+        (point_on_mask1, point_on_mask2, distance), or (None, None, np.inf) if invalid/empty
+    """
+    import cv2
+
+    overlap = np.logical_and(mask1 > 0, mask2 > 0)
+    if np.any(overlap):
+        y, x = np.argwhere(overlap)[0]
+        point = (float(x), float(y))
+        return point, point, 0.0
+
+    if method == 'bbox_filter':
+        bbox1 = bbox_from_mask(mask1)
+        bbox2 = bbox_from_mask(mask2)
+        centroid_dist = np.sqrt((bbox1[0] - bbox2[0])**2 + (bbox1[1] - bbox2[1])**2)
+        max_dim = max(bbox1[2], bbox1[3], bbox2[2], bbox2[3])
+
+        if centroid_dist > max_dim * 3:
+            p1 = (float(bbox1[0]), float(bbox1[1]))
+            p2 = (float(bbox2[0]), float(bbox2[1]))
+            approx_dist = centroid_dist - (bbox1[2] + bbox1[3] + bbox2[2] + bbox2[3]) / 4
+            return p1, p2, max(0.0, float(approx_dist))
+
+        method = 'contour'
+
+    if method == 'contour':
+        contours1, _ = cv2.findContours(mask1.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        contours2, _ = cv2.findContours(mask2.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+        if not contours1 or not contours2:
+            return None, None, np.inf
+
+        coords1 = max(contours1, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+        coords2 = max(contours2, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+
+    elif method == 'downsample':
+        mask1_small = mask1[::4, ::4]
+        mask2_small = mask2[::4, ::4]
+
+        pixels1 = np.argwhere(mask1_small > 0)
+        pixels2 = np.argwhere(mask2_small > 0)
+
+        if len(pixels1) == 0 or len(pixels2) == 0:
+            return None, None, np.inf
+
+        coords1 = (pixels1[:, ::-1] * 4).astype(np.float32)
+        coords2 = (pixels2[:, ::-1] * 4).astype(np.float32)
+
+    else:  # method == 'full'
+        pixels1 = np.argwhere(mask1 > 0)
+        pixels2 = np.argwhere(mask2 > 0)
+
+        if len(pixels1) == 0 or len(pixels2) == 0:
+            return None, None, np.inf
+
+        coords1 = pixels1[:, ::-1].astype(np.float32)
+        coords2 = pixels2[:, ::-1].astype(np.float32)
+
+    if len(coords1) == 0 or len(coords2) == 0:
+        return None, None, np.inf
+
+    distances = cdist(coords1, coords2, metric='euclidean')
+    flat_idx = int(np.argmin(distances))
+    i, j = np.unravel_index(flat_idx, distances.shape)
+    p1 = (float(coords1[i, 0]), float(coords1[i, 1]))
+    p2 = (float(coords2[j, 0]), float(coords2[j, 1]))
+    return p1, p2, float(distances[i, j])
+
+
 def distance_between_masks(mask1: np.ndarray, mask2: np.ndarray, 
                           method: str = 'contour') -> float:
     """
@@ -155,75 +237,7 @@ def distance_between_masks(mask1: np.ndarray, mask2: np.ndarray,
     Returns:
         Minimum distance in pixels, or np.inf if either mask is empty
     """
-    import cv2
-    
-    if method == 'bbox_filter':
-        # First check if bounding boxes are close enough to warrant mask calculation
-        bbox1 = bbox_from_mask(mask1)
-        bbox2 = bbox_from_mask(mask2)
-        
-        # Calculate bbox center-to-center distance
-        centroid_dist = np.sqrt((bbox1[0] - bbox2[0])**2 + (bbox1[1] - bbox2[1])**2)
-        
-        # Max possible bbox dimension (conservative estimate)
-        max_dim = max(bbox1[2], bbox1[3], bbox2[2], bbox2[3])
-        
-        # If centroids are very far apart, use centroid distance as approximation
-        if centroid_dist > max_dim * 3:
-            # Return approximate distance (centroid distance minus half of max dimensions)
-            approx_dist = centroid_dist - (bbox1[2] + bbox1[3] + bbox2[2] + bbox2[3]) / 4
-            return max(0.0, float(approx_dist))
-        
-        # Otherwise fall through to contour method
-        method = 'contour'
-    
-    if method == 'contour':
-        # Use contour points only - much faster than all pixels
-        contours1, _ = cv2.findContours(mask1.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        contours2, _ = cv2.findContours(mask2.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        
-        if not contours1 or not contours2:
-            return np.inf
-        
-        # Get largest contour from each mask
-        contour1 = max(contours1, key=cv2.contourArea)
-        contour2 = max(contours2, key=cv2.contourArea)
-        
-        # Reshape contours to (N, 2)
-        coords1 = contour1.reshape(-1, 2)
-        coords2 = contour2.reshape(-1, 2)
-        
-    elif method == 'downsample':
-        # Downsample masks by factor of 4 to reduce pixel count
-        mask1_small = mask1[::4, ::4]
-        mask2_small = mask2[::4, ::4]
-        
-        pixels1 = np.argwhere(mask1_small > 0)
-        pixels2 = np.argwhere(mask2_small > 0)
-        
-        if len(pixels1) == 0 or len(pixels2) == 0:
-            return np.inf
-        
-        # Convert to (x, y) and scale back up
-        coords1 = pixels1[:, ::-1] * 4
-        coords2 = pixels2[:, ::-1] * 4
-        
-    else:  # method == 'full'
-        # Find all foreground pixels in both masks
-        pixels1 = np.argwhere(mask1 > 0)
-        pixels2 = np.argwhere(mask2 > 0)
-        
-        if len(pixels1) == 0 or len(pixels2) == 0:
-            return np.inf
-        
-        # Convert to (x, y) format - argwhere returns (row, col) = (y, x)
-        coords1 = pixels1[:, ::-1]
-        coords2 = pixels2[:, ::-1]
-    
-    # Calculate pairwise distances and find minimum
-    distances = cdist(coords1, coords2, metric='euclidean')
-    min_distance = distances.min()
-    
+    _, _, min_distance = closest_points_between_masks(mask1, mask2, method=method)
     return float(min_distance)
 
 
@@ -364,6 +378,31 @@ def mask_centroid(mask: np.ndarray) -> Tuple[float, float]:
     return (centroid_x, centroid_y)
 
 
+def mask_to_simplified_polygons(mask: np.ndarray, epsilon_percent: float = 2.0) -> List[List[List[float]]]:
+    """
+    Convert a binary mask to simplified external polygon contours.
+
+    Returns one polygon for each external contour, sorted largest area first.
+    """
+    import cv2
+
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+
+    polygons = []
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    for contour in contours:
+        if cv2.contourArea(contour) <= 0:
+            continue
+
+        epsilon = (epsilon_percent / 100.0) * cv2.arcLength(contour, True)
+        simplified = cv2.approxPolyDP(contour, epsilon, True)
+        polygons.append(simplified.reshape(-1, 2).tolist())
+
+    return polygons
+
+
 def mask_to_simplified_polygon(mask: np.ndarray, epsilon_percent: float = 2.0) -> List[List[float]]:
     """
     Convert a binary mask to a simplified polygon contour
@@ -375,25 +414,8 @@ def mask_to_simplified_polygon(mask: np.ndarray, epsilon_percent: float = 2.0) -
     Returns:
         List of [x, y] coordinate pairs, or empty list if no contours found
     """
-    import cv2
-    
-    # Find contours
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        return []
-    
-    # Get largest contour
-    largest_contour = max(contours, key=cv2.contourArea)
-    
-    # Simplify polygon using Douglas-Peucker algorithm
-    epsilon = (epsilon_percent / 100.0) * cv2.arcLength(largest_contour, True)
-    simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
-    
-    # Convert to list of [x, y] pairs
-    polygon = simplified.reshape(-1, 2).tolist()
-    
-    return polygon
+    polygons = mask_to_simplified_polygons(mask, epsilon_percent=epsilon_percent)
+    return polygons[0] if polygons else []
 
 
 def polygon_to_string(polygon: List[List[float]]) -> str:
@@ -415,3 +437,25 @@ def polygon_to_string(polygon: List[List[float]]) -> str:
         coords.append(f"{point[1]:.2f}")
     
     return " ".join(coords)
+
+
+def polygons_to_string(polygons: List[List[List[float]]], separator: str = "|") -> str:
+    """
+    Convert multiple polygons to one CSV-safe string.
+
+    Each polygon uses the polygon_to_string format. Multiple polygons are joined
+    with a pipe by default.
+    """
+    if not polygons:
+        return ""
+
+    polygon_strings = [polygon_to_string(polygon) for polygon in polygons]
+    polygon_strings = [polygon for polygon in polygon_strings if polygon]
+    return separator.join(polygon_strings)
+
+
+def mask_to_polygons_string(mask: np.ndarray, epsilon_percent: float = 2.0,
+                            separator: str = "|") -> str:
+    """Convert all external contours in a mask to one CSV-safe polygon string."""
+    polygons = mask_to_simplified_polygons(mask, epsilon_percent=epsilon_percent)
+    return polygons_to_string(polygons, separator=separator)

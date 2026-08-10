@@ -651,7 +651,9 @@ class MarkerDetector:
                 
                 # Check if marker center is in bbox (with small tolerance for edge cases)
                 if x <= cx <= (x + w) and y <= cy <= (y + h):
-                    # If there's a segmentation mask, verify the marker is within it
+                    # Prefer segmentation evidence when available, but allow bbox fallback.
+                    # Tight bee masks can exclude the tag even when the marker belongs to
+                    # the bee, so the whole marker does not need to be inside the mask.
                     if bee_ann['has_mask']:
                         mask = bee_ann['mask']
                         cy_int, cx_int = int(cy), int(cx)
@@ -674,15 +676,18 @@ class MarkerDetector:
                                     marker_in_instance = True
                                     break
                         
-                        if marker_in_instance:
-                            # Marker is within segmentation
-                            if instance_id not in bee_markers:
-                                bee_markers[instance_id] = []
-                            bee_markers[instance_id].append(marker)
-                            
-                            if self.debug:
-                                match_type = "center" if center_in_mask else "corner"
-                                print(f"  ✓ Marker {marker['marker_id']} matched to Instance {instance_id} (in segmentation, via {match_type})")
+                        if instance_id not in bee_markers:
+                            bee_markers[instance_id] = []
+                        bee_markers[instance_id].append(marker)
+
+                        if self.debug:
+                            if center_in_mask:
+                                match_type = "segmentation center"
+                            elif marker_in_instance:
+                                match_type = "segmentation corner"
+                            else:
+                                match_type = "bbox fallback"
+                            print(f"  ✓ Marker {marker['marker_id']} matched to Instance {instance_id} (via {match_type})")
                     else:
                         # No mask, just use bbox
                         if instance_id not in bee_markers:

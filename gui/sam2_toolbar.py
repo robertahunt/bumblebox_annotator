@@ -2,10 +2,12 @@
 SAM2 toolbar for segmentation and propagation
 """
 
-from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QToolButton,
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QToolButton,
                              QLabel, QFileDialog, QMessageBox, QButtonGroup)
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
+
+from .toolbar import FlowLayout
 
 
 class SAM2Toolbar(QWidget):
@@ -39,8 +41,7 @@ class SAM2Toolbar(QWidget):
         main_layout.setSpacing(5)
         
         # First row: Model loading and tools
-        row1 = QHBoxLayout()
-        row1.setSpacing(10)
+        row1 = FlowLayout(hspacing=10, vspacing=4)
         
         # SAM2 section label
         row1.addWidget(QLabel("<b>SAM2:</b>"))
@@ -82,12 +83,10 @@ class SAM2Toolbar(QWidget):
         self.box_btn.setEnabled(False)
         row1.addWidget(self.box_btn)
         
-        row1.addStretch()
         main_layout.addLayout(row1)
         
         # Second row: Actions and refinement
-        row2 = QHBoxLayout()
-        row2.setSpacing(10)
+        row2 = FlowLayout(hspacing=10, vspacing=4)
         
         row2.addWidget(QLabel("Actions:"))
         
@@ -130,7 +129,6 @@ class SAM2Toolbar(QWidget):
         self.finetune_btn.setEnabled(False)
         row2.addWidget(self.finetune_btn)
         
-        row2.addStretch()
         main_layout.addLayout(row2)
         
     def create_tool_button(self, text, tool_name):

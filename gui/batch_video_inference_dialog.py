@@ -39,8 +39,9 @@ class BatchVideoInferenceConfigDialog(QDialog):
             "<b>Outputs:</b><br>"
             "• bee_detections.csv - Per-frame bee data with spatial metrics<br>"
             "• bee_velocity.csv - Average velocity and frame transitions per bee<br>"
-            "• hive_detections.csv - Averaged hive pixels and centroid per chamber<br>"
-            "• chamber_detections.csv - Averaged chamber pixels and centroid per chamber<br>"
+            "• hive_detections.csv - Averaged hive pixels, centroid, and polygon per hive instance (when hive model is provided)<br>"
+            "• pollen_detections.csv - Averaged pollen pixels, centroid, and polygon per pollen instance (when pollen model is provided)<br>"
+            "• chamber_detections.csv - Averaged chamber pixels, centroid, and polygon per chamber instance<br>"
             "• Optional: Annotated frame images with tracking trails"
         )
         desc_label.setWordWrap(True)
@@ -160,15 +161,36 @@ class BatchVideoInferenceConfigDialog(QDialog):
         # Hive model
         hive_layout = QHBoxLayout()
         self.hive_model_edit = QLineEdit()
-        self.hive_model_edit.setPlaceholderText("Required: Select YOLO hive segmentation model...")
+        self.hive_model_edit.setPlaceholderText("Optional: Select YOLO hive segmentation model...")
         self.hive_model_edit.setReadOnly(True)
         hive_layout.addWidget(self.hive_model_edit)
         
         self.hive_browse_btn = QPushButton("Browse...")
         self.hive_browse_btn.clicked.connect(self.browse_hive_model)
         hive_layout.addWidget(self.hive_browse_btn)
+
+        self.hive_clear_btn = QPushButton("Clear")
+        self.hive_clear_btn.clicked.connect(lambda: self.hive_model_edit.clear())
+        hive_layout.addWidget(self.hive_clear_btn)
         
-        optional_layout.addRow("Hive Model (required):", hive_layout)
+        optional_layout.addRow("Hive Model:", hive_layout)
+
+        # Pollen model
+        pollen_layout = QHBoxLayout()
+        self.pollen_model_edit = QLineEdit()
+        self.pollen_model_edit.setPlaceholderText("Optional: Select YOLO pollen segmentation model...")
+        self.pollen_model_edit.setReadOnly(True)
+        pollen_layout.addWidget(self.pollen_model_edit)
+
+        self.pollen_browse_btn = QPushButton("Browse...")
+        self.pollen_browse_btn.clicked.connect(self.browse_pollen_model)
+        pollen_layout.addWidget(self.pollen_browse_btn)
+
+        self.pollen_clear_btn = QPushButton("Clear")
+        self.pollen_clear_btn.clicked.connect(lambda: self.pollen_model_edit.clear())
+        pollen_layout.addWidget(self.pollen_clear_btn)
+
+        optional_layout.addRow("Pollen Model:", pollen_layout)
         
         # Chamber model
         chamber_layout = QHBoxLayout()
@@ -299,29 +321,37 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.nms_iou_spin.setSingleStep(0.05)
         self.nms_iou_spin.setDecimals(2)
         detection_layout.addRow("NMS IoU threshold:", self.nms_iou_spin)
-        
-        # Distance calculation method (for segmentation models only)
-        self.distance_method_label = QLabel("Distance Method:")
+
+        self.compute_spatial_metrics_check = QCheckBox("Compute spatial metrics")
+        self.compute_spatial_metrics_check.setChecked(True)
+        self.compute_spatial_metrics_check.setToolTip(
+            "Calculate hive distance, number of bees per chamber, and bee-to-bee distance metrics.\n"
+            "Disable this for faster tracking-only runs; spatial metric columns will be left blank."
+        )
+        self.compute_spatial_metrics_check.stateChanged.connect(self.update_distance_method_visibility)
+        detection_layout.addRow("", self.compute_spatial_metrics_check)
+
+        # Distance calculation method for bee-to-bee spatial metrics
+        self.distance_method_label = QLabel("Bee distance method:")
         self.distance_method_combo = QComboBox()
         self.distance_method_combo.addItems([
-            "contour (Fast & accurate)",
-            "bbox_filter (Fastest, recommended)",
-            "downsample (Very fast, approximate)",
-            "full (Slowest, exact)"
+            "centroid (Fastest, center-to-center)",
+            "contour (Mask edge-to-edge)",
+            "bbox_filter (Mask edge-to-edge, filtered)",
+            "downsample (Mask approximate)",
+            "full (Mask exact, slowest)"
         ])
-        self.distance_method_combo.setCurrentIndex(0)  # Default to contour
+        self.distance_method_combo.setCurrentIndex(0)  # Default to current fast behavior
         self.distance_method_combo.setToolTip(
-            "Method for calculating distances between segmentation masks:\\n"
-            "• contour: Edge pixels only (fast & accurate)\\n"
-            "• bbox_filter: Smart filtering + contours (best balance)\\n"
-            "• downsample: Reduced resolution (very fast)\\n"
-            "• full: All pixels (slow but exact)"
+            "Method for calculating bee-to-bee spatial distances:\n"
+            "• centroid: Center-to-center distance\n"
+            "• contour: Mask edge-to-edge distance\n"
+            "• bbox_filter: Mask edge-to-edge with filtering\n"
+            "• downsample: Approximate mask distance\n"
+            "• full: Exact mask distance, slowest\n"
+            "Mask methods fall back to centroid distance when masks are unavailable."
         )
         detection_layout.addRow(self.distance_method_label, self.distance_method_combo)
-        
-        # Initially hide distance method (bbox is default)
-        self.distance_method_label.hide()
-        self.distance_method_combo.hide()
         
         detection_group.setLayout(detection_layout)
         layout.addWidget(detection_group)
@@ -360,17 +390,32 @@ class BatchVideoInferenceConfigDialog(QDialog):
         
         output_layout.addLayout(output_folder_layout)
         
-        self.save_visualizations_check = QCheckBox("Generate annotated video visualizations")
+        self.save_visualizations_check = QCheckBox("Generate annotated frame visualizations")
         self.save_visualizations_check.setChecked(False)
         self.save_visualizations_check.setToolTip(
-            "Create annotated videos with:\n"
+            "Create annotated frame images with:\n"
             "• Bee bounding boxes with IDs and ArUco codes\n"
             "• Tracking trails\n"
             "• Chamber boundaries\n"
             "• Hive segmentation\n"
-            "• Velocity vectors"
+            "Saved under output_folder/visualizations/<video_id>/"
         )
         output_layout.addWidget(self.save_visualizations_check)
+
+        self.high_resolution_polygons_check = QCheckBox("Output high resolution polygons")
+        self.high_resolution_polygons_check.setChecked(False)
+        self.high_resolution_polygons_check.setToolTip(
+            "Use lighter polygon simplification in CSV outputs. Files will be larger, but contours will preserve more detail."
+        )
+        output_layout.addWidget(self.high_resolution_polygons_check)
+
+        self.verbose_output_check = QCheckBox("Verbose output")
+        self.verbose_output_check.setChecked(False)
+        self.verbose_output_check.setToolTip(
+            "Show detailed frame timing, GPU memory, and ArUco diagnostic messages.\n"
+            "Leave unchecked for a quieter processing log."
+        )
+        output_layout.addWidget(self.verbose_output_check)
         
         output_group.setLayout(output_layout)
         layout.addWidget(output_group)
@@ -421,10 +466,14 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.centroid_params.setVisible(algo_name == "Centroid")
     
     def update_distance_method_visibility(self):
-        """Show/hide distance method selector based on model type"""
-        is_segmentation = self.seg_radio.isChecked()
-        self.distance_method_label.setVisible(is_segmentation)
-        self.distance_method_combo.setVisible(is_segmentation)
+        """Enable the distance method selector when spatial metrics are calculated."""
+        compute_spatial_metrics = (
+            self.compute_spatial_metrics_check.isChecked()
+            if hasattr(self, 'compute_spatial_metrics_check')
+            else True
+        )
+        self.distance_method_label.setEnabled(compute_spatial_metrics)
+        self.distance_method_combo.setEnabled(compute_spatial_metrics)
     
     def browse_input_folder(self):
         """Browse for input folder"""
@@ -476,6 +525,18 @@ class BatchVideoInferenceConfigDialog(QDialog):
         
         if model_path:
             self.hive_model_edit.setText(model_path)
+
+    def browse_pollen_model(self):
+        """Browse for pollen segmentation model"""
+        model_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Pollen Segmentation Model",
+            str(Path.home()),
+            "YOLO Models (*.pt *.onnx);;All Files (*)"
+        )
+
+        if model_path:
+            self.pollen_model_edit.setText(model_path)
     
     def browse_chamber_model(self):
         """Browse for chamber segmentation model"""
@@ -526,14 +587,22 @@ class BatchVideoInferenceConfigDialog(QDialog):
             QMessageBox.warning(self, "Invalid Path", "Bee model does not exist.")
             return
         
-        if not self.hive_model_edit.text():
-            QMessageBox.warning(self, "Model Required", "Please select a hive segmentation model.")
-            return
-        
-        hive_model_path = Path(self.hive_model_edit.text())
-        if not hive_model_path.exists():
-            QMessageBox.warning(self, "Invalid Path", "Hive model does not exist.")
-            return
+        # Hive model is optional. If omitted, hive-distance metrics are left blank
+        # and hive_detections.csv is not produced.
+        hive_model_path = None
+        if self.hive_model_edit.text():
+            hive_model_path = Path(self.hive_model_edit.text())
+            if not hive_model_path.exists():
+                QMessageBox.warning(self, "Invalid Path", "Hive model does not exist.")
+                return
+
+        # Pollen model is optional.
+        pollen_model_path = None
+        if self.pollen_model_edit.text():
+            pollen_model_path = Path(self.pollen_model_edit.text())
+            if not pollen_model_path.exists():
+                QMessageBox.warning(self, "Invalid Path", "Pollen model does not exist.")
+                return
         
         # Chamber model is optional
         chamber_model_path = None
@@ -590,14 +659,18 @@ class BatchVideoInferenceConfigDialog(QDialog):
             'bee_model_path': str(bee_model_path),
             'bee_model_type': bee_model_type,
             'distance_method': distance_method,
-            'hive_model_path': str(hive_model_path),
+            'hive_model_path': str(hive_model_path) if hive_model_path else None,
+            'pollen_model_path': str(pollen_model_path) if pollen_model_path else None,
             'chamber_model_path': str(chamber_model_path) if chamber_model_path else None,
             'tracking_config': tracking_config,
             'confidence_threshold': self.confidence_spin.value(),
             'nms_iou_threshold': self.nms_iou_spin.value(),
+            'compute_spatial_metrics': self.compute_spatial_metrics_check.isChecked(),
             'enable_aruco': self.enable_aruco_check.isChecked(),
             'output_folder': str(output_folder),
-            'save_visualizations': self.save_visualizations_check.isChecked()
+            'save_visualizations': self.save_visualizations_check.isChecked(),
+            'high_resolution_polygons': self.high_resolution_polygons_check.isChecked(),
+            'verbose_output': self.verbose_output_check.isChecked()
         }
         
         super().accept()
@@ -691,6 +764,13 @@ class BatchVideoInferenceProgressDialog(QDialog):
         self.close_btn.setEnabled(True)
         self.status_label.setText("✓ Processing complete!")
         self.progress_bar.setValue(100)
+
+    @pyqtSlot()
+    def processing_stopped(self):
+        """Called when processing is stopped by the user"""
+        self.stop_btn.setEnabled(False)
+        self.close_btn.setEnabled(True)
+        self.status_label.setText("⚠️ Processing stopped")
     
     @pyqtSlot(str)
     def processing_failed(self, error):

@@ -2,12 +2,14 @@
 YOLO Instance-Focused toolbar for refining individual instance masks using a trained model
 """
 
-from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QPushButton,
+from PyQt6.QtWidgets import (QWidget, QPushButton,
                              QLabel, QFileDialog, QMessageBox, QSpinBox,
                              QToolButton, QMenu)
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction
 from pathlib import Path
+
+from .toolbar import FlowLayout
 
 
 class YOLOInstanceFocusedToolbar(QWidget):
@@ -31,9 +33,7 @@ class YOLOInstanceFocusedToolbar(QWidget):
         
     def init_ui(self):
         """Initialize UI"""
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(10)
+        layout = FlowLayout(self, margin=5, hspacing=10, vspacing=4)
         
         # YOLO Instance-Focused section label
         layout.addWidget(QLabel("<b>Instance-Focused YOLO Refinement:</b>"))
@@ -107,7 +107,6 @@ class YOLOInstanceFocusedToolbar(QWidget):
         self.refine_all_btn.clicked.connect(self.on_refine_all_requested)
         layout.addWidget(self.refine_all_btn)
         
-        layout.addStretch()
         
     def create_separator(self):
         """Create a vertical separator"""

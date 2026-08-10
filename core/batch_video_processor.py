@@ -19,8 +19,8 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 from core.instance_tracker import Detection
-from core.marker_detector import MarkerDetector
-from utils.validation_metrics import distance_between_masks
+from core.aruco_tracking_identity import ArucoTrackingIdentityManager
+from utils.validation_metrics import distance_between_masks, mask_to_polygons_string
 
 
 @dataclass
@@ -38,12 +38,13 @@ class BeeDetectionData:
     confidence: float
     centroid_x: float
     centroid_y: float
-    distance_to_hive_pixels: float
-    num_bees_in_chamber: int
-    avg_distance_to_other_bees_pixels: float
-    distance_to_nearest_bee_pixels: float
-    avg_distance_to_nearest_2_bees_pixels: float
-    avg_distance_to_nearest_3_bees_pixels: float
+    pred_polygon: str
+    distance_to_hive_pixels: Optional[float]
+    num_bees_in_chamber: Optional[int]
+    avg_distance_to_other_bees_pixels: Optional[float]
+    distance_to_nearest_bee_pixels: Optional[float]
+    avg_distance_to_nearest_2_bees_pixels: Optional[float]
+    avg_distance_to_nearest_3_bees_pixels: Optional[float]
 
 
 @dataclass
@@ -52,7 +53,7 @@ class ChamberFrameData:
     video_id: str
     chamber_id: int
     frame_number: int
-    hive_pixels: int
+    hive_pixels: Optional[int]
 
 
 @dataclass
@@ -67,17 +68,23 @@ class BeeTrajectory:
 class BatchVideoProcessor:
     """Process video frames with detection, tracking, ArUco, and spatial analysis"""
     
-    def __init__(self, video_path: Path, video_id: str, bee_model, hive_model, chamber_model,
+    def __init__(self, video_path: Path, video_id: str, bee_model, hive_model, pollen_model, chamber_model,
                  tracker, confidence_threshold: float, nms_iou_threshold: float,
                  enable_aruco: bool = True, output_folder: Optional[Path] = None,
                  distance_method: str = 'contour', bee_model_type: str = 'bbox',
-                 store_masks: bool = False):
+                 compute_spatial_metrics: bool = True, store_masks: bool = False,
+                 store_bee_masks: bool = False,
+                 log_callback=None, stop_callback=None, timing_log_interval: int = 1,
+                 cleanup_interval: int = 25, verbose_output: bool = False,
+                 max_frames: Optional[int] = None, high_quality_masks: bool = False,
+                 polygon_epsilon: float = 2.0):
         """
         Args:
             video_path: Path to video file
             video_id: Unique identifier for this video
             bee_model: YOLO model for bee detection
-            hive_model: YOLO model for hive segmentation
+            hive_model: Optional YOLO model for hive segmentation
+            pollen_model: Optional YOLO model for pollen segmentation
             chamber_model: YOLO model for chamber segmentation
             tracker: Tracking algorithm instance
             confidence_threshold: Minimum confidence for detections
@@ -86,12 +93,23 @@ class BatchVideoProcessor:
             output_folder: Optional output folder for debug files
             distance_method: Method for calculating mask distances ('contour', 'bbox_filter', etc.)
             bee_model_type: Type of bee model ('bbox' or 'segmentation')
-            store_masks: Whether to store masks for visualization (uses significant memory)
+            compute_spatial_metrics: Whether to calculate hive/nearest-bee spatial metrics
+            store_masks: Whether to store hive/chamber/pollen masks for CSVs or visualization
+            store_bee_masks: Whether to store bee masks for visualization (uses significant memory)
+            log_callback: Optional callable for progress/timing messages
+            stop_callback: Optional callable returning True when processing should stop
+            timing_log_interval: Log per-frame timings every N frames
+            cleanup_interval: Clear Python/CUDA caches every N frames
+            verbose_output: Whether to print detailed diagnostic/timing output
+            max_frames: Optional maximum number of frames to process from the start
+            high_quality_masks: Request full-resolution YOLO masks for prettier visualization
+            polygon_epsilon: Contour simplification percentage for CSV polygons
         """
         self.video_path = video_path
         self.video_id = video_id
         self.bee_model = bee_model
         self.hive_model = hive_model
+        self.pollen_model = pollen_model
         self.chamber_model = chamber_model
         self.tracker = tracker
         self.confidence_threshold = confidence_threshold
@@ -99,31 +117,48 @@ class BatchVideoProcessor:
         self.enable_aruco = enable_aruco
         self.distance_method = distance_method
         self.bee_model_type = bee_model_type
+        self.compute_spatial_metrics = compute_spatial_metrics
         self.store_masks = store_masks
+        self.store_bee_masks = store_bee_masks
+        self.log_callback = log_callback
+        self.stop_callback = stop_callback
+        self.timing_log_interval = max(1, int(timing_log_interval))
+        self.cleanup_interval = max(1, int(cleanup_interval))
+        self.verbose_output = verbose_output
+        self.max_frames = max_frames
+        self.high_quality_masks = high_quality_masks
+        self.polygon_epsilon = polygon_epsilon
+        self.was_stopped = False
         
-        # Initialize ArUco detector for bee ID tracking
+        # Initialize ArUco identity manager for bee ID tracking
+        self.aruco_identity = None
         self.marker_detector = None
         if self.enable_aruco:
-            self.marker_detector = MarkerDetector(
-                aruco_dicts=['4x4_50', '4x4_100', '4x4_250', '4x4_1000'],  # Only 4x4 codes
-                enable_aruco=True,
-                enable_qr=False,  # Disable QR codes for performance
-                min_confidence=0.2,
-                debug=False,  # Disabled for performance (detect_aruco_in_bee_instances is much faster)
-                debug_folder=None
+            self.aruco_identity = ArucoTrackingIdentityManager(
+                log_callback=self.log_callback,
+                verbose_output=self.verbose_output
             )
+            self.marker_detector = self.aruco_identity.marker_detector
         
         # Data storage
         self.bee_detections: List[BeeDetectionData] = []
         self.chamber_frame_data: List[ChamberFrameData] = []
         self.bee_trajectories: Dict[int, BeeTrajectory] = {}  # bee_id -> trajectory
-        self.bee_to_aruco: Dict[int, str] = {}  # bee_id -> aruco_code (retroactive)
-        self.aruco_to_bee: Dict[str, int] = {}  # aruco_code -> bee_id (reverse mapping)
-        self.bee_frames: Dict[int, set] = defaultdict(set)  # bee_id -> set of frame_numbers
+        if self.aruco_identity is not None:
+            self.bee_to_aruco = self.aruco_identity.bee_to_aruco
+            self.aruco_to_bee = self.aruco_identity.aruco_to_bee
+            self.bee_frames = self.aruco_identity.bee_frames
+        else:
+            self.bee_to_aruco: Dict[int, str] = {}
+            self.aruco_to_bee: Dict[str, int] = {}
+            self.bee_frames: Dict[int, set] = defaultdict(set)
         
         # Per-frame visualization data
         self.chambers_by_frame: Dict[int, Dict] = {}  # frame_number -> chambers_detected
         self.hive_masks_by_frame: Dict[int, Dict[int, Optional[np.ndarray]]] = {}  # frame -> chamber_id -> mask
+        self.hive_instance_masks_by_frame: Dict[int, Dict[int, List[np.ndarray]]] = {}  # frame -> chamber_id -> instance masks
+        self.pollen_masks_by_frame: Dict[int, Dict[int, Optional[np.ndarray]]] = {}  # frame -> chamber_id -> mask
+        self.pollen_instance_masks_by_frame: Dict[int, Dict[int, List[np.ndarray]]] = {}  # frame -> chamber_id -> instance masks
         self.bee_masks_by_frame: Dict[int, Dict[int, Optional[np.ndarray]]] = {}  # frame -> bee_id -> mask
         
         # Chamber management
@@ -139,6 +174,52 @@ class BatchVideoProcessor:
         # Reset tracker at start of new video
         if hasattr(self.tracker, 'reset'):
             self.tracker.reset()
+
+    def _log(self, message: str):
+        """Log to the GUI worker when available, otherwise print."""
+        if self.log_callback:
+            self.log_callback(message)
+        else:
+            print(message)
+
+    def _log_verbose(self, message: str):
+        """Log detailed diagnostics only when verbose output is enabled."""
+        if self.verbose_output:
+            self._log(message)
+
+    def _should_stop(self) -> bool:
+        """Return whether processing has been cancelled."""
+        return bool(self.stop_callback and self.stop_callback())
+
+    def _record_timing(self, name: str, elapsed: float, frame_timings: Dict[str, float]):
+        """Record cumulative and per-frame timing for an operation."""
+        self.timings[name] += elapsed
+        self.timing_counts[name] += 1
+        frame_timings[name] = frame_timings.get(name, 0.0) + elapsed
+
+    def _gpu_memory_text(self) -> str:
+        """Return a compact CUDA memory string for logs."""
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            peak = torch.cuda.max_memory_allocated() / 1e9
+            return f", GPU {allocated:.2f} GB allocated/{reserved:.2f} GB reserved, peak {peak:.2f} GB"
+        return ""
+
+    def _sync_cuda(self):
+        """Synchronize CUDA so per-step timings are attributed accurately."""
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def _cleanup_memory(self):
+        """Run periodic Python and CUDA memory cleanup."""
+        gc.collect()
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
     
     def process(self) -> bool:
         """
@@ -150,14 +231,27 @@ class BatchVideoProcessor:
         cap = cv2.VideoCapture(str(self.video_path))
         if not cap.isOpened():
             return False
+
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if self.max_frames is not None and total_frames > 0:
+            total_frames = min(total_frames, self.max_frames)
         frame_number = 0
         
         # For progress reporting
         last_reported_percent = -1
         
         while True:
+            if self.max_frames is not None and frame_number >= self.max_frames:
+                break
+
+            if self._should_stop():
+                self.was_stopped = True
+                self._log(f"  Stop requested before frame {frame_number + 1}")
+                break
+
             ret, frame = cap.read()
             if not ret:
                 break
@@ -169,13 +263,28 @@ class BatchVideoProcessor:
             if total_frames > 0:
                 percent_complete = int((frame_number / total_frames) * 100)
                 if percent_complete % 10 == 0 and percent_complete != last_reported_percent:
-                    print(f"  Progress: {frame_number}/{total_frames} frames ({percent_complete}%)")
+                    self._log(f"  Progress: {frame_number}/{total_frames} frames ({percent_complete}%)")
                     last_reported_percent = percent_complete
             
             # Process this frame
-            self._process_frame(frame, frame_number)
+            try:
+                self._process_frame(frame, frame_number)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and TORCH_AVAILABLE and torch.cuda.is_available():
+                    self._log(f"  ❌ CUDA out of memory at frame {frame_number}{self._gpu_memory_text()}")
+                    self._cleanup_memory()
+                raise
+
+            if self._should_stop():
+                self.was_stopped = True
+                self._log(f"  Stop requested after frame {frame_number}")
+                break
         
         cap.release()
+
+        if self.was_stopped:
+            self._finalize_processing()
+            return False
         
         # Finalize data
         self._finalize_processing()
@@ -184,25 +293,28 @@ class BatchVideoProcessor:
     
     def _process_frame(self, frame: np.ndarray, frame_number: int):
         """Process a single frame"""
+        frame_start = time.perf_counter()
+        frame_timings = {}
+
         # 1. Run chamber detection (YOLO) and establish left-to-right ordering
-        t0 = time.time()
+        t0 = time.perf_counter()
         chambers_detected = self._detect_chambers(frame)
         # Only store for visualization if requested (saves memory)
         if self.store_masks:
             self.chambers_by_frame[frame_number] = chambers_detected
-        self.timings['chamber_detection'] += time.time() - t0
-        self.timing_counts['chamber_detection'] += 1
+        self._record_timing('chamber_detection', time.perf_counter() - t0, frame_timings)
         
         # 2. Run bee detection
-        t0 = time.time()
-        # Use no_grad context to prevent autograd graph buildup in GPU memory
+        t0 = time.perf_counter()
+        # Use inference_mode to prevent autograd graph buildup in GPU memory
         if TORCH_AVAILABLE:
-            with torch.no_grad():
+            with torch.inference_mode():
                 bee_results = self.bee_model(
                     frame,
                     conf=self.confidence_threshold,
                     iou=self.nms_iou_threshold,
-                    retina_masks=True if self.bee_model_type == 'segmentation' else False,
+                    retina_masks=self.high_quality_masks,
+                    half=torch.cuda.is_available(),
                     verbose=False
                 )
         else:
@@ -210,61 +322,105 @@ class BatchVideoProcessor:
                 frame,
                 conf=self.confidence_threshold,
                 iou=self.nms_iou_threshold,
-                retina_masks=True if self.bee_model_type == 'segmentation' else False,
+                retina_masks=self.high_quality_masks,
                 verbose=False
             )
-        self.timings['bee_detection'] += time.time() - t0
-        self.timing_counts['bee_detection'] += 1
+        self._sync_cuda()
+        self._record_timing('bee_detection', time.perf_counter() - t0, frame_timings)
         
-        # 3. Run hive detection
-        t0 = time.time()
-        # Use no_grad context to prevent autograd graph buildup in GPU memory
-        if TORCH_AVAILABLE:
-            with torch.no_grad():
+        # 3. Run hive detection, if available
+        t0 = time.perf_counter()
+        hive_results = None
+        if self.hive_model is not None:
+            # Use inference_mode to prevent autograd graph buildup in GPU memory
+            if TORCH_AVAILABLE:
+                with torch.inference_mode():
+                    hive_results = self.hive_model(
+                        frame,
+                        conf=self.confidence_threshold,
+                        iou=self.nms_iou_threshold,
+                        half=torch.cuda.is_available(),
+                        verbose=False
+                    )
+            else:
                 hive_results = self.hive_model(
                     frame,
                     conf=self.confidence_threshold,
                     iou=self.nms_iou_threshold,
                     verbose=False
                 )
-        else:
-            hive_results = self.hive_model(
-                frame,
-                conf=self.confidence_threshold,
-                iou=self.nms_iou_threshold,
-                verbose=False
-            )
-        self.timings['hive_detection'] += time.time() - t0
-        self.timing_counts['hive_detection'] += 1
+        self._sync_cuda()
+        self._record_timing('hive_detection', time.perf_counter() - t0, frame_timings)
+
+        # 4. Run pollen detection, if available
+        t0 = time.perf_counter()
+        pollen_results = None
+        if self.pollen_model is not None:
+            if TORCH_AVAILABLE:
+                with torch.inference_mode():
+                    pollen_results = self.pollen_model(
+                        frame,
+                        conf=self.confidence_threshold,
+                        iou=self.nms_iou_threshold,
+                        half=torch.cuda.is_available(),
+                        verbose=False
+                    )
+            else:
+                pollen_results = self.pollen_model(
+                    frame,
+                    conf=self.confidence_threshold,
+                    iou=self.nms_iou_threshold,
+                    verbose=False
+                )
+        self._sync_cuda()
+        self._record_timing('pollen_detection', time.perf_counter() - t0, frame_timings)
         
-        # 4. Convert YOLO results to Detection objects
-        t0 = time.time()
+        # 5. Convert YOLO results to Detection objects
+        t0 = time.perf_counter()
         bee_detections = self._yolo_to_detections(bee_results[0])
         # Delete YOLO result objects to free GPU memory immediately
         del bee_results
-        self.timings['yolo_conversion'] += time.time() - t0
-        self.timing_counts['yolo_conversion'] += 1
+        self._record_timing('yolo_conversion', time.perf_counter() - t0, frame_timings)
         
-        # 5. Apply tracking to assign IDs
-        t0 = time.time()
+        # 6. Apply tracking to assign IDs
+        t0 = time.perf_counter()
         bee_detections = self._apply_tracking(bee_detections, frame_number)
-        self.timings['tracking'] += time.time() - t0
-        self.timing_counts['tracking'] += 1
+        self._record_timing('tracking', time.perf_counter() - t0, frame_timings)
         
-        # 6. Extract hive masks per chamber
-        t0 = time.time()
-        hive_masks_by_chamber = self._extract_hive_masks(hive_results[0], chambers_detected)
+        # 7. Extract hive and pollen masks per chamber
+        t0 = time.perf_counter()
+        hive_masks_by_chamber = self._extract_hive_masks(
+            hive_results[0] if hive_results is not None else None,
+            chambers_detected
+        )
+        hive_instance_masks_by_chamber = self._extract_hive_instance_masks(
+            hive_results[0] if hive_results is not None else None,
+            chambers_detected
+        )
+        pollen_masks_by_chamber = self._extract_hive_masks(
+            pollen_results[0] if pollen_results is not None else None,
+            chambers_detected
+        )
+        pollen_instance_masks_by_chamber = self._extract_hive_instance_masks(
+            pollen_results[0] if pollen_results is not None else None,
+            chambers_detected
+        )
         # Delete YOLO result objects to free GPU memory immediately
-        del hive_results
+        if hive_results is not None:
+            del hive_results
+        if pollen_results is not None:
+            del pollen_results
         # Only store for visualization if requested (saves memory)
         if self.store_masks:
             self.hive_masks_by_frame[frame_number] = hive_masks_by_chamber
-        self.timings['hive_extraction'] += time.time() - t0
-        self.timing_counts['hive_extraction'] += 1
+            self.hive_instance_masks_by_frame[frame_number] = hive_instance_masks_by_chamber
+            self.pollen_masks_by_frame[frame_number] = pollen_masks_by_chamber
+            self.pollen_instance_masks_by_frame[frame_number] = pollen_instance_masks_by_chamber
+        self._record_timing('mask_extraction', time.perf_counter() - t0, frame_timings)
         
-        # 7. Save chamber frame data (hive pixels per chamber)
+        # 8. Save chamber frame data (hive pixels per chamber)
         for chamber_id, hive_mask in hive_masks_by_chamber.items():
-            hive_pixels = np.sum(hive_mask > 0) if hive_mask is not None else 0
+            hive_pixels = int(np.sum(hive_mask > 0)) if hive_mask is not None else None
             
             self.chamber_frame_data.append(ChamberFrameData(
                 video_id=self.video_id,
@@ -273,35 +429,46 @@ class BatchVideoProcessor:
                 hive_pixels=hive_pixels
             ))
         
-        # 8. Assign bees to chambers and calculate spatial metrics
-        t0 = time.time()
+        # 9. Assign bees to chambers, optionally calculate spatial metrics, and write bee rows.
         self._process_bee_detections(
             bee_detections, 
             frame_number, 
             chambers_detected, 
-            hive_masks_by_chamber
+            hive_masks_by_chamber,
+            frame_timings
         )
-        self.timings['spatial_metrics'] += time.time() - t0
-        self.timing_counts['spatial_metrics'] += 1
         
-        # 9. Detect ArUco codes on bees (retroactive tagging)
+        # 10. Detect ArUco codes on bees (retroactive tagging)
         if self.enable_aruco and self.marker_detector is not None:
-            t0 = time.time()
+            t0 = time.perf_counter()
             self._detect_bee_aruco_codes(frame, bee_detections)
-            self.timings['aruco_detection'] += time.time() - t0
-            self.timing_counts['aruco_detection'] += 1
+            self._record_timing('aruco_detection', time.perf_counter() - t0, frame_timings)
+
+        frame_elapsed = time.perf_counter() - frame_start
+        if self.verbose_output and frame_number % self.timing_log_interval == 0:
+            top_steps = sorted(frame_timings.items(), key=lambda item: item[1], reverse=True)
+            timing_text = ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in top_steps)
+            self._log(
+                f"  Frame {frame_number}: total={frame_elapsed:.3f}s, "
+                f"detections={len(bee_detections)}, {timing_text}{self._gpu_memory_text()}"
+            )
+
+        # Drop large per-frame references as soon as all per-frame work is complete.
+        del bee_detections, hive_masks_by_chamber, hive_instance_masks_by_chamber, pollen_masks_by_chamber, pollen_instance_masks_by_chamber, chambers_detected
         
         # Report timing every 100 frames
-        if frame_number % 100 == 0:
+        if self.verbose_output and frame_number % 100 == 0:
             self._print_timing_stats(frame_number)
             # Periodic garbage collection and GPU cache clearing to prevent memory buildup
-            gc.collect()
-            if TORCH_AVAILABLE and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._cleanup_memory()
+
+        if frame_number % self.cleanup_interval == 0:
+            self._cleanup_memory()
+            self._log_verbose(f"  [Frame {frame_number}] Memory cleanup complete{self._gpu_memory_text()}")
         
         # More aggressive cleanup every 500 frames
         if frame_number % 500 == 0:
-            print(f"  [Frame {frame_number}] Aggressive memory cleanup...")
+            self._log_verbose(f"  [Frame {frame_number}] Aggressive memory cleanup...")
             # Clear stored frames if not needed for visualization
             if not self.store_masks and frame_number > 100:
                 # Keep only recent frames for trajectory calculation
@@ -315,18 +482,29 @@ class BatchVideoProcessor:
                 old_hive_frames = [f for f in self.hive_masks_by_frame.keys() if f not in frames_to_keep]
                 for f in old_hive_frames:
                     del self.hive_masks_by_frame[f]
+
+                old_hive_instance_frames = [f for f in self.hive_instance_masks_by_frame.keys() if f not in frames_to_keep]
+                for f in old_hive_instance_frames:
+                    del self.hive_instance_masks_by_frame[f]
+
+                old_pollen_frames = [f for f in self.pollen_masks_by_frame.keys() if f not in frames_to_keep]
+                for f in old_pollen_frames:
+                    del self.pollen_masks_by_frame[f]
+
+                old_pollen_instance_frames = [f for f in self.pollen_instance_masks_by_frame.keys() if f not in frames_to_keep]
+                for f in old_pollen_instance_frames:
+                    del self.pollen_instance_masks_by_frame[f]
                 
                 old_bee_frames = [f for f in self.bee_masks_by_frame.keys() if f not in frames_to_keep]
                 for f in old_bee_frames:
                     del self.bee_masks_by_frame[f]
             
-            gc.collect()
+            self._cleanup_memory()
             if TORCH_AVAILABLE and torch.cuda.is_available():
-                torch.cuda.empty_cache()
                 if frame_number % 1000 == 0:  # Log every 1000 frames
                     mem_allocated = torch.cuda.memory_allocated() / 1e9
                     mem_reserved = torch.cuda.memory_reserved() / 1e9
-                    print(f"    GPU: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
+                    self._log_verbose(f"    GPU: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
     
     def _detect_chambers(self, frame: np.ndarray) -> Dict[int, Dict]:
         """
@@ -344,13 +522,14 @@ class BatchVideoProcessor:
             }}
         
         # Run chamber detection
-        # Use no_grad context to prevent autograd graph buildup in GPU memory
+        # Use inference_mode to prevent autograd graph buildup in GPU memory
         if TORCH_AVAILABLE:
-            with torch.no_grad():
+            with torch.inference_mode():
                 chamber_results = self.chamber_model(
                     frame,
                     conf=self.confidence_threshold,
                     iou=self.nms_iou_threshold,
+                    half=torch.cuda.is_available(),
                     verbose=False
                 )
         else:
@@ -360,8 +539,10 @@ class BatchVideoProcessor:
                 iou=self.nms_iou_threshold,
                 verbose=False
             )
+        self._sync_cuda()
         
         if chamber_results[0].masks is None or len(chamber_results[0].masks) == 0:
+            del chamber_results
             # No chambers detected - treat entire frame as single chamber
             return {0: {
                 'mask': None,
@@ -459,12 +640,15 @@ class BatchVideoProcessor:
         has_masks = yolo_result.masks is not None
         
         # Log mask availability on first frame
-        if self.frame_count == 1:
+        if self.verbose_output and self.frame_count == 1:
             if has_masks:
-                print(f"✓ YOLO bee model returned {len(yolo_result.masks)} segmentation masks")
+                self._log(f"✓ YOLO bee model returned {len(yolo_result.masks)} segmentation masks")
             else:
-                print(f"⚠ YOLO bee model has NO segmentation masks (detection-only model)")
-                print(f"  Creating rectangular masks from bounding boxes for ArUco detection...")
+                self._log(f"⚠ YOLO bee model has NO segmentation masks (detection-only model)")
+                if self.enable_aruco:
+                    self._log(f"  Creating rectangular masks from bounding boxes for ArUco detection...")
+                else:
+                    self._log(f"  ArUco disabled; bbox detections will not allocate rectangular masks.")
         
         for idx in range(len(boxes)):
             bbox = boxes[idx]
@@ -476,18 +660,18 @@ class BatchVideoProcessor:
                 # Resize mask to frame size if needed
                 if mask.shape[:2] != yolo_result.orig_shape[:2]:
                     # Debug on first frame
-                    if self.frame_count == 1 and idx == 0:
-                        print(f"[MASK RESIZE DEBUG]")
-                        print(f"  Original mask shape: {mask.shape}")
-                        print(f"  yolo_result.orig_shape: {yolo_result.orig_shape}")
-                        print(f"  Resizing to: ({yolo_result.orig_shape[1]}, {yolo_result.orig_shape[0]})")
+                    if self.verbose_output and self.frame_count == 1 and idx == 0:
+                        self._log(f"[MASK RESIZE DEBUG]")
+                        self._log(f"  Original mask shape: {mask.shape}")
+                        self._log(f"  yolo_result.orig_shape: {yolo_result.orig_shape}")
+                        self._log(f"  Resizing to: ({yolo_result.orig_shape[1]}, {yolo_result.orig_shape[0]})")
                     mask = cv2.resize(mask, (yolo_result.orig_shape[1], yolo_result.orig_shape[0]), 
                                     interpolation=cv2.INTER_NEAREST)
-                    if self.frame_count == 1 and idx == 0:
-                        print(f"  Resized mask shape: {mask.shape}")
+                    if self.verbose_output and self.frame_count == 1 and idx == 0:
+                        self._log(f"  Resized mask shape: {mask.shape}")
                 # Convert to binary mask (0 or 255 for marker detector compatibility)
                 mask = ((mask > 0.5).astype(np.uint8)) * 255
-            else:
+            elif self.enable_aruco and self.bee_model_type != 'segmentation':
                 # Create rectangular mask from bounding box for ArUco detection
                 # This allows ArUco detection to work with detection-only models
                 frame_height, frame_width = yolo_result.orig_shape[:2]
@@ -507,6 +691,14 @@ class BatchVideoProcessor:
                 instance_id=None
             )
             detections.append(det)
+
+        if self.verbose_output and self.bee_model_type == 'segmentation':
+            missing_masks = sum(1 for det in detections if det.mask is None)
+            if missing_masks:
+                self._log(
+                    f"  ⚠ Frame {self.frame_count}: segmentation model returned "
+                    f"{missing_masks}/{len(detections)} detections without masks"
+                )
         
         return detections
     
@@ -536,6 +728,10 @@ class BatchVideoProcessor:
             Dict mapping chamber_id -> mask array (or None)
         """
         hive_masks_by_chamber = {}
+
+        if hive_result is None:
+            chamber_ids = chambers_detected.keys() if chambers_detected else [0]
+            return {chamber_id: None for chamber_id in chamber_ids}
         
         # If no chambers detected, assign all hive to chamber 0
         if not chambers_detected:
@@ -601,32 +797,96 @@ class BatchVideoProcessor:
                 hive_masks_by_chamber[chamber_id] = None
         
         return hive_masks_by_chamber
+
+    def _extract_hive_instance_masks(self, hive_result, chambers_detected: Dict) -> Dict[int, List[np.ndarray]]:
+        """
+        Extract separate hive segmentation instance masks per chamber.
+
+        Instances are sorted left-to-right within each chamber so downstream averaging can
+        assign stable per-chamber instance ids.
+        """
+        chamber_ids = list(chambers_detected.keys()) if chambers_detected else [0]
+        hive_instances_by_chamber = {chamber_id: [] for chamber_id in chamber_ids}
+
+        if hive_result is None or hive_result.masks is None or len(hive_result.masks) == 0:
+            return hive_instances_by_chamber
+
+        for idx in range(len(hive_result.masks)):
+            mask = hive_result.masks.data[idx].detach().cpu().numpy()
+            if mask.shape[:2] != hive_result.orig_shape[:2]:
+                mask = cv2.resize(
+                    mask,
+                    (hive_result.orig_shape[1], hive_result.orig_shape[0]),
+                    interpolation=cv2.INTER_NEAREST
+                )
+            mask = (mask > 0.5).astype(np.uint8)
+
+            if not np.any(mask > 0):
+                continue
+
+            if not chambers_detected:
+                hive_instances_by_chamber[0].append(mask)
+                continue
+
+            best_chamber_id = None
+            best_overlap = 0
+            for chamber_id, chamber_info in chambers_detected.items():
+                chamber_mask = chamber_info.get('mask')
+                if chamber_mask is None:
+                    continue
+                overlap = int(np.logical_and(chamber_mask > 0, mask > 0).sum())
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_chamber_id = chamber_id
+
+            if best_chamber_id is not None and best_overlap > 0:
+                hive_instances_by_chamber[best_chamber_id].append(mask)
+
+        def centroid_sort_key(mask):
+            coords = np.argwhere(mask > 0)
+            if len(coords) == 0:
+                return (float('inf'), float('inf'))
+            return (float(np.mean(coords[:, 1])), float(np.mean(coords[:, 0])))
+
+        for chamber_id in hive_instances_by_chamber:
+            hive_instances_by_chamber[chamber_id].sort(key=centroid_sort_key)
+
+        return hive_instances_by_chamber
     
     def _process_bee_detections(self, bee_detections: List[Detection], frame_number: int,
-                                chambers_detected: Dict, hive_masks_by_chamber: Dict[int, Optional[np.ndarray]]):
-        """Process bee detections: assign to chambers, calculate spatial metrics, save data"""
+                                chambers_detected: Dict, hive_masks_by_chamber: Dict[int, Optional[np.ndarray]],
+                                frame_timings: Optional[Dict[str, float]] = None):
+        """Process bee detections: assign to chambers, optionally calculate spatial metrics, save data"""
+        if frame_timings is None:
+            frame_timings = {}
+
         # Group bees by chamber
+        t_record = time.perf_counter()
         bees_by_chamber: Dict[int, List[Detection]] = defaultdict(list)
         
         for det in bee_detections:
             # Assign bee to chamber based on centroid location
             chamber_id = self._assign_bee_to_chamber(det, chambers_detected)
             bees_by_chamber[chamber_id].append(det)
+        self._record_timing('bee_recording', time.perf_counter() - t_record, frame_timings)
         
         # Pre-compute hive coordinates and KDTree for each chamber (OPTIMIZATION)
         hive_kdtrees = {}
-        for chamber_id, hive_mask in hive_masks_by_chamber.items():
-            if hive_mask is not None and np.sum(hive_mask) > 0:
-                # Extract hive pixel coordinates once per chamber
-                hive_coords = np.argwhere(hive_mask > 0)  # Shape: (N, 2) as (y, x)
-                if len(hive_coords) > 0:
-                    # Swap to (x, y) for consistency and build KDTree
-                    hive_coords_xy = hive_coords[:, [1, 0]]  # Now (x, y)
-                    hive_kdtrees[chamber_id] = cKDTree(hive_coords_xy)
+        if self.compute_spatial_metrics:
+            t_spatial = time.perf_counter()
+            for chamber_id, hive_mask in hive_masks_by_chamber.items():
+                if hive_mask is not None and np.sum(hive_mask) > 0:
+                    # Extract hive pixel coordinates once per chamber
+                    hive_coords = np.argwhere(hive_mask > 0)  # Shape: (N, 2) as (y, x)
+                    if len(hive_coords) > 0:
+                        # Swap to (x, y) for consistency and build KDTree
+                        hive_coords_xy = hive_coords[:, [1, 0]]  # Now (x, y)
+                        hive_kdtrees[chamber_id] = cKDTree(hive_coords_xy)
+                    else:
+                        hive_kdtrees[chamber_id] = None
                 else:
                     hive_kdtrees[chamber_id] = None
-            else:
-                hive_kdtrees[chamber_id] = None
+            self._record_timing('spatial_metrics', time.perf_counter() - t_spatial, frame_timings)
         
         # Process each chamber
         for chamber_id, bees in bees_by_chamber.items():
@@ -637,6 +897,13 @@ class BatchVideoProcessor:
             for bee in bees:
                 centroid = self._get_centroid(bee.bbox, bee.mask)
                 bee_centroids.append(centroid)
+
+            if self.compute_spatial_metrics:
+                t_spatial = time.perf_counter()
+                distance_matrix = self._calculate_bee_distance_matrix(bees, bee_centroids)
+                self._record_timing('spatial_metrics', time.perf_counter() - t_spatial, frame_timings)
+            else:
+                distance_matrix = None
             
             # Process each bee
             for bee_idx, bee in enumerate(bees):
@@ -646,21 +913,32 @@ class BatchVideoProcessor:
                 centroid = bee_centroids[bee_idx]
                 centroid_x, centroid_y = centroid
                 
-                # Calculate distance to hive (using KDTree for speed)
-                distance_to_hive = self._calculate_distance_to_hive_fast(centroid, hive_kdtree)
-                
-                # Calculate average distance to other bees in chamber
-                avg_distance_to_bees = self._calculate_avg_distance_to_other_bees(
-                    bee_idx, bees
-                )
-                
-                # Calculate distances to nearest N bees
-                nearest_distances = self._calculate_nearest_n_bee_distances(
-                    bee_idx, bees, n_values=[1, 2, 3]
-                )
+                if self.compute_spatial_metrics:
+                    t_spatial = time.perf_counter()
+                    # Calculate distance to hive (using KDTree for speed) when hive data is available.
+                    distance_to_hive = (
+                        self._calculate_distance_to_hive_fast(centroid, hive_kdtree)
+                        if hive_kdtree is not None
+                        else None
+                    )
+                    num_bees_in_chamber = len(bees)
+                    avg_distance_to_bees = self._distance_matrix_avg_to_other_bees(
+                        bee_idx, distance_matrix
+                    )
+                    nearest_distances = self._distance_matrix_nearest_n(
+                        bee_idx, distance_matrix, n_values=[1, 2, 3]
+                    )
+                    self._record_timing('spatial_metrics', time.perf_counter() - t_spatial, frame_timings)
+                else:
+                    distance_to_hive = None
+                    num_bees_in_chamber = None
+                    avg_distance_to_bees = None
+                    nearest_distances = {1: None, 2: None, 3: None}
                 
                 # Get ArUco code (if detected)
+                t_record = time.perf_counter()
                 aruco_code = self.bee_to_aruco.get(bee.instance_id, "")
+                pred_polygon = self._mask_to_polygon_string(bee.mask)
                 
                 # Save bee detection data
                 bbox_x, bbox_y, bbox_x2, bbox_y2 = bee.bbox
@@ -680,19 +958,48 @@ class BatchVideoProcessor:
                     confidence=bee.confidence,
                     centroid_x=centroid_x,
                     centroid_y=centroid_y,
+                    pred_polygon=pred_polygon,
                     distance_to_hive_pixels=distance_to_hive,
-                    num_bees_in_chamber=len(bees),
+                    num_bees_in_chamber=num_bees_in_chamber,
                     avg_distance_to_other_bees_pixels=avg_distance_to_bees,
                     distance_to_nearest_bee_pixels=nearest_distances[1],
                     avg_distance_to_nearest_2_bees_pixels=nearest_distances[2],
                     avg_distance_to_nearest_3_bees_pixels=nearest_distances[3]
                 ))
+                self._record_timing('bee_recording', time.perf_counter() - t_record, frame_timings)
                 
                 # Store bee mask for visualization (only if requested to reduce memory usage)
-                if self.store_masks:
+                if self.store_bee_masks:
                     if frame_number not in self.bee_masks_by_frame:
                         self.bee_masks_by_frame[frame_number] = {}
-                    self.bee_masks_by_frame[frame_number][bee.instance_id] = bee.mask
+                    
+                    # If current detection has no mask, try to preserve previous frame's mask
+                    # This handles cases where YOLO inconsistently produces masks for tracked bees
+                    if bee.mask is not None:
+                        self.bee_masks_by_frame[frame_number][bee.instance_id] = bee.mask
+                    else:
+                        # Look for mask in previous frame for same bee_id
+                        previous_mask = None
+                        for prev_frame in range(frame_number - 1, max(0, frame_number - 10), -1):
+                            if prev_frame in self.bee_masks_by_frame:
+                                prev_mask = self.bee_masks_by_frame[prev_frame].get(bee.instance_id)
+                                if prev_mask is not None:
+                                    previous_mask = prev_mask
+                                    break
+                        
+                        # Only store if we found a previous mask, otherwise don't store (or store None)
+                        # Storing None explicitly so we don't accidentally retrieve old values
+                        if previous_mask is not None:
+                            self.bee_masks_by_frame[frame_number][bee.instance_id] = previous_mask
+                        else:
+                            # No previous mask found - store None (this will fall back to bbox in visualization)
+                            self.bee_masks_by_frame[frame_number][bee.instance_id] = None
+
+                if self.verbose_output and self.store_bee_masks and bee.mask is None:
+                    self._log(
+                        f"  ⚠ Frame {frame_number}: no segmentation mask stored for "
+                        f"bee ID {bee.instance_id}; visualization will use bbox if no previous mask exists"
+                    )
                 
                 # Update trajectory for velocity calculation
                 if bee.instance_id not in self.bee_trajectories:
@@ -722,136 +1029,15 @@ class BatchVideoProcessor:
            - If ArUco not yet assigned and only in one bee's box: assign
            - If ArUco was assigned before but that bee is inactive: re-identify (merge tracks)
         """
-        # Diagnostic logging on first frame
-        if self.frame_count == 1:
-            print(f"\n=== Frame 1 ArUco Diagnostic ===")
-            print(f"Total detections: {len(bee_detections)}")
-            
-            dets_with_id = sum(1 for det in bee_detections if det.instance_id is not None)
-            dets_with_mask = sum(1 for det in bee_detections if det.mask is not None)
-            dets_with_both = sum(1 for det in bee_detections if det.instance_id is not None and det.mask is not None)
-            
-            print(f"  Detections with instance_id: {dets_with_id}")
-            print(f"  Detections with mask: {dets_with_mask}")
-            print(f"  Detections with BOTH (valid for ArUco): {dets_with_both}")
-            
-            if dets_with_mask > 0:
-                sample = next((det for det in bee_detections if det.mask is not None), None)
-                if sample:
-                    print(f"  Sample mask: shape={sample.mask.shape}, dtype={sample.mask.dtype}, range=[{sample.mask.min()}, {sample.mask.max()}]")
-                    print(f"  Sample has instance_id: {sample.instance_id is not None} (id={sample.instance_id})")
-            print("=" * 35 + "\n")
-        
-        # Get active bee IDs in current frame
-        active_bee_ids = set(det.instance_id for det in bee_detections if det.instance_id is not None)
-        
-        # Convert Detection objects to annotation format for marker detector
-        annotations = []
-        for det in bee_detections:
-            if det.instance_id is None or det.mask is None:
-                continue
-            
-            # Convert bbox to [x, y, w, h] format
-            x1, y1, x2, y2 = det.bbox
-            bbox = [x1, y1, x2 - x1, y2 - y1]
-            
-            # Convert mask from 0/255 to 0/1 format if needed
-            mask = det.mask
-            if mask.max() > 1:
-                mask = (mask > 127).astype(np.uint8)
-            
-            annotations.append({
-                'instance_id': det.instance_id,
-                'mask_id': det.instance_id,
-                'category': 'bee',
-                'bbox': bbox,
-                'mask': mask
-            })
-        
-        if not annotations:
+        if self.aruco_identity is None:
             return
-        
-        # Detect all ArUco codes in frame at once and match to bees
-        detections = self.marker_detector.detect_aruco_in_bee_instances(
-            image=frame,
-            annotations=annotations,
-            reject_multiple=True  # Reject bees with multiple ArUco codes
+
+        self.aruco_identity.detect_bee_aruco_codes(
+            frame=frame,
+            bee_detections=bee_detections,
+            frame_count=self.frame_count,
+            merge_callback=self._merge_bee_tracks
         )
-        
-        # Build reverse mapping: aruco_code -> list of instance_ids in this frame
-        aruco_to_instances = {}
-        for instance_id, marker_result in detections.items():
-            if marker_result.marker_type == 'aruco':
-                aruco_code = str(int(marker_result.marker_id))
-            else:
-                aruco_code = str(marker_result.marker_id)
-            
-            if aruco_code not in aruco_to_instances:
-                aruco_to_instances[aruco_code] = []
-            aruco_to_instances[aruco_code].append(instance_id)
-        
-        # Rule 1: Reject ArUco codes matched to multiple bees in this frame
-        ambiguous_codes = set()
-        for aruco_code, instance_list in aruco_to_instances.items():
-            if len(instance_list) > 1:
-                ambiguous_codes.add(aruco_code)
-                if self.frame_count <= 10:
-                    print(f"  ⚠ Frame {self.frame_count}: ArUco {aruco_code} in {len(instance_list)} boxes (rejected): {instance_list}")
-        
-        # Process each detection
-        for instance_id, marker_result in detections.items():
-            if marker_result.marker_type == 'aruco':
-                aruco_code = str(int(marker_result.marker_id))
-            else:
-                aruco_code = str(marker_result.marker_id)
-            
-            # Rule 1: Skip if this code is ambiguous in this frame (multiple boxes)
-            if aruco_code in ambiguous_codes:
-                continue
-            
-            # Rule 2: Check if ArUco already assigned to a different bee
-            if aruco_code in self.aruco_to_bee:
-                assigned_bee_id = self.aruco_to_bee[aruco_code]
-                
-                # Rule 2a: If the assigned bee is active in this frame, reject new assignment
-                if assigned_bee_id in active_bee_ids:
-                    if assigned_bee_id != instance_id:
-                        # Different bee has this code and is active - conflict!
-                        if self.frame_count <= 10:
-                            print(f"  ⚠ Frame {self.frame_count}: ArUco {aruco_code} already on active bee {assigned_bee_id}, rejecting for bee {instance_id}")
-                        continue
-                    # else: same bee, no problem
-                else:
-                    # Rule 2b: Assigned bee is NOT active - possible re-identification
-                    # Check if these two bees ever appeared together
-                    if self._bees_coexisted(assigned_bee_id, instance_id):
-                        # They appeared together before - they're different bees
-                        # This is a conflict - reject this assignment
-                        if self.frame_count <= 10:
-                            print(f"  ⚠ Frame {self.frame_count}: ArUco {aruco_code} conflict - bees {assigned_bee_id} and {instance_id} coexisted, rejecting")
-                        continue
-                    else:
-                        # They never coexisted - this is re-identification
-                        # Merge instance_id into assigned_bee_id
-                        if self.frame_count <= 10:
-                            print(f"  🔄 Frame {self.frame_count}: Re-identification - merging bee {instance_id} into bee {assigned_bee_id} (ArUco {aruco_code})")
-                        self._merge_bee_tracks(source_id=instance_id, target_id=assigned_bee_id, aruco_code=aruco_code)
-                        continue
-            
-            # Rule 3: New assignment - ArUco not yet assigned
-            if instance_id in self.bee_to_aruco:
-                # Bee already has a different ArUco code
-                if self.bee_to_aruco[instance_id] != aruco_code:
-                    if self.frame_count <= 10:
-                        print(f"  ⚠ Frame {self.frame_count}: Bee {instance_id} already has ArUco {self.bee_to_aruco[instance_id]}, rejecting new code {aruco_code}")
-                    continue
-                # else: same code, already assigned (no action needed)
-            else:
-                # New assignment
-                self.bee_to_aruco[instance_id] = aruco_code
-                self.aruco_to_bee[aruco_code] = instance_id
-                if self.frame_count <= 10:
-                    print(f"  ✓ Frame {self.frame_count}: Assigned ArUco {aruco_code} to bee {instance_id}")
     
     def _bees_coexisted(self, bee_id_a: int, bee_id_b: int) -> bool:
         """Check if two bees ever appeared in the same frame"""
@@ -894,13 +1080,24 @@ class BatchVideoProcessor:
         if source_id in self.bee_frames:
             self.bee_frames[target_id].update(self.bee_frames[source_id])
             del self.bee_frames[source_id]
+
+        # Move stored visualization masks to the merged ID as well. Without this,
+        # retroactively renamed detections can point at target_id while the mask is
+        # still keyed under source_id, causing the visualizer to fall back to bbox.
+        for frame_masks in self.bee_masks_by_frame.values():
+            if source_id not in frame_masks:
+                continue
+
+            source_mask = frame_masks.pop(source_id)
+            if target_id not in frame_masks or frame_masks[target_id] is None:
+                frame_masks[target_id] = source_mask
         
         # Update bee_to_aruco mapping
         if source_id in self.bee_to_aruco:
             del self.bee_to_aruco[source_id]
         self.bee_to_aruco[target_id] = aruco_code
         
-        print(f"    Merged bee {source_id} → {target_id} (ArUco {aruco_code})")
+        self._log_verbose(f"    Merged bee {source_id} → {target_id} (ArUco {aruco_code})")
     
     def _get_centroid(self, bbox, mask) -> Tuple[float, float]:
         """Get centroid from bbox or mask"""
@@ -913,6 +1110,80 @@ class BatchVideoProcessor:
         # Fall back to bbox centroid
         x1, y1, x2, y2 = bbox
         return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+    def _mask_to_polygon_string(self, mask: Optional[np.ndarray]) -> str:
+        """Convert a bee mask to a simplified polygon string for CSV export."""
+        if mask is None:
+            return ""
+
+        return mask_to_polygons_string((mask > 0).astype(np.uint8), epsilon_percent=self.polygon_epsilon)
+
+    def _calculate_centroid_distance_matrix(self, centroids: List[Tuple[float, float]]) -> np.ndarray:
+        """Calculate all pairwise centroid distances for one chamber."""
+        if not centroids:
+            return np.zeros((0, 0), dtype=np.float32)
+
+        coords = np.asarray(centroids, dtype=np.float32)
+        deltas = coords[:, None, :] - coords[None, :, :]
+        return np.sqrt(np.sum(deltas * deltas, axis=2, dtype=np.float32))
+
+    def _calculate_bee_distance_matrix(self, bees: List[Detection],
+                                       centroids: List[Tuple[float, float]]) -> np.ndarray:
+        """Calculate all pairwise bee distances using the selected spatial metric."""
+        if self.distance_method == 'centroid':
+            return self._calculate_centroid_distance_matrix(centroids)
+
+        n_bees = len(bees)
+        distance_matrix = np.zeros((n_bees, n_bees), dtype=np.float32)
+        if n_bees <= 1:
+            return distance_matrix
+
+        centroid_matrix = self._calculate_centroid_distance_matrix(centroids)
+        for i in range(n_bees):
+            current_bee = bees[i]
+            for j in range(i + 1, n_bees):
+                other_bee = bees[j]
+                if current_bee.mask is not None and other_bee.mask is not None:
+                    dist = distance_between_masks(
+                        current_bee.mask,
+                        other_bee.mask,
+                        method=self.distance_method
+                    )
+                else:
+                    dist = centroid_matrix[i, j]
+
+                distance_matrix[i, j] = dist
+                distance_matrix[j, i] = dist
+
+        return distance_matrix
+
+    def _distance_matrix_avg_to_other_bees(self, bee_idx: int, distance_matrix: np.ndarray) -> float:
+        """Average distance from one bee to every other bee in its chamber."""
+        n_bees = distance_matrix.shape[0]
+        if n_bees <= 1:
+            return 0.0
+
+        distances = np.delete(distance_matrix[bee_idx], bee_idx)
+        return float(np.mean(distances)) if len(distances) else 0.0
+
+    def _distance_matrix_nearest_n(self, bee_idx: int, distance_matrix: np.ndarray,
+                                   n_values: List[int]) -> Dict[int, float]:
+        """Average distance from one bee to its nearest N neighbors."""
+        result = {n: 0.0 for n in n_values}
+        n_bees = distance_matrix.shape[0]
+        if n_bees <= 1:
+            return result
+
+        distances = np.delete(distance_matrix[bee_idx], bee_idx)
+        if len(distances) == 0:
+            return result
+
+        sorted_distances = np.sort(distances)
+        for n in n_values:
+            count = min(n, len(sorted_distances))
+            result[n] = float(np.mean(sorted_distances[:count])) if count > 0 else 0.0
+
+        return result
     
     def _calculate_distance_to_hive_fast(self, bee_centroid: Tuple[float, float], 
                                          hive_kdtree: Optional[cKDTree]) -> float:
@@ -1056,32 +1327,36 @@ class BatchVideoProcessor:
         # Print ArUco detection summary
         total_bees = len(self.bee_trajectories)
         tagged_bees = len(self.bee_to_aruco)
-        print(f"\nArUco Detection Summary:")
-        print(f"  Total unique bees tracked: {total_bees}")
-        print(f"  Bees tagged with ArUco codes: {tagged_bees}")
+        self._log_verbose(f"\nArUco Detection Summary:")
+        self._log_verbose(f"  Total unique bees tracked: {total_bees}")
+        self._log_verbose(f"  Bees tagged with ArUco codes: {tagged_bees}")
         if tagged_bees > 0:
-            print(f"  ArUco codes detected: {list(self.bee_to_aruco.values())}")
+            self._log_verbose(f"  ArUco codes detected: {list(self.bee_to_aruco.values())}")
         
         # Print final timing statistics
-        print(f"\n{'='*60}")
-        print(f"FINAL PERFORMANCE STATISTICS")
-        print(f"{'='*60}")
-        self._print_timing_stats(self.frame_count, final=True)
+        if self.verbose_output:
+            self._log(f"\n{'='*60}")
+            self._log(f"FINAL PERFORMANCE STATISTICS")
+            self._log(f"{'='*60}")
+            self._print_timing_stats(self.frame_count, final=True)
         
         # Free memory by clearing large data structures that are no longer needed
         # (keep only the essential data: bee_detections, chamber_frame_data, bee_trajectories)
-        print(f"\nCleaning up memory...")
+        self._log_verbose(f"\nCleaning up memory...")
         if not self.store_masks:
             # These should already be empty, but ensure they're cleared
             self.chambers_by_frame.clear()
             self.hive_masks_by_frame.clear()
+            self.hive_instance_masks_by_frame.clear()
+            self.pollen_masks_by_frame.clear()
+            self.pollen_instance_masks_by_frame.clear()
             self.bee_masks_by_frame.clear()
         
         # Force garbage collection and GPU cache clearing
         gc.collect()
         if TORCH_AVAILABLE and torch.cuda.is_available():
             torch.cuda.empty_cache()
-            print(f"✓ GPU cache cleared")
+            self._log_verbose(f"✓ GPU cache cleared")
     
     def _print_timing_stats(self, frame_number: int, final: bool = False):
         """Print timing statistics for performance analysis"""
@@ -1091,12 +1366,12 @@ class BatchVideoProcessor:
         total_time = sum(self.timings.values())
         
         if final:
-            print(f"Total frames processed: {frame_number}")
-            print(f"Total processing time: {total_time:.2f}s")
-            print(f"Average time per frame: {total_time/frame_number:.3f}s")
-            print(f"\nTime breakdown by operation:")
+            self._log(f"Total frames processed: {frame_number}")
+            self._log(f"Total processing time: {total_time:.2f}s")
+            self._log(f"Average time per frame: {total_time/frame_number:.3f}s")
+            self._log(f"\nTime breakdown by operation:")
         else:
-            print(f"\n[Frame {frame_number}] Performance stats (last {frame_number} frames):")
+            self._log(f"\n[Frame {frame_number}] Performance stats (last {frame_number} frames):")
         
         # Sort by time (descending)
         sorted_ops = sorted(self.timings.items(), key=lambda x: x[1], reverse=True)
@@ -1107,12 +1382,12 @@ class BatchVideoProcessor:
             percentage = (op_time / total_time * 100) if total_time > 0 else 0
             
             if final:
-                print(f"  {op_name:20s}: {op_time:7.2f}s ({percentage:5.1f}%) - avg {avg_time*1000:6.1f}ms/frame")
+                self._log(f"  {op_name:20s}: {op_time:7.2f}s ({percentage:5.1f}%) - avg {avg_time*1000:6.1f}ms/frame")
             else:
-                print(f"  {op_name:20s}: {op_time:7.2f}s ({percentage:5.1f}%) - {avg_time*1000:6.1f}ms avg")
+                self._log(f"  {op_name:20s}: {op_time:7.2f}s ({percentage:5.1f}%) - {avg_time*1000:6.1f}ms avg")
         
         if final:
-            print(f"{'='*60}\n")
+            self._log(f"{'='*60}\n")
     
     def get_bee_detections(self) -> List[BeeDetectionData]:
         """Get all bee detection data"""
@@ -1132,6 +1407,18 @@ class BatchVideoProcessor:
     def get_hive_masks_by_frame(self) -> Dict[int, Dict[int, Optional[np.ndarray]]]:
         """Get hive masks per frame per chamber"""
         return self.hive_masks_by_frame
+
+    def get_hive_instance_masks_by_frame(self) -> Dict[int, Dict[int, List[np.ndarray]]]:
+        """Get separate hive instance masks per frame per chamber."""
+        return self.hive_instance_masks_by_frame
+
+    def get_pollen_masks_by_frame(self) -> Dict[int, Dict[int, Optional[np.ndarray]]]:
+        """Get pollen masks per frame per chamber"""
+        return self.pollen_masks_by_frame
+
+    def get_pollen_instance_masks_by_frame(self) -> Dict[int, Dict[int, List[np.ndarray]]]:
+        """Get separate pollen instance masks per frame per chamber."""
+        return self.pollen_instance_masks_by_frame
     
     def get_bee_masks_by_frame(self) -> Dict[int, Dict[int, Optional[np.ndarray]]]:
         """Get bee masks per frame per bee_id"""

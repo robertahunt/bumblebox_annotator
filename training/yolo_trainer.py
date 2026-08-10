@@ -10,6 +10,7 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
+from .carbon_tracking import CarbonTrainingRun
 
 try:
     from ultralytics import YOLO
@@ -47,6 +48,7 @@ class YOLOTrainingWorker(QThread):
         self.project_path = Path(project_path)
         self.config = training_config
         self.should_stop = False
+        self._last_carbon_metrics = {}
         
     def stop(self):
         """Request training to stop"""
@@ -409,11 +411,30 @@ class YOLOTrainingWorker(QThread):
         model.add_callback('on_train_epoch_end', callback.on_train_epoch_end)
         model.add_callback('on_val_end', callback.on_val_end)
         
-        # Train
-        results = model.train(**training_params)
-        
-        # Return best model path
-        best_model_path = output_dir / self.config.get('name', 'bee_segmentation') / 'weights' / 'best.pt'
+        training_name = self.config.get('name', 'bee_segmentation')
+        model_kind = f"yolo_segmentation_{self.config.get('model_type', 'bee')}"
+        carbon_run = CarbonTrainingRun(
+            self.project_path,
+            model_kind=model_kind,
+            training_name=training_name,
+            config=training_params,
+        )
+
+        carbon_run.start()
+        try:
+            # Train
+            results = model.train(**training_params)
+
+            # Return best model path
+            best_model_path = output_dir / training_name / 'weights' / 'best.pt'
+            status = "cancelled" if self.should_stop else "completed"
+            carbon_run.finish(status=status, model_path=best_model_path)
+            self._last_carbon_metrics = carbon_run.metrics_for_final_report()
+        except Exception as exc:
+            carbon_run.finish(status="failed", error=f"{type(exc).__name__}: {exc}")
+            self._last_carbon_metrics = carbon_run.metrics_for_final_report()
+            raise
+
         return best_model_path
         
     def _get_final_metrics(self, model_path):
@@ -430,16 +451,18 @@ class YOLOTrainingWorker(QThread):
                     df = pd.read_csv(results_file)
                     last_row = df.iloc[-1]
                     
-                    return {
+                    metrics = {
                         'mAP50': float(last_row.get('metrics/mAP50(B)', 0)),
                         'mAP50-95': float(last_row.get('metrics/mAP50-95(B)', 0)),
                         'precision': float(last_row.get('metrics/precision(B)', 0)),
                         'recall': float(last_row.get('metrics/recall(B)', 0)),
                     }
+                    metrics.update(self._last_carbon_metrics)
+                    return metrics
                 except ImportError:
                     print("pandas not available, skipping metrics parsing")
             
         except Exception as e:
             print(f"Could not load final metrics: {e}")
             
-        return {}
+        return dict(self._last_carbon_metrics)

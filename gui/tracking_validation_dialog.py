@@ -71,6 +71,45 @@ class TrackingValidationConfigDialog(QDialog):
         source_layout.addWidget(self.use_gt_radio)
         source_group.setLayout(source_layout)
         content_layout.addWidget(source_group)
+
+        # ArUco detection
+        aruco_group = QGroupBox("ArUco Detection")
+        aruco_layout = QVBoxLayout()
+
+        self.enable_aruco_check = QCheckBox("Enable ArUco marker detection on bees")
+        self.enable_aruco_check.setChecked(False)
+        self.enable_aruco_check.setToolTip(
+            "Use detected ArUco markers to guide track identity assignment and re-identification.\n"
+            "Available for both model detections and ground truth detections."
+        )
+        aruco_layout.addWidget(self.enable_aruco_check)
+
+        self.external_aruco_check = QCheckBox("Load ArUco detections from CSV file or folder")
+        self.external_aruco_check.setChecked(False)
+        self.external_aruco_check.setToolTip(
+            "Use externally optimized ArUco detections instead of running the built-in detector.\n"
+            "Rows are matched to tracked bees by marker center and bee mask/bounding box."
+        )
+        aruco_layout.addWidget(self.external_aruco_check)
+
+        external_aruco_layout = QHBoxLayout()
+        self.external_aruco_edit = QLineEdit()
+        self.external_aruco_edit.setPlaceholderText("Select ArUco CSV file or folder...")
+        self.external_aruco_edit.setReadOnly(True)
+        external_aruco_layout.addWidget(self.external_aruco_edit)
+
+        browse_aruco_file_btn = QPushButton("Browse File...")
+        browse_aruco_file_btn.clicked.connect(self.browse_external_aruco_file)
+        external_aruco_layout.addWidget(browse_aruco_file_btn)
+
+        browse_aruco_folder_btn = QPushButton("Browse Folder...")
+        browse_aruco_folder_btn.clicked.connect(self.browse_external_aruco_folder)
+        external_aruco_layout.addWidget(browse_aruco_folder_btn)
+
+        aruco_layout.addLayout(external_aruco_layout)
+
+        aruco_group.setLayout(aruco_layout)
+        content_layout.addWidget(aruco_group)
         
         # Detection model (only shown when use_model_radio is selected)
         self.model_group = QGroupBox("Detection Model")
@@ -295,6 +334,14 @@ class TrackingValidationConfigDialog(QDialog):
         self.save_csv_check = QCheckBox("Save detailed CSV per algorithm")
         self.save_csv_check.setChecked(True)
         output_layout.addWidget(self.save_csv_check)
+
+        self.export_bee_detections_check = QCheckBox("Export all bee detections CSV")
+        self.export_bee_detections_check.setChecked(False)
+        self.export_bee_detections_check.setToolTip(
+            "Save one per-algorithm CSV with every tracked bee detection, raw ArUco detections, "
+            "assigned ArUco identity, and matched ground-truth ArUco identity."
+        )
+        output_layout.addWidget(self.export_bee_detections_check)
         
         output_group.setLayout(output_layout)
         content_layout.addWidget(output_group)
@@ -332,6 +379,33 @@ class TrackingValidationConfigDialog(QDialog):
         
         if file_path:
             self.model_edit.setText(file_path)
+
+    def browse_external_aruco_file(self):
+        """Browse for an external ArUco detection CSV."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select ArUco Detection CSV",
+            str(Path.home()),
+            "CSV Files (*.csv);;All Files (*)"
+        )
+
+        if file_path:
+            self.external_aruco_edit.setText(file_path)
+            self.external_aruco_check.setChecked(True)
+            self.enable_aruco_check.setChecked(True)
+
+    def browse_external_aruco_folder(self):
+        """Browse for a folder containing external ArUco detection CSVs."""
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select ArUco Detection Folder",
+            str(Path.home())
+        )
+
+        if folder_path:
+            self.external_aruco_edit.setText(folder_path)
+            self.external_aruco_check.setChecked(True)
+            self.enable_aruco_check.setChecked(True)
     
     def _update_model_controls_visibility(self):
         """Show or hide model-related controls based on detection source"""
@@ -365,6 +439,15 @@ class TrackingValidationConfigDialog(QDialog):
                    self.centroid_check.isChecked()]):
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "No Algorithms", "Please select at least one tracking algorithm.")
+            return
+
+        if self.external_aruco_check.isChecked() and not self.external_aruco_edit.text():
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Missing ArUco Detections",
+                "Please select an ArUco detection CSV file or folder."
+            )
             return
         
         # Get sequences to validate
@@ -422,8 +505,12 @@ class TrackingValidationConfigDialog(QDialog):
             'gt_iou_threshold': self.gt_iou_spin.value(),
             'min_confidence': self.conf_threshold_spin.value() if not use_ground_truth else None,
             'nms_iou_threshold': self.nms_iou_spin.value() if not use_ground_truth else None,
+            'enable_aruco': self.enable_aruco_check.isChecked() or self.external_aruco_check.isChecked(),
+            'aruco_source': 'external' if self.external_aruco_check.isChecked() else 'builtin',
+            'external_aruco_path': self.external_aruco_edit.text() if self.external_aruco_check.isChecked() else '',
             'save_visualizations': self.save_viz_check.isChecked(),
             'save_csv': self.save_csv_check.isChecked(),
+            'export_bee_detections': self.export_bee_detections_check.isChecked(),
         }
         
         # Add selected algorithms
@@ -582,6 +669,34 @@ class TrackingValidationProgressDialog(QDialog):
                 lines.append(f"  Precision: {metrics['precision']:.2%}")
             if 'recall' in metrics:
                 lines.append(f"  Recall: {metrics['recall']:.2%}")
+            if 'num_bee_detections' in metrics:
+                lines.append(f"  Bee Detections: {metrics['num_bee_detections']}")
+            if 'num_gt_bees' in metrics:
+                lines.append(f"  Ground Truth Bees: {metrics['num_gt_bees']}")
+            if 'num_aruco_detections' in metrics:
+                lines.append(f"  ArUco Detections: {metrics['num_aruco_detections']}")
+            if 'num_noid_detections' in metrics:
+                lines.append(f"  noID Detections: {metrics['num_noid_detections']}")
+            if 'num_aruco_or_noid_detections' in metrics:
+                lines.append(f"  ArUco + noID Detections: {metrics['num_aruco_or_noid_detections']}")
+            if 'num_external_csv_aruco_rows' in metrics:
+                lines.append(f"  External CSV ArUco Rows: {metrics['num_external_csv_aruco_rows']}")
+            if 'num_external_csv_linked_aruco_rows' in metrics:
+                lines.append(f"  External CSV Linked ArUco Rows: {metrics['num_external_csv_linked_aruco_rows']}")
+            if 'num_external_csv_aruco_detections' in metrics:
+                lines.append(f"  External CSV ArUco Detections: {metrics['num_external_csv_aruco_detections']}")
+            if 'num_builtin_aruco_detections' in metrics:
+                lines.append(f"  Built-in ArUco Detections: {metrics['num_builtin_aruco_detections']}")
+            if 'num_sequences_external_aruco_used' in metrics:
+                lines.append(f"  External ArUco Sequences: {metrics['num_sequences_external_aruco_used']}")
+            if 'num_sequences_external_aruco_missing' in metrics:
+                lines.append(f"  External Missing, Built-in Used: {metrics['num_sequences_external_aruco_missing']}")
+            if 'num_true_positive_aruco_tracked' in metrics:
+                lines.append(f"  TP ArUco Tracked: {metrics['num_true_positive_aruco_tracked']}")
+            if 'num_false_positive_aruco_tracked' in metrics:
+                lines.append(f"  FP ArUco Tracked: {metrics['num_false_positive_aruco_tracked']}")
+            if 'num_false_negative_aruco_tracked' in metrics:
+                lines.append(f"  FN ArUco Tracked: {metrics['num_false_negative_aruco_tracked']}")
         
         self.metrics_label.setText("<br>".join(lines))
         

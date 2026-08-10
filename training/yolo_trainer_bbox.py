@@ -10,6 +10,7 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
+from .carbon_tracking import CarbonTrainingRun
 
 try:
     from ultralytics import YOLO
@@ -47,6 +48,7 @@ class YOLOTrainingWorkerBBox(QThread):
         self.project_path = Path(project_path)
         self.config = training_config
         self.should_stop = False
+        self._last_carbon_metrics = {}
         
     def stop(self):
         """Request training to stop"""
@@ -348,27 +350,46 @@ class YOLOTrainingWorkerBBox(QThread):
         model.add_callback('on_train_epoch_end', callback.on_train_epoch_end)
         model.add_callback('on_val_end', callback.on_val_end)
         
-        # Train
-        print(f"Starting training with params: {training_params}")
-        results = model.train(**training_params)
-        
-        # Find best model - get actual save directory from results
-        # YOLO appends numbers to avoid overwriting, so use the actual save_dir
-        run_dir = Path(results.save_dir)
-        best_model = run_dir / 'weights' / 'best.pt'
-        print(f"Looking for best model at: {best_model}")
-        
+        training_name = self.config.get('name', 'bee_bbox_detection')
+        carbon_run = CarbonTrainingRun(
+            self.project_path,
+            model_kind="yolo_bbox",
+            training_name=training_name,
+            config=training_params,
+        )
+
+        carbon_run.start()
+        try:
+            # Train
+            print(f"Starting training with params: {training_params}")
+            results = model.train(**training_params)
+
+            # Find best model - get actual save directory from results
+            # YOLO appends numbers to avoid overwriting, so use the actual save_dir
+            run_dir = Path(results.save_dir)
+            best_model = run_dir / 'weights' / 'best.pt'
+            print(f"Looking for best model at: {best_model}")
+
+            if not best_model.exists():
+                carbon_run.finish(status="failed", error=f"Best model not found at {best_model}")
+                self._last_carbon_metrics = carbon_run.metrics_for_final_report()
+                raise FileNotFoundError(f"Best model not found at {best_model}")
+
+            status = "cancelled" if self.should_stop else "completed"
+            carbon_run.finish(status=status, model_path=best_model)
+            self._last_carbon_metrics = carbon_run.metrics_for_final_report()
+        except Exception as exc:
+            carbon_run.finish(status="failed", error=f"{type(exc).__name__}: {exc}")
+            self._last_carbon_metrics = carbon_run.metrics_for_final_report()
+            raise
+
         # Copy to standard location
         models_dir = self.project_path / 'models'
         models_dir.mkdir(exist_ok=True)
         final_path = models_dir / 'yolo_bbox_best.pt'
-        
-        if best_model.exists():
-            shutil.copy(best_model, final_path)
-            print(f"Model saved to {final_path}")
-            return final_path
-        else:
-            raise FileNotFoundError(f"Best model not found at {best_model}")
+        shutil.copy(best_model, final_path)
+        print(f"Model saved to {final_path}")
+        return final_path
     
     def _get_final_metrics(self, model_path):
         """Extract final metrics from trained model"""
@@ -390,10 +411,11 @@ class YOLOTrainingWorkerBBox(QThread):
                     if hasattr(box_metrics, 'map75'):
                         metrics['mAP75'] = float(box_metrics.map75)
                 
+                metrics.update(self._last_carbon_metrics)
                 return metrics
             
-            return {}
+            return dict(self._last_carbon_metrics)
             
         except Exception as e:
             print(f"Could not extract final metrics: {e}")
-            return {}
+            return dict(self._last_carbon_metrics)
