@@ -4,7 +4,7 @@ Annotation toolbar with tools and controls
 
 import math
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QToolButton, QButtonGroup,
-                             QSlider, QLabel, QSpinBox, QCheckBox, QMenu)
+                             QSlider, QLabel, QSpinBox, QCheckBox, QMenu, QComboBox)
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
 
@@ -25,6 +25,13 @@ class AnnotationToolbar(QWidget):
     show_bboxes_changed = pyqtSignal(bool)
     annotation_type_changed = pyqtSignal(str)  # Annotation type selection (bee/hive/chamber)
     annotation_type_visibility_changed = pyqtSignal(str, bool)  # annotation_type, visible
+    clear_no_draw_zones_requested = pyqtSignal()
+    set_measurement_scale_requested = pyqtSignal()
+    clear_measurement_scale_requested = pyqtSignal()
+    clear_measurement_line_requested = pyqtSignal()
+    imaging_setup_changed = pyqtSignal(str)
+    apply_imaging_setup_requested = pyqtSignal(str)
+    new_imaging_setup_requested = pyqtSignal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -63,6 +70,20 @@ class AnnotationToolbar(QWidget):
         self.bbox_btn = self.create_tool_button("BBox", "bbox")
         self.bbox_btn.setToolTip("Draw or edit bounding box")
         row1.addWidget(self.bbox_btn)
+
+        self.no_draw_zone_btn = self.create_tool_button("No Draw Zone", "no_draw_zone")
+        self.no_draw_zone_btn.setToolTip(
+            "Protect a polygon from Brush and Eraser strokes: click vertices, "
+            "double-click or press Enter to close"
+        )
+        row1.addWidget(self.no_draw_zone_btn)
+
+        self.measure_btn = self.create_tool_button("Measure", "measure")
+        self.measure_btn.setToolTip(
+            "Click and drag a line to measure its length in image pixels and, "
+            "after calibration, centimeters"
+        )
+        row1.addWidget(self.measure_btn)
         
         row1.addWidget(self.create_separator())
         
@@ -137,6 +158,16 @@ class AnnotationToolbar(QWidget):
         )
         self.brush_cursor_checkbox.stateChanged.connect(self.on_brush_cursor_preview_changed)
         row2.addWidget(self.brush_cursor_checkbox)
+
+        self.clear_no_draw_zones_btn = QToolButton()
+        self.clear_no_draw_zones_btn.setText("Clear Zones")
+        self.clear_no_draw_zones_btn.setToolTip(
+            "Remove every No Draw Zone from the current frame"
+        )
+        self.clear_no_draw_zones_btn.clicked.connect(
+            self.clear_no_draw_zones_requested.emit
+        )
+        row2.addWidget(self.clear_no_draw_zones_btn)
         
         row2.addWidget(self.create_separator())
         
@@ -205,6 +236,89 @@ class AnnotationToolbar(QWidget):
         
         row2.addStretch()
         main_layout.addLayout(row2)
+
+        # Third row: physical-distance calibration and measurement controls.
+        row3 = QHBoxLayout()
+        row3.setSpacing(5)
+        row3.addWidget(QLabel("Imaging setup:"))
+
+        self.imaging_setup_combo = QComboBox()
+        self.imaging_setup_combo.setMinimumWidth(180)
+        self.imaging_setup_combo.setToolTip(
+            "Choose an imaging setup for the selected video or videos. Videos "
+            "assigned to the same setup share one pixel-to-centimeter calibration."
+        )
+        self.imaging_setup_combo.currentIndexChanged.connect(
+            self.on_imaging_setup_changed
+        )
+        row3.addWidget(self.imaging_setup_combo)
+
+        self.apply_imaging_setup_btn = QToolButton()
+        self.apply_imaging_setup_btn.setText("Apply to Selected")
+        self.apply_imaging_setup_btn.setToolTip(
+            "Apply the setup shown in the list to every selected sidebar video"
+        )
+        self.apply_imaging_setup_btn.clicked.connect(
+            self.on_apply_imaging_setup
+        )
+        row3.addWidget(self.apply_imaging_setup_btn)
+
+        self.new_imaging_setup_btn = QToolButton()
+        self.new_imaging_setup_btn.setText("New Setup")
+        self.new_imaging_setup_btn.setToolTip(
+            "Create a named imaging setup and assign all selected videos to it"
+        )
+        self.new_imaging_setup_btn.clicked.connect(
+            self.new_imaging_setup_requested.emit
+        )
+        row3.addWidget(self.new_imaging_setup_btn)
+
+        row3.addWidget(self.create_separator())
+        row3.addWidget(QLabel("Physical scale:"))
+
+        self.measurement_scale_label = QLabel("Not calibrated (pixels only)")
+        self.measurement_scale_label.setMinimumWidth(270)
+        self.measurement_scale_label.setToolTip(
+            "Physical scale for the current video. Draw a Measure line over an "
+            "object of known length, then choose Set Scale from Line."
+        )
+        row3.addWidget(self.measurement_scale_label)
+
+        self.set_measurement_scale_btn = QToolButton()
+        self.set_measurement_scale_btn.setText("Set Scale from Line")
+        self.set_measurement_scale_btn.setToolTip(
+            "Use the most recently drawn Measure line as a known physical distance"
+        )
+        self.set_measurement_scale_btn.clicked.connect(
+            self.set_measurement_scale_requested.emit
+        )
+        row3.addWidget(self.set_measurement_scale_btn)
+
+        self.clear_measurement_scale_btn = QToolButton()
+        self.clear_measurement_scale_btn.setText("Clear Scale")
+        self.clear_measurement_scale_btn.setToolTip(
+            "Remove the saved pixel-to-centimeter calibration for the current video"
+        )
+        self.clear_measurement_scale_btn.clicked.connect(
+            self.clear_measurement_scale_requested.emit
+        )
+        self.clear_measurement_scale_btn.setEnabled(False)
+        row3.addWidget(self.clear_measurement_scale_btn)
+
+        self.clear_measurement_line_btn = QToolButton()
+        self.clear_measurement_line_btn.setText("Clear Line")
+        self.clear_measurement_line_btn.setToolTip(
+            "Remove the temporary measurement line from the canvas"
+        )
+        self.clear_measurement_line_btn.clicked.connect(
+            self.clear_measurement_line_requested.emit
+        )
+        row3.addWidget(self.clear_measurement_line_btn)
+
+        row3.addStretch()
+        main_layout.addLayout(row3)
+
+        self.set_imaging_setups([], None)
         
     def create_tool_button(self, text, tool_name):
         """Create a tool button"""
@@ -316,6 +430,62 @@ class AnnotationToolbar(QWidget):
                 btn.setChecked(True)
                 self.tool_changed.emit(tool_name)
                 break
+
+    def on_imaging_setup_changed(self, index):
+        """Emit the selected setup name, or an empty string for unassigned."""
+        setup_name = self.imaging_setup_combo.itemData(index)
+        self.imaging_setup_changed.emit(str(setup_name or ""))
+
+    def on_apply_imaging_setup(self):
+        """Re-emit the displayed setup for an explicit batch assignment."""
+        setup_name = self.imaging_setup_combo.currentData()
+        self.apply_imaging_setup_requested.emit(str(setup_name or ""))
+
+    def set_imaging_setups(self, setup_names, current_setup=None):
+        """Populate the setup selector without changing video assignments."""
+        self.imaging_setup_combo.blockSignals(True)
+        self.imaging_setup_combo.clear()
+        self.imaging_setup_combo.addItem("Video-specific / unassigned", "")
+        for setup_name in sorted(setup_names, key=str.casefold):
+            self.imaging_setup_combo.addItem(str(setup_name), str(setup_name))
+
+        target_index = 0
+        if current_setup:
+            for index in range(self.imaging_setup_combo.count()):
+                if self.imaging_setup_combo.itemData(index) == current_setup:
+                    target_index = index
+                    break
+        self.imaging_setup_combo.setCurrentIndex(target_index)
+        self.imaging_setup_combo.blockSignals(False)
+
+    def set_measurement_scale(self, pixels_per_cm, setup_name=None):
+        """Update the physical-scale readout for the current video."""
+        self.measurement_scale_label.setToolTip(
+            "Physical scale for the current video. Draw a Measure line over an "
+            "object of known length, then choose Set Scale from Line."
+        )
+        if pixels_per_cm is None or pixels_per_cm <= 0:
+            if setup_name:
+                self.measurement_scale_label.setText("Shared setup not calibrated (pixels only)")
+                self.measurement_scale_label.setToolTip(
+                    f'Imaging setup "{setup_name}" has no physical calibration yet.'
+                )
+            else:
+                self.measurement_scale_label.setText("Not calibrated (pixels only)")
+            self.clear_measurement_scale_btn.setEnabled(False)
+            return
+
+        cm_per_pixel = 1.0 / float(pixels_per_cm)
+        source_text = "Shared setup: " if setup_name else "Video-specific: "
+        self.measurement_scale_label.setText(
+            f"{source_text}{float(pixels_per_cm):.3f} px/cm "
+            f"(1 px = {cm_per_pixel:.6f} cm)"
+        )
+        if setup_name:
+            self.measurement_scale_label.setToolTip(
+                f'Inherited from imaging setup "{setup_name}".'
+            )
+        self.clear_measurement_scale_btn.setEnabled(True)
     
     def uncheck_all_tools(self):
         """Uncheck all tool buttons without emitting signals"""

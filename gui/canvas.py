@@ -3,13 +3,15 @@ Image canvas with zoom, pan, and annotation capabilities
 """
 
 import numpy as np
+import math
 from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
                              QGraphicsTextItem, QMenu, QGraphicsRectItem,
                              QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
+                             QGraphicsPolygonItem, QGraphicsPathItem,
                              QWidget, QHBoxLayout, QPushButton)
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF, QTimer
 from PyQt6.QtGui import (QPixmap, QImage, QPen, QBrush, QColor, QPainter,
-                        QTransform, QCursor, QPolygonF, QFont, QAction)
+                        QTransform, QCursor, QPolygonF, QPainterPath, QFont, QAction)
 from pathlib import Path
 import cv2
 import time
@@ -57,6 +59,7 @@ class ImageCanvas(QGraphicsView):
     brush_eraser_toggle_requested = pyqtSignal()
     instance_switch_tap_progress = pyqtSignal(int, str, int)  # instance_id, category, taps remaining
     new_instance_requested = pyqtSignal(str)  # category
+    measurement_line_completed = pyqtSignal(float)  # source-image pixel length
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -213,6 +216,25 @@ class ImageCanvas(QGraphicsView):
         self.dragging_bbox_handle = None  # 'tl', 'tr', 'bl', 'br', 'move'
         self.bbox_drag_offset = None
         self.bbox_original_rect = None  # Original rect before editing
+
+        # Temporary per-frame polygons that protect pixels from brush/eraser
+        # strokes. These are editing guides, not exported annotations.
+        self.no_draw_zone_polygons = []
+        self.no_draw_zone_items = []
+        self.no_draw_zone_mask = None
+        self.no_draw_polygon_points = []
+        self.no_draw_preview_item = None
+
+        # Physical measurement. The scale is video-level state supplied by the
+        # main window; measurement graphics are temporary and never exported.
+        self.pixels_per_cm = None
+        self.measurement_start = None
+        self.measurement_end = None
+        self.measurement_line_item = None
+        self.measurement_label_item = None
+        self.bbox_dimension_label_item = None
+        self.polygon_dimension_label_item = None
+        self._last_no_draw_cursor_pos = None
         
         # Undo/redo
         self.history = []
@@ -226,6 +248,20 @@ class ImageCanvas(QGraphicsView):
         
     def keyPressEvent(self, event):
         """Handle key press events"""
+        if self.current_tool == 'no_draw_zone':
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._finish_no_draw_polygon()
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Backspace:
+                self._undo_no_draw_polygon_point()
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Escape:
+                self._cancel_no_draw_polygon()
+                event.accept()
+                return
+
         if event.key() == Qt.Key.Key_Space:
             if event.isAutoRepeat():
                 event.accept()
@@ -360,7 +396,9 @@ class ImageCanvas(QGraphicsView):
             'eraser',
             'sam2_box',
             'inference_box',
-            'bbox'
+            'bbox',
+            'no_draw_zone',
+            'measure'
         }:
             self.setCursor(Qt.CursorShape.CrossCursor)
         else:
@@ -438,6 +476,181 @@ class ImageCanvas(QGraphicsView):
         self._update_brush_cursor_preview()
         if not self.brush_cursor_preview_enabled:
             self._set_default_cursor_for_current_tool()
+
+    @staticmethod
+    def _line_length_pixels(start, end):
+        """Return Euclidean length between two scene/image points."""
+        if start is None or end is None:
+            return 0.0
+        return math.hypot(float(end.x() - start.x()), float(end.y() - start.y()))
+
+    def _format_physical_distance(self, length_pixels):
+        """Format one image-space distance using the active video scale."""
+        pixel_text = f"{float(length_pixels):.1f} px"
+        if self.pixels_per_cm is None:
+            return pixel_text
+        return f"{pixel_text} | {float(length_pixels) / self.pixels_per_cm:.3f} cm"
+
+    def _set_dimension_label(self, attribute_name, text, anchor, accent_color):
+        """Create or update a fixed-screen-size measurement label."""
+        item = getattr(self, attribute_name, None)
+        try:
+            item_is_valid = item is not None and item.scene() == self.scene
+        except RuntimeError:
+            item_is_valid = False
+
+        if not item_is_valid:
+            item = QGraphicsTextItem()
+            item.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations,
+                True
+            )
+            item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            item.setZValue(265)
+            self.scene.addItem(item)
+            setattr(self, attribute_name, item)
+
+        red, green, blue = accent_color
+        html_text = text.replace("\n", "<br>")
+        item.setHtml(
+            '<div style="background-color: rgba(20, 24, 30, 220); '
+            'color: rgb(255, 255, 255); '
+            f'border: 2px solid rgb({red}, {green}, {blue}); '
+            'padding: 3px 6px; font-size: 13px; font-weight: 600;">'
+            f'{html_text}</div>'
+        )
+        item.setPos(float(anchor.x()) + 10.0, float(anchor.y()) + 10.0)
+        item.setVisible(True)
+
+    def _remove_dimension_label(self, attribute_name):
+        """Remove a measurement label, tolerating a scene that was cleared."""
+        item = getattr(self, attribute_name, None)
+        if item is not None:
+            try:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                pass
+        setattr(self, attribute_name, None)
+
+    def set_pixels_per_cm(self, pixels_per_cm):
+        """Set or clear the scalar pixel-to-centimeter conversion."""
+        if pixels_per_cm is None:
+            self.pixels_per_cm = None
+        else:
+            value = float(pixels_per_cm)
+            self.pixels_per_cm = value if math.isfinite(value) and value > 0 else None
+
+        if self.measurement_start is not None and self.measurement_end is not None:
+            self._update_measurement_line(
+                self.measurement_start,
+                self.measurement_end
+            )
+        if (
+            self.current_tool == 'bbox' and
+            self.selected_bbox_id in self.bbox_items_map
+        ):
+            self._update_bbox_dimension_label(
+                self.bbox_items_map[self.selected_bbox_id].rect()
+            )
+        if self.no_draw_polygon_points and self._last_no_draw_cursor_pos is not None:
+            self._update_polygon_dimension_label(self._last_no_draw_cursor_pos)
+
+    def _update_measurement_line(self, start, end):
+        """Draw/update the temporary ruler and its live distance label."""
+        start = self._clamp_point_to_image(start)
+        end = self._clamp_point_to_image(end)
+        self.measurement_start = QPointF(start)
+        self.measurement_end = QPointF(end)
+
+        try:
+            line_is_valid = (
+                self.measurement_line_item is not None and
+                self.measurement_line_item.scene() == self.scene
+            )
+        except RuntimeError:
+            line_is_valid = False
+
+        if not line_is_valid:
+            self.measurement_line_item = QGraphicsLineItem()
+            pen = QPen(QColor(0, 255, 255), 2, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            self.measurement_line_item.setPen(pen)
+            self.measurement_line_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.measurement_line_item.setZValue(260)
+            self.scene.addItem(self.measurement_line_item)
+
+        self.measurement_line_item.setLine(
+            start.x(), start.y(), end.x(), end.y()
+        )
+        midpoint = QPointF(
+            (start.x() + end.x()) / 2.0,
+            (start.y() + end.y()) / 2.0
+        )
+        length = self._line_length_pixels(start, end)
+        self._set_dimension_label(
+            'measurement_label_item',
+            f"Length: {self._format_physical_distance(length)}",
+            midpoint,
+            (0, 255, 255)
+        )
+
+    def get_measurement_pixel_length(self):
+        """Return the current temporary ruler length in source-image pixels."""
+        return self._line_length_pixels(self.measurement_start, self.measurement_end)
+
+    def clear_measurement_line(self):
+        """Remove the temporary ruler without changing video calibration."""
+        if self.measurement_line_item is not None:
+            try:
+                if self.measurement_line_item.scene() == self.scene:
+                    self.scene.removeItem(self.measurement_line_item)
+            except (RuntimeError, AttributeError):
+                pass
+        self.measurement_line_item = None
+        self.measurement_start = None
+        self.measurement_end = None
+        self._remove_dimension_label('measurement_label_item')
+
+    def _update_bbox_dimension_label(self, rect):
+        """Show live source-pixel and physical width/height for a bbox."""
+        if rect is None:
+            self._remove_dimension_label('bbox_dimension_label_item')
+            return
+        text = (
+            f"Width (x): {self._format_physical_distance(rect.width())}\n"
+            f"Height (y): {self._format_physical_distance(rect.height())}"
+        )
+        self._set_dimension_label(
+            'bbox_dimension_label_item',
+            text,
+            rect.bottomRight(),
+            (255, 225, 0)
+        )
+
+    def _update_polygon_dimension_label(self, cursor_pos):
+        """Show the live length of the active protected-polygon segment."""
+        if not self.no_draw_polygon_points or cursor_pos is None:
+            self._remove_dimension_label('polygon_dimension_label_item')
+            return
+        cursor_pos = self._clamp_point_to_image(cursor_pos)
+        self._last_no_draw_cursor_pos = QPointF(cursor_pos)
+        length = self._line_length_pixels(
+            self.no_draw_polygon_points[-1], cursor_pos
+        )
+        self._set_dimension_label(
+            'polygon_dimension_label_item',
+            f"Segment: {self._format_physical_distance(length)}",
+            cursor_pos,
+            (255, 45, 45)
+        )
+
+    def _clear_temporary_dimension_graphics(self):
+        """Clear frame-specific ruler and live dimension labels."""
+        self.clear_measurement_line()
+        self._remove_dimension_label('bbox_dimension_label_item')
+        self._remove_dimension_label('polygon_dimension_label_item')
+        self._last_no_draw_cursor_pos = None
     
     def hide_masks(self):
         """Hide all masks until toggled visible again."""
@@ -785,6 +998,8 @@ class ImageCanvas(QGraphicsView):
             )
         
         # Clear remaining scene items
+        self.clear_no_draw_zones()
+        self._clear_temporary_dimension_graphics()
         self._clear_brush_cursor_preview()
         self.scene.clear()
         self.bee_mask = None
@@ -818,6 +1033,8 @@ class ImageCanvas(QGraphicsView):
     
     def clear_image(self):
         """Clear the current image and all annotations"""
+        self.clear_no_draw_zones()
+        self._clear_temporary_dimension_graphics()
         self._clear_brush_cursor_preview()
         self.scene.clear()
         self.current_image = None
@@ -933,6 +1150,14 @@ class ImageCanvas(QGraphicsView):
             self._viz_update_timer.stop()
             self._flush_pending_viz_update()
         self._cancel_pending_instance_switch_tap(reset_sequence=True)
+
+        previous_tool = self.current_tool
+        if previous_tool == 'no_draw_zone' and tool_name != 'no_draw_zone':
+            self._cancel_no_draw_polygon()
+        if previous_tool == 'bbox' and tool_name != 'bbox':
+            self._remove_dimension_label('bbox_dimension_label_item')
+        if previous_tool == 'measure' and tool_name != 'measure':
+            self.is_drawing = False
         
         self.current_tool = tool_name
         
@@ -952,14 +1177,49 @@ class ImageCanvas(QGraphicsView):
                 self.setCursor(Qt.CursorShape.CrossCursor)
             elif tool_name == 'inference_box':
                 self.setCursor(Qt.CursorShape.CrossCursor)
+            elif tool_name == 'bbox':
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            elif tool_name == 'no_draw_zone':
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            elif tool_name == 'measure':
+                self.setCursor(Qt.CursorShape.CrossCursor)
+
+        if (
+            tool_name == 'bbox' and
+            self.selected_bbox_id in self.bbox_items_map
+        ):
+            self._update_bbox_dimension_label(
+                self.bbox_items_map[self.selected_bbox_id].rect()
+            )
         self._update_brush_cursor_preview()
 
     def mouseDoubleClickEvent(self, event):
         """Treat brush/eraser double-clicks as regular taps for switch counting."""
         if (
+            self.current_tool == 'no_draw_zone' and
+            event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._finish_no_draw_polygon()
+            event.accept()
+            return
+        if (
             self.current_tool in {'brush', 'eraser'} and
             event.button() == Qt.MouseButton.LeftButton
         ):
+            scene_pos = self.mapToScene(event.pos())
+            instance_id, category = self._brush_switch_target_at(scene_pos)
+            if (
+                instance_id > 0 and
+                not self._is_active_brush_instance(instance_id, category)
+            ):
+                # A Qt double-click represents the second press in the click
+                # sequence. Count it immediately instead of depending on a
+                # matching release event; some touchpad/platform event streams
+                # do not deliver that release back to the graphics view.
+                self._cancel_pending_instance_switch_tap(reset_sequence=False)
+                self._complete_instance_switch_tap(instance_id, category)
+                event.accept()
+                return
             self.mousePressEvent(event)
             return
         super().mouseDoubleClickEvent(event)
@@ -981,6 +1241,10 @@ class ImageCanvas(QGraphicsView):
         if event.button() == Qt.MouseButton.RightButton:
             if self.current_tool == 'sam2_prompt':
                 pass
+            elif self.current_tool == 'no_draw_zone':
+                self._undo_no_draw_polygon_point()
+                event.accept()
+                return
             elif self.is_drawing:
                 event.accept()
                 return
@@ -997,7 +1261,23 @@ class ImageCanvas(QGraphicsView):
         # Get scene position
         scene_pos = self.mapToScene(event.pos())
         
-        if self.current_tool == 'sam2_prompt':
+        if self.current_tool == 'measure':
+            if event.button() == Qt.MouseButton.LeftButton:
+                point = self._clamp_point_to_image(scene_pos)
+                self.clear_measurement_line()
+                self.is_drawing = True
+                self.drawing_start = point
+                self._update_measurement_line(point, point)
+                event.accept()
+                return
+
+        elif self.current_tool == 'no_draw_zone':
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._add_no_draw_polygon_point(scene_pos)
+                event.accept()
+                return
+
+        elif self.current_tool == 'sam2_prompt':
             # SAM2 point prompting
             x, y = int(scene_pos.x()), int(scene_pos.y())
             is_positive = event.button() == Qt.MouseButton.LeftButton
@@ -1079,6 +1359,9 @@ class ImageCanvas(QGraphicsView):
                             self.dragging_bbox_handle = handle
                             self.dragging_bbox = True
                             self.bbox_drag_offset = scene_pos
+                            self.bbox_original_rect = QRectF(
+                                self.bbox_items_map[self.selected_mask_idx].rect()
+                            )
                             return
                         elif self.bbox_items_map[self.selected_mask_idx].rect().contains(scene_pos):
                             self._select_bbox(self.selected_mask_idx, zoom=False)
@@ -1115,6 +1398,9 @@ class ImageCanvas(QGraphicsView):
                         self.dragging_bbox_handle = handle
                         self.dragging_bbox = True
                         self.bbox_drag_offset = scene_pos
+                        self.bbox_original_rect = QRectF(
+                            self.bbox_items_map[self.selected_bbox_id].rect()
+                        )
                         return
                 
                 # Check if clicking inside existing bbox
@@ -1583,6 +1869,13 @@ class ImageCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.pos())
         self._update_brush_cursor_preview(scene_pos)
 
+        if self.current_tool == 'no_draw_zone':
+            if self.no_draw_polygon_points:
+                self._update_no_draw_polygon_preview(scene_pos)
+                self._update_polygon_dimension_label(scene_pos)
+            event.accept()
+            return
+
         if self._pending_switch_tap is not None:
             if self._pending_switch_tap_moved(event):
                 press_scene_pos = self._pending_switch_tap['scene_pos']
@@ -1596,7 +1889,9 @@ class ImageCanvas(QGraphicsView):
             return
         
         if self.is_drawing:
-            if self.drawing_new_bbox:
+            if self.current_tool == 'measure':
+                self._update_measurement_line(self.drawing_start, scene_pos)
+            elif self.drawing_new_bbox:
                 # Update bbox preview
                 if self.temp_item:
                     try:
@@ -1613,6 +1908,7 @@ class ImageCanvas(QGraphicsView):
                 self.temp_item.setPen(pen)
                 self.temp_item.setZValue(150)
                 self.scene.addItem(self.temp_item)
+                self._update_bbox_dimension_label(rect)
             elif self.current_tool == 'sam2_box':
                 # Update box preview
                 if self.temp_item:
@@ -1679,25 +1975,36 @@ class ImageCanvas(QGraphicsView):
                     rect = rect_item.rect()
                     new_x = scene_pos.x() - self.bbox_drag_offset.x()
                     new_y = scene_pos.y() - self.bbox_drag_offset.y()
+                    if self.current_image is not None:
+                        image_h, image_w = self.current_image.shape[:2]
+                        new_x = max(0.0, min(new_x, image_w - rect.width()))
+                        new_y = max(0.0, min(new_y, image_h - rect.height()))
                     rect.moveTo(new_x, new_y)
                     rect_item.setRect(rect)
                     self._update_bbox_handles()
-            elif self.dragging_bbox_handle in ['tl', 'tr', 'bl', 'br']:
-                # Resize from corner
+                    self._update_bbox_dimension_label(rect)
+            elif self.dragging_bbox_handle in [
+                'tl', 'tm', 'tr', 'ml', 'mr', 'bl', 'bm', 'br'
+            ]:
+                # Resize from a fixed opposite edge/corner. Using the original
+                # rectangle prevents a dragged handle from changing identity.
                 if self.selected_bbox_id and self.selected_bbox_id in self.bbox_items_map:
                     rect_item = self.bbox_items_map[self.selected_bbox_id]
-                    rect = rect_item.rect()
-                    if self.dragging_bbox_handle == 'tl':
-                        rect.setTopLeft(scene_pos)
-                    elif self.dragging_bbox_handle == 'tr':
-                        rect.setTopRight(scene_pos)
-                    elif self.dragging_bbox_handle == 'bl':
-                        rect.setBottomLeft(scene_pos)
-                    elif self.dragging_bbox_handle == 'br':
-                        rect.setBottomRight(scene_pos)
-                    rect = rect.normalized()
+                    original_rect = self.bbox_original_rect or QRectF(rect_item.rect())
+                    bounds = None
+                    if self.current_image is not None:
+                        image_h, image_w = self.current_image.shape[:2]
+                        bounds = QRectF(0, 0, image_w, image_h)
+                    rect = self._resize_bbox_rect(
+                        original_rect,
+                        self.dragging_bbox_handle,
+                        scene_pos,
+                        minimum_size=3.0,
+                        bounds=bounds
+                    )
                     rect_item.setRect(rect)
                     self._update_bbox_handles()
+                    self._update_bbox_dimension_label(rect)
                 
         else:
             super().mouseMoveEvent(event)
@@ -1727,7 +2034,15 @@ class ImageCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.pos())
         
         if self.is_drawing:
-            if self.drawing_new_bbox:
+            if self.current_tool == 'measure':
+                self._update_measurement_line(self.drawing_start, scene_pos)
+                length = self.get_measurement_pixel_length()
+                if length > 0:
+                    self.measurement_line_completed.emit(length)
+                else:
+                    self.clear_measurement_line()
+
+            elif self.drawing_new_bbox:
                 # Finish drawing new bbox
                 if self.temp_item:
                     try:
@@ -1742,6 +2057,8 @@ class ImageCanvas(QGraphicsView):
                 # Only create if bbox has minimum size
                 if rect.width() > 10 and rect.height() > 10:
                     self._create_new_bbox(rect)
+                else:
+                    self._remove_dimension_label('bbox_dimension_label_item')
                 
                 self.drawing_new_bbox = False
                 self.is_drawing = False
@@ -1824,6 +2141,7 @@ class ImageCanvas(QGraphicsView):
             self.dragging_bbox = False
             self.dragging_bbox_handle = None
             self.bbox_drag_offset = None
+            self.bbox_original_rect = None
         else:
             super().mouseReleaseEvent(event)
     
@@ -1924,6 +2242,148 @@ class ImageCanvas(QGraphicsView):
                 return corner_name
         
         return None
+
+    def _clamp_point_to_image(self, point):
+        """Return a scene point constrained to valid image pixel coordinates."""
+        if self.current_image is None:
+            return QPointF(point)
+        image_h, image_w = self.current_image.shape[:2]
+        return QPointF(
+            max(0.0, min(float(point.x()), float(image_w - 1))),
+            max(0.0, min(float(point.y()), float(image_h - 1)))
+        )
+
+    def _add_no_draw_polygon_point(self, scene_pos):
+        """Append a vertex to the in-progress protected polygon."""
+        point = self._clamp_point_to_image(scene_pos)
+        if self.no_draw_polygon_points:
+            previous = self.no_draw_polygon_points[-1]
+            if (
+                abs(previous.x() - point.x()) < 0.5 and
+                abs(previous.y() - point.y()) < 0.5
+            ):
+                return
+        self.no_draw_polygon_points.append(point)
+        self._last_no_draw_cursor_pos = None
+        self._remove_dimension_label('polygon_dimension_label_item')
+        self._update_no_draw_polygon_preview()
+
+    def _update_no_draw_polygon_preview(self, cursor_pos=None):
+        """Draw the open polygon and its vertices above annotation overlays."""
+        if not self.no_draw_polygon_points:
+            self._remove_no_draw_polygon_preview()
+            return
+
+        path = QPainterPath()
+        first = self.no_draw_polygon_points[0]
+        path.moveTo(first)
+        for point in self.no_draw_polygon_points[1:]:
+            path.lineTo(point)
+        if cursor_pos is not None:
+            path.lineTo(self._clamp_point_to_image(cursor_pos))
+        for point in self.no_draw_polygon_points:
+            path.addEllipse(QRectF(point.x() - 3, point.y() - 3, 6, 6))
+
+        if self.no_draw_preview_item is None:
+            self.no_draw_preview_item = QGraphicsPathItem()
+            pen = QPen(QColor(255, 45, 45), 2, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            self.no_draw_preview_item.setPen(pen)
+            self.no_draw_preview_item.setBrush(QBrush(QColor(255, 45, 45)))
+            self.no_draw_preview_item.setZValue(242)
+            self.scene.addItem(self.no_draw_preview_item)
+        self.no_draw_preview_item.setPath(path)
+
+    def _remove_no_draw_polygon_preview(self):
+        if self.no_draw_preview_item is not None:
+            try:
+                if self.no_draw_preview_item.scene() == self.scene:
+                    self.scene.removeItem(self.no_draw_preview_item)
+            except (RuntimeError, AttributeError):
+                pass
+        self.no_draw_preview_item = None
+
+    def _undo_no_draw_polygon_point(self):
+        """Remove the most recently placed vertex from the open polygon."""
+        if not self.no_draw_polygon_points:
+            return False
+        self.no_draw_polygon_points.pop()
+        self._update_no_draw_polygon_preview()
+        if self.no_draw_polygon_points and self._last_no_draw_cursor_pos is not None:
+            self._update_polygon_dimension_label(self._last_no_draw_cursor_pos)
+        else:
+            self._remove_dimension_label('polygon_dimension_label_item')
+        return True
+
+    def _cancel_no_draw_polygon(self):
+        """Discard only the currently open polygon."""
+        self.no_draw_polygon_points = []
+        self._last_no_draw_cursor_pos = None
+        self._remove_no_draw_polygon_preview()
+        self._remove_dimension_label('polygon_dimension_label_item')
+
+    def _finish_no_draw_polygon(self):
+        """Close and activate the current protected polygon."""
+        if len(self.no_draw_polygon_points) < 3:
+            return False
+
+        polygon = [
+            (int(round(point.x())), int(round(point.y())))
+            for point in self.no_draw_polygon_points
+        ]
+        contour = np.asarray(polygon, dtype=np.int32)
+        if abs(cv2.contourArea(contour)) < 1.0:
+            return False
+
+        self.no_draw_zone_polygons.append(polygon)
+        self.no_draw_polygon_points = []
+        self._last_no_draw_cursor_pos = None
+        self._remove_no_draw_polygon_preview()
+        self._remove_dimension_label('polygon_dimension_label_item')
+
+        polygon_item = QGraphicsPolygonItem(
+            QPolygonF([QPointF(x, y) for x, y in polygon])
+        )
+        pen = QPen(QColor(255, 35, 35), 2, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        polygon_item.setPen(pen)
+        fill = QBrush(QColor(255, 35, 35, 80))
+        fill.setStyle(Qt.BrushStyle.BDiagPattern)
+        polygon_item.setBrush(fill)
+        polygon_item.setZValue(240)
+        self.scene.addItem(polygon_item)
+        self.no_draw_zone_items.append(polygon_item)
+        self._rebuild_no_draw_zone_mask()
+        return True
+
+    def _rebuild_no_draw_zone_mask(self):
+        """Rasterize the union of completed polygons for fast stroke clipping."""
+        if self.current_image is None or not self.no_draw_zone_polygons:
+            self.no_draw_zone_mask = None
+            return
+        image_h, image_w = self.current_image.shape[:2]
+        protected = np.zeros((image_h, image_w), dtype=np.uint8)
+        contours = [
+            np.asarray(polygon, dtype=np.int32).reshape((-1, 1, 2))
+            for polygon in self.no_draw_zone_polygons
+        ]
+        cv2.fillPoly(protected, contours, 255)
+        self.no_draw_zone_mask = protected
+
+    def clear_no_draw_zones(self):
+        """Remove all current-frame protected polygons and return their count."""
+        removed_count = len(self.no_draw_zone_polygons)
+        self._cancel_no_draw_polygon()
+        for item in self.no_draw_zone_items:
+            try:
+                if item.scene() == self.scene:
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                pass
+        self.no_draw_zone_items = []
+        self.no_draw_zone_polygons = []
+        self.no_draw_zone_mask = None
+        return removed_count
             
     def draw_on_mask(self, start_pos, end_pos):
         """Draw on the current mask with brush/eraser"""
@@ -1970,23 +2430,43 @@ class ImageCanvas(QGraphicsView):
         x1, y1 = int(start_pos.x()), int(start_pos.y())
         x2, y2 = int(end_pos.x()), int(end_pos.y())
         
-        # Draw directly on editing mask (much faster - no temp array allocation)
-        if self.current_tool == 'brush':
-            cv2.line(self.editing_mask, (x1, y1), (x2, y2), 255, self.brush_size)
-        else:  # eraser
-            cv2.line(self.editing_mask, (x1, y1), (x2, y2), 0, self.brush_size)
-        self._cached_bboxes.pop(instance_id, None)
-        
-        # Calculate bounding box of stroke for dirty region (much more memory efficient)
+        # Calculate a small stroke raster so protected pixels never reach the
+        # editing mask. This applies equally to additive and erasing strokes.
         half_brush = self.brush_size // 2 + 1
         min_x = max(0, min(x1, x2) - half_brush)
-        max_x = min(self.editing_mask.shape[1], max(x1, x2) + half_brush)
+        max_x = min(self.editing_mask.shape[1], max(x1, x2) + half_brush + 1)
         min_y = max(0, min(y1, y2) - half_brush)
-        max_y = min(self.editing_mask.shape[0], max(y1, y2) + half_brush)
+        max_y = min(self.editing_mask.shape[0], max(y1, y2) + half_brush + 1)
+
+        if max_x <= min_x or max_y <= min_y:
+            return
+
+        stroke_mask = np.zeros((max_y - min_y, max_x - min_x), dtype=np.uint8)
+        cv2.line(
+            stroke_mask,
+            (x1 - min_x, y1 - min_y),
+            (x2 - min_x, y2 - min_y),
+            255,
+            self.brush_size
+        )
+        allowed_pixels = stroke_mask > 0
+        if (
+            self.no_draw_zone_mask is not None and
+            self.no_draw_zone_mask.shape == self.editing_mask.shape
+        ):
+            allowed_pixels &= (
+                self.no_draw_zone_mask[min_y:max_y, min_x:max_x] == 0
+            )
+        if not np.any(allowed_pixels):
+            return
+
+        editing_crop = self.editing_mask[min_y:max_y, min_x:max_x]
+        editing_crop[allowed_pixels] = 255 if self.current_tool == 'brush' else 0
+        self._cached_bboxes.pop(instance_id, None)
         
         # Create dirty region mask for this stroke
         stroke_dirty = np.zeros(self.editing_mask.shape, dtype=bool)
-        stroke_dirty[min_y:max_y, min_x:max_x] = True
+        stroke_dirty[min_y:max_y, min_x:max_x] = allowed_pixels
         
         # Accumulate dirty pixels for batched update (major performance improvement)
         if self._dirty_pixels is None:
@@ -5060,6 +5540,8 @@ class ImageCanvas(QGraphicsView):
             rect = rect_item.rect()
             self.zoom_to_rect(int(rect.x()), int(rect.y()),
                               int(rect.width()), int(rect.height()), padding=100)
+        if self.current_tool == 'bbox':
+            self._update_bbox_dimension_label(rect_item.rect())
         self.instance_selected.emit(mask_id, self.selected_instance_category)
     
     def _deselect_bbox(self):
@@ -5083,6 +5565,7 @@ class ImageCanvas(QGraphicsView):
         self.bbox_handles = []
         
         self.selected_bbox_id = None
+        self._remove_dimension_label('bbox_dimension_label_item')
         if self.show_bboxes:
             self.setToolTip("Click on a bbox to select and edit")
     
@@ -5145,7 +5628,7 @@ class ImageCanvas(QGraphicsView):
         print(f"Created new bbox with ID {mask_id}: {bbox}")
     
     def _create_bbox_handles(self):
-        """Create corner handles for selected bbox"""
+        """Create corner and edge handles for the selected bbox."""
         from PyQt6.QtWidgets import QGraphicsEllipseItem
         
         # Remove old handles
@@ -5163,51 +5646,86 @@ class ImageCanvas(QGraphicsView):
         handle_size = 10
         handle_color = QColor(255, 255, 0)  # Yellow handles
         
-        # Create corner handles
-        corners = {
+        positions = {
             'tl': rect.topLeft(),
+            'tm': QPointF(rect.center().x(), rect.top()),
             'tr': rect.topRight(),
+            'ml': QPointF(rect.left(), rect.center().y()),
+            'mr': QPointF(rect.right(), rect.center().y()),
             'bl': rect.bottomLeft(),
+            'bm': QPointF(rect.center().x(), rect.bottom()),
             'br': rect.bottomRight()
         }
         
-        for corner_id, corner_pos in corners.items():
+        for handle_id, handle_pos in positions.items():
             handle = QGraphicsEllipseItem(
-                corner_pos.x() - handle_size/2,
-                corner_pos.y() - handle_size/2,
+                handle_pos.x() - handle_size/2,
+                handle_pos.y() - handle_size/2,
                 handle_size, handle_size
             )
             handle.setBrush(QBrush(handle_color))
             handle.setPen(QPen(QColor(0, 0, 0), 1))
             handle.setZValue(102)  # Above bbox
-            handle.setData(0, corner_id)  # Store corner ID
+            handle.setData(0, handle_id)
             self.scene.addItem(handle)
             self.bbox_handles.append(handle)
     
     def _update_bbox_handles(self):
-        """Update corner handle positions"""
+        """Update corner and edge handle positions."""
         if not self.selected_bbox_id or self.selected_bbox_id not in self.bbox_items_map:
             return
         
         rect = self.bbox_items_map[self.selected_bbox_id].rect()
         handle_size = 10
         
-        corners = {
+        positions = {
             'tl': rect.topLeft(),
+            'tm': QPointF(rect.center().x(), rect.top()),
             'tr': rect.topRight(),
+            'ml': QPointF(rect.left(), rect.center().y()),
+            'mr': QPointF(rect.right(), rect.center().y()),
             'bl': rect.bottomLeft(),
+            'bm': QPointF(rect.center().x(), rect.bottom()),
             'br': rect.bottomRight()
         }
         
         for handle in self.bbox_handles:
-            corner_id = handle.data(0)
-            if corner_id in corners:
-                corner_pos = corners[corner_id]
+            handle_id = handle.data(0)
+            if handle_id in positions:
+                handle_pos = positions[handle_id]
                 handle.setRect(
-                    corner_pos.x() - handle_size/2,
-                    corner_pos.y() - handle_size/2,
+                    handle_pos.x() - handle_size/2,
+                    handle_pos.y() - handle_size/2,
                     handle_size, handle_size
                 )
+
+    @staticmethod
+    def _resize_bbox_rect(original_rect, handle_id, scene_pos,
+                          minimum_size=3.0, bounds=None):
+        """Resize a bbox while keeping the opposite side/corner fixed."""
+        left = float(original_rect.left())
+        right = float(original_rect.right())
+        top = float(original_rect.top())
+        bottom = float(original_rect.bottom())
+        x = float(scene_pos.x())
+        y = float(scene_pos.y())
+        minimum_size = max(1.0, float(minimum_size))
+
+        bound_left = float(bounds.left()) if bounds is not None else float('-inf')
+        bound_right = float(bounds.right()) if bounds is not None else float('inf')
+        bound_top = float(bounds.top()) if bounds is not None else float('-inf')
+        bound_bottom = float(bounds.bottom()) if bounds is not None else float('inf')
+
+        if handle_id in {'tl', 'ml', 'bl'}:
+            left = max(bound_left, min(x, right - minimum_size))
+        if handle_id in {'tr', 'mr', 'br'}:
+            right = min(bound_right, max(x, left + minimum_size))
+        if handle_id in {'tl', 'tm', 'tr'}:
+            top = max(bound_top, min(y, bottom - minimum_size))
+        if handle_id in {'bl', 'bm', 'br'}:
+            bottom = min(bound_bottom, max(y, top + minimum_size))
+
+        return QRectF(left, top, right - left, bottom - top)
     
     def _get_bbox_handle_at_pos(self, pos):
         """Get bbox handle at scene position
@@ -5216,11 +5734,11 @@ class ImageCanvas(QGraphicsView):
             pos: QPointF scene position
             
         Returns:
-            Handle ID ('tl', 'tr', 'bl', 'br') or None
+            Handle ID ('tl', 'tm', 'tr', 'ml', 'mr', 'bl', 'bm', 'br') or None
         """
         for handle in self.bbox_handles:
             try:
-                if handle.contains(pos):
+                if handle.sceneBoundingRect().adjusted(-3, -3, 3, 3).contains(pos):
                     return handle.data(0)
             except RuntimeError:
                 # Handle has been deleted by Qt

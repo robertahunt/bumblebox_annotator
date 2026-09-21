@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from PyQt6.QtCore import Qt, pyqtSignal, QSettings, QThread, QTimer, QEvent
 from PyQt6.QtGui import QAction, QKeySequence, QActionGroup
 from pathlib import Path
+from datetime import datetime
 import queue
 import time
 import json
@@ -45,6 +46,10 @@ from core.instance_tracker import InstanceTracker, Detection, Track
 from core.frame_cache import FrameCache, PreloadWorker
 from core.marker_detector import MarkerDetector
 from core.tracking_sequence_manager import TrackingSequenceManager
+from core.validation_review import (
+    frame_has_bee_mask_annotation,
+    video_has_selected_bee_masks,
+)
 from training.coco_video_export import export_coco_per_video
 from training.yolo_trainer import YOLOTrainingWorker
 from training.yolo_trainer_instance_focused import YOLOTrainingWorkerInstanceFocused
@@ -146,8 +151,14 @@ class MainWindow(QMainWindow):
         self.frame_list_to_frames_map = []  # Map list row to actual frame index
         self.project_path = None
         self.split_filter = 'all'  # 'all', 'train', 'val', 'test', or 'inference'
+        self.video_split_filter = 'all'
         self.video_next_mask_id = {}  # Track next_mask_id per video for unique IDs
         self.video_mask_colors = {}  # Track mask colors per video: {video_id: {mask_id: (r,g,b)}}
+        self.video_physical_scales = {}  # {video_id: pixels_per_cm or None}
+        self.video_scale_known_lengths_cm = {}  # Last calibration length per video
+        self.imaging_setup_profiles = {}  # Project-level named calibration profiles
+        self.video_imaging_setups = {}  # {video_id: setup_name}
+        self._imaging_setups_loaded = False
         self.box_inference_mode = False  # Track if box inference mode is active
         self.annotation_mode = 'segmentation'  # 'segmentation' or ' bbox' - which annotation type to display/edit
         
@@ -226,12 +237,15 @@ class MainWindow(QMainWindow):
         self.canvas.brush_eraser_toggle_requested.connect(self.on_brush_eraser_toggle_requested)
         self.canvas.instance_switch_tap_progress.connect(self.on_instance_switch_tap_progress)
         self.canvas.new_instance_requested.connect(self.new_instance)
+        self.canvas.measurement_line_completed.connect(self.on_measurement_line_completed)
         self.canvas.annotation_changed.connect(self.on_annotation_changed)
         self.canvas.annotation_changed.connect(self._schedule_instance_list_update)
         self.canvas.setToolTip(
             "Space toggles masks and boxes | "
             "Shift+Space toggles selected instance | Ctrl+/- zooms | +/- changes brush size | "
             "Middle-click toggles Brush/Eraser | Triple-tap another instance to switch while brushing | "
+            "No Draw Zone: click vertices, double-click/Enter closes, Backspace/right-click undoes | "
+            "Measure: drag a ruler line, then set its known length in cm | "
             "Press F to fit image to window"
         )
         
@@ -242,6 +256,15 @@ class MainWindow(QMainWindow):
         self.toolbar.brush_cursor_preview_changed.connect(self.canvas.set_brush_cursor_preview_enabled)
         self.toolbar.mask_opacity_changed.connect(self.canvas.set_mask_opacity)
         self.toolbar.clear_instance_requested.connect(self.clear_selected_instance)
+        self.toolbar.clear_no_draw_zones_requested.connect(self.on_clear_no_draw_zones)
+        self.toolbar.set_measurement_scale_requested.connect(self.on_set_measurement_scale)
+        self.toolbar.clear_measurement_scale_requested.connect(self.on_clear_measurement_scale)
+        self.toolbar.clear_measurement_line_requested.connect(self.canvas.clear_measurement_line)
+        self.toolbar.imaging_setup_changed.connect(self.on_imaging_setup_changed)
+        self.toolbar.apply_imaging_setup_requested.connect(
+            self.on_imaging_setup_changed
+        )
+        self.toolbar.new_imaging_setup_requested.connect(self.on_new_imaging_setup)
         self.toolbar.new_instance_requested.connect(self.new_instance)
         self.toolbar.detect_aruco_requested.connect(self.on_detect_aruco_in_bees)
         self.toolbar.clear_all_aruco_requested.connect(self.on_clear_all_aruco_tracking)
@@ -261,6 +284,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_annotation_type_visibility('chamber', self.toolbar.show_chambers_checkbox.isChecked(), rebuild=False)
         self.canvas.set_annotation_type_visibility('pollen', self.toolbar.show_pollen_checkbox.isChecked(), rebuild=False)
         self.canvas.set_brush_cursor_preview_enabled(self.toolbar.brush_cursor_checkbox.isChecked())
+        self.toolbar.set_measurement_scale(None)
         
         # Create SAM2 toolbar
         if self.sam2_checkpoint:
@@ -1778,26 +1802,64 @@ class MainWindow(QMainWindow):
             tracks.append(track)
         return tracks
     
-    def on_video_selected(self, row):
-        """Handle video selection from video list"""
-        if row < 0 or row >= self.video_list.count():
+    def _selected_video_ids(self):
+        """Return selected sidebar video IDs in their visible order."""
+        selected_ids = {
+            item.data(Qt.ItemDataRole.UserRole)
+            for item in self.video_list.selectedItems()
+            if item.data(Qt.ItemDataRole.UserRole)
+        }
+        ordered_ids = []
+        for row in range(self.video_list.count()):
+            video_id = self.video_list.item(row).data(Qt.ItemDataRole.UserRole)
+            if video_id in selected_ids:
+                ordered_ids.append(video_id)
+        if not ordered_ids and self.current_video_id:
+            ordered_ids.append(self.current_video_id)
+        return ordered_ids
+
+    def _load_video_list_item(self, item):
+        """Load one sidebar video without changing the batch selection."""
+        if item is None:
             return
-        
-        item = self.video_list.item(row)
-        video_id = item.data(Qt.ItemDataRole.UserRole)  # Store video_id in item data
-        
-        if video_id:
-            # Show loading cursor
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            try:
-                # Load this video's frames
-                self.load_video_frames(video_id)
-            finally:
-                # Restore normal cursor
-                QApplication.restoreOverrideCursor()
-            
-            # Set focus to canvas so keyboard shortcuts work immediately
+        video_id = item.data(Qt.ItemDataRole.UserRole)
+        if not video_id:
+            return
+        if video_id == self.current_video_id:
             self.canvas.setFocus()
+            return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.load_video_frames(video_id)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.canvas.setFocus()
+
+    def on_video_item_clicked(self, item):
+        """Load plain clicks, while Ctrl/Shift clicks only modify selection."""
+        modifiers = QApplication.keyboardModifiers()
+        selection_modifiers = (
+            Qt.KeyboardModifier.ControlModifier |
+            Qt.KeyboardModifier.ShiftModifier
+        )
+        if modifiers & selection_modifiers:
+            selected_count = len(self._selected_video_ids())
+            self.status_label.setText(
+                f"Selected {selected_count} video"
+                f"{'s' if selected_count != 1 else ''} for batch assignment."
+            )
+            return
+        self._load_video_list_item(item)
+
+    def on_video_item_activated(self, item):
+        """Allow Enter or double-click to explicitly load a selected video."""
+        self._load_video_list_item(item)
+
+    def on_video_selected(self, row):
+        """Compatibility entry point for code that loads a sidebar row."""
+        if 0 <= row < self.video_list.count():
+            self._load_video_list_item(self.video_list.item(row))
     
     def on_tracking_filter_changed(self, state):
         """Handle tracking filter checkbox state change"""
@@ -2030,6 +2092,12 @@ class MainWindow(QMainWindow):
             
             if not deleted_video:
                 print(f"Warning: Could not find video file for {video_id} (might have failed to import)")
+
+            self._load_imaging_setup_config()
+            if self.video_imaging_setups.pop(video_id, None) is not None:
+                self._save_imaging_setup_config()
+            self.video_physical_scales.pop(video_id, None)
+            self.video_scale_known_lengths_cm.pop(video_id, None)
             
             # Update video list
             self.update_video_list()
@@ -2050,10 +2118,32 @@ class MainWindow(QMainWindow):
     
     def update_video_list(self):
         """Update the video list with all videos in the project"""
+        selected_video_ids = set()
+        current_list_video_id = None
+        if hasattr(self, 'video_list'):
+            selected_video_ids = {
+                item.data(Qt.ItemDataRole.UserRole)
+                for item in self.video_list.selectedItems()
+                if item.data(Qt.ItemDataRole.UserRole)
+            }
+            current_item = self.video_list.currentItem()
+            if current_item is not None:
+                current_list_video_id = current_item.data(Qt.ItemDataRole.UserRole)
         self.video_list.clear()
         
         if not self.project_path:
             return
+
+        self._load_imaging_setup_config()
+
+        def setup_sort_key(video_id):
+            setup_name = self.video_imaging_setups.get(video_id)
+            return (setup_name is None, (setup_name or "").casefold(), video_id.casefold())
+
+        def video_item_text(split_label, video_id):
+            setup_name = self.video_imaging_setups.get(video_id)
+            setup_suffix = f"  •  {setup_name}" if setup_name else "  •  unassigned"
+            return f"[{split_label}] {video_id}{setup_suffix}"
         
         # Get videos with tracking sequences if filter is enabled
         videos_with_tracking = None
@@ -2065,6 +2155,33 @@ class MainWindow(QMainWindow):
         val_videos = self.project_manager.get_videos_by_split('val')
         test_videos = self.project_manager.get_videos_by_split('test')
         inference_videos = self.project_manager.get_videos_by_split('inference')
+
+        # Restrict the sidebar by split. The mask-only choice follows the
+        # selected-frame metadata used by the annotation export workflow.
+        if self.video_split_filter == 'train':
+            val_videos = []
+            test_videos = []
+            inference_videos = []
+        elif self.video_split_filter == 'val':
+            train_videos = []
+            test_videos = []
+            inference_videos = []
+        elif self.video_split_filter == 'val_masks':
+            train_videos = []
+            val_videos = [
+                video_id for video_id in val_videos
+                if video_has_selected_bee_masks(self.project_path, video_id)
+            ]
+            test_videos = []
+            inference_videos = []
+        elif self.video_split_filter == 'test':
+            train_videos = []
+            val_videos = []
+            inference_videos = []
+        elif self.video_split_filter == 'inference':
+            train_videos = []
+            val_videos = []
+            test_videos = []
         
         # Apply filter if enabled
         if videos_with_tracking is not None:
@@ -2074,11 +2191,12 @@ class MainWindow(QMainWindow):
             inference_videos = [v for v in inference_videos if v in videos_with_tracking]
         
         # Add train videos
-        for video_id in train_videos:
-            item_text = f"[TRAIN] {video_id}"
+        for video_id in sorted(train_videos, key=setup_sort_key):
+            item_text = video_item_text("TRAIN", video_id)
             from PyQt6.QtWidgets import QListWidgetItem
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
+            item.setToolTip(item_text)
             
             # Highlight current video
             if video_id == self.current_video_id:
@@ -2088,13 +2206,14 @@ class MainWindow(QMainWindow):
                 item.setFont(font)
             
             self.video_list.addItem(item)
-        
+
         # Add val videos
-        for video_id in val_videos:
-            item_text = f"[VAL] {video_id}"
+        for video_id in sorted(val_videos, key=setup_sort_key):
+            item_text = video_item_text("VAL", video_id)
             from PyQt6.QtWidgets import QListWidgetItem
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
+            item.setToolTip(item_text)
             
             # Highlight current video
             if video_id == self.current_video_id:
@@ -2104,13 +2223,14 @@ class MainWindow(QMainWindow):
                 item.setFont(font)
             
             self.video_list.addItem(item)
-        
+
         # Add test videos
-        for video_id in test_videos:
-            item_text = f"[TEST] {video_id}"
+        for video_id in sorted(test_videos, key=setup_sort_key):
+            item_text = video_item_text("TEST", video_id)
             from PyQt6.QtWidgets import QListWidgetItem
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
+            item.setToolTip(item_text)
             
             # Highlight current video
             if video_id == self.current_video_id:
@@ -2122,11 +2242,12 @@ class MainWindow(QMainWindow):
             self.video_list.addItem(item)
         
         # Add inference videos
-        for video_id in inference_videos:
-            item_text = f"[INFERENCE] {video_id}"
+        for video_id in sorted(inference_videos, key=setup_sort_key):
+            item_text = video_item_text("INFERENCE", video_id)
             from PyQt6.QtWidgets import QListWidgetItem
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
+            item.setToolTip(item_text)
             
             # Highlight current video
             if video_id == self.current_video_id:
@@ -2136,7 +2257,31 @@ class MainWindow(QMainWindow):
                 item.setFont(font)
             
             self.video_list.addItem(item)
-        
+
+        # Preserve batch selections when labels/sorting are refreshed. The
+        # current video remains the keyboard anchor, but only previously
+        # selected videos are reselected.
+        restore_current_id = current_list_video_id or self.current_video_id
+        self.video_list.blockSignals(True)
+        try:
+            current_item_to_restore = None
+            for index in range(self.video_list.count()):
+                item = self.video_list.item(index)
+                video_id = item.data(Qt.ItemDataRole.UserRole)
+                if video_id == restore_current_id:
+                    current_item_to_restore = item
+                if video_id in selected_video_ids:
+                    item.setSelected(True)
+            if current_item_to_restore is not None:
+                self.video_list.setCurrentItem(current_item_to_restore)
+                for index in range(self.video_list.count()):
+                    item = self.video_list.item(index)
+                    item.setSelected(
+                        item.data(Qt.ItemDataRole.UserRole) in selected_video_ids
+                    )
+        finally:
+            self.video_list.blockSignals(False)
+
     def create_video_list_dock(self):
         """Create dock widget for video list sidebar"""
         self.video_dock = QDockWidget("Project Videos", self)
@@ -2144,11 +2289,28 @@ class MainWindow(QMainWindow):
                                         Qt.DockWidgetArea.RightDockWidgetArea)
         
         # Create container widget with filter controls
-        from PyQt6.QtWidgets import QCheckBox
+        from PyQt6.QtWidgets import QCheckBox, QComboBox
         container = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
+
+        split_filter_layout = QHBoxLayout()
+        split_filter_layout.addWidget(QLabel("Show:"))
+        self.video_split_filter_combo = QComboBox()
+        self.video_split_filter_combo.addItems([
+            'All Videos',
+            'Training Videos',
+            'Validation Videos',
+            'Validation Videos with Masks',
+            'Test Videos',
+            'Inference Videos',
+        ])
+        self.video_split_filter_combo.currentTextChanged.connect(
+            self.on_video_split_filter_changed
+        )
+        split_filter_layout.addWidget(self.video_split_filter_combo)
+        layout.addLayout(split_filter_layout)
         
         # Tracking filter checkbox
         self.tracking_filter_checkbox = QCheckBox("Show only videos with tracking sequences")
@@ -2157,15 +2319,42 @@ class MainWindow(QMainWindow):
         
         # Create video list widget
         self.video_list = QListWidget()
-        self.video_list.currentRowChanged.connect(self.on_video_selected)
+        self.video_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.video_list.itemClicked.connect(self.on_video_item_clicked)
+        self.video_list.itemActivated.connect(self.on_video_item_activated)
         self.video_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.video_list.customContextMenuRequested.connect(self.show_video_context_menu)
         layout.addWidget(self.video_list)
+
+        batch_help = QLabel(
+            "Ctrl-click selects individual videos; Shift-click selects a range. "
+            "Ctrl+A selects all visible videos. Choosing an imaging setup applies "
+            "it to all selected videos."
+        )
+        batch_help.setWordWrap(True)
+        layout.addWidget(batch_help)
         
         container.setLayout(layout)
         self.video_dock.setWidget(container)
         self.video_dock.visibilityChanged.connect(self.on_video_dock_visibility_changed)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.video_dock)
+
+    def on_video_split_filter_changed(self, text):
+        """Filter the project video sidebar by split and mask availability."""
+        filter_map = {
+            'All Videos': 'all',
+            'Training Videos': 'train',
+            'Validation Videos': 'val',
+            'Validation Videos with Masks': 'val_masks',
+            'Test Videos': 'test',
+            'Inference Videos': 'inference',
+        }
+        self.video_split_filter = filter_map.get(text, 'all')
+
+        if self.video_split_filter == 'val_masks' and hasattr(self, 'split_filter_combo'):
+            self.split_filter_combo.setCurrentText('Validation Masks Only')
+
+        self.update_video_list()
     
     def create_frame_list_dock(self):
         """Create dock widget for frame list"""
@@ -2184,7 +2373,14 @@ class MainWindow(QMainWindow):
         filter_layout = QHBoxLayout()
         filter_layout.addWidget(QLabel("Show:"))
         self.split_filter_combo = QComboBox()
-        self.split_filter_combo.addItems(['All Frames', 'Training Only', 'Validation Only', 'Test Only', 'Inference Only'])
+        self.split_filter_combo.addItems([
+            'All Frames',
+            'Training Only',
+            'Validation Only',
+            'Validation Masks Only',
+            'Test Only',
+            'Inference Only',
+        ])
         self.split_filter_combo.currentTextChanged.connect(self.on_split_filter_changed)
         filter_layout.addWidget(self.split_filter_combo)
         layout.addLayout(filter_layout)
@@ -2318,6 +2514,732 @@ class MainWindow(QMainWindow):
                 return None
         
         return None
+
+    def _imaging_setups_path(self):
+        """Return the project-level imaging-setup calibration file."""
+        if not self.project_path:
+            return None
+        return Path(self.project_path) / 'annotations' / 'imaging_setups.json'
+
+    @staticmethod
+    def _valid_pixels_per_cm(value):
+        """Return a finite positive scale, or None for an invalid value."""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if np.isfinite(value) and value > 0 else None
+
+    def _load_imaging_setup_config(self, force=False):
+        """Load named setup profiles and video assignments for this project."""
+        if self._imaging_setups_loaded and not force:
+            return
+
+        self.imaging_setup_profiles = {}
+        self.video_imaging_setups = {}
+        config_path = self._imaging_setups_path()
+        if config_path and config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                raw_setups = config.get('setups', {})
+                raw_assignments = config.get('video_assignments', {})
+                if not isinstance(raw_setups, dict) or not isinstance(raw_assignments, dict):
+                    raise ValueError("setups and video_assignments must be JSON objects")
+
+                for raw_name, raw_profile in raw_setups.items():
+                    name = str(raw_name).strip()
+                    if not name or not isinstance(raw_profile, dict):
+                        continue
+                    profile = dict(raw_profile)
+                    profile['pixels_per_cm'] = self._valid_pixels_per_cm(
+                        profile.get('pixels_per_cm')
+                    )
+                    self.imaging_setup_profiles[name] = profile
+
+                self.video_imaging_setups = {
+                    str(video_id): str(setup_name)
+                    for video_id, setup_name in raw_assignments.items()
+                    if str(setup_name) in self.imaging_setup_profiles
+                }
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                print(f"Warning: Could not load imaging setup calibrations: {e}")
+
+        self._imaging_setups_loaded = True
+
+    def _save_imaging_setup_config(self):
+        """Persist named setup profiles and video assignments atomically."""
+        config_path = self._imaging_setups_path()
+        if config_path is None:
+            return False
+        try:
+            config = {
+                'version': 1,
+                'updated_at': datetime.now().isoformat(),
+                'setups': self.imaging_setup_profiles,
+                'video_assignments': self.video_imaging_setups,
+            }
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_file = config_path.parent / f'.{config_path.name}.tmp'
+            try:
+                with open(temp_file, 'w') as f:
+                    json.dump(config, f, indent=2, sort_keys=True)
+                temp_file.replace(config_path)
+            except Exception:
+                if temp_file.exists():
+                    temp_file.unlink()
+                raise
+            return True
+        except Exception as e:
+            print(f"Warning: Could not save imaging setup calibrations: {e}")
+            return False
+
+    def _reset_imaging_setup_cache(self):
+        """Clear setup state when opening or creating another project."""
+        self.video_physical_scales.clear()
+        self.video_scale_known_lengths_cm.clear()
+        self.imaging_setup_profiles = {}
+        self.video_imaging_setups = {}
+        self._imaging_setups_loaded = False
+        if hasattr(self, 'toolbar'):
+            self.toolbar.set_imaging_setups([], None)
+            self.toolbar.set_measurement_scale(None)
+
+    def _current_imaging_setup(self, video_id=None):
+        """Return the named setup assigned to a video, if any."""
+        self._load_imaging_setup_config()
+        return self.video_imaging_setups.get(video_id or self.current_video_id)
+
+    def _profile_calibration_values(self, setup_name):
+        """Return normalized calibration values for a named setup."""
+        profile = self.imaging_setup_profiles.get(setup_name, {})
+        return {
+            'pixels_per_cm': self._valid_pixels_per_cm(profile.get('pixels_per_cm')),
+            'calibration_line_pixels': profile.get('calibration_line_pixels'),
+            'calibration_distance_cm': profile.get('calibration_distance_cm'),
+            'image_width_pixels': profile.get('image_width_pixels'),
+            'image_height_pixels': profile.get('image_height_pixels'),
+        }
+
+    def _read_video_physical_scale_record(self, video_id):
+        """Read a video's complete legacy/mirrored calibration record."""
+        if not self.project_path or not video_id:
+            return {}
+        metadata_file = self.project_manager.get_frames_dir(video_id) / 'video_metadata.json'
+        if not metadata_file.exists():
+            return {}
+        try:
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+            physical_scale = metadata.get('physical_scale', {})
+            if isinstance(physical_scale, dict):
+                record = dict(physical_scale)
+            else:
+                record = {}
+            if record.get('pixels_per_cm') is None:
+                record['pixels_per_cm'] = metadata.get('pixels_per_cm')
+            return record
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            print(f"Warning: Could not read physical scale for {video_id}: {e}")
+            return {}
+
+    def _load_video_physical_scale(self, video_id, use_cache=True):
+        """Load a video's pixels-per-centimeter calibration from metadata."""
+        if not video_id:
+            return None
+        if use_cache and video_id in self.video_physical_scales:
+            return self.video_physical_scales[video_id]
+
+        pixels_per_cm = None
+        known_length_cm = None
+        if self.project_path:
+            physical_scale = self._read_video_physical_scale_record(video_id)
+            pixels_per_cm = physical_scale.get('pixels_per_cm')
+            known_length_cm = physical_scale.get('calibration_distance_cm')
+
+        try:
+            pixels_per_cm = float(pixels_per_cm)
+            if not np.isfinite(pixels_per_cm) or pixels_per_cm <= 0:
+                pixels_per_cm = None
+        except (TypeError, ValueError):
+            pixels_per_cm = None
+
+        try:
+            known_length_cm = float(known_length_cm)
+            if np.isfinite(known_length_cm) and known_length_cm > 0:
+                self.video_scale_known_lengths_cm[video_id] = known_length_cm
+        except (TypeError, ValueError):
+            pass
+
+        self.video_physical_scales[video_id] = pixels_per_cm
+        return pixels_per_cm
+
+    def _save_video_physical_scale(self, video_id, pixels_per_cm,
+                                   calibration_line_pixels=None,
+                                   calibration_distance_cm=None,
+                                   imaging_setup=None,
+                                   image_width_pixels=None,
+                                   image_height_pixels=None):
+        """Persist or remove video-level physical calibration atomically."""
+        if not self.project_path or not video_id:
+            return False
+
+        metadata_file = self.project_manager.get_frames_dir(video_id) / 'video_metadata.json'
+        try:
+            metadata = {}
+            if metadata_file.exists():
+                try:
+                    with open(metadata_file, 'r') as f:
+                        metadata = json.load(f)
+                except (json.JSONDecodeError, ValueError) as e:
+                    print(f"Warning: Corrupted metadata file, recreating: {e}")
+
+            if imaging_setup:
+                metadata['imaging_setup'] = str(imaging_setup)
+            else:
+                metadata.pop('imaging_setup', None)
+
+            if pixels_per_cm is None:
+                metadata.pop('physical_scale', None)
+                metadata.pop('pixels_per_cm', None)
+            else:
+                if (
+                    (image_width_pixels is None or image_height_pixels is None) and
+                    self.canvas.current_image is not None
+                ):
+                    current_height, current_width = self.canvas.current_image.shape[:2]
+                    image_width_pixels = image_width_pixels or current_width
+                    image_height_pixels = image_height_pixels or current_height
+                metadata['physical_scale'] = {
+                    'pixels_per_cm': float(pixels_per_cm),
+                    'cm_per_pixel': 1.0 / float(pixels_per_cm),
+                    'calibration_line_pixels': (
+                        float(calibration_line_pixels)
+                        if calibration_line_pixels is not None else None
+                    ),
+                    'calibration_distance_cm': (
+                        float(calibration_distance_cm)
+                        if calibration_distance_cm is not None else None
+                    ),
+                    'image_width_pixels': image_width_pixels,
+                    'image_height_pixels': image_height_pixels,
+                    'source': 'imaging_setup' if imaging_setup else 'video_specific',
+                    'imaging_setup': str(imaging_setup) if imaging_setup else None,
+                }
+
+            metadata_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_file = metadata_file.parent / f'.{metadata_file.name}.tmp'
+            try:
+                with open(temp_file, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                temp_file.replace(metadata_file)
+            except Exception:
+                if temp_file.exists():
+                    temp_file.unlink()
+                raise
+            return True
+        except Exception as e:
+            print(f"Warning: Could not save physical scale for {video_id}: {e}")
+            return False
+
+    def _apply_video_physical_scale(self, video_id):
+        """Apply the current video's persisted scale to canvas and toolbar."""
+        self._load_imaging_setup_config()
+        setup_name = self.video_imaging_setups.get(video_id)
+        if setup_name:
+            pixels_per_cm = self._profile_calibration_values(setup_name)[
+                'pixels_per_cm'
+            ]
+            compatible, mismatch_reason = self._setup_matches_current_resolution(
+                setup_name
+            )
+            if not compatible:
+                pixels_per_cm = None
+            self.video_physical_scales[video_id] = pixels_per_cm
+        else:
+            mismatch_reason = None
+            pixels_per_cm = self._load_video_physical_scale(video_id)
+
+        self.canvas.set_pixels_per_cm(pixels_per_cm)
+        self.toolbar.set_imaging_setups(
+            self.imaging_setup_profiles.keys(), setup_name
+        )
+        self.toolbar.set_measurement_scale(pixels_per_cm, setup_name)
+        if mismatch_reason:
+            self.toolbar.measurement_scale_label.setText(
+                f'Setup "{setup_name}": resolution mismatch — pixels only'
+            )
+            self.toolbar.measurement_scale_label.setToolTip(mismatch_reason)
+
+    def _setup_matches_current_resolution(self, setup_name):
+        """Check that a calibrated setup uses the current frame dimensions."""
+        if not self.current_video_id:
+            return True, None
+        return self._setup_matches_video_resolution(
+            setup_name, self.current_video_id
+        )
+
+    def _video_frame_dimensions(self, video_id):
+        """Read a video's native saved-frame dimensions without loading it."""
+        if video_id == self.current_video_id and self.canvas.current_image is not None:
+            image_height, image_width = self.canvas.current_image.shape[:2]
+            return image_width, image_height
+
+        frames_dir = self.project_manager.get_frames_dir(video_id)
+        frame_files = []
+        for pattern in ('frame_*.jpg', 'frame_*.jpeg', 'frame_*.png'):
+            frame_files.extend(frames_dir.glob(pattern))
+        if not frame_files:
+            return None
+        image = cv2.imread(str(sorted(frame_files)[0]), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            return None
+        image_height, image_width = image.shape[:2]
+        return image_width, image_height
+
+    def _setup_matches_video_resolution(self, setup_name, video_id):
+        """Check one video against the resolution stored for a setup."""
+        values = self._profile_calibration_values(setup_name)
+        expected_width = values['image_width_pixels']
+        expected_height = values['image_height_pixels']
+        if expected_width is None or expected_height is None:
+            return True, None
+        dimensions = self._video_frame_dimensions(video_id)
+        if dimensions is None:
+            return True, None
+        current_width, current_height = dimensions
+        if (int(expected_width), int(expected_height)) == dimensions:
+            return True, None
+        return False, (
+            f'Setup "{setup_name}" was calibrated at '
+            f'{expected_width} × {expected_height} pixels, but {video_id} is '
+            f'{current_width} × {current_height} pixels. The same pixels/cm value '
+            "cannot safely be reused at a different resolution."
+        )
+
+    def _mirror_setup_calibration_to_assigned_videos(self, setup_name):
+        """Write an auditable copy of a setup scale into assigned video metadata."""
+        values = self._profile_calibration_values(setup_name)
+        assigned_videos = [
+            video_id
+            for video_id, assigned_setup in self.video_imaging_setups.items()
+            if assigned_setup == setup_name
+        ]
+        saved_count = 0
+        for video_id in assigned_videos:
+            if self._save_video_physical_scale(
+                video_id,
+                values['pixels_per_cm'],
+                calibration_line_pixels=values['calibration_line_pixels'],
+                calibration_distance_cm=values['calibration_distance_cm'],
+                imaging_setup=setup_name,
+                image_width_pixels=values['image_width_pixels'],
+                image_height_pixels=values['image_height_pixels'],
+            ):
+                saved_count += 1
+            self.video_physical_scales[video_id] = values['pixels_per_cm']
+            known_length = values['calibration_distance_cm']
+            if known_length is not None:
+                self.video_scale_known_lengths_cm[video_id] = float(known_length)
+        return saved_count, len(assigned_videos)
+
+    def _assign_videos_to_imaging_setup(self, setup_name, video_ids):
+        """Assign a setup to compatible videos and return assigned/skipped IDs."""
+        values = self._profile_calibration_values(setup_name)
+        assigned_ids = []
+        skipped = []
+        for video_id in video_ids:
+            compatible, reason = self._setup_matches_video_resolution(
+                setup_name, video_id
+            )
+            if not compatible:
+                skipped.append((video_id, reason))
+                continue
+
+            self.video_imaging_setups[video_id] = setup_name
+            self._save_video_physical_scale(
+                video_id,
+                values['pixels_per_cm'],
+                calibration_line_pixels=values['calibration_line_pixels'],
+                calibration_distance_cm=values['calibration_distance_cm'],
+                imaging_setup=setup_name,
+                image_width_pixels=values['image_width_pixels'],
+                image_height_pixels=values['image_height_pixels'],
+            )
+            self.video_physical_scales[video_id] = values['pixels_per_cm']
+            known_length = values['calibration_distance_cm']
+            if known_length is not None:
+                self.video_scale_known_lengths_cm[video_id] = float(known_length)
+            else:
+                self.video_scale_known_lengths_cm.pop(video_id, None)
+            assigned_ids.append(video_id)
+        return assigned_ids, skipped
+
+    def _show_batch_resolution_warning(self, setup_name, skipped):
+        """Summarize videos omitted from a batch due to resolution mismatch."""
+        if not skipped:
+            return
+        video_lines = "\n".join(f"• {video_id}" for video_id, _ in skipped)
+        first_reason = skipped[0][1]
+        QMessageBox.warning(
+            self,
+            "Some Videos Were Skipped",
+            f'The following videos were not assigned to "{setup_name}" because '
+            f"their saved-frame resolution does not match the setup:\n\n"
+            f"{video_lines}\n\n{first_reason}"
+        )
+
+    def on_new_imaging_setup(self):
+        """Create a named setup and assign all selected videos to it."""
+        if not self.project_path or not self.current_video_id:
+            QMessageBox.information(
+                self,
+                "Open a Project Video",
+                "Open a project video before creating an imaging setup."
+            )
+            return
+
+        self._load_imaging_setup_config()
+        setup_name, accepted = QInputDialog.getText(
+            self,
+            "New Imaging Setup",
+            "Setup name (for example, D2024 paired microcolonies):"
+        )
+        setup_name = setup_name.strip()
+        if not accepted or not setup_name:
+            self._apply_video_physical_scale(self.current_video_id)
+            return
+
+        existing_names = {
+            name.casefold(): name for name in self.imaging_setup_profiles
+        }
+        if setup_name.casefold() in existing_names:
+            existing_name = existing_names[setup_name.casefold()]
+            QMessageBox.information(
+                self,
+                "Setup Already Exists",
+                f'An imaging setup named "{existing_name}" already exists. '
+                "Select it from the setup list instead."
+            )
+            self._apply_video_physical_scale(self.current_video_id)
+            return
+
+        target_video_ids = self._selected_video_ids()
+
+        previous_setup = self.video_imaging_setups.get(self.current_video_id)
+        inherited_scale = (
+            self.canvas.pixels_per_cm if previous_setup is None else None
+        )
+        inherited_record = (
+            self._read_video_physical_scale_record(self.current_video_id)
+            if inherited_scale is not None else {}
+        )
+        inherited_known_length = inherited_record.get('calibration_distance_cm')
+        inherited_line_length = inherited_record.get('calibration_line_pixels')
+        image_height = None
+        image_width = None
+        if self.canvas.current_image is not None:
+            image_height, image_width = self.canvas.current_image.shape[:2]
+        timestamp = datetime.now().isoformat()
+        self.imaging_setup_profiles[setup_name] = {
+            'pixels_per_cm': inherited_scale,
+            'cm_per_pixel': (
+                1.0 / inherited_scale if inherited_scale is not None else None
+            ),
+            'created_at': timestamp,
+            'updated_at': timestamp,
+            'calibration_video_id': (
+                self.current_video_id if inherited_scale is not None else None
+            ),
+            'calibration_line_pixels': inherited_line_length,
+            'calibration_distance_cm': inherited_known_length,
+            'image_width_pixels': (
+                inherited_record.get('image_width_pixels', image_width)
+                if inherited_scale is not None else None
+            ),
+            'image_height_pixels': (
+                inherited_record.get('image_height_pixels', image_height)
+                if inherited_scale is not None else None
+            ),
+            'calibration_source': (
+                'migrated_video_specific' if inherited_scale is not None else None
+            ),
+        }
+        assigned_ids, skipped = self._assign_videos_to_imaging_setup(
+            setup_name, target_video_ids
+        )
+        self._save_imaging_setup_config()
+        self._apply_video_physical_scale(self.current_video_id)
+        self.update_video_list()
+        assignment_note = (
+            f"assigned {len(assigned_ids)} selected video"
+            f"{'s' if len(assigned_ids) != 1 else ''}"
+        )
+        if inherited_scale is not None:
+            self.status_label.setText(
+                f'Created setup "{setup_name}", {assignment_note}, '
+                f"and retained its existing {inherited_scale:.3f} px/cm calibration."
+            )
+        else:
+            self.status_label.setText(
+                f'Created setup "{setup_name}" and {assignment_note}. '
+                "Draw a known-length line and choose Set Scale from Line."
+            )
+        self._show_batch_resolution_warning(setup_name, skipped)
+
+    def on_imaging_setup_changed(self, setup_name):
+        """Assign all selected videos to a setup selected in the toolbar."""
+        if not self.project_path or not self.current_video_id:
+            self._apply_video_physical_scale(self.current_video_id)
+            return
+
+        self._load_imaging_setup_config()
+        setup_name = str(setup_name).strip()
+        target_video_ids = self._selected_video_ids()
+        if setup_name and setup_name not in self.imaging_setup_profiles:
+            self._apply_video_physical_scale(self.current_video_id)
+            return
+
+        if setup_name:
+            if all(
+                self.video_imaging_setups.get(video_id) == setup_name
+                for video_id in target_video_ids
+            ):
+                return
+            assigned_ids, skipped = self._assign_videos_to_imaging_setup(
+                setup_name, target_video_ids
+            )
+        else:
+            assigned_ids = []
+            skipped = []
+            for video_id in target_video_ids:
+                previous_setup = self.video_imaging_setups.get(video_id)
+                if not previous_setup:
+                    continue
+                previous_values = self._profile_calibration_values(previous_setup)
+                self.video_imaging_setups.pop(video_id, None)
+                retained_scale = previous_values.get('pixels_per_cm')
+                self._save_video_physical_scale(
+                    video_id,
+                    retained_scale,
+                    calibration_line_pixels=previous_values.get(
+                        'calibration_line_pixels'
+                    ),
+                    calibration_distance_cm=previous_values.get(
+                        'calibration_distance_cm'
+                    ),
+                    image_width_pixels=previous_values.get('image_width_pixels'),
+                    image_height_pixels=previous_values.get('image_height_pixels'),
+                )
+                self.video_physical_scales[video_id] = retained_scale
+                retained_known_length = previous_values.get(
+                    'calibration_distance_cm'
+                )
+                if retained_known_length is not None:
+                    self.video_scale_known_lengths_cm[video_id] = float(
+                        retained_known_length
+                    )
+                else:
+                    self.video_scale_known_lengths_cm.pop(video_id, None)
+                assigned_ids.append(video_id)
+
+            if not assigned_ids:
+                return
+
+        self._save_imaging_setup_config()
+        self._apply_video_physical_scale(self.current_video_id)
+        self.update_video_list()
+        if setup_name:
+            pixels_per_cm = self._profile_calibration_values(setup_name)[
+                'pixels_per_cm'
+            ]
+            if pixels_per_cm:
+                scale_note = f" using {pixels_per_cm:.3f} px/cm"
+            else:
+                scale_note = "; this setup still needs calibration"
+            plural_suffix = 's' if len(assigned_ids) != 1 else ''
+            self.status_label.setText(
+                f'Assigned {len(assigned_ids)} selected video'
+                f'{plural_suffix} to '
+                f'"{setup_name}"{scale_note}.'
+            )
+            self._show_batch_resolution_warning(setup_name, skipped)
+        else:
+            self.status_label.setText(
+                f"Removed the imaging-setup assignment for {len(assigned_ids)} "
+                f"selected video{'s' if len(assigned_ids) != 1 else ''}. "
+                "Any inherited scale values were retained as video-specific "
+                "calibrations."
+            )
+
+    def on_measurement_line_completed(self, length_pixels):
+        """Report a completed temporary ruler measurement."""
+        if self.canvas.pixels_per_cm:
+            length_cm = length_pixels / self.canvas.pixels_per_cm
+            self.status_label.setText(
+                f"Measured line: {length_pixels:.1f} px = {length_cm:.3f} cm"
+            )
+        else:
+            self.status_label.setText(
+                f"Measured line: {length_pixels:.1f} px. "
+                "Choose Set Scale from Line to assign its known length in cm."
+            )
+
+    def on_set_measurement_scale(self):
+        """Calibrate the current video's setup, or the video itself if unassigned."""
+        length_pixels = self.canvas.get_measurement_pixel_length()
+        if length_pixels <= 0:
+            QMessageBox.information(
+                self,
+                "Draw a Measurement Line",
+                "Choose the Measure tool and drag a line over an object of known "
+                "length before setting the scale."
+            )
+            return
+
+        setup_name = self._current_imaging_setup()
+        setup_values = (
+            self._profile_calibration_values(setup_name) if setup_name else {}
+        )
+        default_cm = setup_values.get('calibration_distance_cm')
+        if default_cm is None:
+            default_cm = self.video_scale_known_lengths_cm.get(
+                self.current_video_id, 1.0
+            )
+        known_length_cm, accepted = QInputDialog.getDouble(
+            self,
+            "Set Physical Scale",
+            f"The current line is {length_pixels:.1f} pixels long.\n"
+            "Enter the physical length represented by this line (cm):",
+            default_cm,
+            0.000001,
+            1000000.0,
+            6
+        )
+        if not accepted:
+            return
+
+        pixels_per_cm = length_pixels / known_length_cm
+        if setup_name:
+            assigned_count = sum(
+                assigned_setup == setup_name
+                for assigned_setup in self.video_imaging_setups.values()
+            )
+            old_scale = setup_values.get('pixels_per_cm')
+            if old_scale is not None and assigned_count > 1:
+                reply = QMessageBox.question(
+                    self,
+                    "Update Shared Setup Scale?",
+                    f'This will update setup "{setup_name}" from '
+                    f'{old_scale:.3f} to {pixels_per_cm:.3f} px/cm for '
+                    f"all {assigned_count} assigned videos. Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+        self.canvas.set_pixels_per_cm(pixels_per_cm)
+        self.toolbar.set_measurement_scale(pixels_per_cm, setup_name)
+        if setup_name:
+            image_height = None
+            image_width = None
+            if self.canvas.current_image is not None:
+                image_height, image_width = self.canvas.current_image.shape[:2]
+            profile = self.imaging_setup_profiles[setup_name]
+            profile.update({
+                'pixels_per_cm': float(pixels_per_cm),
+                'cm_per_pixel': 1.0 / float(pixels_per_cm),
+                'calibration_video_id': self.current_video_id,
+                'calibration_line_pixels': float(length_pixels),
+                'calibration_distance_cm': float(known_length_cm),
+                'image_width_pixels': image_width,
+                'image_height_pixels': image_height,
+                'calibration_source': 'ruler_line',
+                'updated_at': datetime.now().isoformat(),
+            })
+            config_saved = self._save_imaging_setup_config()
+            saved_count, assigned_count = (
+                self._mirror_setup_calibration_to_assigned_videos(setup_name)
+            )
+            self.status_label.setText(
+                f'Calibrated setup "{setup_name}": {pixels_per_cm:.3f} px/cm; '
+                f"applied to {saved_count}/{assigned_count} assigned videos"
+                f"{' and saved project setup data' if config_saved else ''}."
+            )
+        else:
+            if self.current_video_id:
+                self.video_physical_scales[self.current_video_id] = pixels_per_cm
+                self.video_scale_known_lengths_cm[self.current_video_id] = known_length_cm
+            saved = self._save_video_physical_scale(
+                self.current_video_id,
+                pixels_per_cm,
+                calibration_line_pixels=length_pixels,
+                calibration_distance_cm=known_length_cm
+            )
+            save_note = "saved for this video" if saved else "active for this session"
+            self.status_label.setText(
+                f"Video-specific physical scale {save_note}: "
+                f"{pixels_per_cm:.3f} px/cm "
+                f"(1 px = {1.0 / pixels_per_cm:.6f} cm)"
+            )
+
+    def on_clear_measurement_scale(self):
+        """Clear a shared setup calibration or a video-specific calibration."""
+        setup_name = self._current_imaging_setup()
+        if setup_name:
+            assigned_count = sum(
+                assigned_setup == setup_name
+                for assigned_setup in self.video_imaging_setups.values()
+            )
+            reply = QMessageBox.question(
+                self,
+                "Clear Shared Setup Scale?",
+                f'This will clear the calibration for setup "{setup_name}" and '
+                f"all {assigned_count} assigned video"
+                f"{'s' if assigned_count != 1 else ''}. The setup assignments "
+                "will be retained. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            profile = self.imaging_setup_profiles[setup_name]
+            profile.update({
+                'pixels_per_cm': None,
+                'cm_per_pixel': None,
+                'calibration_video_id': None,
+                'calibration_line_pixels': None,
+                'calibration_distance_cm': None,
+                'image_width_pixels': None,
+                'image_height_pixels': None,
+                'calibration_source': None,
+                'updated_at': datetime.now().isoformat(),
+            })
+            self._save_imaging_setup_config()
+            saved_count, _ = self._mirror_setup_calibration_to_assigned_videos(
+                setup_name
+            )
+            self.canvas.set_pixels_per_cm(None)
+            self.toolbar.set_measurement_scale(None, setup_name)
+            self.status_label.setText(
+                f'Cleared the scale for setup "{setup_name}" in '
+                f"{saved_count} assigned video metadata files."
+            )
+            return
+
+        self.canvas.set_pixels_per_cm(None)
+        self.toolbar.set_measurement_scale(None)
+        if self.current_video_id:
+            self.video_physical_scales[self.current_video_id] = None
+            self.video_scale_known_lengths_cm.pop(self.current_video_id, None)
+        removed = self._save_video_physical_scale(self.current_video_id, None)
+        if removed:
+            self.status_label.setText(
+                "Cleared the saved physical scale for this video; measurements show pixels only."
+            )
+        else:
+            self.status_label.setText("Cleared the physical scale for this session.")
     
     def _save_max_mask_id_to_metadata(self, video_id, max_mask_id):
         """
@@ -2725,6 +3647,8 @@ class MainWindow(QMainWindow):
             self.split_filter = 'train'
         elif text == 'Validation Only':
             self.split_filter = 'val'
+        elif text == 'Validation Masks Only':
+            self.split_filter = 'val_masks'
         elif text == 'Test Only':
             self.split_filter = 'test'
         elif text == 'Inference Only':
@@ -2739,6 +3663,7 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             project_info = dialog.get_project_info()
             project_name = project_info['name']
+            self._reset_imaging_setup_cache()
             
             # Create project in a subfolder with the project name
             base_path = Path(project_info['path'])
@@ -2774,6 +3699,7 @@ class MainWindow(QMainWindow):
     def load_project(self, path):
         """Load a project from path"""
         self.project_path = Path(path)
+        self._reset_imaging_setup_cache()
         
         # Set project path in ProjectManager
         self.project_manager.project_path = self.project_path
@@ -2920,6 +3846,7 @@ class MainWindow(QMainWindow):
                 # Load existing project
                 try:
                     self.project_path = project_dir
+                    self._reset_imaging_setup_cache()
                     self.annotation_manager.load_project(project_dir)
                     self.load_frames_from_project()
                     
@@ -2949,6 +3876,7 @@ class MainWindow(QMainWindow):
             (project_dir / 'annotations').mkdir(exist_ok=True)
             
             self.project_path = project_dir
+            self._reset_imaging_setup_cache()
             
             # Initialize annotation manager with new project
             self.annotation_manager.new_project({
@@ -3171,7 +4099,9 @@ class MainWindow(QMainWindow):
             progress.setLabelText(f"Loading video {video_id}... (loading first frame)")
             QApplication.processEvents()
             
-            if self.frames:
+            if self.frame_list_to_frames_map:
+                self.load_frame(self.frame_list_to_frames_map[0])
+            elif self.frames:
                 self.load_frame(0)
             
             self.status_label.setText(
@@ -3235,7 +4165,28 @@ class MainWindow(QMainWindow):
                 continue
             elif self.split_filter == 'val' and (not is_selected or split != 'val'):
                 continue
+            elif self.split_filter == 'val_masks':
+                video_id = (
+                    self.frame_video_ids[i]
+                    if i < len(self.frame_video_ids)
+                    else self.current_video_id
+                )
+                try:
+                    frame_idx_in_video = int(Path(frame_path).stem.split('_')[1])
+                except (ValueError, IndexError):
+                    frame_idx_in_video = i
+                if (
+                    not is_selected
+                    or split != 'val'
+                    or not video_id
+                    or not frame_has_bee_mask_annotation(
+                        self.project_path, video_id, frame_idx_in_video
+                    )
+                ):
+                    continue
             elif self.split_filter == 'test' and (not is_selected or split != 'test'):
+                continue
+            elif self.split_filter == 'inference' and (not is_selected or split != 'inference'):
                 continue
             
             # Create label with split indicator (only for selected frames)
@@ -3368,6 +4319,7 @@ class MainWindow(QMainWindow):
             try:
                 # Pass frame to canvas (can be path or array)
                 self.canvas.load_image(image_to_load, preserve_view=preserve_canvas_view)
+                self._apply_video_physical_scale(self.current_video_id)
                 
                 # Force garbage collection after loading to free memory from old frame
                 import gc
@@ -3591,6 +4543,32 @@ class MainWindow(QMainWindow):
         # When switching to SAM2 tools, uncheck annotation toolbar buttons
         if tool_name in ['sam2_prompt', 'sam2_box']:
             self.toolbar.uncheck_all_tools()
+
+        if tool_name == 'no_draw_zone':
+            self.status_label.setText(
+                "No Draw Zone: click polygon vertices; double-click or Enter to close; "
+                "Backspace/right-click undoes a vertex; Esc cancels the open polygon"
+            )
+        elif tool_name == 'measure':
+            if self.canvas.pixels_per_cm:
+                scale_text = f"{self.canvas.pixels_per_cm:.3f} px/cm"
+            else:
+                scale_text = "not calibrated; pixels only"
+            self.status_label.setText(
+                f"Measure: click and drag a line ({scale_text}). "
+                "Use Set Scale from Line for a known distance."
+            )
+
+    def on_clear_no_draw_zones(self):
+        """Remove current-frame brush protection guides."""
+        removed_count = self.canvas.clear_no_draw_zones()
+        if removed_count:
+            self.status_label.setText(
+                f"Cleared {removed_count} No Draw Zone"
+                f"{'s' if removed_count != 1 else ''}"
+            )
+        else:
+            self.status_label.setText("No completed No Draw Zones to clear")
 
     def on_brush_size_step_requested(self, direction):
         """Handle +/- keyboard shortcuts for brush and eraser size."""
@@ -8232,8 +9210,10 @@ class MainWindow(QMainWindow):
                 item = self.video_list.item(i)
                 video_id = item.data(Qt.ItemDataRole.UserRole)
                 if video_id == self.last_video_id:
-                    # Found the video - select it (this will load the video's frames)
+                    # Found the video. Programmatic selection does not emit the
+                    # click signal, so load it explicitly.
                     self.video_list.setCurrentRow(i)
+                    self.load_video_frames(video_id)
                     # After video loads, find and load the correct frame within the video
                     if hasattr(self, 'last_frame_index_in_video'):
                         # Find the frame in self.frames that matches the saved frame index
