@@ -34,7 +34,7 @@ class BatchInferenceConfigDialog(QDialog):
             "Run inference on PNG images from a folder.\n\n"
             "This will:\n"
             "• Discover all PNG images recursively in the selected folder\n"
-            "• Run bee detection, and optionally hive/chamber segmentation\n"
+            "• Run bee detection, and optionally hive/chamber/pollen segmentation\n"
             "• Generate detailed CSV reports with predictions\n"
             "• Optionally export annotations and visualizations\n"
         )
@@ -126,6 +126,23 @@ class BatchInferenceConfigDialog(QDialog):
         hive_layout.addWidget(self.hive_clear_btn)
         
         optional_layout.addRow("Hive Model:", hive_layout)
+
+        # Pollen model (optional)
+        pollen_layout = QHBoxLayout()
+        self.pollen_model_edit = QLineEdit()
+        self.pollen_model_edit.setPlaceholderText("Optional: Select YOLO pollen segmentation model...")
+        self.pollen_model_edit.setReadOnly(True)
+        pollen_layout.addWidget(self.pollen_model_edit)
+
+        self.pollen_browse_btn = QPushButton("Browse...")
+        self.pollen_browse_btn.clicked.connect(self.browse_pollen_model)
+        pollen_layout.addWidget(self.pollen_browse_btn)
+
+        self.pollen_clear_btn = QPushButton("Clear")
+        self.pollen_clear_btn.clicked.connect(lambda: self.pollen_model_edit.clear())
+        pollen_layout.addWidget(self.pollen_clear_btn)
+
+        optional_layout.addRow("Pollen Model:", pollen_layout)
         
         # Chamber model (optional)
         chamber_layout = QHBoxLayout()
@@ -197,7 +214,7 @@ class BatchInferenceConfigDialog(QDialog):
         
         self.save_visualizations_check = QCheckBox("Save visualization images")
         self.save_visualizations_check.setChecked(True)
-        self.save_visualizations_check.setToolTip("Save images with color-coded bounding boxes and hive/chamber outlines")
+        self.save_visualizations_check.setToolTip("Save images with color-coded bounding boxes, hive/chamber/pollen outlines, and distance links")
         output_layout.addWidget(self.save_visualizations_check)
         
         self.debug_mode_check = QCheckBox("Debug mode (process first image only)")
@@ -266,6 +283,18 @@ class BatchInferenceConfigDialog(QDialog):
         
         if file_path:
             self.hive_model_edit.setText(file_path)
+
+    def browse_pollen_model(self):
+        """Browse for YOLO pollen segmentation model"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select YOLO Pollen Segmentation Model",
+            str(Path.home()),
+            "PyTorch Model Files (*.pt);;All Files (*)"
+        )
+
+        if file_path:
+            self.pollen_model_edit.setText(file_path)
     
     def browse_chamber_model(self):
         """Browse for YOLO chamber segmentation model"""
@@ -306,6 +335,18 @@ class BatchInferenceConfigDialog(QDialog):
         if not bbox_model_path.exists():
             QMessageBox.warning(self, "Invalid Model", "Bee detection model file does not exist.")
             return
+
+        if self.hive_model_edit.text() and not Path(self.hive_model_edit.text()).exists():
+            QMessageBox.warning(self, "Invalid Model", "Hive segmentation model file does not exist.")
+            return
+
+        if self.pollen_model_edit.text() and not Path(self.pollen_model_edit.text()).exists():
+            QMessageBox.warning(self, "Invalid Model", "Pollen segmentation model file does not exist.")
+            return
+
+        if self.chamber_model_edit.text() and not Path(self.chamber_model_edit.text()).exists():
+            QMessageBox.warning(self, "Invalid Model", "Chamber segmentation model file does not exist.")
+            return
         
         # Build config
         # Extract distance method from combo box (format: "method_name (description)")
@@ -317,6 +358,7 @@ class BatchInferenceConfigDialog(QDialog):
             'bbox_model': bbox_model_path,
             'bee_model_type': 'segmentation' if self.seg_radio.isChecked() else 'bbox',
             'hive_model': Path(self.hive_model_edit.text()) if self.hive_model_edit.text() else None,
+            'pollen_model': Path(self.pollen_model_edit.text()) if self.pollen_model_edit.text() else None,
             'chamber_model': Path(self.chamber_model_edit.text()) if self.chamber_model_edit.text() else None,
             'conf_threshold': self.conf_threshold_spin.value(),
             'distance_method': distance_method,

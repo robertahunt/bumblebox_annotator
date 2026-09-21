@@ -144,6 +144,70 @@ class EditingToolTests(unittest.TestCase):
         self.assertEqual(canvas.editing_mask[50, 25], 0)
         self.assertEqual(canvas.editing_mask[50, 50], 255)
 
+    def test_fill_respects_protection_and_supports_undo_redo(self):
+        canvas = self.make_canvas()
+        canvas.editing_mask[20:80, 20:80] = 255
+        canvas.editing_mask[30:70, 30:70] = 0
+        self.add_square_zone(canvas)
+        original = canvas.editing_mask.copy()
+        self.assertTrue(canvas.fill_enclosed_region_at(QPointF(35, 35)))
+        self.assertEqual(canvas.editing_mask[35, 35], 255)
+        self.assertEqual(canvas.editing_mask[50, 50], 0)
+        filled = canvas.editing_mask.copy()
+        canvas.undo()
+        np.testing.assert_array_equal(canvas.editing_mask, original)
+        canvas.redo()
+        np.testing.assert_array_equal(canvas.editing_mask, filled)
+
+    def test_subtract_preserves_protected_pixels_and_other_components(self):
+        canvas = self.make_canvas()
+        canvas.editing_mask[20:80, 20:80] = 255
+        canvas.editing_mask[5:10, 5:10] = 255
+        self.add_square_zone(canvas)
+        original = canvas.editing_mask.copy()
+        self.assertTrue(canvas.subtract_enclosed_region_at(QPointF(25, 25)))
+        self.assertEqual(canvas.editing_mask[25, 25], 0)
+        self.assertEqual(canvas.editing_mask[50, 50], 255)
+        self.assertEqual(canvas.editing_mask[7, 7], 255)
+        canvas.undo()
+        np.testing.assert_array_equal(canvas.editing_mask, original)
+
+    def test_space_toggle_preserves_class_instance_and_bbox_switches(self):
+        canvas = self.make_canvas(initial_value=255)
+        canvas.set_annotation_type_visibility('bee', False)
+        canvas.set_instance_visible(2, 'pollen', False)
+        canvas.set_annotation_overlay_visibility(True, False)
+        hidden = canvas.hidden_instance_keys.copy()
+        canvas.toggle_annotation_overlays()
+        self.assertFalse(canvas.show_segmentations)
+        self.assertFalse(canvas.show_bboxes)
+        canvas.toggle_annotation_overlays()
+        self.assertTrue(canvas.show_segmentations)
+        self.assertFalse(canvas.show_bboxes)
+        self.assertFalse(canvas.annotation_type_visibility['bee'])
+        self.assertEqual(canvas.hidden_instance_keys, hidden)
+
+    def test_individual_switch_cannot_override_hidden_class(self):
+        canvas = self.make_canvas()
+        canvas.set_annotation_type_visibility('bee', False)
+        canvas.set_instance_visible(1, 'bee', True)
+        self.assertFalse(canvas.is_annotation_instance_visible(1, 'bee'))
+        canvas.set_annotation_type_visibility('bee', True)
+        self.assertTrue(canvas.is_annotation_instance_visible(1, 'bee'))
+
+    def test_loading_next_image_preserves_zoom_and_position(self):
+        canvas = ImageCanvas()
+        canvas.resize(500, 500)
+        canvas.load_image(np.zeros((1000, 1000), dtype=np.uint8))
+        canvas.show()
+        self.app.processEvents()
+        canvas.scale(3, 3)
+        canvas.centerOn(QPointF(700, 650))
+        before = canvas.get_view_state()
+        canvas.load_image(np.ones((1000, 1000), dtype=np.uint8), preserve_view=True)
+        after = canvas.get_view_state()
+        self.assertEqual(before, after)
+
     def test_can_switch_instances_after_erasing_active_mask_entirely(self):
         canvas = ImageCanvas()
         canvas.resize(500, 500)

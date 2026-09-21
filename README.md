@@ -30,6 +30,8 @@ pip install -r requirements.txt
 python main.py
 ```
 
+Proposed reusable arena editing, chamber-position review, and image alignment tools are described in the [arena review work-in-progress outline](docs/wip/arena_review/README.md).
+
 ## Project Structure
 
 ```

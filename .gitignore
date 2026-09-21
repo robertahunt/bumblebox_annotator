@@ -2,6 +2,19 @@
 projects/
 input_data/
 
+# New local run lists and experiment-specific metadata
+/local_run_manifests/
+
+# Local integration worktrees
+/.worktrees/
+
+# Generated colony-20 review masks, overlays, and analysis tables
+colony20_outputs/
+
+# Local social-responsiveness analysis and its dedicated tests
+/social_responsiveness/
+/tests/test_social_responsiveness.py
+
 # Python
 __pycache__/
 *.py[cod]

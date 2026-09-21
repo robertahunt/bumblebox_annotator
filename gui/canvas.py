@@ -15,6 +15,7 @@ from PyQt6.QtGui import (QPixmap, QImage, QPen, QBrush, QColor, QPainter,
 from pathlib import Path
 import cv2
 import time
+from core.mask_editing import enclosed_mask_region
 
 
 class OutwardBBoxRectItem(QGraphicsRectItem):
@@ -2509,27 +2510,11 @@ class ImageCanvas(QGraphicsView):
             print("Fill skipped: click inside the unfilled enclosed area, not on the outline.")
             return False
 
-        # Flood-fill the blank component under the cursor. Existing mask pixels
-        # are boundaries; 128 marks the candidate fill region. Use 8-connected
-        # fill so diagonal slivers along thick brush outlines are included.
-        flood_source = self.editing_mask.copy()
-        flood_source[flood_source > 0] = 255
-        flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-        cv2.floodFill(flood_source, flood_mask, (x, y), 128, flags=8)
-        fill_region = flood_source == 128
-
-        if not np.any(fill_region):
-            print("Fill skipped: no fillable region found.")
-            return False
-
-        touches_image_edge = (
-            np.any(fill_region[0, :]) or
-            np.any(fill_region[-1, :]) or
-            np.any(fill_region[:, 0]) or
-            np.any(fill_region[:, -1])
+        fill_region = enclosed_mask_region(
+            self.editing_mask, (x, y), protected_mask=self.no_draw_zone_mask
         )
-        if touches_image_edge:
-            print("Fill skipped: the clicked region is not fully enclosed.")
+        if fill_region is None:
+            print("Fill skipped: the clicked region is open or protected.")
             return False
 
         self._push_current_brush_undo_snapshot()
@@ -2573,27 +2558,12 @@ class ImageCanvas(QGraphicsView):
             print("Subtract skipped: click inside the filled area to remove, not on the erased outline.")
             return False
 
-        # Flood-fill the filled component under the cursor. Blank pixels are
-        # boundaries; 128 marks the candidate region to subtract. Use the same
-        # 8-connected behavior as fill for diagonal brush-edge slivers.
-        flood_source = self.editing_mask.copy()
-        flood_source[flood_source > 0] = 255
-        flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-        cv2.floodFill(flood_source, flood_mask, (x, y), 128, flags=8)
-        subtract_region = flood_source == 128
-
-        if not np.any(subtract_region):
-            print("Subtract skipped: no filled region found.")
-            return False
-
-        touches_image_edge = (
-            np.any(subtract_region[0, :]) or
-            np.any(subtract_region[-1, :]) or
-            np.any(subtract_region[:, 0]) or
-            np.any(subtract_region[:, -1])
+        subtract_region = enclosed_mask_region(
+            self.editing_mask, (x, y), filled=True,
+            protected_mask=self.no_draw_zone_mask,
         )
-        if touches_image_edge:
-            print("Subtract skipped: the clicked region is not fully enclosed.")
+        if subtract_region is None:
+            print("Subtract skipped: the clicked region is open or protected.")
             return False
 
         current_pixels = self.editing_mask > 0
