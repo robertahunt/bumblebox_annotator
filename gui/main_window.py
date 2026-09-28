@@ -26,7 +26,7 @@ from .yolo_bbox_toolbar import YOLOBBoxToolbar
 from .hive_chamber_toolbar import HiveChamberToolbar
 from .sam2_toolbar import SAM2Toolbar
 from .sam2_training_dialog import SAM2TrainingConfigDialog
-from .dialogs import VideoImportDialog, ProjectDialog
+from .dialogs import VideoImportDialog, ProjectDialog, ProjectVideoImportDialog
 from .training_dialog import TrainingConfigDialog, TrainingProgressDialog
 from .validation_dialog import ValidationConfigDialog, ValidationProgressDialog
 from .validation_worker import ValidationWorker
@@ -3847,8 +3847,6 @@ class MainWindow(QMainWindow):
             )
             return
         
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QComboBox, QPushButton, QSpinBox
-        
         # Select video file
         video_path, _ = QFileDialog.getOpenFileName(
             self, "Select Video to Add", "",
@@ -3858,47 +3856,9 @@ class MainWindow(QMainWindow):
         if not video_path:
             return
         
-        # Create dialog for settings
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Add Video to Project")
-        layout = QVBoxLayout()
-        
-        # Split selector
-        from PyQt6.QtWidgets import QLabel
-        layout.addWidget(QLabel("Select split:"))
-        split_combo = QComboBox()
-        split_combo.addItems(['train', 'val', 'test', 'inference'])
-        layout.addWidget(split_combo)
-        
-        # Frames for training/validation/test/inference selector
-        layout.addWidget(QLabel("Number of frames to select:"))
-        frames_spin = QSpinBox()
-        frames_spin.setMinimum(1)
-        frames_spin.setMaximum(1000)
-        frames_spin.setValue(15)
-        layout.addWidget(frames_spin)
-        
-        # Info text
-        info_label = QLabel("All frames will be extracted, but only selected frames\nwill be marked for the chosen split.")
-        info_label.setStyleSheet("color: gray; font-style: italic;")
-        layout.addWidget(info_label)
-        
-        # Buttons
-        from PyQt6.QtWidgets import QDialogButtonBox
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | 
-            QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        
-        dialog.setLayout(layout)
-        
+        dialog = ProjectVideoImportDialog(self)
         if dialog.exec():
-            split = split_combo.currentText()
-            n_selected = frames_spin.value()
-            self.add_video_to_project(video_path, split, n_selected)
+            self.add_video_to_project(video_path, **dialog.get_settings())
             
     def load_video(self, video_path):
         """Load video and extract frames, or load existing project if available"""
@@ -3994,14 +3954,16 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Failed to extract frames: {str(e)}")
                 self.status_label.setText("Ready")
     
-    def add_video_to_project(self, video_path, split='train', n_selected=15):
+    def add_video_to_project(self, video_path, split='train', n_selected=15,
+                             extract_all=True):
         """
-        Add a video to project and extract all frames
+        Copy a video to the project and extract selected frames (or all frames).
         
         Args:
             video_path: Path to video file
-            split: 'train', 'val', or 'test'
+            split: 'train', 'val', 'test', or 'inference'
             n_selected: Number of frames to mark for the chosen split
+            extract_all: Also extract frames outside the selected subset
         """
         if not self.project_path:
             QMessageBox.warning(self, "No Project", "Please create or open a project first")
@@ -4037,18 +3999,20 @@ class MainWindow(QMainWindow):
             if not metadata:
                 raise ValueError(f"Could not read video metadata for {video_id}")
             
-            # Extract ALL frames
             total_frames = metadata['total_frames']
-            frame_indices = list(range(total_frames))
+            if total_frames <= 0:
+                raise ValueError(f"No readable frames found in {video_id}")
+            selected_indices = self.project_manager.select_frames_uniform(
+                total_frames, n_selected
+            )
+            frame_indices = list(range(total_frames)) if extract_all else selected_indices
             
             extract_result = self.project_manager.extract_video_frames(
                 video_id, frame_indices
             )
             
-            # Select subset for training/validation
-            selected_indices = self.project_manager.select_frames_uniform(
-                total_frames, n_selected
-            )
+            extracted_indices = set(extract_result['frame_indices'])
+            selected_indices = [idx for idx in selected_indices if idx in extracted_indices]
             
             # Save metadata about which frames are selected for training/validation
             video_metadata_file = self.project_manager.get_frames_dir(video_id) / 'video_metadata.json'
@@ -4058,20 +4022,31 @@ class MainWindow(QMainWindow):
                     'split': split,
                     'total_frames': total_frames,
                     'selected_frames': selected_indices,
-                    'n_selected': n_selected
+                    'n_selected': len(selected_indices),
+                    'extraction_mode': 'all' if extract_all else 'selected',
+                    'extracted_frame_count': extract_result['extracted'],
                 }, f, indent=2)
             
             self.status_label.setText(
                 f"✓ Added {video_id} to {split}: "
                 f"{extract_result['extracted']} frames extracted, "
-                f"{n_selected} marked for {split}"
+                f"{len(selected_indices)} marked for {split}"
             )
+
+            if extract_result['failed']:
+                QMessageBox.warning(
+                    self, "Incomplete Frame Extraction",
+                    f"Extracted {extract_result['extracted']} of {len(frame_indices)} requested frames.\n"
+                    f"{extract_result['failed']} frames could not be read or saved.\n"
+                    "Only successfully extracted frames were selected. The video copy was kept."
+                )
             
             # Update video list to show newly added video
             self.update_video_list()
             
             # Load this video's frames for annotation
-            self.load_video_frames(video_id)
+            if extract_result['extracted']:
+                self.load_video_frames(video_id)
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to add video: {str(e)}")
@@ -4156,7 +4131,10 @@ class MainWindow(QMainWindow):
             self.frame_video_ids = [video_id] * len(frame_files)
             self.frame_splits = [split] * len(frame_files)
             # Mark which frames are selected for training/validation
-            self.frame_selected = [i in selected_indices for i in range(len(frame_files))]
+            self.frame_selected = [
+                self._get_frame_idx_in_video(i) in selected_indices
+                for i in range(len(frame_files))
+            ]
             
             progress.setLabelText(f"Loading video {video_id}... (updating UI)")
             QApplication.processEvents()
@@ -9308,7 +9286,10 @@ class MainWindow(QMainWindow):
             all_frames.extend(frame_files)
             all_video_ids.extend([video_id] * len(frame_files))
             all_splits.extend([split] * len(frame_files))
-            all_selected.extend([i in selected_indices for i in range(len(frame_files))])
+            all_selected.extend([
+                int(frame_path.stem.split('_')[1]) in selected_indices
+                for frame_path in frame_files
+            ])
         
         self.frames = all_frames
         self.frame_video_ids = all_video_ids

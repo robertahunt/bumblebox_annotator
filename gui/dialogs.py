@@ -4,7 +4,8 @@ Various dialog windows
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QLineEdit, QPushButton, QFileDialog, QSpinBox,
-                             QCheckBox, QComboBox, QGroupBox, QFormLayout)
+                             QCheckBox, QComboBox, QGroupBox, QFormLayout,
+                             QDialogButtonBox)
 from PyQt6.QtCore import Qt
 from pathlib import Path
 
@@ -101,6 +102,68 @@ class VideoImportDialog(QDialog):
             settings['resize'] = (self.width_spin.value(), self.height_spin.value())
             
         return settings
+
+
+class ProjectVideoImportDialog(QDialog):
+    """Choose the split and frame extraction scope for a project video."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Video to Project")
+        self.setMinimumWidth(400)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.split_combo = QComboBox()
+        self.split_combo.addItems(['train', 'val', 'test', 'inference'])
+        form.addRow("Split:", self.split_combo)
+
+        self.frames_spin = QSpinBox()
+        self.frames_spin.setRange(1, 1000000)
+        self.frames_spin.setValue(15)
+        self.frames_spin.setToolTip(
+            "Select evenly spaced frames across the video, up to the number available."
+        )
+        self.frames_label = QLabel("Frames to extract:")
+        form.addRow(self.frames_label, self.frames_spin)
+
+        self.extract_all_check = QCheckBox("Extract all frames")
+        self.extract_all_check.setToolTip(
+            "Save every frame, but only mark the selected number for this split. "
+            "Keep enabled for tracking and mask propagation."
+        )
+        self.extract_all_check.toggled.connect(self._update_extraction_mode)
+        form.addRow(self.extract_all_check)
+        layout.addLayout(form)
+
+        self.sampled_frames_warning = QLabel(
+            "Warning: GUI tracking, SAM2/YOLO propagation, and tracking validation "
+            "may not work correctly with nonconsecutive sampled frames. "
+            "Keep all frames for these tools."
+        )
+        self.sampled_frames_warning.setWordWrap(True)
+        layout.addWidget(self.sampled_frames_warning)
+        self.extract_all_check.setChecked(True)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _update_extraction_mode(self, extract_all):
+        self.frames_label.setText(
+            "Frames to select:" if extract_all else "Frames to extract:"
+        )
+        self.sampled_frames_warning.setVisible(not extract_all)
+
+    def get_settings(self):
+        return {
+            'split': self.split_combo.currentText(),
+            'n_selected': self.frames_spin.value(),
+            'extract_all': self.extract_all_check.isChecked(),
+        }
 
 
 class ProjectDialog(QDialog):

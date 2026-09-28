@@ -533,6 +533,14 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.aruco_sweep_max_perimeter_edit.setText("0.052808")
         aruco_form.addRow("Sweep max perimeter:", self.aruco_sweep_max_perimeter_edit)
 
+        self.aruco_measure_bounds_btn = QPushButton("Measure tag bounds...")
+        self.aruco_measure_bounds_btn.setToolTip(
+            "Measure the smallest and largest tags in a video. "
+            "Apply the resulting perimeter bounds to every video in this batch."
+        )
+        self.aruco_measure_bounds_btn.clicked.connect(self.measure_aruco_bounds)
+        aruco_form.addRow("", self.aruco_measure_bounds_btn)
+
         self.aruco_sweep_win_min_edit = QLineEdit()
         self.aruco_sweep_win_min_edit.setText("3")
         aruco_form.addRow("Sweep thresh win min:", self.aruco_sweep_win_min_edit)
@@ -914,6 +922,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
             self.aruco_exclude_tag_list_edit,
             self.aruco_exclude_tag_list_browse_btn,
             self.aruco_exclude_tag_list_clear_btn,
+            self.aruco_measure_bounds_btn,
         ]
         optimize_controls = [
             self.aruco_profile_combo,
@@ -935,6 +944,44 @@ class BatchVideoInferenceConfigDialog(QDialog):
             control.setEnabled(aruco_enabled)
         for control in optimize_controls:
             control.setEnabled(optimize_enabled)
+
+    def measure_aruco_bounds(self):
+        """Use a representative source video to calibrate this batch's size sweep."""
+        from gui.aruco_measurement_dialog import ArucoMeasurementDialog
+
+        if self.aruco_dictionary_combo.currentText().startswith("Auto"):
+            QMessageBox.information(
+                self, "Choose ArUco dictionary",
+                "Choose a specific dictionary before applying measured optimization bounds."
+            )
+            return
+
+        if not self.folder_radio.isChecked() and len(self.selected_files) == 1:
+            video_path = self.selected_files[0]
+        else:
+            initial = self.input_folder_edit.text() if self.folder_radio.isChecked() else (
+                str(Path(self.selected_files[0]).parent) if self.selected_files else ""
+            )
+            video_path, _ = QFileDialog.getOpenFileName(
+                self, "Select video for tag measurement", initial,
+                "Videos (*.mp4 *.avi *.mov *.mkv *.mjpeg *.mjpg);;All files (*)"
+            )
+        if not video_path:
+            return
+        try:
+            dialog = ArucoMeasurementDialog(video_path, self)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Tag measurement unavailable", str(exc))
+            return
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted and dialog.bounds is not None:
+                lower, upper = dialog.bounds
+                self.aruco_sweep_min_perimeter_edit.setText(f"{lower:.6f}")
+                self.aruco_sweep_max_perimeter_edit.setText(f"{upper:.6f}")
+                self.aruco_optimize_check.setChecked(True)
+        finally:
+            dialog.reader.close()
+            dialog.deleteLater()
 
     def _update_temporal_hive_controls(self):
         """Enable temporal prior controls only when a hive model is selected."""

@@ -98,6 +98,7 @@ class ProjectManager:
             raise ValueError(f"Split must be 'train', 'val', 'test', or 'inference', got: {split}")
         
         dest_folder = self.project_path / 'input_data' / split
+        dest_folder.mkdir(parents=True, exist_ok=True)
         results = {'added': [], 'failed': []}
         
         # Get existing videos from all splits
@@ -381,8 +382,10 @@ class ProjectManager:
                 if ret:
                     # Save frame
                     frame_path = self.get_frame_path(video_id, frame_idx)
-                    cv2.imwrite(str(frame_path), frame)
-                    extracted.append(frame_idx)
+                    if cv2.imwrite(str(frame_path), frame):
+                        extracted.append(frame_idx)
+                    else:
+                        failed.append(frame_idx)
                 else:
                     failed.append(frame_idx)
         
@@ -469,6 +472,8 @@ class ProjectManager:
     
     def select_frames_uniform(self, total_frames: int, n_frames: int) -> List[int]:
         """Select frames uniformly spaced throughout video"""
+        if total_frames < 0 or n_frames < 1:
+            raise ValueError("Frame count must be nonnegative and selection count must be positive")
         if n_frames >= total_frames:
             return list(range(total_frames))
         

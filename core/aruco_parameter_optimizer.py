@@ -339,7 +339,8 @@ def _corner_perimeter_rate(corner: np.ndarray, frame_width: int, frame_height: i
     if len(points) < 4:
         return 0.0
     perimeter = float(cv2.arcLength(points, True))
-    return perimeter / float(max(1, frame_width + frame_height))
+    # Match OpenCV's candidate-size thresholds and manual corner measurements.
+    return perimeter / float(max(1, frame_width, frame_height))
 
 
 def _evaluate_candidate(

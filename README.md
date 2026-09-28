@@ -32,6 +32,10 @@ python main.py
 
 Proposed reusable arena editing, chamber-position review, and image alignment tools are described in the [arena review work-in-progress outline](docs/wip/arena_review/README.md).
 
+See [video import and frame selection](docs/video_import.md) for full-video or sampled extraction and how unfinished annotations affect training.
+
+See [ArUco tag size measurement](docs/aruco_tag_measurement.md) to measure minimum and maximum tag sizes before batch optimization.
+
 ## Project Structure
 
 ```

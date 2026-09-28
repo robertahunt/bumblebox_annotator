@@ -2,7 +2,8 @@
 
 Status: combined on local branch `integration/annotation-batch`, in
 `.worktrees/annotation-integration` under the batch worktree. Neither original
-worktree has been switched or reset. Nothing has been pushed.
+worktree has been switched or reset. This is a development checkpoint, not a
+validated production release.
 
 ## Completed Integration
 
@@ -25,6 +26,26 @@ worktree has been switched or reset. Nothing has been pushed.
   copies. Historical manifests and five already-published model weights remain
   in Git history; this is not a history purge.
 
+## September 28 Progress Checkpoint
+
+- Added project-video import controls with full-frame extraction by default,
+  optional uniform sampling, and warnings about tracking/propagation on sampled
+  frames. Frame selections retain their original source indices after reopening;
+  failed frame writes are not counted as successful extractions.
+- Added a Qt smallest/largest ArUco tag measurement dialog with frame navigation,
+  zoom/pan, draggable corners, and an adjustable margin. Applying a measurement
+  updates the current batch's perimeter sweeps, not per-video overrides.
+- Corrected the optimizer's decoded-marker perimeter normalization to use the
+  longest frame dimension, matching OpenCV and the measurement tool.
+- Verified measurement-frame browsing on an actual unknown-length MJPEG clip.
+  No end-to-end GPU batch validation is implied by this check.
+- Re-ran all seven synthetic test groups below: 79 tests passed. The immediate
+  next step is hands-on editing and representative batch-output review, followed
+  by further extraction of arena-boundary and landmark editor controls.
+
+See [video import](../../video_import.md) and
+[tag measurement](../../aruco_tag_measurement.md) for the new workflows.
+
 ## Verification and Launch
 
 Run from the integration worktree, with the usual application dependencies:
@@ -35,15 +56,18 @@ python scripts/test_annotation_batch_integration.py
 python -m unittest discover -s tests -p test_registration.py -v
 python -m unittest discover -s tests -p test_mask_editing.py -v
 python -m pytest tests/test_validation_review.py -q
+python scripts/test_video_import.py
+python scripts/test_aruco_measurement.py
 python main.py
 ```
 
-Verified 46 synthetic tests: 15 editing, 11 integration, 11 registration,
-6 enclosed-mask, and 3 validation-review tests. Tests cover no-draw protection,
+Verified 79 synthetic tests: 15 editing, 11 integration, 11 registration,
+6 enclosed-mask, 3 validation-review, 15 video-import, and 18 tag-measurement tests.
+Tests cover no-draw protection,
 undo/redo, visibility hierarchy, view preservation across frames, calibration,
 ArUco bank/filter behavior, checkpoint round trips and resume guards, category
 filtering, annotation save/reopen, and offscreen main-window construction.
-The local private analysis suite also passes after helper extraction.
+The local private analysis suite previously passed after helper extraction.
 
 Physical-tablet behavior, real GPU inference/training, and an end-to-end research
 batch have not been exercised here. Try a disposable project before adopting
