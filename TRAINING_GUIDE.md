@@ -1,5 +1,11 @@
 # Training Guide
 
+For the current YOLO visible-nest workflow, frame-specific hive labels, and
+hole-preserving mask exports, see [Visible Nest Training](docs/visible_nest_training.md).
+For the five appearance labels and optional temporal maps, see
+[Experimental Brood Segmentation](docs/brood_segmentation.md).
+The Detectron2 instructions below describe the older training workflow.
+
 ## Overview
 
 The BeeWhere Annotator now includes a complete training pipeline for fine-tuning Detectron2 models on your annotated bee videos with instance tracking support.

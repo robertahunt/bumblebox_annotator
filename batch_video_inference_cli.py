@@ -137,6 +137,7 @@ def parse_args():
     parser.add_argument("--bee-model", type=Path, default=saved["bee_model"] or Path("best.pt"))
     parser.add_argument("--hive-model", type=Path, default=saved["hive_model"])
     parser.add_argument("--pollen-model", type=Path, default=saved["pollen_model"])
+    parser.add_argument("--brood-model", type=Path, help="Experimental five-class brood model; requires a fresh output folder (no resume)")
     parser.add_argument("--chamber-model", type=Path, default=saved["chamber_model"])
     parser.add_argument("--tag-map", type=Path, default=saved["tag_map"], help="Simple allowlist or per-MC-pair CSV")
     parser.add_argument("--exclude-tags", type=Path, default=saved["exclude_tags"])
@@ -146,6 +147,10 @@ def parse_args():
     parser.add_argument("--distance-method", default="centroid")
     parser.add_argument("--pixel-size-mm", type=float, default=0.0666)
     parser.add_argument("--temporal-window-hours", type=float, default=8.0)
+    parser.add_argument('--stabilize-temporal-hive', action='store_true',
+                        help='Smooth chamber placement for temporal hive evidence, scores and overlays.')
+    parser.add_argument('--temporal-hive-scoring', choices=['updated', 'prior'], default='updated',
+                        help='Score bee contact after current evidence is added (default), or against the past-only map.')
     parser.add_argument(
         "--temporal-resolution",
         default="256x256",
@@ -210,6 +215,8 @@ def parse_args():
     parser.add_argument("--ignore-config-mismatch", action="store_true")
     parser.add_argument("--save-visualizations", action="store_true")
     parser.add_argument("--visualization-format", choices=["video", "frames"], default="video")
+    parser.add_argument("--hive-overlay", choices=['scored', 'current', 'temporal', 'compare', 'updated'], default='scored',
+                        help="Default follows contact scoring; explicit history modes require a hive model.")
     parser.add_argument("--visualize-every", type=int, default=1)
     parser.add_argument(
         "--visualize-indices",
@@ -320,6 +327,8 @@ def validate_path(path: Path, label: str, required: bool = True):
 
 def build_config(args):
     temporal_resolution = parse_resolution(args.temporal_resolution)
+    if args.hive_overlay not in ('current', 'scored') and not args.hive_model:
+        raise ValueError('--hive-overlay temporal/compare/updated requires --hive-model')
 
     if args.video:
         video_source = [str(validate_path(args.video, "Video"))]
@@ -340,6 +349,7 @@ def build_config(args):
         "folder_mode": False,
         "preserve_file_order": True,
         "selected_file_order_signature": hashlib.sha256(order_payload.encode("utf-8")).hexdigest()[:16],
+        "brood_model_path": str(validate_path(args.brood_model, "Brood model", required=False)) if args.brood_model else None,
         "bee_model_path": str(validate_path(args.bee_model, "Bee model")),
         "bee_model_type": "segmentation",
         "distance_method": args.distance_method,
@@ -349,6 +359,8 @@ def build_config(args):
         "use_temporal_hive_prior": bool(args.hive_model),
         "temporal_hive_window_hours": args.temporal_window_hours,
         "temporal_hive_resolution": temporal_resolution,
+        "stabilize_temporal_hive": args.stabilize_temporal_hive,
+        "temporal_hive_scoring": args.temporal_hive_scoring,
         "temporal_hive_checkpointing": args.temporal_prior_checkpointing,
         "temporal_context_include_date": True,
         "exclude_pollen_from_hive": not args.keep_pollen_in_hive,
@@ -381,6 +393,7 @@ def build_config(args):
         "resume_ignore_config_mismatch": args.ignore_config_mismatch,
         "save_visualizations": args.save_visualizations,
         "visualization_format": args.visualization_format,
+        "hive_overlay_mode": args.hive_overlay,
         "visualization_interval": max(1, args.visualize_every),
         "visualization_video_indices": parse_int_list(args.visualize_indices),
         "visualization_max_frames": max(0, args.visualization_max_frames),

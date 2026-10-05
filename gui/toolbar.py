@@ -2,6 +2,8 @@
 Annotation toolbar with tools and controls
 """
 
+from core.categories import BROOD_CATEGORIES, BROOD_DESCRIPTIONS, CATEGORY_LABELS, category_label
+
 import math
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QToolButton, QButtonGroup,
                              QSlider, QLabel, QSpinBox, QCheckBox, QMenu, QComboBox)
@@ -117,6 +119,22 @@ class AnnotationToolbar(QWidget):
         self.show_pollen_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('pollen', state))
         row1.addWidget(self.show_pollen_checkbox)
         
+        self.brood_visibility_actions = {}
+        self.brood_visibility_button = QToolButton()
+        self.brood_visibility_button.setText("Brood")
+        self.brood_visibility_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        brood_menu = QMenu(self.brood_visibility_button)
+        for category in BROOD_CATEGORIES:
+            action = brood_menu.addAction(category_label(category))
+            action.setToolTip(BROOD_DESCRIPTIONS[category])
+            action.setCheckable(True)
+            action.setChecked(False)
+            action.toggled.connect(
+                lambda checked, cat=category: self.annotation_type_visibility_changed.emit(cat, checked))
+            self.brood_visibility_actions[category] = action
+        self.brood_visibility_button.setMenu(brood_menu)
+        row1.addWidget(self.brood_visibility_button)
+
         # Keep old checkboxes for backward compatibility with segmentation/bbox view modes
         self.segmentation_checkbox = QCheckBox("Segmentations")
         self.segmentation_checkbox.setChecked(True)
@@ -199,13 +217,10 @@ class AnnotationToolbar(QWidget):
         self.new_instance_btn.setToolTip("Choose object type for a new instance")
         self.new_instance_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.new_instance_menu = QMenu(self.new_instance_btn)
-        for category, label in [
-            ('bee', 'Bee'),
-            ('hive', 'Hive'),
-            ('chamber', 'Chamber'),
-            ('pollen', 'Pollen')
-        ]:
+        for category, label in CATEGORY_LABELS.items():
             action = QAction(label, self.new_instance_menu)
+            if category in BROOD_DESCRIPTIONS:
+                action.setToolTip(BROOD_DESCRIPTIONS[category])
             action.triggered.connect(
                 lambda checked=False, cat=category: self.new_instance_requested.emit(cat)
             )
@@ -415,7 +430,7 @@ class AnnotationToolbar(QWidget):
 
     def _display_text_to_annotation_type(self, type_text):
         """Convert display text to internal annotation type."""
-        type_map = {'Bee': 'bee', 'Hive': 'hive', 'Chamber': 'chamber', 'Pollen': 'pollen'}
+        type_map = {label: category for category, label in CATEGORY_LABELS.items()}
         return type_map.get(type_text, 'bee')
     
     def on_annotation_type_visibility_changed(self, annotation_type, state):

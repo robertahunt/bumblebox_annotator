@@ -25,7 +25,10 @@ from core.aruco_parameter_optimizer import (
     optimize_aruco_parameter_bank,
 )
 from core.batch_video_processor import BatchVideoProcessor
+from core.temporal_brood import TemporalBroodMap
+from core.brood_inference import brood_model_classes
 from core.temporal_hive_prior import TemporalHivePrior
+from core.temporal_hive_visualization import resolve_hive_overlay_mode
 from core.video_inference_exporter import VideoInferenceExporter
 from core.visualization_generator import VisualizationGenerator
 
@@ -38,6 +41,7 @@ class BatchVideoInferenceWorker(QThread):
         'visualization_format',
         'visualization_interval',
         'visualization_max_frames',
+        'hive_overlay_mode',
     }
     STREAMING_CSVS = (
         'bee_detections.csv',
@@ -86,6 +90,8 @@ class BatchVideoInferenceWorker(QThread):
         self.accumulated_data_size_mb = 0
         self.verbose_output = bool(self.config.get('verbose_output', False))
         self.temporal_hive_prior = None
+        self.brood_model = None
+        self.temporal_brood_map = None
         self.total_bee_detections = 0
         self.total_bee_interactions = 0
         self.total_aruco_observations = 0
@@ -247,9 +253,11 @@ class BatchVideoInferenceWorker(QThread):
             )
             return
 
-        if tuple(loaded_prior.resolution) != tuple(self.temporal_hive_prior.resolution):
+        if (tuple(loaded_prior.resolution) != tuple(self.temporal_hive_prior.resolution)
+                or loaded_prior.stabilize_chambers != self.temporal_hive_prior.stabilize_chambers
+                or loaded_prior.scoring_mode != self.temporal_hive_prior.scoring_mode):
             self.log_message.emit(
-                "  Temporal prior checkpoint ignored because prior resolution differs."
+                "  Temporal prior checkpoint ignored because resolution, stabilization or scoring mode differs."
             )
             return
 
@@ -286,6 +294,19 @@ class BatchVideoInferenceWorker(QThread):
         config_items = dict(self.config)
         if visualization_overrides:
             config_items.update(visualization_overrides)
+        if not config_items.get('brood_model_path'):
+            config_items.pop('brood_model_path', None)
+        if config_items.get('hive_overlay_mode') == 'current':
+            config_items.pop('hive_overlay_mode')
+        if config_items.get('stabilize_temporal_hive') is False:
+            config_items.pop('stabilize_temporal_hive')
+        if config_items.get('use_temporal_hive_prior', False) and config_items.get('hive_model_path'):
+            config_items.setdefault('temporal_hive_scoring', 'updated')
+        else:
+            config_items.pop('temporal_hive_scoring', None)
+        # Before this option existed, all temporal scores used the past-only map.
+        if config_items.get('temporal_hive_scoring') == 'prior':
+            config_items.pop('temporal_hive_scoring')
 
         def normalize(value):
             if isinstance(value, Path):
@@ -375,6 +396,10 @@ class BatchVideoInferenceWorker(QThread):
     def run(self):
         """Main execution"""
         try:
+            if self.config.get('brood_model_path'):
+                output = Path(self.config['output_folder'])
+                if self.config.get('resume_completed_videos') or (output.exists() and any(output.iterdir())):
+                    raise ValueError('Experimental brood inference requires an empty output folder and Resume disabled')
             self.log_message.emit("=== Batch Video Inference with Tracking ===")
             self.log_message.emit(f"Model type: {self.config.get('bee_model_type', 'bbox')}")
             self.log_message.emit(f"Distance method: {self.config.get('distance_method', 'contour')}")
@@ -517,16 +542,27 @@ class BatchVideoInferenceWorker(QThread):
             else:
                 self.log_message.emit("  (No pollen model - pollen metrics will be blank)")
 
+            if self.config.get('brood_model_path'):
+                self.brood_model = YOLO(self.config['brood_model_path'])
+                brood_model_classes(self.brood_model)
+                self.temporal_brood_map = TemporalBroodMap(
+                    resolution=self._temporal_hive_resolution(),
+                    window_seconds=float(self.config.get('temporal_hive_window_hours', 8.0)) * 3600)
+                self.log_message.emit('Experimental brood maps enabled: appearance only, history + current evidence')
+
             if self.config.get('use_temporal_hive_prior', False) and hive_model is not None:
                 window_hours = float(self.config.get('temporal_hive_window_hours', 8.0))
                 resolution = self._temporal_hive_resolution()
                 self.temporal_hive_prior = TemporalHivePrior(
                     window_seconds=window_hours * 60 * 60,
                     resolution=resolution,
+                    stabilize_chambers=self.config.get('stabilize_temporal_hive', False),
+                    scoring_mode=self.config.get('temporal_hive_scoring', 'updated'),
                 )
                 self.log_message.emit(
                     f"✓ Temporal hive prior enabled ({window_hours:.1f}h window, "
-                    f"{resolution[0]}x{resolution[1]} chamber map)"
+                    f"{resolution[0]}x{resolution[1]} chamber map; "
+                    f"contact scoring={self.temporal_hive_prior.scoring_mode})"
                 )
                 self._load_temporal_hive_prior_checkpoint(video_files, completed_video_paths)
             elif self.config.get('use_temporal_hive_prior', False):
@@ -748,6 +784,7 @@ class BatchVideoInferenceWorker(QThread):
             output_folder / 'annotated_videos',
             output_folder / 'visualizations',
             output_folder / 'aruco_optimization',
+            output_folder / 'brood',
         ]
         if any(self._path_is_relative_to(video_path, generated_dir) for generated_dir in generated_dirs):
             return True
@@ -765,7 +802,7 @@ class BatchVideoInferenceWorker(QThread):
     def _video_order_description(self) -> str:
         if self.config.get('preserve_file_order', False) and not self.config.get('folder_mode', False):
             return "selected file/list order"
-        if self.config.get('use_temporal_hive_prior', False):
+        if self.config.get('use_temporal_hive_prior', False) or self.config.get('brood_model_path'):
             return "chronological order"
         return "randomized order"
 
@@ -777,7 +814,7 @@ class BatchVideoInferenceWorker(QThread):
             )
             return list(video_files)
 
-        if self.config.get('use_temporal_hive_prior', False):
+        if self.config.get('use_temporal_hive_prior', False) or self.config.get('brood_model_path'):
             ordered = sorted(video_files, key=self._video_sort_key)
             parsed = sum(1 for path in ordered if self._extract_video_datetime(path) is not None)
             self.log_message.emit(
@@ -1593,6 +1630,10 @@ class BatchVideoInferenceWorker(QThread):
         visualization_enabled = self._should_generate_visualization(video_idx)
         visualization_frame_limit = self._visualization_frame_limit() if visualization_enabled else None
         visualization_format = self.config.get('visualization_format', 'video')
+        hive_overlay_mode = resolve_hive_overlay_mode(
+            self.config.get('hive_overlay_mode', 'scored'), self.temporal_hive_prior,
+        )
+        overlay_suffix = '' if hive_overlay_mode == 'current' else f'_{hive_overlay_mode}'
         streaming_visualization_enabled = (
             visualization_enabled and visualization_format in {'video', 'frames'}
         )
@@ -1600,12 +1641,12 @@ class BatchVideoInferenceWorker(QThread):
         if streaming_visualization_enabled:
             if visualization_format == 'frames':
                 streaming_visualization_path = (
-                    Path(self.config['output_folder']) / 'visualizations' / video_id
+                    Path(self.config['output_folder']) / 'visualizations' / f'{video_id}{overlay_suffix}'
                 )
             else:
                 suffix = "_partial_annotated.mp4" if self.should_stop else "_annotated.mp4"
                 streaming_visualization_path = (
-                    Path(self.config['output_folder']) / 'annotated_videos' / f"{video_id}{suffix}"
+                    Path(self.config['output_folder']) / 'annotated_videos' / f"{video_id}{overlay_suffix}{suffix}"
                 )
         
         # Log memory optimization setting
@@ -1669,7 +1710,20 @@ class BatchVideoInferenceWorker(QThread):
             temporal_hive_context_id=temporal_context_id,
             video_start_time_seconds=video_start_time_seconds,
             pixel_size_mm=self.config.get('pixel_size_mm'),
-            exclude_pollen_from_hive=self.config.get('exclude_pollen_from_hive', True)
+            exclude_pollen_from_hive=self.config.get('exclude_pollen_from_hive', True),
+            hive_overlay_mode=hive_overlay_mode,
+            brood_model=self.brood_model,
+            temporal_brood_map=self.temporal_brood_map,
+            brood_preview=visualization_enabled,
+            brood_context_id=(
+                temporal_context_id if re.search(r'bumblebox[-_]\d+', video_path.stem, re.IGNORECASE)
+                else str(video_path.resolve())
+            ),
+            temporal_overlay_path=(
+                Path(self.config['output_folder']) / 'temporal_hive_overlays' /
+                (f'{video_id}_updated.zip' if hive_overlay_mode == 'updated' else f'{video_id}.zip')
+                if visualization_enabled and self.temporal_hive_prior is not None else None
+            ),
         )
         
         # Process video
@@ -1690,6 +1744,7 @@ class BatchVideoInferenceWorker(QThread):
                 self.all_pollen_frame_data.extend(processor.get_pollen_frame_data())
                 for bee_id, trajectory in processor.get_bee_trajectories().items():
                     self.all_bee_trajectories[(video_id, bee_id)] = trajectory
+                self._collect_mask_summaries(processor)
                 if streaming_visualization_enabled:
                     self._log_streaming_visualization_result(processor, streaming_visualization_path, partial=True)
                 elif visualization_enabled:
@@ -1697,7 +1752,6 @@ class BatchVideoInferenceWorker(QThread):
                         video_path, video_id, processor, partial=True,
                         frame_limit=visualization_frame_limit,
                     )
-                    self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
                 del processor
                 gc.collect()
                 if torch.cuda.is_available():
@@ -1743,16 +1797,7 @@ class BatchVideoInferenceWorker(QThread):
             composite_key = (video_id, bee_id)
             self.all_bee_trajectories[composite_key] = trajectory
         
-        # Accumulate masks for averaging (only if visualization disabled)
-        # If visualization enabled, we'll handle masks during viz generation
-        visualization_enabled = self._should_generate_visualization(video_idx)
-        visualization_frame_limit = self._visualization_frame_limit() if visualization_enabled else None
-        visualization_format = self.config.get('visualization_format', 'video')
-        streaming_visualization_enabled = (
-            visualization_enabled and visualization_format in {'video', 'frames'}
-        )
-        if not visualization_enabled or streaming_visualization_enabled:
-            self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
+        self._collect_mask_summaries(processor)
         
         # Generate visualization if requested (BEFORE deleting processor)
         if streaming_visualization_enabled and not self.should_stop:
@@ -1762,8 +1807,6 @@ class BatchVideoInferenceWorker(QThread):
                 video_path, video_id, processor, partial=False,
                 frame_limit=visualization_frame_limit,
             )
-            # Accumulate masks after visualization (so we still have averaged masks for CSV)
-            self._accumulate_masks(video_id, processor.get_hive_masks_by_frame(), processor.get_chambers_by_frame())
         else:
             if not self.config.get('save_visualizations', False):
                 reason = "checkbox not enabled"
@@ -1869,6 +1912,8 @@ class BatchVideoInferenceWorker(QThread):
                 chamber_frame_data=processor.get_chamber_frame_data(),
                 chambers_by_frame=processor.get_chambers_by_frame(),
                 hive_masks_by_frame=processor.get_hive_masks_by_frame(),
+                hive_overlay_mode=processor.hive_overlay_mode,
+                temporal_hive_snapshots_by_frame=processor.temporal_hive_snapshots_by_frame,
                 bee_masks_by_frame=processor.get_bee_masks_by_frame(),
                 pollen_masks_by_frame=processor.get_pollen_masks_by_frame(),
                 aruco_markers_by_frame=processor.get_aruco_markers_by_frame(),
@@ -1903,81 +1948,16 @@ class BatchVideoInferenceWorker(QThread):
             import traceback
             self._log_verbose(traceback.format_exc())
     
-    def _accumulate_masks(self, video_id: str, hive_masks_by_frame: Dict, chambers_by_frame: Dict):
-        """
-        Accumulate hive and chamber masks across frames for averaging
-        
-        Args:
-            video_id: Video identifier
-            hive_masks_by_frame: Dict[frame_number -> Dict[chamber_id -> mask]]
-            chambers_by_frame: Dict[frame_number -> Dict[chamber_id -> chamber_info]]
-        
-        Note: If visualization is disabled, these dictionaries will be empty (store_masks=False)
-        and this function will do nothing, which is the intended behavior for memory efficiency.
-        """
-        # Skip if no data (visualization disabled)
-        if not hive_masks_by_frame and not chambers_by_frame:
-            return
-        
-        # Accumulate hive masks
-        for frame_number, hive_masks in hive_masks_by_frame.items():
-            for chamber_id, mask in hive_masks.items():
-                if mask is None:
-                    continue
+    def _collect_mask_summaries(self, processor: BatchVideoProcessor):
+        """Keep running export counts, not the disposable visualization mask cache."""
+        self.accumulated_hive_masks.update(processor.get_accumulated_hive_masks())
+        self.accumulated_chamber_masks.update(processor.get_accumulated_chamber_masks())
+        self.accumulated_data_size_mb = sum(
+            data['accumulated_mask'].nbytes
+            for masks in (self.accumulated_hive_masks, self.accumulated_chamber_masks)
+            for data in masks.values()
+        ) / (1024 * 1024)
 
-                mask_counts = (mask > 0).astype(np.uint16, copy=False)
-                
-                key = (video_id, chamber_id)
-                
-                if key not in self.accumulated_hive_masks:
-                    # Initialize with zeros
-                    self.accumulated_hive_masks[key] = {
-                        'accumulated_mask': np.zeros_like(mask_counts, dtype=np.uint16),
-                        'frame_count': 0,
-                        'shape': mask.shape
-                    }
-                    # Track memory usage (estimate)
-                    mask_size_mb = self.accumulated_hive_masks[key]['accumulated_mask'].nbytes / (1024 * 1024)
-                    self.accumulated_data_size_mb += mask_size_mb
-                
-                # Add this frame's mask
-                self.accumulated_hive_masks[key]['accumulated_mask'] += mask_counts
-                self.accumulated_hive_masks[key]['frame_count'] += 1
-        
-        # Accumulate chamber masks
-        for frame_number, chambers in chambers_by_frame.items():
-            for chamber_id, chamber_info in chambers.items():
-                mask = chamber_info.get('mask')
-                centroid = chamber_info.get('centroid')
-                
-                if mask is None:
-                    continue
-
-                mask_counts = (mask > 0).astype(np.uint16, copy=False)
-                
-                key = (video_id, chamber_id)
-                
-                if key not in self.accumulated_chamber_masks:
-                    # Initialize with zeros
-                    self.accumulated_chamber_masks[key] = {
-                        'accumulated_mask': np.zeros_like(mask_counts, dtype=np.uint16),
-                        'frame_count': 0,
-                        'shape': mask.shape,
-                        'accumulated_centroid': np.array([0.0, 0.0], dtype=np.float32)
-                    }
-                    # Track memory usage (estimate)
-                    mask_size_mb = self.accumulated_chamber_masks[key]['accumulated_mask'].nbytes / (1024 * 1024)
-                    self.accumulated_data_size_mb += mask_size_mb
-                
-                # Add this frame's mask
-                self.accumulated_chamber_masks[key]['accumulated_mask'] += mask_counts
-                self.accumulated_chamber_masks[key]['frame_count'] += 1
-                
-                # Accumulate centroid
-                if centroid is not None:
-                    self.accumulated_chamber_masks[key]['accumulated_centroid'] += np.array(centroid, dtype=np.float32)
-        
-        # Log memory usage if it's getting large
         if self.accumulated_data_size_mb > 100:  # Over 100 MB
             self._log_verbose(f"  ⚠️  Accumulated mask data: ~{self.accumulated_data_size_mb:.1f} MB in memory")
 

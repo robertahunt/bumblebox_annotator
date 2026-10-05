@@ -2,6 +2,9 @@
 Image canvas with zoom, pan, and annotation capabilities
 """
 
+from core.categories import (CATEGORIES, BROOD_CATEGORIES, CATEGORY_COLORS, CATEGORY_LABELS,
+                             MASK_ATTRIBUTES, category_label)
+
 import numpy as np
 import math
 from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
@@ -95,6 +98,8 @@ class ImageCanvas(QGraphicsView):
         self.chamber_mask = None  # H×W int32 array with chamber instance IDs
         self.hive_mask = None  # H×W int32 array with hive instance IDs
         self.pollen_mask = None  # H×W int32 array with pollen instance IDs
+        for category in BROOD_CATEGORIES:
+            setattr(self, f'{category}_mask', None)
         
         # Legacy compatibility: provide combined view of all masks (readonly, dynamically generated)
         self._combined_mask_cache = None
@@ -115,19 +120,8 @@ class ImageCanvas(QGraphicsView):
         self.annotation_metadata = {}  # Dict mapping instance_id -> metadata dict (for marker data, etc.)
         
         # Annotation type visibility and colors
-        self.annotation_type_colors = {
-            'bee': None,  # Random colors for bee instances
-            'chamber': (255, 0, 0),  # Red for chamber
-            'hive': (255, 255, 0),  # Yellow for hive
-            'pollen': (255, 165, 0)  # Orange for pollen
-        }
-        # Initialize visibility to match toolbar checkbox defaults (bees=True, others=False)
-        self.annotation_type_visibility = {
-            'bee': True,
-            'chamber': False,
-            'hive': False,
-            'pollen': False
-        }
+        self.annotation_type_colors = {'bee': None, **CATEGORY_COLORS}
+        self.annotation_type_visibility = {cat: cat == 'bee' for cat in CATEGORIES}
         
         # Performance optimization: cache instance IDs and bounding boxes
         self._cached_instance_ids = None  # Cached sorted list of instance IDs
@@ -1003,10 +997,8 @@ class ImageCanvas(QGraphicsView):
         self._clear_temporary_dimension_graphics()
         self._clear_brush_cursor_preview()
         self.scene.clear()
-        self.bee_mask = None
-        self.chamber_mask = None
-        self.hive_mask = None
-        self.pollen_mask = None
+        for _category, mask_attr in MASK_ATTRIBUTES:
+            setattr(self, mask_attr, None)
         self.next_mask_id = 1
         self.mask_colors = {}
         self.positive_points = []
@@ -1041,10 +1033,8 @@ class ImageCanvas(QGraphicsView):
         self.current_image = None
         self.image_path = None
         self.image_item = None
-        self.bee_mask = None
-        self.chamber_mask = None
-        self.hive_mask = None
-        self.pollen_mask = None
+        for _category, mask_attr in MASK_ATTRIBUTES:
+            setattr(self, mask_attr, None)
         self.next_mask_id = 1
         self.mask_items = []  # QGraphicsPixmapItems for visualization 
         self.mask_colors = {}  # Dict mapping instance_id -> (r,g,b) color
@@ -1433,12 +1423,13 @@ class ImageCanvas(QGraphicsView):
         if not self._segmentation_overlays_visible():
             return 0, None
 
-        if category in ('bee', 'chamber', 'hive', 'pollen'):
+        if category in CATEGORIES:
             masks_to_search = [(category, self._get_mask_array_by_category(category))]
         else:
             # Search in approximate visual top-to-bottom order.
             masks_to_search = [
                 ('bee', self.bee_mask),
+                *[(cat, self._get_mask_array_by_category(cat)) for cat in reversed(BROOD_CATEGORIES)],
                 ('pollen', self.pollen_mask),
                 ('hive', self.hive_mask),
                 ('chamber', self.chamber_mask),
@@ -1516,12 +1507,7 @@ class ImageCanvas(QGraphicsView):
 
         change_category_menu = menu.addMenu(f"Change Instance {instance_id} Category")
 
-        categories = [
-            ('bee', 'Bee (per-frame)'),
-            ('hive', 'Hive (video-level)'),
-            ('chamber', 'Chamber (video-level)'),
-            ('pollen', 'Pollen (video-level)')
-        ]
+        categories = list(CATEGORY_LABELS.items())
 
         current_category = current_category or self.annotation_metadata.get(
             instance_id, {}
@@ -1541,13 +1527,7 @@ class ImageCanvas(QGraphicsView):
                 change_category_menu.addAction(action)
 
     def _category_label(self, category):
-        labels = {
-            'bee': 'Bee',
-            'hive': 'Hive',
-            'chamber': 'Chamber',
-            'pollen': 'Pollen',
-        }
-        return labels.get(category, 'Bee')
+        return category_label(category)
 
     def _preferred_new_instance_category(self, context_category=None):
         """Choose the category for context-menu same-kind creation."""
@@ -1557,7 +1537,7 @@ class ImageCanvas(QGraphicsView):
             self.selected_instance_category,
             self.current_annotation_type,
         ):
-            if category in {'bee', 'hive', 'chamber', 'pollen'}:
+            if category in CATEGORIES:
                 return category
         return 'bee'
 
@@ -1576,7 +1556,7 @@ class ImageCanvas(QGraphicsView):
         menu.addAction(same_kind_action)
 
         new_instance_menu = menu.addMenu("New Instance")
-        for category in ('bee', 'hive', 'chamber', 'pollen'):
+        for category in CATEGORIES:
             action = QAction(self._category_label(category), self)
             action.triggered.connect(
                 lambda checked=False, cat=category:
@@ -2394,19 +2374,9 @@ class ImageCanvas(QGraphicsView):
         else:
             return
         
-        # Initialize appropriate mask based on annotation type
-        if self.current_annotation_type == 'chamber':
-            if self.chamber_mask is None:
-                self.chamber_mask = np.zeros((h, w), dtype=np.int32)
-        elif self.current_annotation_type == 'hive':
-            if self.hive_mask is None:
-                self.hive_mask = np.zeros((h, w), dtype=np.int32)
-        elif self.current_annotation_type == 'pollen':
-            if self.pollen_mask is None:
-                self.pollen_mask = np.zeros((h, w), dtype=np.int32)
-        else:  # bee
-            if self.bee_mask is None:
-                self.bee_mask = np.zeros((h, w), dtype=np.int32)
+        if self._get_mask_array_by_category(self.current_annotation_type) is None:
+            self._set_mask_array_by_category(
+                self.current_annotation_type, np.zeros((h, w), dtype=np.int32))
 
         if self.selected_mask_idx <= 0:
             return
@@ -2708,19 +2678,10 @@ class ImageCanvas(QGraphicsView):
         # Convert binary mask to boolean
         binary_mask = mask > 0 if mask.dtype != bool else mask
         
-        if effective_category == 'chamber':
-            # Update chamber mask
-            self._add_chamber_mask(binary_mask, mask_id, color, rebuild_viz)
-        elif effective_category == 'hive':
-            # Update hive mask
-            self._add_hive_mask(binary_mask, mask_id, color, rebuild_viz)
-        elif effective_category == 'pollen':
-            # Update pollen mask
-            self._add_pollen_mask(binary_mask, mask_id, color, rebuild_viz)
-        else:
-            # Default: bee annotation (multi-instance)
-            self._add_bee_mask(binary_mask, mask_id, color, rebuild_viz)
-    
+        if effective_category not in CATEGORIES:
+            raise ValueError(f'Unknown annotation category: {effective_category}')
+        self._add_bee_mask(binary_mask, mask_id, color, rebuild_viz, category=effective_category)
+
     def _add_bee_mask(self, binary_mask, mask_id=None, color=None, rebuild_viz=True, category='bee'):
         """Add an instance mask to the appropriate mask array (bee, chamber, or hive)
         
@@ -2731,16 +2692,10 @@ class ImageCanvas(QGraphicsView):
             rebuild_viz: If True, rebuild visualization immediately
             category: Instance category ('bee', 'chamber', 'hive', or 'pollen')
         """
-        # Get reference to the appropriate mask based on category
-        if category == 'chamber':
-            mask_array_name = 'chamber_mask'
-        elif category == 'hive':
-            mask_array_name = 'hive_mask'
-        elif category == 'pollen':
-            mask_array_name = 'pollen_mask'
-        else:
-            mask_array_name = 'bee_mask'
-        
+        mask_array_name = f'{category}_mask'
+        if category not in CATEGORIES:
+            raise ValueError(f'Unknown annotation category: {category}')
+
         # Initialize mask if needed
         if getattr(self, mask_array_name) is None:
             h, w = binary_mask.shape[:2]
@@ -2835,7 +2790,7 @@ class ImageCanvas(QGraphicsView):
         
         Args:
             instance_id: Instance ID to look up
-            category: Optional explicit category ('bee', 'chamber', 'hive', 'pollen')
+            category: Optional explicit category CATEGORIES
             
         Returns:
             Tuple of (mask_array, category) or (None, None) if not found
@@ -2853,27 +2808,15 @@ class ImageCanvas(QGraphicsView):
         if category is None:
             category = self.annotation_metadata.get(instance_id, {}).get('category')
         if category is None:
-            for candidate_category, candidate_mask in [
-                ('bee', self.bee_mask),
-                ('chamber', self.chamber_mask),
-                ('hive', self.hive_mask),
-                ('pollen', self.pollen_mask)
-            ]:
+            for candidate_category, candidate_mask in self._mask_sources():
                 if candidate_mask is not None and np.any(candidate_mask == instance_id):
                     category = candidate_category
                     break
         if category is None:
             category = 'bee'
         
-        if category == 'chamber':
-            return self.chamber_mask, 'chamber'
-        elif category == 'hive':
-            return self.hive_mask, 'hive'
-        elif category == 'pollen':
-            return self.pollen_mask, 'pollen'
-        else:
-            return self.bee_mask, 'bee'
-    
+        return self._get_mask_array_by_category(category), category
+
     def _find_instance_at_point(self, x, y, category=None):
         """Find which instance (if any) is at the given point
 
@@ -2920,17 +2863,12 @@ class ImageCanvas(QGraphicsView):
         if instance_id <= 0:
             return
 
-        valid_categories = {'bee', 'chamber', 'hive', 'pollen'}
+        valid_categories = CATEGORIES
         if new_category not in valid_categories:
             print(f"Warning: Unknown category '{new_category}'")
             return
 
-        categories = [
-            ('bee', 'bee_mask'),
-            ('chamber', 'chamber_mask'),
-            ('hive', 'hive_mask'),
-            ('pollen', 'pollen_mask')
-        ]
+        categories = MASK_ATTRIBUTES
         found_categories = []
         mask_shape = None
 
@@ -3047,28 +2985,16 @@ class ImageCanvas(QGraphicsView):
         
         print(f"Moved instance {instance_id} from {old_category_label} to {new_category}")
     
+    def _mask_sources(self):
+        return [(category, getattr(self, attr, None)) for category, attr in MASK_ATTRIBUTES]
+
     def _get_mask_array_by_category(self, category):
-        """Get the mask array for a specific category"""
-        if category == 'bee':
-            return self.bee_mask
-        elif category == 'chamber':
-            return self.chamber_mask
-        elif category == 'hive':
-            return self.hive_mask
-        elif category == 'pollen':
-            return self.pollen_mask
-        return None
-    
+        return getattr(self, f'{category}_mask', None) if category in CATEGORIES else None
+
     def _set_mask_array_by_category(self, category, mask_array):
-        """Set the mask array for a specific category"""
-        if category == 'bee':
-            self.bee_mask = mask_array
-        elif category == 'chamber':
-            self.chamber_mask = mask_array
-        elif category == 'hive':
-            self.hive_mask = mask_array
-        elif category == 'pollen':
-            self.pollen_mask = mask_array
+        if category not in CATEGORIES:
+            raise ValueError(f'Unknown annotation category: {category}')
+        setattr(self, f'{category}_mask', mask_array)
 
     def _instance_key(self, instance_id, category=None):
         """Stable key for per-instance UI state."""
@@ -3085,12 +3011,7 @@ class ImageCanvas(QGraphicsView):
     def _remove_instance_from_other_category_masks(self, instance_id, keep_category):
         """Ensure one instance ID is represented by only one category mask."""
         removed_categories = []
-        for category, mask_attr in [
-            ('bee', 'bee_mask'),
-            ('chamber', 'chamber_mask'),
-            ('hive', 'hive_mask'),
-            ('pollen', 'pollen_mask')
-        ]:
+        for category, mask_attr in MASK_ATTRIBUTES:
             if category == keep_category:
                 continue
 
@@ -3113,12 +3034,7 @@ class ImageCanvas(QGraphicsView):
 
     def _normalize_duplicate_instance_categories(self):
         """Remove stale duplicate same-ID masks from non-metadata categories."""
-        categories = [
-            ('bee', 'bee_mask'),
-            ('chamber', 'chamber_mask'),
-            ('hive', 'hive_mask'),
-            ('pollen', 'pollen_mask')
-        ]
+        categories = MASK_ATTRIBUTES
         appearances = {}
         for category, mask_attr in categories:
             mask_array = getattr(self, mask_attr)
@@ -3169,12 +3085,7 @@ class ImageCanvas(QGraphicsView):
         entries = []
         seen = set()
 
-        for category, mask_array in [
-            ('bee', self.bee_mask),
-            ('chamber', self.chamber_mask),
-            ('hive', self.hive_mask),
-            ('pollen', self.pollen_mask)
-        ]:
+        for category, mask_array in self._mask_sources():
             if mask_array is None:
                 continue
             instance_ids = np.unique(mask_array)
@@ -3200,7 +3111,7 @@ class ImageCanvas(QGraphicsView):
             if key not in seen:
                 entries.append({'id': int(self.editing_instance_id), 'category': category})
 
-        category_order = {'bee': 0, 'hive': 1, 'chamber': 2, 'pollen': 3}
+        category_order = {cat: i for i, cat in enumerate(CATEGORIES)}
         return sorted(entries, key=lambda entry: (entry['id'], category_order.get(entry['category'], 99)))
     
     @property
@@ -3214,52 +3125,17 @@ class ImageCanvas(QGraphicsView):
         Returns:
             H×W int32 array with all instance IDs, or None if no masks exist
         """
-        # Return None if no masks exist
-        if self.bee_mask is None and self.chamber_mask is None and self.hive_mask is None and self.pollen_mask is None:
+        sources = [(category, mask) for category, mask in self._mask_sources() if mask is not None]
+        if not sources:
             return None
-        
-        # Use cached version if available and not dirty
         if self._combined_mask_cache is not None and not self._combined_mask_dirty:
             return self._combined_mask_cache
-        
-        #Determine dimensions
-        if self.bee_mask is not None:
-            h, w = self.bee_mask.shape
-        elif self.chamber_mask is not None:
-            h, w = self.chamber_mask.shape
-        elif self.hive_mask is not None:
-            h, w = self.hive_mask.shape
-        elif self.pollen_mask is not None:
-            h, w = self.pollen_mask.shape
-        else:
-            return None
-        
-        # Create combined view (simple approach: bee mask as base since it's most common)
+        h, w = sources[0][1].shape
         combined = np.zeros((h, w), dtype=np.int32)
-        
-        # Layer masks: bee first (base layer), then chamber, then hive
-        # Later layers overwrite earlier ones where they overlap
-        if self.bee_mask is not None:
-            combined[self.bee_mask > 0] = self.bee_mask[self.bee_mask > 0]
-        if self.chamber_mask is not None:
-            if self.chamber_mask.shape[:2] == (h, w):
-                combined[self.chamber_mask > 0] = self.chamber_mask[self.chamber_mask > 0]
-            else:
-                print(f"Warning: combined_mask skipping chamber_mask "
-                      f"(shape {self.chamber_mask.shape[:2]} != {(h, w)})")
-        if self.hive_mask is not None:
-            if self.hive_mask.shape[:2] == (h, w):
-                combined[self.hive_mask > 0] = self.hive_mask[self.hive_mask > 0]
-            else:
-                print(f"Warning: combined_mask skipping hive_mask "
-                      f"(shape {self.hive_mask.shape[:2]} != {(h, w)})")
-        if self.pollen_mask is not None:
-            if self.pollen_mask.shape[:2] == (h, w):
-                combined[self.pollen_mask > 0] = self.pollen_mask[self.pollen_mask > 0]
-            else:
-                print(f"Warning: combined_mask skipping pollen_mask "
-                      f"(shape {self.pollen_mask.shape[:2]} != {(h, w)})")
-        
+        for category, mask in sources:
+            if mask.shape == (h, w):
+                combined[mask > 0] = mask[mask > 0]
+
         # Cache for future reads
         self._combined_mask_cache = combined
         self._combined_mask_dirty = False
@@ -3271,10 +3147,8 @@ class ImageCanvas(QGraphicsView):
         """Setter for backward compatibility - mark cache as dirty"""
         # Setting to None clears all masks
         if value is None:
-            self.bee_mask = None
-            self.chamber_mask = None
-            self.hive_mask = None
-            self.pollen_mask = None
+            for _category, mask_attr in MASK_ATTRIBUTES:
+                setattr(self, mask_attr, None)
             self._combined_mask_cache = None
             self._combined_mask_dirty = True
         else:
@@ -3306,11 +3180,8 @@ class ImageCanvas(QGraphicsView):
         self.bbox_items_map = {}
         
         # Check if any masks exist
-        has_masks = (self.bee_mask is not None or 
-                     self.chamber_mask is not None or 
-                     self.hive_mask is not None or
-                     self.pollen_mask is not None)
-        
+        has_masks = any(mask is not None for _, mask in self._mask_sources())
+
         if not has_masks:
             self._cached_overlay = None
             # Still draw bbox-only annotations if we have them
@@ -3324,57 +3195,20 @@ class ImageCanvas(QGraphicsView):
         all_instance_ids = []
         mask_lookup = {}  # Map instance_id -> (mask_type, mask_array)
         
-        if self.bee_mask is not None and self.annotation_type_visibility.get('bee', True):
-            bee_ids = np.unique(self.bee_mask)
-            bee_ids = bee_ids[bee_ids > 0]
-            for instance_id in bee_ids:
-                if not self.is_instance_enabled(instance_id, 'bee'):
-                    continue
-                mask_lookup[instance_id] = ('bee', self.bee_mask)
-        
-        if self.chamber_mask is not None and self.annotation_type_visibility.get('chamber', True):
-            chamber_ids = np.unique(self.chamber_mask)
-            chamber_ids = chamber_ids[chamber_ids > 0]
-            for instance_id in chamber_ids:
-                if not self.is_instance_enabled(instance_id, 'chamber'):
-                    continue
-                mask_lookup[instance_id] = ('chamber', self.chamber_mask)
-        
-        if self.hive_mask is not None and self.annotation_type_visibility.get('hive', True):
-            hive_ids = np.unique(self.hive_mask)
-            hive_ids = hive_ids[hive_ids > 0]
-            for instance_id in hive_ids:
-                if not self.is_instance_enabled(instance_id, 'hive'):
-                    continue
-                mask_lookup[instance_id] = ('hive', self.hive_mask)
-        
-        if self.pollen_mask is not None and self.annotation_type_visibility.get('pollen', True):
-            pollen_ids = np.unique(self.pollen_mask)
-            pollen_ids = pollen_ids[pollen_ids > 0]
-            for instance_id in pollen_ids:
-                if not self.is_instance_enabled(instance_id, 'pollen'):
-                    continue
-                mask_lookup[instance_id] = ('pollen', self.pollen_mask)
-        
-        # Build rendering order: chamber and hive first (background), bees last (on top)
-        chamber_ids_visible = [iid for iid, (cat, _) in mask_lookup.items() if cat == 'chamber']
-        hive_ids_visible = [iid for iid, (cat, _) in mask_lookup.items() if cat == 'hive']
-        pollen_ids_visible = [iid for iid, (cat, _) in mask_lookup.items() if cat == 'pollen']
-        bee_ids_visible = [iid for iid, (cat, _) in mask_lookup.items() if cat == 'bee']
-        all_instance_ids = chamber_ids_visible + hive_ids_visible + pollen_ids_visible + bee_ids_visible
-        
+        for category, mask_array in self._mask_sources():
+            if mask_array is None or not self.annotation_type_visibility.get(category, True):
+                continue
+            for instance_id in np.unique(mask_array):
+                if instance_id > 0 and self.is_instance_enabled(instance_id, category):
+                    mask_lookup[instance_id] = (category, mask_array)
+        render_order = ('chamber', 'hive', 'pollen') + BROOD_CATEGORIES + ('bee',)
+        all_instance_ids = [iid for cat in render_order
+                            for iid, (category, _) in mask_lookup.items() if category == cat]
+
         # Draw segmentation masks if enabled
         if self._segmentation_overlays_visible() and len(all_instance_ids) > 0:
-            # Get dimensions from the first non-None mask
-            if self.pollen_mask is not None:
-                h, w = self.pollen_mask.shape
-            elif self.bee_mask is not None:
-                h, w = self.bee_mask.shape
-            elif self.chamber_mask is not None:
-                h, w = self.chamber_mask.shape
-            else:
-                h, w = self.hive_mask.shape
-            
+            h, w = next(mask.shape for _, mask in self._mask_sources() if mask is not None)
+
             # Create composite overlay for all instances
             overlay = np.zeros((h, w, 4), dtype=np.uint8)
             
@@ -3436,12 +3270,7 @@ class ImageCanvas(QGraphicsView):
         from PyQt6.QtCore import Qt
         
         # Draw bboxes for all instance types from their separate masks
-        mask_sources = [
-            ('bee', self.bee_mask),
-            ('chamber', self.chamber_mask),
-            ('hive', self.hive_mask),
-            ('pollen', self.pollen_mask)
-        ]
+        mask_sources = self._mask_sources()
         
         for category, mask_array in mask_sources:
             if mask_array is None:
@@ -3609,7 +3438,7 @@ class ImageCanvas(QGraphicsView):
         from PyQt6.QtGui import QPainterPath, QPen, QColor
         
         # Only draw outlines for hive, chamber, and pollen instances
-        categories_to_outline = {'hive', 'chamber', 'pollen'}
+        categories_to_outline = set(CATEGORIES) - {'bee'}
         
         for instance_id in instance_ids:
             if instance_id not in mask_lookup:
@@ -3834,6 +3663,7 @@ class ImageCanvas(QGraphicsView):
                 ('chamber', self.chamber_mask),
                 ('hive', self.hive_mask),
                 ('pollen', self.pollen_mask),
+                *[(cat, self._get_mask_array_by_category(cat)) for cat in BROOD_CATEGORIES],
                 ('bee', self.bee_mask),
             ]:
                 if mask_array is None:
@@ -4070,7 +3900,7 @@ class ImageCanvas(QGraphicsView):
             self.commit_editing()
         
         # Clear existing masks and free memory
-        for mask_attr in ['bee_mask', 'chamber_mask', 'hive_mask', 'pollen_mask']:
+        for mask_attr in [attr for _, attr in MASK_ATTRIBUTES]:
             if getattr(self, mask_attr) is not None:
                 delattr(self, mask_attr)
                 setattr(self, mask_attr, None)
@@ -4150,12 +3980,9 @@ class ImageCanvas(QGraphicsView):
         if h is None or w is None:
             return  # Can't determine size
         
-        # Initialize separate masks for each category
-        self.bee_mask = np.zeros((h, w), dtype=np.int32)
-        self.chamber_mask = np.zeros((h, w), dtype=np.int32)
-        self.hive_mask = np.zeros((h, w), dtype=np.int32)
-        self.pollen_mask = np.zeros((h, w), dtype=np.int32)
-        
+        for _category, attr in MASK_ATTRIBUTES:
+            setattr(self, attr, None)
+
         # Build separate masks from annotations
         for ann in annotations:
             # Get instance ID
@@ -4166,15 +3993,12 @@ class ImageCanvas(QGraphicsView):
             # Get category (defaults to 'bee' for backward compatibility)
             category = ann.get('category', 'bee')
             
-            # Determine which mask array to use
-            if category == 'chamber':
-                mask_array = self.chamber_mask
-            elif category == 'hive':
-                mask_array = self.hive_mask
-            elif category == 'pollen':
-                mask_array = self.pollen_mask
-            else:  # bee
-                mask_array = self.bee_mask
+            if category not in CATEGORIES:
+                raise ValueError(f'Unknown annotation category: {category}')
+            mask_array = self._get_mask_array_by_category(category)
+            if mask_array is None:
+                mask_array = np.zeros((h, w), dtype=np.int32)
+                self._set_mask_array_by_category(category, mask_array)
 
             # Store or assign color. Fixed-color categories ignore stale saved
             # per-instance colors; bees can keep their saved color.
@@ -4242,12 +4066,7 @@ class ImageCanvas(QGraphicsView):
         annotations = []
         
         # Process all four mask types
-        mask_sources = [
-            ('bee', self.bee_mask),
-            ('chamber', self.chamber_mask),
-            ('hive', self.hive_mask),
-            ('pollen', self.pollen_mask)
-        ]
+        mask_sources = self._mask_sources()
         
         for category, mask_array in mask_sources:
             if mask_array is None:
@@ -4328,7 +4147,7 @@ class ImageCanvas(QGraphicsView):
         instance_ids_set = set()
         
         # 1. From all three mask arrays (instances with segmentations)
-        for mask_array in [self.bee_mask, self.chamber_mask, self.hive_mask, self.pollen_mask]:
+        for mask_array in [mask for _, mask in self._mask_sources()]:
             if mask_array is not None:
                 mask_instance_ids = np.unique(mask_array)
                 mask_instance_ids = mask_instance_ids[mask_instance_ids > 0]  # Exclude background (0)
@@ -4750,23 +4569,9 @@ class ImageCanvas(QGraphicsView):
         if mask_array is None:
             if self.current_image is not None:
                 h, w = self.current_image.shape[:2]
-                # Create the appropriate mask based on category
-                if category == 'chamber' or self.current_annotation_type == 'chamber':
-                    if self.chamber_mask is None:
-                        self.chamber_mask = np.zeros((h, w), dtype=np.int32)
-                    mask_array = self.chamber_mask
-                elif category == 'hive' or self.current_annotation_type == 'hive':
-                    if self.hive_mask is None:
-                        self.hive_mask = np.zeros((h, w), dtype=np.int32)
-                    mask_array = self.hive_mask
-                elif category == 'pollen' or self.current_annotation_type == 'pollen':
-                    if self.pollen_mask is None:
-                        self.pollen_mask = np.zeros((h, w), dtype=np.int32)
-                    mask_array = self.pollen_mask
-                else:  # bee
-                    if self.bee_mask is None:
-                        self.bee_mask = np.zeros((h, w), dtype=np.int32)
-                    mask_array = self.bee_mask
+                category = category or self.current_annotation_type
+                mask_array = np.zeros((h, w), dtype=np.int32)
+                self._set_mask_array_by_category(category, mask_array)
             else:
                 return
         
@@ -4891,24 +4696,11 @@ class ImageCanvas(QGraphicsView):
             self.editing_instance_id, {}
         ).get('category', self.current_annotation_type)
         
-        # Get or create the appropriate mask array
-        if category == 'chamber':
-            if self.chamber_mask is None:
-                self.chamber_mask = np.zeros((h, w), dtype=np.int32)
-            mask_array = self.chamber_mask
-        elif category == 'hive':
-            if self.hive_mask is None:
-                self.hive_mask = np.zeros((h, w), dtype=np.int32)
-            mask_array = self.hive_mask
-        elif category == 'pollen':
-            if self.pollen_mask is None:
-                self.pollen_mask = np.zeros((h, w), dtype=np.int32)
-            mask_array = self.pollen_mask
-        else:  # bee
-            if self.bee_mask is None:
-                self.bee_mask = np.zeros((h, w), dtype=np.int32)
-            mask_array = self.bee_mask
-        
+        mask_array = self._get_mask_array_by_category(category)
+        if mask_array is None:
+            mask_array = np.zeros((h, w), dtype=np.int32)
+            self._set_mask_array_by_category(category, mask_array)
+
         # Merge editing mask back into appropriate mask array
         editing_pixels = self.editing_mask > 0
         mask_array[editing_pixels] = self.editing_instance_id
@@ -5007,12 +4799,7 @@ class ImageCanvas(QGraphicsView):
             self._remove_editing_items()
             changed = True
 
-        for _mask_category, mask_attr in (
-            ('bee', 'bee_mask'),
-            ('chamber', 'chamber_mask'),
-            ('hive', 'hive_mask'),
-            ('pollen', 'pollen_mask'),
-        ):
+        for _mask_category, mask_attr in MASK_ATTRIBUTES:
             mask_array = getattr(self, mask_attr, None)
             if mask_array is not None and np.any(mask_array == instance_id):
                 mask_array[mask_array == instance_id] = 0
@@ -5739,7 +5526,7 @@ class ImageCanvas(QGraphicsView):
             annotation_type: 'bee', 'chamber', or 'hive'
             rebuild: If True, rebuild visualizations immediately (default: True)
         """
-        if annotation_type not in ['bee', 'chamber', 'hive', 'pollen']:
+        if annotation_type not in CATEGORIES:
             return
 
         if annotation_type == self.current_annotation_type:

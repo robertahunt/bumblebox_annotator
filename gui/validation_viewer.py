@@ -184,7 +184,10 @@ class ValidationViewer(QDialog):
         return vis_image
     
     def polygon_to_mask(self, segmentation, shape):
-        """Convert polygon segmentation to binary mask"""
+        """Convert polygon or exact COCO RLE segmentation to a binary mask."""
+        if isinstance(segmentation, dict):
+            from core.coco_masks import decode_segmentation
+            return decode_segmentation(segmentation, *shape)
         mask = np.zeros(shape, dtype=np.uint8)
         
         for polygon in segmentation:

@@ -10,6 +10,33 @@ from PyQt6.QtCore import Qt
 from pathlib import Path
 
 
+class TrainingMaskCopyDialog(QDialog):
+    """Choose an endpoint from eligible training frames, not arbitrary frames."""
+
+    def __init__(self, parent, frame_options, instance_count):
+        super().__init__(parent)
+        self.setWindowTitle("Copy Through Training Frames")
+        layout = QFormLayout(self)
+        self.endpoint = QComboBox()
+        for list_index, frame_number in frame_options:
+            self.endpoint.addItem(f"Frame {frame_number:06d}", list_index)
+        layout.addRow("Last training frame:", self.endpoint)
+        self.count_label = QLabel()
+        layout.addRow("Copy scope:", self.count_label)
+        self.endpoint.currentIndexChanged.connect(
+            lambda index: self.count_label.setText(
+                f"{instance_count} instance(s), {index + 1} training frame(s), same video"))
+        self.count_label.setText(f"{instance_count} instance(s), 1 training frame, same video")
+        self.replace_check = QCheckBox("Replace existing instances with the same ID and category")
+        layout.addRow(self.replace_check)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                  | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Copy")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+
 class VideoImportDialog(QDialog):
     """Dialog for video import settings"""
     
@@ -205,6 +232,11 @@ class ProjectDialog(QDialog):
         path_layout.addWidget(browse_btn)
         
         form.addRow("Location:", path_layout)
+
+        self.hive_scope_combo = QComboBox()
+        self.hive_scope_combo.addItem("Per frame (visible nest)", 'frame')
+        self.hive_scope_combo.addItem("Shared across video (legacy)", 'video')
+        form.addRow("Nest / hive labels:", self.hive_scope_combo)
         
         layout.addLayout(form)
         
@@ -235,6 +267,7 @@ class ProjectDialog(QDialog):
         info = {
             'name': self.name_edit.text(),
             'path': self.path_edit.text(),
+            'hive_annotation_scope': self.hive_scope_combo.currentData(),
         }
         
         return info

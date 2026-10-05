@@ -2,9 +2,9 @@
 Chamber-aligned temporal hive prior for batch video inference.
 
 The prior keeps a rolling, normalized map of where hive pixels usually appear
-inside each chamber/context. It is updated after each frame is scored, so bee
-rows are evaluated against information from frames/videos that came before the
-current one.
+inside each chamber/context. By default, current usable evidence is incorporated
+before scoring bee contact; past-only scoring remains available. Bee-occluded
+pixels do not contribute new evidence in either mode.
 """
 
 from dataclasses import dataclass
@@ -34,11 +34,53 @@ class TemporalHiveOverlap:
 
 
 @dataclass
+class TemporalHiveSnapshot:
+    """Map snapshot: 0 unknown, 1 supported non-hive, 2 supported hive."""
+
+    chamber_id: int
+    bbox: Tuple[int, int, int, int]
+    labels: np.ndarray
+
+
+@dataclass
 class _PriorState:
     hive_sum: np.ndarray
     weight_sum: np.ndarray
     last_time_seconds: Optional[float] = None
     observation_count: int = 0
+
+
+class TemporalChamberStabilizer:
+    """Causal, per-video smoothing of small chamber-box changes, not image registration."""
+
+    alpha = 0.2
+    reset_fraction = 0.02
+
+    def __init__(self):
+        self.boxes = {}
+        self.frame_shape = None
+
+    def reset(self):
+        self.boxes.clear()
+        self.frame_shape = None
+
+    def prepare(self, chambers, frame_shape):
+        shape = tuple(frame_shape[:2])
+        if self.frame_shape != shape or set(self.boxes) != set(chambers):
+            self.reset()
+        self.frame_shape = shape
+        prepared = {}
+        for chamber_id, info in chambers.items():
+            raw = np.array(TemporalHivePrior._chamber_bbox({'bbox': info.get('bbox')}, shape), dtype=float)
+            previous = self.boxes.get(chamber_id)
+            if previous is not None:
+                size = np.array([previous[2] - previous[0], previous[3] - previous[1]] * 2)
+                # Follow large moves immediately instead of dragging a stale box across the image.
+                if np.max(np.abs(raw - previous) / np.maximum(size, 1)) <= self.reset_fraction:
+                    raw = self.alpha * raw + (1 - self.alpha) * previous
+            self.boxes[chamber_id] = raw
+            prepared[chamber_id] = dict(info, temporal_bbox=tuple(raw))
+        return prepared
 
 
 class TemporalHivePrior:
@@ -53,7 +95,11 @@ class TemporalHivePrior:
         min_prior_weight: float = 2.0,
         cleanup_kernel_size: int = 3,
         min_component_pixels: int = 12,
+        stabilize_chambers: bool = False,
+        scoring_mode: str = 'updated',
     ):
+        if scoring_mode not in ('updated', 'prior'):
+            raise ValueError(f'Unknown temporal hive scoring mode: {scoring_mode}')
         self.window_seconds = max(1.0, float(window_seconds))
         self.resolution = (int(resolution[0]), int(resolution[1]))
         self.hive_probability_threshold = float(hive_probability_threshold)
@@ -61,6 +107,8 @@ class TemporalHivePrior:
         self.min_prior_weight = float(min_prior_weight)
         self.cleanup_kernel_size = max(0, int(cleanup_kernel_size))
         self.min_component_pixels = max(0, int(min_component_pixels))
+        self.stabilize_chambers = bool(stabilize_chambers)
+        self.scoring_mode = scoring_mode
         self._states: Dict[Tuple[str, int], _PriorState] = {}
 
     def query_bee_overlap(
@@ -73,7 +121,9 @@ class TemporalHivePrior:
         frame_shape: Tuple[int, int],
         observation_time_seconds: Optional[float],
     ) -> TemporalHiveOverlap:
-        """Evaluate a bee mask/bbox against the prior before current-frame update."""
+        """Evaluate the current map state; the caller controls update/scoring order."""
+        if chamber_info.get('temporal_unavailable', False):
+            return self._empty_overlap()
         state = self._states.get((context_id, chamber_id))
         if state is None:
             return self._empty_overlap()
@@ -125,6 +175,25 @@ class TemporalHivePrior:
             sum_prior_weight=sum_prior_weight,
         )
 
+    def visualization_snapshot(
+        self, context_id: str, chamber_id: int, chamber_info: Dict,
+        frame_shape: Tuple[int, int], observation_time_seconds: Optional[float],
+    ) -> TemporalHiveSnapshot:
+        """Copy the map at the time of capture without mutating its values or clock."""
+        labels = np.zeros(self.resolution[::-1], dtype=np.uint8)
+        state = (None if chamber_info.get('temporal_unavailable', False)
+                 else self._states.get((context_id, chamber_id)))
+        if state is not None:
+            snapshot = _PriorState(state.hive_sum.copy(), state.weight_sum.copy(),
+                                   state.last_time_seconds, state.observation_count)
+            self._decay_state(snapshot, observation_time_seconds)
+            known = snapshot.weight_sum >= self.min_prior_weight
+            labels[known] = 1
+            labels[known & (self._probability_map(snapshot) >= self.hive_probability_threshold)] = 2
+        return TemporalHiveSnapshot(
+            chamber_id, self._chamber_bbox(chamber_info, frame_shape), labels,
+        )
+
     def update(
         self,
         context_id: str,
@@ -136,7 +205,7 @@ class TemporalHivePrior:
         observation_time_seconds: Optional[float],
     ):
         """Update the prior with current hive evidence, excluding bee-occluded pixels."""
-        if hive_mask is None or not np.any(hive_mask > 0):
+        if chamber_info.get('temporal_unavailable', False) or hive_mask is None or not np.any(hive_mask > 0):
             return
 
         key = (context_id, chamber_id)
@@ -216,6 +285,8 @@ class TemporalHivePrior:
             "min_prior_weight": self.min_prior_weight,
             "cleanup_kernel_size": self.cleanup_kernel_size,
             "min_component_pixels": self.min_component_pixels,
+            "stabilize_chambers": self.stabilize_chambers,
+            "scoring_mode": self.scoring_mode,
         }
 
         state_metadata = []
@@ -266,6 +337,8 @@ class TemporalHivePrior:
                 min_prior_weight=float(settings.get("min_prior_weight", 2.0)),
                 cleanup_kernel_size=int(settings.get("cleanup_kernel_size", 3)),
                 min_component_pixels=int(settings.get("min_component_pixels", 12)),
+                stabilize_chambers=bool(settings.get("stabilize_chambers", False)),
+                scoring_mode=settings.get("scoring_mode", "prior"),
             )
 
             for state_info in metadata.get("states", []):
@@ -406,9 +479,10 @@ class TemporalHivePrior:
             normalized[ny1:ny2, nx1:nx2] = True
         return normalized
 
-    def _chamber_bbox(self, chamber_info: Dict, frame_shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    @staticmethod
+    def _chamber_bbox(chamber_info: Dict, frame_shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
         frame_h, frame_w = frame_shape[:2]
-        bbox = chamber_info.get("bbox") if chamber_info else None
+        bbox = chamber_info.get('temporal_bbox', chamber_info.get('bbox')) if chamber_info else None
         if bbox is None:
             return (0, 0, frame_w, frame_h)
 

@@ -26,7 +26,7 @@ from .yolo_bbox_toolbar import YOLOBBoxToolbar
 from .hive_chamber_toolbar import HiveChamberToolbar
 from .sam2_toolbar import SAM2Toolbar
 from .sam2_training_dialog import SAM2TrainingConfigDialog
-from .dialogs import VideoImportDialog, ProjectDialog, ProjectVideoImportDialog
+from .dialogs import VideoImportDialog, ProjectDialog, ProjectVideoImportDialog, TrainingMaskCopyDialog
 from .training_dialog import TrainingConfigDialog, TrainingProgressDialog
 from .validation_dialog import ValidationConfigDialog, ValidationProgressDialog
 from .validation_worker import ValidationWorker
@@ -42,6 +42,9 @@ from .tracking_validation_dialog import TrackingValidationConfigDialog, Tracking
 from .tracking_validation_worker import TrackingValidationWorker
 from core.video_processor import VideoProcessor
 from core.annotation import AnnotationManager
+from core.categories import CATEGORIES, BROOD_CATEGORIES, BROOD_SHORT_LABELS, CATEGORY_LABELS, category_label, training_categories
+from core.annotation_scope import split_annotations, merge_annotations, frame_categories
+from core.annotation_copy import training_copy_targets, selected_copy_masks, merge_copied_masks
 from core.project_manager import ProjectManager
 from core.instance_tracker import InstanceTracker, Detection, Track
 from core.frame_cache import FrameCache, PreloadWorker
@@ -94,10 +97,18 @@ class SaveWorker(QThread):
                     self.save_completed.emit(frame_idx)
                 except Exception as e:
                     self.error_occurred.emit(f"Save failed for frame {frame_idx}: {str(e)}")
+                finally:
+                    self.save_queue.task_done()
                     
             except Exception as e:
                 self.error_occurred.emit(f"Worker error: {str(e)}")
                 
+    def wait_until_idle(self):
+        """Finish queued and in-flight writes before synchronous annotation copies."""
+        if self.save_queue.unfinished_tasks and (not self.running or not self.isRunning()):
+            raise RuntimeError('The annotation save worker is not running.')
+        self.save_queue.join()
+
     def stop(self):
         """Stop the worker thread"""
         self.running = False
@@ -411,7 +422,7 @@ class MainWindow(QMainWindow):
 
     def _init_done_counter_overlay(self):
         """Create a small automatic instance counter over the canvas viewport."""
-        self.done_counter_categories = ('bee', 'hive', 'chamber', 'pollen')
+        self.done_counter_categories = CATEGORIES
         self.done_counter_saved_counts = self._zero_annotation_counts()
         self.done_counter_session_baseline_counts = self._zero_annotation_counts()
         self.done_counter_saved_counts_dirty = True
@@ -480,7 +491,7 @@ class MainWindow(QMainWindow):
         self.done_counter_overlay.raise_()
 
     def _zero_annotation_counts(self):
-        categories = getattr(self, 'done_counter_categories', ('bee', 'hive', 'chamber', 'pollen'))
+        categories = getattr(self, 'done_counter_categories', CATEGORIES)
         return {category: 0 for category in categories}
 
     def _add_annotation_counts(self, base_counts, delta_counts, sign=1):
@@ -665,7 +676,7 @@ class MainWindow(QMainWindow):
             'hive': 'Hives',
             'chamber': 'Chambers',
             'pollen': 'Pollen',
-        }.get(category, category.capitalize())
+        }.get(category, category_label(category))
 
     def _reset_done_counter_baseline(self):
         self.done_counter_saved_counts_dirty = True
@@ -705,6 +716,7 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, 'done_counter_category_labels'):
             for category, label in self.done_counter_category_labels.items():
+                label.setVisible(category not in BROOD_CATEGORIES or counts.get(category, 0) > 0)
                 label.setText(
                     f"{self._category_display_name(category)}: "
                     f"{counts.get(category, 0)} (+{session_counts.get(category, 0)})"
@@ -3413,15 +3425,7 @@ class MainWindow(QMainWindow):
 
     def _split_source_annotations(self, annotations):
         """Split canvas annotations into per-frame and video-level sources."""
-        bee_annotations = [
-            ann for ann in annotations
-            if ann.get('category', 'bee') == 'bee'
-        ]
-        video_level_annotations = [
-            ann for ann in annotations
-            if ann.get('category', 'bee') in ('chamber', 'hive', 'pollen')
-        ]
-        return bee_annotations, video_level_annotations
+        return split_annotations(annotations, self.annotation_manager.project_info)
 
     def _mark_current_annotations_dirty(self, include_frame=True, include_video=True):
         """Mark the current annotation source files as needing a save."""
@@ -3487,22 +3491,22 @@ class MainWindow(QMainWindow):
                 'video_id': target_video_id,
             }
 
-        bee_annotations, video_level_annotations = self._split_source_annotations(annotations)
+        frame_annotations, video_level_annotations = self._split_source_annotations(annotations)
         saved_files = []
 
         if save_frame:
             self.annotation_manager.set_frame_annotations(
-                target_list_idx, bee_annotations, video_id=target_video_id
+                target_list_idx, frame_annotations, video_id=target_video_id
             )
             if use_background:
                 self.save_worker.add_save_task(
                     self.project_path, target_video_id,
-                    frame_idx_in_video, bee_annotations
+                    frame_idx_in_video, frame_annotations
                 )
             else:
                 self.annotation_manager.save_frame_annotations(
                     self.project_path, target_video_id,
-                    frame_idx_in_video, bee_annotations
+                    frame_idx_in_video, frame_annotations
                 )
             saved_files.append('frame')
             if frame_key is not None:
@@ -3531,15 +3535,33 @@ class MainWindow(QMainWindow):
             'saved_files': saved_files,
             'frame_idx': frame_idx_in_video,
             'video_id': target_video_id,
-            'bee_count': len(bee_annotations),
+            'bee_count': sum(ann.get('category', 'bee') == 'bee' for ann in frame_annotations),
+            'frame_count': len(frame_annotations),
             'video_level_count': len(video_level_annotations),
         }
     
-    def _save_video_level_annotations(self, video_id=None):
-        """Save chamber/hive/pollen annotations at the video level (shared across all frames).
+    def _queue_tracked_bee_annotations(self, list_idx, annotations):
+        """Replace tracked bees without erasing other frame-local labels."""
+        frame_idx = self._get_frame_idx_in_video(list_idx)
+        key = (self.current_video_id, list_idx)
+        if key in self.annotation_manager.frame_annotations:
+            existing = self.annotation_manager.get_frame_annotations(list_idx, video_id=self.current_video_id)
+        else:
+            existing = self.annotation_manager.load_frame_annotations(
+                self.project_path, self.current_video_id, frame_idx
+            ) or []
+        existing_frame, _ = self._split_source_annotations(existing)
+        preserved = [ann for ann in existing_frame if ann.get('category', 'bee') != 'bee']
+        reserved = {ann.get('mask_id', ann.get('instance_id')) for ann in preserved}
+        if any(ann.get('mask_id', ann.get('instance_id')) in reserved for ann in annotations):
+            raise ValueError('Tracked bee IDs conflict with existing frame-local nest IDs; '
+                             'the frame annotations have not been overwritten.')
+        combined = preserved + annotations
+        self.annotation_manager.set_frame_annotations(list_idx, combined, video_id=self.current_video_id)
+        self.save_worker.add_save_task(self.project_path, self.current_video_id, frame_idx, combined)
 
-        These annotation types do not change between frames, so they are stored once
-        per video rather than per frame.
+    def _save_video_level_annotations(self, video_id=None):
+        """Save annotations whose project scope is shared across the video.
 
         Args:
             video_id: The video ID to save for. Defaults to self.current_video_id.
@@ -3551,8 +3573,7 @@ class MainWindow(QMainWindow):
             return
         try:
             all_annotations = self.canvas.get_annotations()
-            video_anns = [a for a in all_annotations
-                          if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
+            _, video_anns = self._split_source_annotations(all_annotations)
             self.annotation_manager.save_video_annotations(
                 self.project_path, target_video_id, video_anns
             )
@@ -3678,7 +3699,8 @@ class MainWindow(QMainWindow):
             self.project_manager.create_project(
                 self.project_path, 
                 project_name,
-                frames_per_video=15  # Default, user can change per video
+                frames_per_video=15,  # Default, user can change per video
+                hive_annotation_scope=project_info['hive_annotation_scope']
             )
             
             # Set marker detector debug folder
@@ -4460,11 +4482,10 @@ class MainWindow(QMainWindow):
                         self.project_path, self.current_video_id
                     )
                     if video_level_anns:
-                        # Strip any chamber/hive/pollen that may have been saved per-frame
-                        # (backward-compat: old saves may have put them per-frame)
-                        bee_anns = [a for a in (annotations or [])
-                                    if a.get('category', 'bee') == 'bee']
-                        annotations = bee_anns + video_level_anns
+                        annotations = merge_annotations(
+                            annotations or [], video_level_anns,
+                            self.annotation_manager.project_info,
+                        )
                         annotation_source += "+video-level"
                         
                 t_load = (time.perf_counter() - t_load_start) * 1000
@@ -5202,8 +5223,8 @@ class MainWindow(QMainWindow):
             metadata = self.canvas.annotation_metadata.get(instance_id, {})
             
             # Determine category prefix
-            category_prefix_map = {'bee': 'B', 'hive': 'H', 'chamber': 'C', 'pollen': 'P'}
-            prefix = category_prefix_map.get(category, 'B')
+            category_prefix_map = {'bee': 'B', 'hive': 'H', 'chamber': 'C', 'pollen': 'P', **BROOD_SHORT_LABELS}
+            prefix = category_prefix_map.get(category, category_label(category))
             class_visible = self.canvas.annotation_type_visibility.get(category, True)
             
             # Determine if instance has segmentation or is bbox-only
@@ -5249,9 +5270,9 @@ class MainWindow(QMainWindow):
                 else Qt.CheckState.Unchecked
             )
             item.setToolTip(
-                "Checked: show this instance. Unchecked: hide this instance."
+                f"{category_label(category)} {instance_id}\nChecked: show this instance. Unchecked: hide this instance."
                 if class_visible else
-                f"Turn on {category} visibility first; the class switch overrides this row."
+                f"Turn on {category_label(category)} visibility first; the class switch overrides this row."
             )
             self.instance_list.addItem(item)
             
@@ -5734,7 +5755,7 @@ class MainWindow(QMainWindow):
     
     def _sync_annotation_type_control(self, category, preserve_active_edit=False):
         """Keep the canvas active category in sync with the selected instance."""
-        if category not in {'bee', 'chamber', 'hive', 'pollen'}:
+        if category not in CATEGORIES:
             return
 
         if preserve_active_edit:
@@ -5776,7 +5797,7 @@ class MainWindow(QMainWindow):
             self.canvas.commit_editing()
 
         # Handle chamber/hive/pollen instance selection
-        if item_type in ['chamber', 'hive', 'pollen']:
+        if item_type in CATEGORIES and item_type != 'bee':
             # Switch to that annotation mode
             self._sync_annotation_type_control(item_type)
             
@@ -6138,12 +6159,7 @@ class MainWindow(QMainWindow):
                 change_category_menu = menu.addMenu(f"Change Category")
                 
                 # Add actions for each category (except current one)
-                categories = [
-                    ('bee', 'Bee (per-frame)'),
-                    ('hive', 'Hive (video-level)'),
-                    ('chamber', 'Chamber (video-level)'),
-                    ('pollen', 'Pollen (video-level)')
-                ]
+                categories = list(CATEGORY_LABELS.items())
                 
                 category_actions = {}
                 for cat_id, cat_label in categories:
@@ -6167,17 +6183,16 @@ class MainWindow(QMainWindow):
             clear_aruco_action = None
             category_actions = {}
         
-        # Add propagate options if not at last frame
+        # Copy destinations are independent of the frame-list display filter.
         propagate_action = None
         propagate_through_action = None
-        next_idx = self._get_next_frame_index()
-        if next_idx is not None:
+        if self._get_training_copy_targets():
             menu.addSeparator()
             if len(selected_items) == 1:
-                propagate_action = menu.addAction("Copy to Next Frame...")
-                propagate_through_action = menu.addAction("Copy Through Frames...")
+                propagate_action = menu.addAction("Copy to Next Training Frame...")
+                propagate_through_action = menu.addAction("Copy Through Training Frames...")
             else:
-                propagate_through_action = menu.addAction(f"Copy {len(selected_items)} Instances Through Frames...")
+                propagate_through_action = menu.addAction(f"Copy {len(selected_items)} Instances Through Training Frames...")
         
         action = menu.exec(self.instance_list.mapToGlobal(position))
         
@@ -6218,710 +6233,165 @@ class MainWindow(QMainWindow):
             else:
                 self.propagate_selected_instances_through_frames()
     
-    def propagate_selected_instance_through_frames(self):
-        """Copy the selected instance mask through multiple frames until a specified frame"""
-        from PyQt6.QtWidgets import QInputDialog
-        
-        # Get selected instance
-        idx = self.instance_list.currentRow()
-        if idx < 0:
-            QMessageBox.warning(
-                self, "No Instance Selected",
-                "Please select an instance to copy."
-            )
-            return
-        
-        # Get the instance ID and mask
-        if self.canvas.combined_mask is None:
-            QMessageBox.warning(
-                self, "No Annotations",
-                "No annotations found on current frame."
-            )
-            return
-        
-        # Get unique instance IDs
-        instance_ids = np.unique(self.canvas.combined_mask)
-        instance_ids = instance_ids[instance_ids > 0].tolist()
-        
-        # Add editing instance if present
-        if self.canvas.editing_instance_id > 0 and self.canvas.editing_mask is not None:
-            if self.canvas.editing_instance_id not in instance_ids:
-                instance_ids.append(self.canvas.editing_instance_id)
-        
-        instance_ids = sorted(instance_ids)
-        
-        if idx >= len(instance_ids):
-            QMessageBox.warning(
-                self, "Invalid Selection",
-                "Selected instance index is out of range."
-            )
-            return
-        
-        instance_id = instance_ids[idx]
-        
-        # Get the mask for this instance
-        if instance_id == self.canvas.editing_instance_id and self.canvas.editing_mask is not None:
-            instance_mask = self.canvas.editing_mask.copy()
+    def _get_training_copy_targets(self):
+        return [index for index in training_copy_targets(
+            self.current_frame_idx, self.current_video_id,
+            self.frame_video_ids, self.frame_splits, self.frame_selected,
+        ) if index < len(self.frames)]
+
+    def _training_copy_existing_annotations(self, list_idx):
+        key = (self.current_video_id, list_idx)
+        if key in self.annotation_manager.frame_annotations:
+            annotations = self.annotation_manager.get_frame_annotations(
+                list_idx, video_id=self.current_video_id)
         else:
-            instance_mask = (self.canvas.combined_mask == instance_id).astype(np.uint8) * 255
-        
-        if not np.any(instance_mask > 0):
-            QMessageBox.warning(
-                self, "Empty Mask",
-                "The selected instance has an empty mask."
-            )
+            annotations = self.annotation_manager.load_frame_annotations(
+                self.project_path, self.current_video_id,
+                self._get_frame_idx_in_video(list_idx)) or []
+        frame_annotations, _ = self._split_source_annotations(annotations)
+        return frame_annotations
+
+    def _copy_masks_to_training_frame(self, list_idx, sources, replace, shared):
+        """Write one eligible frame; never navigate the canvas during batch copies."""
+        if list_idx not in self._get_training_copy_targets():
+            raise ValueError('Destination is no longer a selected training frame in this video.')
+        frame = self.frames[list_idx]
+        image = frame if isinstance(frame, np.ndarray) else cv2.imread(str(frame), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise ValueError(f'Cannot read destination image: {frame}')
+        existing = self._training_copy_existing_annotations(list_idx)
+        updated, copied, skipped = merge_copied_masks(
+            existing, sources, image.shape, shared=shared, replace=replace)
+        if copied:
+            frame_number = self._get_frame_idx_in_video(list_idx)
+            # Persist before caching so eviction, cancellation, and closing do not
+            # lose completed copies. Shared video annotation files are untouched.
+            self.annotation_manager.save_frame_annotations(
+                self.project_path, self.current_video_id, frame_number, updated)
+            self.annotation_manager.set_frame_annotations(
+                list_idx, updated, video_id=self.current_video_id)
+            self.dirty_frame_annotation_keys.discard((self.current_video_id, frame_number))
+            self.coco_export_dirty = True
+            self._schedule_done_counter_update(saved_counts_dirty=True)
+        return copied, skipped
+
+    def _copy_selected_training_masks(self, next_only=False):
+        if not self.project_path or not self.current_video_id:
             return
-        
-        # Find the range of available frames
-        last_frame_idx = len(self.frames) - 1
-        
-        # Create a custom dialog to get target frame and selected-only option
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Copy Through Frames")
-        dialog_layout = QVBoxLayout()
-        
-        # Target frame input
-        dialog_layout.addWidget(QLabel(
-            f"Copy Instance ID {instance_id} through frames until:\n"
-            f"(Current frame: {self.current_frame_idx}, Last frame: {last_frame_idx})"
-        ))
-        
-        from PyQt6.QtWidgets import QSpinBox
-        target_spin = QSpinBox()
-        target_spin.setMinimum(self.current_frame_idx + 1)
-        target_spin.setMaximum(last_frame_idx)
-        target_spin.setValue(last_frame_idx)
-        dialog_layout.addWidget(target_spin)
-        
-        # Selected frames only checkbox
-        selected_only_check = QCheckBox("Copy only to selected frames (training/validation)")
-        selected_only_check.setChecked(False)
-        
-        # Check if we have selected frames info
-        has_selected_frames = bool(self.frame_selected and any(self.frame_selected))
-        if has_selected_frames:
-            # Count how many selected frames are in range
-            selected_in_range = sum(1 for i in range(self.current_frame_idx + 1, last_frame_idx + 1)
-                                   if i < len(self.frame_selected) and self.frame_selected[i])
-            selected_only_check.setToolTip(
-                f"{selected_in_range} selected frames available in range"
-            )
-        else:
-            selected_only_check.setEnabled(False)
-            selected_only_check.setToolTip("No frames marked for training/validation")
-        
-        dialog_layout.addWidget(selected_only_check)
-        
-        # Buttons
-        button_layout = QHBoxLayout()
-        ok_btn = QPushButton("OK")
-        cancel_btn = QPushButton("Cancel")
-        ok_btn.clicked.connect(dialog.accept)
-        cancel_btn.clicked.connect(dialog.reject)
-        button_layout.addWidget(ok_btn)
-        button_layout.addWidget(cancel_btn)
-        dialog_layout.addLayout(button_layout)
-        
-        dialog.setLayout(dialog_layout)
-        
+        targets = self._get_training_copy_targets()
+        if not targets:
+            QMessageBox.information(
+                self, "No Training Frames",
+                "There are no subsequent selected training frames in this video. "
+                "Validation videos and unselected frames are not copy destinations.")
+            return
+        try:
+            # Sidebar rows are category-sorted and are not numeric instance IDs.
+            keys = self._get_selected_instance_keys()
+            sources = selected_copy_masks(
+                self.canvas.get_annotations(), keys, self.annotation_manager.project_info)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot Copy Masks", str(exc))
+            return
+
+        source_context = (self.project_path, self.current_video_id, self.current_frame_idx)
+        if next_only:
+            targets = targets[:1]
+        dialog = TrainingMaskCopyDialog(
+            self, [(index, self._get_frame_idx_in_video(index)) for index in targets],
+            len(sources))
+        if next_only:
+            dialog.setWindowTitle("Copy to Next Training Frame")
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        
-        target_frame = target_spin.value()
-        selected_only = selected_only_check.isChecked()
-        
-        # Build list of frames to copy to
-        if selected_only:
-            # Only copy to selected frames
-            target_frames = [i for i in range(self.current_frame_idx + 1, target_frame + 1)
-                           if i < len(self.frame_selected) and self.frame_selected[i]]
-        else:
-            # Copy to all frames
-            target_frames = list(range(self.current_frame_idx + 1, target_frame + 1))
-        
-        if not target_frames:
-            QMessageBox.warning(
-                self, "No Target Frames",
-                "No frames found in the specified range."
-            )
+        targets = targets[:dialog.endpoint.currentIndex() + 1]
+        replace = dialog.replace_check.isChecked()
+        if source_context != (self.project_path, self.current_video_id, self.current_frame_idx):
+            QMessageBox.warning(self, "Copy Canceled", "The source frame changed. Please try again.")
             return
-        
-        num_frames = len(target_frames)
-        
-        # Confirm the operation
-        frame_type = "selected " if selected_only else ""
-        reply = QMessageBox.question(
-            self,
-            "Confirm Copy",
-            f"Copy Instance ID {instance_id} to {num_frames} {frame_type}frame(s)?\n\n"
-            f"This will overwrite any existing annotations for this instance ID on those frames.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        
+
+        progress = QProgressDialog("Saving source annotations...", "Cancel", 0, len(targets), self)
+        progress.setWindowTitle("Copy Training Masks")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        completed, skipped_count, failures = [], 0, []
+        canceled = False
         try:
-            # Save current frame first
-            current_annotations = self.canvas.get_annotations()
-            self.annotation_manager.set_frame_annotations(
-                self.current_frame_idx, current_annotations, video_id=self.current_video_id
-            )
-            
-            # Find source annotation to get category
-            source_ann = None
-            for ann in current_annotations:
-                if ann.get('mask_id', ann.get('instance_id', 0)) == instance_id:
-                    source_ann = ann
-                    break
-            
-            original_frame_idx = self.current_frame_idx
-            frames_copied = 0
-            
-            # Create progress dialog
-            progress = QProgressDialog(
-                f"Copying Instance ID {instance_id}...",
-                "Cancel",
-                0,
-                num_frames,
-                self
-            )
-            progress.setWindowTitle("Copy Progress")
-            progress.setWindowModality(Qt.WindowModality.WindowModal)
-            progress.setMinimumDuration(0)  # Show immediately
-            progress.setValue(0)
-            
-            # Loop through frames
-            for i, target_idx in enumerate(target_frames):
-                # Check if user cancelled
-                if progress.wasCanceled():
-                    break
-                
-                progress.setLabelText(
-                    f"Copying Instance ID {instance_id} to frame {target_idx}\n"
-                    f"({i + 1}/{num_frames})"
-                )
-                progress.setValue(i)
+            # A pending autosave must not overwrite a newly copied destination.
+            self.save_worker.wait_until_idle()
+            self._commit_canvas_edit_if_needed()
+            self._save_annotation_sources(use_background=False)
+            shared, _ = self.annotation_manager.load_video_annotations(
+                self.project_path, self.current_video_id)
+            shared = merge_annotations([], shared, self.annotation_manager.project_info)
+            for position, index in enumerate(targets):
+                frame_number = self._get_frame_idx_in_video(index)
+                progress.setLabelText(f"Copying to training frame {frame_number:06d}...")
                 QApplication.processEvents()
-                
-                # Navigate to target frame
-                self.load_frame(target_idx)
-                
-                # Get existing annotations on target frame
-                target_annotations = self.canvas.get_annotations()
-                
-                # Check if this instance ID already exists
-                existing_ids = [ann.get('mask_id', ann.get('instance_id', 0)) 
-                               for ann in target_annotations]
-                
-                # Preserve mask ID and color if tracking is enabled
-                if self.tracking_enabled and self.current_video_id:
-                    mask_id = instance_id
-                    # Get color from video colors
-                    if self.current_video_id not in self.video_mask_colors:
-                        self.video_mask_colors[self.current_video_id] = {}
-                    color = self.video_mask_colors[self.current_video_id].get(mask_id)
+                if progress.wasCanceled():
+                    canceled = True
+                    break
+                if source_context != (self.project_path, self.current_video_id, self.current_frame_idx):
+                    raise ValueError('Source frame changed; copying stopped.')
+                try:
+                    copied, skipped = self._copy_masks_to_training_frame(index, sources, replace, shared)
+                except ValueError as exc:
+                    failures.append(f"Frame {frame_number:06d}: {exc}")
                 else:
-                    mask_id = instance_id
-                    color = None
-                
-                # If instance ID already exists, remove the old one
-                if mask_id in existing_ids:
-                    # Remove old instance with this ID
-                    target_annotations = [ann for ann in target_annotations 
-                                         if ann.get('mask_id', ann.get('instance_id', 0)) != mask_id]
-                    # Rebuild canvas with remaining annotations
-                    mask_colors_dict = {ann['mask_id']: self.canvas.mask_colors.get(ann['mask_id']) 
-                                       for ann in target_annotations if ann.get('mask_id')}
-                    self.canvas.set_annotations(target_annotations, mask_colors_dict)
-                
-                # Add the copied mask to canvas with its original category
-                category = source_ann.get('category', 'bee') if source_ann else 'bee'
-                self.canvas.add_mask(instance_mask, mask_id=mask_id, color=color, rebuild_viz=True, category=category)
-                self._register_canvas_colors()
-                
-                # Save this frame
-                updated_annotations = self.canvas.get_annotations()
-                self.annotation_manager.set_frame_annotations(
-                    target_idx, updated_annotations, video_id=self.current_video_id
-                )
-                
-                frames_copied += 1
-            
-            progress.setValue(num_frames)
+                    skipped_count += len(skipped)
+                    if copied:
+                        completed.append((index, copied))
+                progress.setValue(position + 1)
+        except Exception as exc:
+            failures.append(f"Copy stopped: {exc}")
+        finally:
             progress.close()
-            
-            # Return to original frame
-            self.load_frame(original_frame_idx)
-            
-            # Check if operation was cancelled
-            if progress.wasCanceled():
+
+        summary = (f"Saved copies to {len(completed)} training frame(s). "
+                   f"Skipped {skipped_count} existing matching instance(s).")
+        if canceled:
+            summary += " Canceled; completed copies were kept."
+        if failures:
+            summary += f" {len(failures)} issue(s); see details."
+        self.status_label.setText(summary)
+
+        if next_only and completed and not failures and not canceled:
+            index, copied_keys = completed[0]
+            self.load_frame(index)
+            if self.current_frame_idx == index:
+                instance_id, category = copied_keys[0]
+                self.canvas.current_annotation_type = category
+                self.canvas.set_instance_visible(instance_id, category, True, rebuild=False)
+                self.toolbar.set_tool('brush')
+                self.canvas.set_selected_instance(instance_id, category=category, zoom=False)
+                self.update_instance_list_from_canvas()
                 self.status_label.setText(
-                    f"Cancelled - Copied Instance ID {instance_id} to {frames_copied}/{num_frames} frame(s)"
-                )
-                QMessageBox.information(
-                    self, "Copy Cancelled",
-                    f"Operation cancelled.\n\n"
-                    f"Instance ID {instance_id} was copied to {frames_copied} of {num_frames} frame(s)."
-                )
-            else:
-                self.status_label.setText(
-                    f"✓ Copied Instance ID {instance_id} to {frames_copied} frame(s)"
-                )
-                
-                frame_range = f"{target_frames[0]} through {target_frames[-1]}" if len(target_frames) > 1 else str(target_frames[0])
-                QMessageBox.information(
-                    self, "Copy Complete",
-                    f"Instance ID {instance_id} has been copied to {frames_copied} frame(s)\n"
-                    f"(frames {frame_range}).\n\n"
-                    f"All frames have been saved."
-                )
-            
-        except Exception as e:
-            import traceback
-            error_msg = traceback.format_exc()
-            QMessageBox.critical(
-                self, "Copy Error",
-                f"Error copying instance through frames:\n{str(e)}\n\n{error_msg}"
-            )
-            self.status_label.setText("Copy failed")
-            # Try to return to original frame
-            try:
-                self.load_frame(original_frame_idx)
-            except:
-                pass
-    
+                    f"Copied {category} {instance_id} to training frame "
+                    f"{self._get_frame_idx_in_video(index):06d}. Review where bees moved.")
+        else:
+            message = QMessageBox(self)
+            message.setWindowTitle("Training Mask Copy")
+            message.setText(summary)
+            if completed:
+                message.setInformativeText(
+                    "Review each copied mask where bees have moved or nest visibility has changed.")
+            if failures:
+                message.setIcon(QMessageBox.Icon.Warning)
+                message.setDetailedText("\n".join(failures))
+            message.exec()
+
+    def propagate_selected_instance_through_frames(self):
+        self._copy_selected_training_masks()
+
     def propagate_selected_instances_through_frames(self):
-        """Copy multiple selected instance masks through multiple frames until a specified frame"""
-        # Get selected instances
-        selected_items = self.instance_list.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(
-                self, "No Instances Selected",
-                "Please select one or more instances to copy."
-            )
-            return
-        
-        # Get the instance IDs and masks
-        if self.canvas.combined_mask is None:
-            QMessageBox.warning(
-                self, "No Annotations",
-                "No annotations found on current frame."
-            )
-            return
-        
-        # Get unique instance IDs from canvas
-        canvas_instance_ids = np.unique(self.canvas.combined_mask)
-        canvas_instance_ids = canvas_instance_ids[canvas_instance_ids > 0].tolist()
-        
-        # Add editing instance if present
-        if self.canvas.editing_instance_id > 0 and self.canvas.editing_mask is not None:
-            if self.canvas.editing_instance_id not in canvas_instance_ids:
-                canvas_instance_ids.append(self.canvas.editing_instance_id)
-        
-        canvas_instance_ids = sorted(canvas_instance_ids)
-        
-        # Map selected rows to instance IDs
-        selected_rows = [self.instance_list.row(item) for item in selected_items]
-        selected_instance_ids = []
-        instance_masks = {}
-        instance_categories = {}
-        
-        for row in selected_rows:
-            if row >= len(canvas_instance_ids):
-                continue
-            instance_id = canvas_instance_ids[row]
-            
-            # Get the mask for this instance
-            if instance_id == self.canvas.editing_instance_id and self.canvas.editing_mask is not None:
-                instance_mask = self.canvas.editing_mask.copy()
-            else:
-                instance_mask = (self.canvas.combined_mask == instance_id).astype(np.uint8) * 255
-            
-            if np.any(instance_mask > 0):
-                selected_instance_ids.append(instance_id)
-                instance_masks[instance_id] = instance_mask
-                
-                # Get category for this instance
-                current_annotations = self.canvas.get_annotations()
-                for ann in current_annotations:
-                    if ann.get('mask_id', ann.get('instance_id', 0)) == instance_id:
-                        instance_categories[instance_id] = ann.get('category', 'bee')
-                        break
-                if instance_id not in instance_categories:
-                    instance_categories[instance_id] = 'bee'
-        
-        if not selected_instance_ids:
-            QMessageBox.warning(
-                self, "No Valid Instances",
-                "No valid instances with masks found in selection."
-            )
-            return
-        
-        # Find the range of available frames
-        last_frame_idx = len(self.frames) - 1
-        
-        # Create a custom dialog to get target frame and selected-only option
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Copy Multiple Instances Through Frames")
-        dialog_layout = QVBoxLayout()
-        
-        # Target frame input
-        dialog_layout.addWidget(QLabel(
-            f"Copy {len(selected_instance_ids)} instance(s) (IDs: {', '.join(map(str, selected_instance_ids))}) through frames until:\n"
-            f"(Current frame: {self.current_frame_idx}, Last frame: {last_frame_idx})"
-        ))
-        
-        from PyQt6.QtWidgets import QSpinBox
-        target_spin = QSpinBox()
-        target_spin.setMinimum(self.current_frame_idx + 1)
-        target_spin.setMaximum(last_frame_idx)
-        target_spin.setValue(last_frame_idx)
-        dialog_layout.addWidget(target_spin)
-        
-        # Selected frames only checkbox
-        selected_only_check = QCheckBox("Copy only to selected frames (training/validation)")
-        selected_only_check.setChecked(False)
-        
-        # Check if we have selected frames info
-        has_selected_frames = bool(self.frame_selected and any(self.frame_selected))
-        if has_selected_frames:
-            # Count how many selected frames are in range
-            selected_in_range = sum(1 for i in range(self.current_frame_idx + 1, last_frame_idx + 1)
-                                   if i < len(self.frame_selected) and self.frame_selected[i])
-            selected_only_check.setToolTip(
-                f"{selected_in_range} selected frames available in range"
-            )
-        else:
-            selected_only_check.setEnabled(False)
-            selected_only_check.setToolTip("No frames marked for training/validation")
-        
-        dialog_layout.addWidget(selected_only_check)
-        
-        # Buttons
-        button_layout = QHBoxLayout()
-        ok_btn = QPushButton("OK")
-        cancel_btn = QPushButton("Cancel")
-        ok_btn.clicked.connect(dialog.accept)
-        cancel_btn.clicked.connect(dialog.reject)
-        button_layout.addWidget(ok_btn)
-        button_layout.addWidget(cancel_btn)
-        dialog_layout.addLayout(button_layout)
-        
-        dialog.setLayout(dialog_layout)
-        
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        
-        target_frame = target_spin.value()
-        selected_only = selected_only_check.isChecked()
-        
-        # Build list of frames to copy to
-        if selected_only:
-            # Only copy to selected frames
-            target_frames = [i for i in range(self.current_frame_idx + 1, target_frame + 1)
-                           if i < len(self.frame_selected) and self.frame_selected[i]]
-        else:
-            # Copy to all frames
-            target_frames = list(range(self.current_frame_idx + 1, target_frame + 1))
-        
-        if not target_frames:
-            QMessageBox.warning(
-                self, "No Target Frames",
-                "No frames found in the specified range."
-            )
-            return
-        
-        num_frames = len(target_frames)
-        
-        # Confirm the operation
-        frame_type = "selected " if selected_only else ""
-        reply = QMessageBox.question(
-            self,
-            "Confirm Copy",
-            f"Copy {len(selected_instance_ids)} instance(s) to {num_frames} {frame_type}frame(s)?\n\n"
-            f"This will overwrite any existing annotations for these instance IDs on those frames.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        
-        try:
-            # Save current frame first
-            current_annotations = self.canvas.get_annotations()
-            self.annotation_manager.set_frame_annotations(
-                self.current_frame_idx, current_annotations, video_id=self.current_video_id
-            )
-            
-            original_frame_idx = self.current_frame_idx
-            total_operations = len(selected_instance_ids) * num_frames
-            operations_done = 0
-            
-            # Create progress dialog
-            progress = QProgressDialog(
-                f"Copying {len(selected_instance_ids)} instance(s)...",
-                "Cancel",
-                0,
-                total_operations,
-                self
-            )
-            progress.setWindowTitle("Copy Progress")
-            progress.setWindowModality(Qt.WindowModality.WindowModal)
-            progress.setMinimumDuration(0)  # Show immediately
-            progress.setValue(0)
-            
-            # Loop through frames
-            for frame_num, target_idx in enumerate(target_frames):
-                # Check if user cancelled
-                if progress.wasCanceled():
-                    break
-                
-                # Navigate to target frame
-                self.load_frame(target_idx)
-                
-                # Get existing annotations on target frame
-                target_annotations = self.canvas.get_annotations()
-                
-                # Copy each selected instance
-                for instance_id in selected_instance_ids:
-                    # Check if user cancelled
-                    if progress.wasCanceled():
-                        break
-                    
-                    progress.setLabelText(
-                        f"Copying Instance ID {instance_id} to frame {target_idx}\n"
-                        f"(Frame {frame_num + 1}/{num_frames}, Instance {selected_instance_ids.index(instance_id) + 1}/{len(selected_instance_ids)})"
-                    )
-                    progress.setValue(operations_done)
-                    QApplication.processEvents()
-                    
-                    instance_mask = instance_masks[instance_id]
-                    category = instance_categories[instance_id]
-                    
-                    # Check if this instance ID already exists
-                    existing_ids = [ann.get('mask_id', ann.get('instance_id', 0)) 
-                                   for ann in target_annotations]
-                    
-                    # Preserve mask ID and color if tracking is enabled
-                    if self.tracking_enabled and self.current_video_id:
-                        mask_id = instance_id
-                        # Get color from video colors
-                        if self.current_video_id not in self.video_mask_colors:
-                            self.video_mask_colors[self.current_video_id] = {}
-                        color = self.video_mask_colors[self.current_video_id].get(mask_id)
-                    else:
-                        mask_id = instance_id
-                        color = None
-                    
-                    # If instance ID already exists, remove the old one
-                    if mask_id in existing_ids:
-                        # Remove old instance with this ID
-                        target_annotations = [ann for ann in target_annotations 
-                                             if ann.get('mask_id', ann.get('instance_id', 0)) != mask_id]
-                        # Rebuild canvas with remaining annotations
-                        mask_colors_dict = {ann['mask_id']: self.canvas.mask_colors.get(ann['mask_id']) 
-                                           for ann in target_annotations if ann.get('mask_id')}
-                        self.canvas.set_annotations(target_annotations, mask_colors_dict)
-                    
-                    # Add the copied mask to canvas with its original category
-                    self.canvas.add_mask(instance_mask, mask_id=mask_id, color=color, rebuild_viz=False, category=category)
-                    self._register_canvas_colors()
-                    
-                    # Update target_annotations for next instance
-                    target_annotations = self.canvas.get_annotations()
-                    
-                    operations_done += 1
-                
-                # Rebuild visualization once per frame after all instances are added
-                self.canvas.rebuild_visualization()
-                
-                # Save this frame
-                updated_annotations = self.canvas.get_annotations()
-                self.annotation_manager.set_frame_annotations(
-                    target_idx, updated_annotations, video_id=self.current_video_id
-                )
-                
-                if progress.wasCanceled():
-                    break
-            
-            progress.setValue(total_operations)
-            progress.close()
-            
-            # Return to original frame
-            self.load_frame(original_frame_idx)
-            
-            frames_copied = operations_done // len(selected_instance_ids) if selected_instance_ids else 0
-            
-            # Check if operation was cancelled
-            if progress.wasCanceled():
-                self.status_label.setText(
-                    f"Cancelled - Copied {len(selected_instance_ids)} instance(s) to {frames_copied}/{num_frames} frame(s)"
-                )
-                QMessageBox.information(
-                    self, "Copy Cancelled",
-                    f"Operation cancelled.\n\n"
-                    f"{len(selected_instance_ids)} instance(s) were copied to approximately {frames_copied} of {num_frames} frame(s)."
-                )
-            else:
-                self.status_label.setText(
-                    f"✓ Copied {len(selected_instance_ids)} instance(s) to {frames_copied} frame(s)"
-                )
-                
-                frame_range = f"{target_frames[0]} through {target_frames[-1]}" if len(target_frames) > 1 else str(target_frames[0])
-                QMessageBox.information(
-                    self, "Copy Complete",
-                    f"{len(selected_instance_ids)} instance(s) have been copied to {frames_copied} frame(s)\n"
-                    f"(frames {frame_range}).\n\n"
-                    f"All frames have been saved."
-                )
-            
-        except Exception as e:
-            import traceback
-            error_msg = traceback.format_exc()
-            QMessageBox.critical(
-                self, "Copy Error",
-                f"Error copying instances through frames:\n{str(e)}\n\n{error_msg}"
-            )
-            self.status_label.setText("Copy failed")
-            # Try to return to original frame
-            try:
-                self.load_frame(original_frame_idx)
-            except:
-                pass
-    
+        self._copy_selected_training_masks()
+
     def propagate_selected_instance_to_next_frame(self):
-        """Copy the selected instance mask to the next frame and enter edit mode"""
-        # Get selected instance
-        idx = self.instance_list.currentRow()
-        if idx < 0:
-            QMessageBox.warning(
-                self, "No Instance Selected",
-                "Please select an instance to copy."
-            )
-            return
-        
-        # Get the instance ID
-        if self.canvas.combined_mask is None:
-            QMessageBox.warning(
-                self, "No Annotations",
-                "No annotations found on current frame."
-            )
-            return
-        
-        # Get unique instance IDs
-        instance_ids = np.unique(self.canvas.combined_mask)
-        instance_ids = instance_ids[instance_ids > 0].tolist()
-        
-        # Add editing instance if present
-        if self.canvas.editing_instance_id > 0 and self.canvas.editing_mask is not None:
-            if self.canvas.editing_instance_id not in instance_ids:
-                instance_ids.append(self.canvas.editing_instance_id)
-        
-        instance_ids = sorted(instance_ids)
-        
-        if idx >= len(instance_ids):
-            QMessageBox.warning(
-                self, "Invalid Selection",
-                "Selected instance index is out of range."
-            )
-            return
-        
-        instance_id = instance_ids[idx]
-        
-        # Get the mask for this instance
-        if instance_id == self.canvas.editing_instance_id and self.canvas.editing_mask is not None:
-            instance_mask = self.canvas.editing_mask.copy()
-        else:
-            instance_mask = (self.canvas.combined_mask == instance_id).astype(np.uint8) * 255
-        
-        if not np.any(instance_mask > 0):
-            QMessageBox.warning(
-                self, "Empty Mask",
-                "The selected instance has an empty mask."
-            )
-            return
-        
-        # Find next frame
-        next_idx = self._get_next_frame_index()
-        if next_idx is None:
-            QMessageBox.information(
-                self, "Last Frame",
-                "Already at the last frame in current view."
-            )
-            return
-        
-        try:
-            # Save current frame annotations first
-            current_annotations = self.canvas.get_annotations()
-            self.annotation_manager.set_frame_annotations(
-                self.current_frame_idx, current_annotations, video_id=self.current_video_id
-            )
-            
-            self.status_label.setText(f"Copying Instance ID {instance_id} to next frame...")
-            QApplication.processEvents()
-            
-            # Navigate to next frame
-            self.load_frame(next_idx)
-            
-            # Get existing annotations on next frame (if any)
-            next_frame_annotations = self.canvas.get_annotations()
-            
-            # Preserve mask ID and color if tracking is enabled
-            if self.tracking_enabled and self.current_video_id:
-                mask_id = instance_id
-                # Get color from video colors
-                if self.current_video_id not in self.video_mask_colors:
-                    self.video_mask_colors[self.current_video_id] = {}
-                color = self.video_mask_colors[self.current_video_id].get(mask_id)
-            else:
-                # Assign next available ID
-                existing_ids = [ann.get('mask_id', ann.get('instance_id', 0)) 
-                               for ann in next_frame_annotations]
-                mask_id = max(existing_ids) + 1 if existing_ids else 1
-                color = None
-            
-            # Add the copied mask to canvas with current category
-            category = self.canvas.current_annotation_type
-            self.canvas.add_mask(instance_mask, mask_id=mask_id, color=color, rebuild_viz=True, category=category)
-            self._register_canvas_colors()
-            
-            # Set this instance as selected and start editing
-            self.canvas.selected_mask_idx = mask_id
-            self.canvas.selected_instance_category = category
-            self.canvas.start_editing_instance(mask_id, category=category)
-            
-            # Update instance list
-            self.update_instance_list_from_canvas()
-            
-            # Mark frame as modified
-            self._mark_current_annotations_dirty()
-            
-            self.status_label.setText(
-                f"✓ Copied Instance ID {instance_id} (now in edit mode - adjust as needed)"
-            )
-            
-            QMessageBox.information(
-                self, "Instance Copied",
-                f"Instance ID {instance_id} has been copied to the next frame.\n\n"
-                f"The instance is now in edit mode - you can:\n"
-                f"• Add positive points to expand the mask\n"
-                f"• Add negative points to shrink the mask\n"
-                f"• Click 'Finish Editing' when done\n\n"
-                f"The frame will not be saved until you finish editing."
-            )
-            
-        except Exception as e:
-            import traceback
-            error_msg = traceback.format_exc()
-            QMessageBox.critical(
-                self, "Copy Error",
-                f"Error copying instance:\n{str(e)}\n\n{error_msg}"
-            )
-            self.status_label.setText("Copy failed")
-            
+        self._copy_selected_training_masks(next_only=True)
+
     def delete_selected_instance(self):
         """Delete the currently selected instance"""
         selected_instances = self._get_selected_instance_keys()
@@ -7022,7 +6492,7 @@ class MainWindow(QMainWindow):
         
         # Filter to only bee instances (don't delete hive/chamber/pollen)
         bee_annotations = [a for a in annotations if a.get('category', 'bee') == 'bee']
-        other_annotations = [a for a in annotations if a.get('category', 'bee') in ('chamber', 'hive', 'pollen')]
+        other_annotations = [a for a in annotations if a.get('category', 'bee') != 'bee']
         
         if not bee_annotations:
             QMessageBox.information(
@@ -7062,23 +6532,12 @@ class MainWindow(QMainWindow):
                     # Get frame index within video (not global frame index)
                     frame_idx_in_video = self._get_frame_idx_in_video(self.current_frame_idx)
                     
-                    # Delete PNG annotation file
-                    png_file = project_path / 'annotations' / 'png' / video_id / f'frame_{frame_idx_in_video:06d}.png'
-                    if png_file.exists():
-                        png_file.unlink()
-                        print(f"Deleted PNG annotation: {png_file}")
-                    
-                    # Delete JSON metadata file
-                    json_file = project_path / 'annotations' / 'json' / video_id / f'frame_{frame_idx_in_video:06d}.json'
-                    if json_file.exists():
-                        json_file.unlink()
-                        print(f"Deleted JSON metadata: {json_file}")
-                    
-                    # Delete bbox annotation file
-                    bbox_file = project_path / 'annotations' / 'bbox' / video_id / f'frame_{frame_idx_in_video:06d}.json'
-                    if bbox_file.exists():
-                        bbox_file.unlink()
-                        print(f"Deleted bbox annotation: {bbox_file}")
+                    # Frame files can also contain nest labels. Replace their
+                    # contents instead of deleting the entire annotation source.
+                    remaining_frame, _ = self._split_source_annotations(other_annotations)
+                    self.annotation_manager.save_frame_annotations(
+                        project_path, video_id, frame_idx_in_video, remaining_frame
+                    )
                     
                     # Delete pickle file if it exists (legacy format)
                     pkl_file = project_path / 'annotations' / 'pkl' / video_id / f'frame_{frame_idx_in_video:06d}.pkl'
@@ -7272,7 +6731,7 @@ class MainWindow(QMainWindow):
         
         # Use the type chosen from the New Instance menu.
         current_category = category or 'bee'
-        if current_category not in {'bee', 'chamber', 'hive', 'pollen'}:
+        if current_category not in CATEGORIES:
             current_category = 'bee'
         self.canvas.current_annotation_type = current_category
         self.canvas.selected_instance_category = current_category
@@ -7292,6 +6751,8 @@ class MainWindow(QMainWindow):
         # per-instance colors; chamber/hive/pollen use fixed category colors.
         self.canvas.ensure_instance_color(new_instance_id, current_category)
 
+        if current_category in BROOD_CATEGORIES:
+            self.toolbar.brood_visibility_actions[current_category].setChecked(True)
         self.canvas.set_instance_visible(new_instance_id, current_category, True, rebuild=False)
 
         self.toolbar.set_tool('brush')
@@ -7759,7 +7220,7 @@ class MainWindow(QMainWindow):
                 for category in coco_data.get('categories', [])
                 if category.get('name')
             }
-            if model_type not in category_names:
+            if not set(training_categories(model_type)).issubset(category_names):
                 missing_files.append(Path(json_file).name)
 
         if not missing_files:
@@ -7867,6 +7328,10 @@ class MainWindow(QMainWindow):
                     msg += "\n"
                 
                 model_type = config.get('model_type', 'bee')
+                if model_type == 'brood':
+                    QMessageBox.information(self, 'Brood Training Complete', msg +
+                        'Use this checkpoint in the optional Brood Model slot in Batch Video Inference.')
+                    return
                 target_labels = {
                     'bee': 'coarse YOLO toolbar',
                     'hive': 'Hive model slot',
@@ -8125,6 +7590,8 @@ class MainWindow(QMainWindow):
         
         # Show configuration dialog
         config_dialog = TrainingConfigDialog(self, current_model_path)
+        config_dialog.model_type_combo.removeItem(
+            config_dialog.model_type_combo.findText('Brood (5 appearance classes)'))
         if config_dialog.exec():
             config = config_dialog.get_config()
             
@@ -8948,7 +8415,24 @@ class MainWindow(QMainWindow):
                     break
                     
                 video_id = video_dir.name
-                
+
+                if 'hive' in frame_categories(self.annotation_manager.project_info):
+                    for frame_path in sorted(video_dir.glob('frame_*.jpg')):
+                        if progress.wasCanceled():
+                            break
+                        frame_idx = int(frame_path.stem.split('_')[1])
+                        frame_anns = self.annotation_manager.load_frame_annotations(
+                            self.project_path, video_id, frame_idx
+                        ) or []
+                        hive_anns = [ann for ann in frame_anns if ann.get('category') == 'hive']
+                        if hive_anns:
+                            img = cv2.imread(str(frame_path))
+                            if img is not None:
+                                img = self._draw_annotations_on_image(img, hive_anns, video_id)
+                                cv2.imwrite(str(hive_dir / f'{video_id}_{frame_path.stem}_hive.jpg'), img)
+                                stats['hive'] += 1
+                    continue
+
                 # Load video-level annotations (hive and chamber)
                 video_anns, _ = self.annotation_manager.load_video_annotations(
                     self.project_path, video_id
@@ -10008,7 +9492,7 @@ class MainWindow(QMainWindow):
             # Update next ID for all categories of this video to avoid future conflicts
             if self.current_video_id:
                 new_next_id = next_id + len(detections)
-                for cat in ['bee', 'hive', 'chamber', 'pollen']:
+                for cat in CATEGORIES:
                     cat_key = f"{self.current_video_id}_{cat}"
                     # Update to the max of current stored value or new value
                     if cat_key in self.video_next_mask_id:
@@ -10030,11 +9514,16 @@ class MainWindow(QMainWindow):
             
             # Show summary dialog if requested
             if show_dialog:
+                scope_note = (
+                    'These annotations apply only to the current frame.'
+                    if category in frame_categories(self.annotation_manager.project_info)
+                    else 'These annotations are shared across all frames of this video.'
+                )
                 QMessageBox.information(
                     self, "Detection Complete",
                     f"{display_name} detection found {len(detections)} instance(s) in the current frame.\n\n"
                     f"The detections have been added as {category} instances.\n"
-                    f"Note: {display_name} annotations are video-level and will appear on all frames."
+                    + scope_note
                 )
             
         except ImportError as e:
@@ -10471,14 +9960,7 @@ class MainWindow(QMainWindow):
                         successful_frames += 1
                         # Save empty annotations
                         if self.project_path and self.current_video_id:
-                            frame_idx_in_video = self._get_frame_idx_in_video(next_frame_idx)
-                            self.annotation_manager.set_frame_annotations(next_frame_idx, [], video_id=self.current_video_id)
-                            self.save_worker.add_save_task(
-                                self.project_path,
-                                self.current_video_id,
-                                frame_idx_in_video,
-                                []
-                            )
+                            self._queue_tracked_bee_annotations(next_frame_idx, [])
                         continue
                     
                     frames_with_detections += 1
@@ -10530,16 +10012,7 @@ class MainWindow(QMainWindow):
                     
                     # Save annotations directly (no canvas interaction during batch)
                     if self.project_path and self.current_video_id:
-                        frame_idx_in_video = self._get_frame_idx_in_video(next_frame_idx)
-                        # Update in-memory cache immediately
-                        self.annotation_manager.set_frame_annotations(next_frame_idx, bbox_annotations, video_id=self.current_video_id)
-                        # Queue background save - non-blocking!
-                        self.save_worker.add_save_task(
-                            self.project_path,
-                            self.current_video_id,
-                            frame_idx_in_video,
-                            bbox_annotations
-                        )
+                        self._queue_tracked_bee_annotations(next_frame_idx, bbox_annotations)
                     
                     successful_frames += 1
                     
@@ -10739,14 +10212,7 @@ class MainWindow(QMainWindow):
                         successful_frames += 1
                         # Save empty annotations directly (no canvas interaction)
                         if self.project_path and self.current_video_id:
-                            frame_idx_in_video = self._get_frame_idx_in_video(next_frame_idx)
-                            self.annotation_manager.set_frame_annotations(next_frame_idx, [], video_id=self.current_video_id)
-                            self.save_worker.add_save_task(
-                                self.project_path,
-                                self.current_video_id,
-                                frame_idx_in_video,
-                                []
-                            )
+                            self._queue_tracked_bee_annotations(next_frame_idx, [])
                         continue
                     
                     frames_with_detections += 1
@@ -10813,16 +10279,7 @@ class MainWindow(QMainWindow):
                     
                     # Save annotations directly (no canvas interaction)
                     if self.project_path and self.current_video_id:
-                        frame_idx_in_video = self._get_frame_idx_in_video(next_frame_idx)
-                        # Update in-memory cache immediately
-                        self.annotation_manager.set_frame_annotations(next_frame_idx, frame_annotations, video_id=self.current_video_id)
-                        # Queue background save - non-blocking!
-                        self.save_worker.add_save_task(
-                            self.project_path,
-                            self.current_video_id,
-                            frame_idx_in_video,
-                            frame_annotations
-                        )
+                        self._queue_tracked_bee_annotations(next_frame_idx, frame_annotations)
                     
                     successful_frames += 1
                     
@@ -11109,14 +10566,7 @@ class MainWindow(QMainWindow):
                         successful_frames += 1
                         # Save empty annotations directly (no canvas interaction)
                         if self.project_path and self.current_video_id:
-                            frame_idx_in_video = self._get_frame_idx_in_video(next_frame_idx)
-                            self.annotation_manager.set_frame_annotations(next_frame_idx, [], video_id=self.current_video_id)
-                            self.save_worker.add_save_task(
-                                self.project_path,
-                                self.current_video_id,
-                                frame_idx_in_video,
-                                []
-                            )
+                            self._queue_tracked_bee_annotations(next_frame_idx, [])
                         continue
                     
                     frames_with_detections += 1
@@ -11183,16 +10633,7 @@ class MainWindow(QMainWindow):
                     
                     # Save annotations directly (no canvas interaction)
                     if self.project_path and self.current_video_id:
-                        frame_idx_in_video = self._get_frame_idx_in_video(next_frame_idx)
-                        # Update in-memory cache immediately
-                        self.annotation_manager.set_frame_annotations(next_frame_idx, frame_annotations, video_id=self.current_video_id)
-                        # Queue background save - non-blocking!
-                        self.save_worker.add_save_task(
-                            self.project_path,
-                            self.current_video_id,
-                            frame_idx_in_video,
-                            frame_annotations
-                        )
+                        self._queue_tracked_bee_annotations(next_frame_idx, frame_annotations)
                     
                     successful_frames += 1
                     

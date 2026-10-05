@@ -9,7 +9,9 @@ from pathlib import Path
 from datetime import datetime
 import pickle
 from typing import List, Dict
-from core.annotation import rle_to_mask, mask_to_polygon
+from core.categories import CATEGORIES
+from core.annotation_scope import frame_categories, read_project_info, merge_annotations
+from core.coco_masks import encode_mask, decode_segmentation
 
 
 def export_coco_per_video(project_path: Path, video_ids: List[str], 
@@ -35,7 +37,7 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
     Returns:
         List of paths to generated COCO JSON files (or None if cancelled)
     """
-    built_in_class_names = ['bee', 'hive', 'chamber', 'pollen']
+    built_in_class_names = list(CATEGORIES)
     if class_names is None:
         class_names = list(built_in_class_names)
     else:
@@ -45,6 +47,8 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                 class_names.append(class_name)
     
     project_path = Path(project_path)
+    project_info = read_project_info(project_path)
+    per_frame_categories = frame_categories(project_info)
     
     # Create category name to ID mapping
     category_name_to_id = {name: i + 1 for i, name in enumerate(class_names)}
@@ -165,6 +169,8 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                 for ann_meta in video_annotations_list:
                     mask_id = ann_meta.get('mask_id', 0)
                     category = ann_meta.get('category', 'chamber')
+                    if category in per_frame_categories:
+                        continue
                     
                     # Ensure category_id is correctly set based on category name
                     # This overrides any incorrect category_id that might be in the metadata
@@ -224,11 +230,17 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                             mask_id = ann_meta.get('mask_id', ann_meta.get('instance_id', 0))
                             if mask_id > 0:
                                 # Extract this instance's mask
-                                instance_mask = (combined_mask == mask_id).astype(np.uint8)
+                                if 'mask_coco_rle' in ann_meta:
+                                    instance_mask = decode_segmentation(
+                                        ann_meta['mask_coco_rle'], *combined_mask.shape[:2]
+                                    )
+                                else:
+                                    instance_mask = (combined_mask == mask_id).astype(np.uint8)
                                 
                                 # Create full annotation
                                 ann = ann_meta.copy()
                                 ann['mask'] = instance_mask
+                                ann['category_id'] = category_name_to_id.get(ann.get('category', 'bee'), 1)
                                 mask_annotations.append(ann)
                 except Exception as e:
                     print(f"Warning: Failed to load mask annotations from {json_file}: {e}")
@@ -256,7 +268,7 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                 continue
             
             # Add video-level annotations to frames that have per-frame annotations
-            annotations = per_frame_annotations + video_level_annotations
+            annotations = merge_annotations(per_frame_annotations, video_level_annotations, project_info)
             
             # Use the actual frame dimensions we determined earlier
             frame_width = actual_frame_width
@@ -308,11 +320,7 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                     }
                     
                     # Add segmentation
-                    polygons = mask_to_polygon(mask)
-                    if polygons:
-                        coco_ann['segmentation'] = polygons
-                    else:
-                        continue  # Skip if no valid polygons
+                    coco_ann['segmentation'] = encode_mask(mask)
                     
                     # Add tracking ID
                     if 'mask_id' in ann:
@@ -408,10 +416,12 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
         Path to generated COCO JSON file
     """
     if class_names is None:
-        class_names = ['bee']
+        class_names = list(CATEGORIES)
     
     project_path = Path(project_path)
-    
+    project_info = read_project_info(project_path)
+    per_frame_categories = frame_categories(project_info)
+
     # Create category name to ID mapping
     category_name_to_id = {name: i + 1 for i, name in enumerate(class_names)}
     
@@ -526,7 +536,9 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
                 for ann_meta in video_annotations_list:
                     mask_id = ann_meta.get('mask_id', 0)
                     category = ann_meta.get('category', 'chamber')
-                    
+                    if category in per_frame_categories:
+                        continue
+
                     # Ensure category_id is correctly set based on category name
                     # This overrides any incorrect category_id that might be in the metadata
                     correct_category_id = category_name_to_id.get(category, 1)
@@ -578,11 +590,17 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
                             mask_id = ann_meta.get('mask_id', ann_meta.get('instance_id', 0))
                             if mask_id > 0:
                                 # Extract this instance's mask
-                                instance_mask = (combined_mask == mask_id).astype(np.uint8)
-                                
+                                if 'mask_coco_rle' in ann_meta:
+                                    instance_mask = decode_segmentation(
+                                        ann_meta['mask_coco_rle'], *combined_mask.shape[:2]
+                                    )
+                                else:
+                                    instance_mask = (combined_mask == mask_id).astype(np.uint8)
+
                                 # Create full annotation
                                 ann = ann_meta.copy()
                                 ann['mask'] = instance_mask
+                                ann['category_id'] = category_name_to_id.get(ann.get('category', 'bee'), 1)
                                 mask_annotations.append(ann)
                 except Exception as e:
                     print(f"Warning: Failed to load mask annotations from {json_file}: {e}")
@@ -615,7 +633,7 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
                 continue
             
             # Add video-level annotations to frames that have per-frame annotations
-            annotations = per_frame_annotations + video_level_annotations
+            annotations = merge_annotations(per_frame_annotations, video_level_annotations, project_info)
             
             # Add image entry
             image_file = f"frames/{video_name}/frame_{frame_idx:06d}.jpg"
@@ -664,11 +682,7 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
                     }
                     
                     # Add segmentation
-                    polygons = mask_to_polygon(mask)
-                    if polygons:
-                        coco_ann['segmentation'] = polygons
-                    else:
-                        continue  # Skip if no valid polygons
+                    coco_ann['segmentation'] = encode_mask(mask)
                     
                     # Add tracking ID (instance ID from annotations)
                     if 'mask_id' in ann:

@@ -9,6 +9,9 @@ from typing import List, Dict, Optional, Set
 from collections import defaultdict
 
 from core.batch_video_processor import BeeDetectionData, ChamberFrameData
+from core.temporal_hive_visualization import (
+    HIVE_OVERLAY_MODES, draw_temporal_hive_overlay, draw_hive_overlay_label,
+)
 
 
 class VisualizationGenerator:
@@ -28,7 +31,8 @@ class VisualizationGenerator:
                  show_chambers: bool = True,
                  show_chamber_info: bool = True,
                  bubble_outlines: bool = True,
-                 visualization_mode: str = "science"):
+                 visualization_mode: str = "science", hive_overlay_mode: str = 'current',
+                 temporal_hive_snapshots_by_frame: Optional[Dict] = None):
         """
         Args:
             video_path: Path to input video
@@ -48,6 +52,8 @@ class VisualizationGenerator:
             show_chamber_info: Whether to draw chamber metrics panel
             bubble_outlines: Whether to smooth masks and draw rounded outline halos
             visualization_mode: "pretty" for clean presentation, "science" for diagnostic overlays
+            hive_overlay_mode: "current", "temporal", "compare", or "updated"; current is the default.
+            temporal_hive_snapshots_by_frame: Frame-specific snapshots, not final batch maps.
         """
         self.video_path = video_path
         self.video_id = video_id
@@ -56,6 +62,12 @@ class VisualizationGenerator:
         self.chamber_frame_data = chamber_frame_data
         self.chambers_by_frame = chambers_by_frame
         self.hive_masks_by_frame = hive_masks_by_frame
+        if hive_overlay_mode not in HIVE_OVERLAY_MODES:
+            raise ValueError(f'Unknown hive overlay mode: {hive_overlay_mode}')
+        self.hive_overlay_mode = hive_overlay_mode
+        self.temporal_hive_snapshots_by_frame = (
+            temporal_hive_snapshots_by_frame if temporal_hive_snapshots_by_frame is not None else {}
+        )
         self.bee_masks_by_frame = bee_masks_by_frame if bee_masks_by_frame is not None else {}
         self.pollen_masks_by_frame = pollen_masks_by_frame if pollen_masks_by_frame is not None else {}
         self.aruco_markers_by_frame = aruco_markers_by_frame if aruco_markers_by_frame is not None else {}
@@ -125,6 +137,7 @@ class VisualizationGenerator:
         bee_masks: Optional[Dict[int, Optional[np.ndarray]]] = None,
         pollen_masks: Optional[Dict[int, Optional[np.ndarray]]] = None,
         aruco_markers: Optional[Dict[int, Dict]] = None,
+        temporal_hive_snapshots=None,
     ) -> np.ndarray:
         """Annotate one in-memory frame without retaining full-frame masks afterward."""
         self.detections_by_frame[frame_number] = list(bee_detections or [])
@@ -137,6 +150,7 @@ class VisualizationGenerator:
         self.bee_masks_by_frame[frame_number] = bee_masks or {}
         self.pollen_masks_by_frame[frame_number] = pollen_masks or {}
         self.aruco_markers_by_frame[frame_number] = aruco_markers or {}
+        self.temporal_hive_snapshots_by_frame[frame_number] = temporal_hive_snapshots or []
 
         try:
             return self._annotate_frame(frame, frame_number)
@@ -148,6 +162,7 @@ class VisualizationGenerator:
             self.bee_masks_by_frame.pop(frame_number, None)
             self.pollen_masks_by_frame.pop(frame_number, None)
             self.aruco_markers_by_frame.pop(frame_number, None)
+            self.temporal_hive_snapshots_by_frame.pop(frame_number, None)
     
     def generate(self) -> bool:
         """
@@ -310,7 +325,14 @@ class VisualizationGenerator:
         
         # 2. Draw hive masks (lightly overlaid)
         hive_masks = self.hive_masks_by_frame.get(frame_number, {})
-        self._draw_hive_masks(annotated, hive_masks)
+        prior_supported = False
+        if self.hive_overlay_mode == 'current':
+            self._draw_hive_masks(annotated, hive_masks)
+        else:
+            prior_supported = draw_temporal_hive_overlay(
+                annotated, self.temporal_hive_snapshots_by_frame.get(frame_number, []),
+                hive_masks, compare=self.hive_overlay_mode == 'compare',
+            )
 
         # 3. Draw pollen masks
         pollen_masks = self.pollen_masks_by_frame.get(frame_number, {})
@@ -327,6 +349,9 @@ class VisualizationGenerator:
         # 6. Draw status bar
         if not self.pretty_mode:
             self._draw_status_bar(annotated, frame_number, len(detections))
+
+        if self.hive_overlay_mode != 'current':
+            draw_hive_overlay_label(annotated, self.hive_overlay_mode, prior_supported)
         
         return annotated
     
@@ -616,7 +641,8 @@ class VisualizationGenerator:
                      (255, 255, 255), 2)
         
         # Title
-        cv2.putText(frame, "Hive Pixels per Chamber", 
+        title = 'Hive Pixels per Chamber' if self.hive_overlay_mode == 'current' else 'Current-frame Hive Pixels'
+        cv2.putText(frame, title,
                    (panel_x + 10, panel_y + 25), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
         
@@ -721,7 +747,7 @@ class VisualizationGenerator:
                     cv2.drawContours(hive_summary, contours, -1, (0, 255, 255), 3)
             
             # Add title
-            title = f"Hive Detection Summary - {self.video_id}"
+            title = f"Current-frame Hive Detection (frame 1) - {self.video_id}"
             cv2.putText(hive_summary, title, (20, 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             

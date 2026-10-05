@@ -36,6 +36,8 @@ See [video import and frame selection](docs/video_import.md) for full-video or s
 
 See [ArUco tag size measurement](docs/aruco_tag_measurement.md) to measure minimum and maximum tag sizes before batch optimization.
 
+See [batch hive masks and exports](docs/hive_exports.md) for the difference between video overlays, per-video summaries, and temporal hive priors.
+
 ## Project Structure
 
 ```
@@ -59,6 +61,11 @@ bee_annotator/
     ├── io.py              # File I/O operations
     └── visualization.py   # Visualization utilities
 ```
+
+## Experimental Brood Workflow
+
+See [Brood Segmentation](docs/brood_segmentation.md) for visible-only brood labels,
+five-class training, and optional history-informed batch maps.
 
 ## License
 

@@ -387,7 +387,11 @@ class FrameLevelValidationWorker(QThread):
             gt_bees = self._extract_gt_bees_from_coco(coco_data, frame_idx, frame.shape[:2])
             
             # Always extract GT hive mask for distance calculations (even if no hive model)
-            gt_hive_mask = self._extract_gt_hive(video_annotations, frame.shape[:2])
+            from core.annotation_scope import frame_categories
+            if 'hive' in frame_categories(self.main_window.annotation_manager.project_info):
+                gt_hive_mask = self._extract_gt_hive_from_coco(coco_data, frame_idx, frame.shape[:2])
+            else:
+                gt_hive_mask = self._extract_gt_hive(video_annotations, frame.shape[:2])
             # Run hive prediction if model available
             pred_hive_mask = self._predict_hive(frame_rgb, hive_model) if hive_model else None
 
@@ -774,6 +778,25 @@ class FrameLevelValidationWorker(QThread):
 
         return pollen_balls
     
+    def _extract_gt_hive_from_coco(self, coco_data, frame_idx, frame_shape):
+        """Use this frame's reviewed nest, never a shared or temporally inferred map."""
+        image_ids = {
+            image['id'] for image in coco_data.get('images', [])
+            if image.get('frame_index') == frame_idx
+            or Path(image.get('file_name', '')).stem == f'frame_{frame_idx:06d}'
+        }
+        categories = {category['id']: category['name'] for category in coco_data.get('categories', [])}
+        combined = None
+        for ann in coco_data.get('annotations', []):
+            if ann.get('image_id') not in image_ids:
+                continue
+            if categories.get(ann.get('category_id')) != 'hive':
+                continue
+            mask = self._segmentation_to_mask(ann.get('segmentation'), frame_shape)
+            if mask is not None:
+                combined = mask if combined is None else np.maximum(combined, mask)
+        return combined
+
     def _extract_gt_hive(self, video_annotations: List[Dict], frame_shape: Tuple[int, int]) -> Optional[np.ndarray]:
         """Extract ground truth hive mask from video-level annotations"""
         h, w = frame_shape

@@ -19,9 +19,11 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
+from core.brood_inference import BroodVideoWriter, brood_model_classes, brood_evidence
 from core.instance_tracker import Detection
 from core.marker_detector import MarkerDetector
-from core.temporal_hive_prior import TemporalHiveOverlap
+from core.temporal_hive_prior import TemporalHiveOverlap, TemporalChamberStabilizer
+from core.temporal_hive_visualization import TemporalHiveOverlayWriter, resolve_hive_overlay_mode
 from utils.validation_metrics import distance_between_masks, mask_to_simplified_polygon, polygon_to_string
 
 
@@ -199,7 +201,10 @@ class BatchVideoProcessor:
                  video_start_time_seconds: Optional[float] = None,
                  pixel_size_mm: Optional[float] = None,
                  exclude_pollen_from_hive: bool = True,
-                 prior_only: bool = False):
+                 prior_only: bool = False, hive_overlay_mode: str = 'scored',
+                 temporal_overlay_path: Optional[Path] = None,
+                 brood_model=None, temporal_brood_map=None, brood_preview=False,
+                 brood_context_id=None):
         """
         Args:
             video_path: Path to video file
@@ -242,13 +247,27 @@ class BatchVideoProcessor:
                 before hive counts, distances, visualization, and prior updates.
             prior_only: Only update the temporal hive prior; skip tracking, ArUco,
                 spatial metrics, interactions, and CSV row storage.
+            hive_overlay_mode: Scoring map (default), current detections, past-only, comparison or updated history.
+            temporal_overlay_path: Optional compressed history cache for visualized frames.
+            brood_model: Optional five-class appearance segmentation model.
+            temporal_brood_map: Shared experimental brood history, separate from hive maps.
+            brood_preview: Write a separate history-informed brood MP4.
         """
         self.video_path = video_path
         self.video_id = video_id
+        self.output_folder = Path(output_folder) if output_folder is not None else None
         self.bee_model = bee_model
         self.hive_model = hive_model
         self.chamber_model = chamber_model
         self.pollen_model = pollen_model
+        self.brood_model = brood_model
+        self.temporal_brood_map = temporal_brood_map
+        self.brood_preview = brood_preview
+        self.brood_context_id = brood_context_id or str(Path(video_path).resolve())
+        self._brood_writer = None
+        self._brood_classes = brood_model_classes(brood_model) if brood_model is not None else None
+        if brood_model is not None and (temporal_brood_map is None or output_folder is None):
+            raise ValueError('Brood inference requires a temporal map and output folder')
         self.tracker = tracker
         self.confidence_threshold = confidence_threshold
         self.nms_iou_threshold = nms_iou_threshold
@@ -294,7 +313,19 @@ class BatchVideoProcessor:
         self.allowed_tag_ids = allowed_tag_ids
         self.excluded_tag_ids = excluded_tag_ids
         self.temporal_hive_prior = temporal_hive_prior
+        self._temporal_chamber_stabilizer = (
+            TemporalChamberStabilizer()
+            if temporal_hive_prior is not None and temporal_hive_prior.stabilize_chambers else None
+        )
         self.temporal_hive_context_id = temporal_hive_context_id
+        hive_overlay_mode = resolve_hive_overlay_mode(hive_overlay_mode, temporal_hive_prior)
+        if hive_overlay_mode != 'current' and temporal_hive_prior is None:
+            raise ValueError('Temporal hive visualization requires an enabled temporal prior')
+        self.hive_overlay_mode = hive_overlay_mode
+        self.temporal_overlay_path = temporal_overlay_path
+        self._temporal_overlay_writer = None
+        self._temporal_overlay_failed = False
+        self.temporal_hive_snapshots_by_frame = {}
         self.video_start_time_seconds = video_start_time_seconds
         self.video_fps = None
         self.pixel_size_mm = float(pixel_size_mm) if pixel_size_mm and pixel_size_mm > 0 else None
@@ -327,6 +358,10 @@ class BatchVideoProcessor:
         self.bee_to_aruco: Dict[int, str] = {}  # bee_id -> aruco_code (retroactive)
         self.aruco_to_bee: Dict[str, int] = {}  # aruco_code -> bee_id (reverse mapping)
         self.bee_frames: Dict[int, set] = defaultdict(set)  # bee_id -> set of frame_numbers
+
+        # Running export counts survive visualization cleanup without retaining every frame.
+        self.accumulated_hive_masks: Dict[Tuple[str, int], Dict] = {}
+        self.accumulated_chamber_masks: Dict[Tuple[str, int], Dict] = {}
         
         # Per-frame visualization data
         self.chambers_by_frame: Dict[int, Dict] = {}  # frame_number -> chambers_detected
@@ -431,6 +466,7 @@ class BatchVideoProcessor:
             log_callback=self._log,
             verbose_output=self.verbose_output,
             visualization_mode=self.streaming_visualization_mode,
+            hive_overlay_mode=self.hive_overlay_mode,
         )
         return self._streaming_visualizer
 
@@ -462,6 +498,7 @@ class BatchVideoProcessor:
                 bee_masks=self.bee_masks_by_frame.get(frame_number, {}),
                 pollen_masks=self.pollen_masks_by_frame.get(frame_number, {}),
                 aruco_markers=self.aruco_markers_by_frame.get(frame_number, {}),
+                temporal_hive_snapshots=self.temporal_hive_snapshots_by_frame.get(frame_number, []),
             )
 
             if self.streaming_visualization_format == "frames":
@@ -503,6 +540,7 @@ class BatchVideoProcessor:
                 self.bee_masks_by_frame.pop(frame_number, None)
                 self.pollen_masks_by_frame.pop(frame_number, None)
                 self.aruco_markers_by_frame.pop(frame_number, None)
+                self.temporal_hive_snapshots_by_frame.pop(frame_number, None)
 
     def _close_streaming_visualization(self):
         if self._streaming_video_writer is not None:
@@ -529,6 +567,28 @@ class BatchVideoProcessor:
                 pass
     
     def process(self) -> bool:
+        """Process video and finalize the history cache even after a stop or error."""
+        complete = False
+        try:
+            complete = self._process_video_frames()
+            return complete
+        finally:
+            if self._brood_writer is not None:
+                self._brood_writer.close(complete=complete)
+                if self._brood_writer.context == str(Path(self.video_path).resolve()):
+                    for key in list(self.temporal_brood_map.states):
+                        if key[0] == self._brood_writer.context:
+                            del self.temporal_brood_map.states[key]
+            if self._temporal_overlay_writer is not None:
+                try:
+                    self._temporal_overlay_writer.close(complete=complete and not self._temporal_overlay_failed)
+                    if not self._temporal_overlay_failed:
+                        count = self._temporal_overlay_writer.metadata['frame_count']
+                        self._log(f'  Temporal hive overlay cache: {self.temporal_overlay_path} ({count} frames)')
+                except Exception as exc:
+                    self._log(f'Temporal hive overlay cache could not be finalized: {exc}')
+
+    def _process_video_frames(self) -> bool:
         """
         Process entire video
         
@@ -609,6 +669,7 @@ class BatchVideoProcessor:
         # 1. Run chamber detection (YOLO) and establish left-to-right ordering
         t0 = time.perf_counter()
         chambers_detected = self._detect_chambers(frame)
+        chambers_detected = self._prepare_temporal_chambers(chambers_detected, frame.shape[:2])
         # Only store for visualization if requested (saves memory)
         store_frame_masks = self._should_store_masks_for_frame(frame_number)
         if store_frame_masks:
@@ -724,7 +785,28 @@ class BatchVideoProcessor:
         
         frame_time_seconds = self._frame_time_seconds(frame_number)
 
+        # Capture the optional past-only comparison before any current evidence is added.
+        if (store_frame_masks and self.temporal_hive_prior is not None
+                and self.hive_overlay_mode != 'updated'
+                and (self.hive_overlay_mode != 'current' or self.temporal_overlay_path is not None)):
+            self._capture_temporal_hive_overlay(
+                frame_number, chambers_detected, frame.shape[:2], frame_time_seconds,
+            )
+
+        score_updated_map = (
+            self.temporal_hive_prior is not None and self.temporal_hive_prior.scoring_mode == 'updated'
+        )
+        if score_updated_map:
+            t0 = time.perf_counter()
+            self._update_temporal_hive_prior(
+                chambers_detected, hive_masks_by_chamber, bee_detections,
+                frame.shape[:2], frame_time_seconds,
+            )
+            self._record_timing('temporal_hive_prior', time.perf_counter() - t0, frame_timings)
+
         if not self.prior_only:
+            self._accumulate_export_masks(hive_masks_by_chamber, chambers_detected)
+
             # 9. Save chamber frame data (hive pixels per chamber)
             for chamber_id, hive_mask in hive_masks_by_chamber.items():
                 hive_pixels = int(np.sum(hive_mask > 0)) if hive_mask is not None else None
@@ -750,9 +832,8 @@ class BatchVideoProcessor:
                 frame_timings
             )
 
-        # Update the prior after current-frame bee rows are scored, so each row
-        # reflects only information available before that frame.
-        if self.temporal_hive_prior is not None:
+        # Legacy past-only scoring updates afterwards; each frame contributes exactly once.
+        if self.temporal_hive_prior is not None and not score_updated_map:
             t0 = time.perf_counter()
             self._update_temporal_hive_prior(
                 chambers_detected,
@@ -762,7 +843,15 @@ class BatchVideoProcessor:
                 frame_time_seconds,
             )
             self._record_timing('temporal_hive_prior', time.perf_counter() - t0, frame_timings)
+
+        if store_frame_masks and self.temporal_hive_prior is not None and self.hive_overlay_mode == 'updated':
+            self._capture_temporal_hive_overlay(
+                frame_number, chambers_detected, frame.shape[:2], frame_time_seconds,
+            )
         
+        if self.brood_model is not None:
+            self._process_brood_frame(frame, frame_number, chambers_detected, bee_detections)
+
         # 11. Detect ArUco codes on bees (retroactive tagging)
         aruco_frame_summary = None
         if not self.prior_only and self.enable_aruco and self.marker_detector is not None:
@@ -1043,6 +1132,103 @@ class BatchVideoProcessor:
             # SimpleIoU/Centroid-style API
             return self.tracker.update(detections)
     
+    def _process_brood_frame(self, frame, frame_number, chambers, bees):
+        if not self.video_fps or not np.isfinite(self.video_fps):
+            raise ValueError('Brood history requires a valid video FPS')
+        if self._brood_writer is None:
+            context = self.brood_context_id
+            if self.video_start_time_seconds is None:
+                # Without a wall-clock timestamp, never mix histories from different videos.
+                context = str(Path(self.video_path).resolve())
+                self._log('Brood history is video-local: no filename timestamp was parsed')
+            self._brood_writer = BroodVideoWriter(
+                self.output_folder / 'brood', self.video_id, context,
+                self.temporal_brood_map, preview=self.brood_preview,
+                preview_limit=self.streaming_visualization_max_frames or self.store_masks_until_frame)
+        kwargs = dict(conf=self.confidence_threshold, iou=self.nms_iou_threshold,
+                      retina_masks=True, verbose=False)
+        if TORCH_AVAILABLE:
+            with torch.inference_mode():
+                result = self.brood_model(frame, **kwargs)[0]
+        else:
+            result = self.brood_model(frame, **kwargs)[0]
+        labels = brood_evidence(result, frame.shape[:2], self._brood_classes)
+        del result
+        time_seconds = self._frame_time_seconds(frame_number)
+        if time_seconds is None:
+            time_seconds = (frame_number - 1) / self.video_fps
+        if self.chamber_model is not None:
+            chambers = {cid: dict(info, temporal_unavailable=True) if info.get('mask') is None else info
+                        for cid, info in chambers.items()}
+        self._brood_writer.write(frame_number, frame, labels, chambers, bees, time_seconds, self.video_fps)
+
+    def _prepare_temporal_chambers(self, chambers, frame_shape):
+        if self._temporal_chamber_stabilizer is None:
+            return chambers
+        if self.chamber_model is not None and any(info.get('mask') is None for info in chambers.values()):
+            self._temporal_chamber_stabilizer.reset()
+            return {cid: dict(info, temporal_unavailable=True) for cid, info in chambers.items()}
+        return self._temporal_chamber_stabilizer.prepare(chambers, frame_shape)
+
+    def _capture_temporal_hive_overlay(self, frame_number, chambers, frame_shape, frame_time):
+        snapshots = [
+            self.temporal_hive_prior.visualization_snapshot(
+                self.temporal_hive_context_id, chamber_id, chamber, frame_shape, frame_time,
+            )
+            for chamber_id, chamber in sorted(chambers.items())
+        ]
+        if self.hive_overlay_mode != 'current':
+            self.temporal_hive_snapshots_by_frame[frame_number] = snapshots
+        if self.temporal_overlay_path is not None and not self._temporal_overlay_failed:
+            try:
+                if self._temporal_overlay_writer is None:
+                    self._temporal_overlay_writer = TemporalHiveOverlayWriter(
+                        self.temporal_overlay_path, self.video_path,
+                        self.temporal_hive_context_id, self.video_fps,
+                        prior=self.temporal_hive_prior,
+                        timing=('after_current_frame_update' if self.hive_overlay_mode == 'updated'
+                                else 'before_current_frame_update'),
+                    )
+                self._temporal_overlay_writer.write(frame_number, frame_shape, snapshots)
+            except Exception as exc:
+                self._temporal_overlay_failed = True
+                self._log(f'Temporal hive overlay cache failed: {exc}')
+
+    def _accumulate_export_masks(self, hive_masks_by_chamber: Dict, chambers_detected: Dict):
+        """Accumulate each analyzed frame once, independently of visualization storage."""
+        for chamber_id, mask in hive_masks_by_chamber.items():
+            if mask is None:
+                continue
+            key = (self.video_id, chamber_id)
+            if key not in self.accumulated_hive_masks:
+                self.accumulated_hive_masks[key] = {
+                    'accumulated_mask': np.zeros(mask.shape, dtype=np.uint32),
+                    'frame_count': 0,
+                    'shape': mask.shape,
+                }
+            data = self.accumulated_hive_masks[key]
+            data['accumulated_mask'] += mask > 0
+            data['frame_count'] += 1
+
+        for chamber_id, chamber_info in chambers_detected.items():
+            mask = chamber_info.get('mask')
+            if mask is None:
+                continue
+            key = (self.video_id, chamber_id)
+            if key not in self.accumulated_chamber_masks:
+                self.accumulated_chamber_masks[key] = {
+                    'accumulated_mask': np.zeros(mask.shape, dtype=np.uint32),
+                    'frame_count': 0,
+                    'shape': mask.shape,
+                    'accumulated_centroid': np.zeros(2, dtype=np.float64),
+                }
+            data = self.accumulated_chamber_masks[key]
+            data['accumulated_mask'] += mask > 0
+            data['frame_count'] += 1
+            centroid = chamber_info.get('centroid')
+            if centroid is not None:
+                data['accumulated_centroid'] += np.asarray(centroid, dtype=np.float64)
+
     def _extract_hive_masks(self, hive_result, chambers_detected: Dict) -> Dict[int, Optional[np.ndarray]]:
         """
         Extract hive segmentation masks per chamber
@@ -2631,6 +2817,7 @@ class BatchVideoProcessor:
             self.bee_masks_by_frame.clear()
             self.pollen_masks_by_frame.clear()
             self.aruco_markers_by_frame.clear()
+            self.temporal_hive_snapshots_by_frame.clear()
         
         # Force garbage collection and GPU cache clearing
         gc.collect()
@@ -2707,6 +2894,14 @@ class BatchVideoProcessor:
     def get_hive_masks_by_frame(self) -> Dict[int, Dict[int, Optional[np.ndarray]]]:
         """Get hive masks per frame per chamber"""
         return self.hive_masks_by_frame
+
+    def get_accumulated_hive_masks(self) -> Dict[Tuple[str, int], Dict]:
+        """Get full-video hive counts for CSV export, including partial stopped runs."""
+        return self.accumulated_hive_masks
+
+    def get_accumulated_chamber_masks(self) -> Dict[Tuple[str, int], Dict]:
+        """Get full-video chamber counts and centroid sums for CSV export."""
+        return self.accumulated_chamber_masks
     
     def get_bee_masks_by_frame(self) -> Dict[int, Dict[int, Optional[np.ndarray]]]:
         """Get bee masks per frame per bee_id"""

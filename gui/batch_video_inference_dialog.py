@@ -204,10 +204,19 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.temporal_hive_prior_check.setChecked(True)
         self.temporal_hive_prior_check.setToolTip(
             "Build a rolling hive probability map in normalized chamber coordinates.\n"
-            "Bee rows get on_temporal_hive and overlap metrics using the prior before the current frame is added."
+            "Bee contact scores use a history-informed map; choose whether to include current-frame evidence below."
         )
         self.temporal_hive_prior_check.stateChanged.connect(self._update_temporal_hive_controls)
         optional_layout.addRow("", self.temporal_hive_prior_check)
+
+        self.temporal_hive_scoring_combo = QComboBox()
+        self.temporal_hive_scoring_combo.addItem('History + current evidence', 'updated')
+        self.temporal_hive_scoring_combo.addItem('Past-only map (legacy)', 'prior')
+        self.temporal_hive_scoring_combo.setToolTip(
+            'Choose the map used for on_temporal_hive and overlap scores. Current evidence excludes bee-covered pixels. '
+            'Changing this setting requires a fresh output folder or a compatible run.'
+        )
+        optional_layout.addRow('Hive contact scoring:', self.temporal_hive_scoring_combo)
 
         self.temporal_hive_window_spin = QDoubleSpinBox()
         self.temporal_hive_window_spin.setRange(0.1, 24.0)
@@ -219,6 +228,13 @@ class BatchVideoInferenceConfigDialog(QDialog):
             "Effective time window for the rolling prior. Filename timestamps are used when they can be parsed."
         )
         optional_layout.addRow("Temporal prior window:", self.temporal_hive_window_spin)
+
+        self.stabilize_temporal_hive_check = QCheckBox('Stabilize temporal hive placement and measurements')
+        self.stabilize_temporal_hive_check.setToolTip(
+            'Smooth small chamber-box changes within each video. Applies to temporal evidence, '
+            'overlap scores and overlays, not raw YOLO measurements. Use a fresh output folder.'
+        )
+        optional_layout.addRow('', self.stabilize_temporal_hive_check)
 
         # Pollen model
         pollen_layout = QHBoxLayout()
@@ -237,6 +253,22 @@ class BatchVideoInferenceConfigDialog(QDialog):
 
         optional_layout.addRow("Pollen Model:", pollen_layout)
         
+        brood_layout = QHBoxLayout()
+        self.brood_model_edit = QLineEdit()
+        self.brood_model_edit.setReadOnly(True)
+        self.brood_model_edit.setToolTip(
+            'Experimental five-class appearance model. Requires an empty output folder and Resume disabled. '
+            'Creates separate history-informed brood maps; does not infer chronological age.')
+        brood_layout.addWidget(self.brood_model_edit)
+        self.brood_model_edit.textChanged.connect(self._update_temporal_hive_controls)
+        self.brood_browse_btn = QPushButton('Browse...')
+        self.brood_browse_btn.clicked.connect(self.browse_brood_model)
+        brood_layout.addWidget(self.brood_browse_btn)
+        self.brood_clear_btn = QPushButton('Clear')
+        self.brood_clear_btn.clicked.connect(self.brood_model_edit.clear)
+        brood_layout.addWidget(self.brood_clear_btn)
+        optional_layout.addRow('Brood Model (experimental):', brood_layout)
+
         # Chamber model
         chamber_layout = QHBoxLayout()
         self.chamber_model_edit = QLineEdit()
@@ -627,6 +659,21 @@ class BatchVideoInferenceConfigDialog(QDialog):
         )
         viz_form.addRow("Visualization format:", self.visualization_format_combo)
 
+        self.hive_overlay_combo = QComboBox()
+        self.hive_overlay_combo.addItem('Current frame detections', 'current')
+        self.hive_overlay_combo.addItem('History + current evidence', 'updated')
+        self.hive_overlay_combo.addItem('Temporal hive prior (past only)', 'temporal')
+        self.hive_overlay_combo.addItem('Compare prior and current', 'compare')
+        self.hive_overlay_combo.addItem('Match contact scoring', 'scored')
+        self.hive_overlay_combo.setCurrentIndex(self.hive_overlay_combo.findData('scored'))
+        self.hive_overlay_combo.setToolTip(
+            'History + current evidence shows the map after the current update. '
+            'Match contact scoring follows the selected scoring mode. Past-only and comparison remain optional views. '
+            'Unknown regions stay unpainted. With priors enabled, visualized frames '
+            'also get a compressed replay cache in temporal_hive_overlays/.'
+        )
+        viz_form.addRow('Hive overlay:', self.hive_overlay_combo)
+
         self.visualization_interval_spin = QSpinBox()
         self.visualization_interval_spin.setRange(1, 10000)
         self.visualization_interval_spin.setValue(1)
@@ -761,9 +808,14 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.bee_model_edit.setText(self._setting_text("models/bee_model_path", self.bee_model_edit.text()))
         self.hive_model_edit.setText(self._setting_text("models/hive_model_path", self.hive_model_edit.text()))
         self.pollen_model_edit.setText(self._setting_text("models/pollen_model_path", DEFAULT_POLLEN_MODEL_PATH))
+        self.brood_model_edit.setText(self._setting_text("models/brood_model_path", ""))
         self.chamber_model_edit.setText(self._setting_text("models/chamber_model_path", self.chamber_model_edit.text()))
         self.temporal_hive_prior_check.setChecked(self._setting_bool("models/use_temporal_hive_prior", True))
+        self.temporal_hive_scoring_combo.setCurrentIndex(max(0, self.temporal_hive_scoring_combo.findData(
+            self._setting_text('models/temporal_hive_scoring', 'updated')
+        )))
         self.temporal_hive_window_spin.setValue(self._setting_float("models/temporal_hive_window_hours", 8.0))
+        self.stabilize_temporal_hive_check.setChecked(self._setting_bool('models/stabilize_temporal_hive', False))
 
         self._set_combo_text(self.tracking_algo_combo, self._setting_text("tracking/algorithm", self.tracking_algo_combo.currentText()))
         self.bt_high_conf_spin.setValue(self._setting_float("tracking/bt_high_confidence", 0.5))
@@ -807,6 +859,9 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.resume_completed_check.setChecked(self._setting_bool("output/resume_completed_videos", False))
         self.save_visualizations_check.setChecked(self._setting_bool("output/save_visualizations", False))
         self._set_combo_text(self.visualization_format_combo, self._setting_text("output/visualization_format", "MP4 video"))
+        self.hive_overlay_combo.setCurrentIndex(max(0, self.hive_overlay_combo.findData(
+            self._setting_text('output/hive_overlay_mode', 'scored')
+        )))
         self.visualization_interval_spin.setValue(self._setting_int("output/visualization_interval", 1))
         self.visualization_max_frames_spin.setValue(self._setting_int("output/visualization_max_frames", 25))
         self.skip_completed_visualizations_check.setChecked(
@@ -825,9 +880,12 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.settings.setValue("models/bee_model_path", self.bee_model_edit.text())
         self.settings.setValue("models/hive_model_path", self.hive_model_edit.text())
         self.settings.setValue("models/pollen_model_path", self.pollen_model_edit.text())
+        self.settings.setValue("models/brood_model_path", self.brood_model_edit.text())
         self.settings.setValue("models/chamber_model_path", self.chamber_model_edit.text())
         self.settings.setValue("models/use_temporal_hive_prior", self.temporal_hive_prior_check.isChecked())
+        self.settings.setValue('models/temporal_hive_scoring', self.temporal_hive_scoring_combo.currentData())
         self.settings.setValue("models/temporal_hive_window_hours", self.temporal_hive_window_spin.value())
+        self.settings.setValue('models/stabilize_temporal_hive', self.stabilize_temporal_hive_check.isChecked())
 
         self.settings.setValue("tracking/algorithm", self.tracking_algo_combo.currentText())
         self.settings.setValue("tracking/bt_high_confidence", self.bt_high_conf_spin.value())
@@ -869,6 +927,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.settings.setValue("output/resume_completed_videos", self.resume_completed_check.isChecked())
         self.settings.setValue("output/save_visualizations", self.save_visualizations_check.isChecked())
         self.settings.setValue("output/visualization_format", self.visualization_format_combo.currentText())
+        self.settings.setValue('output/hive_overlay_mode', self.hive_overlay_combo.currentData())
         self.settings.setValue("output/visualization_interval", self.visualization_interval_spin.value())
         self.settings.setValue("output/visualization_max_frames", self.visualization_max_frames_spin.value())
         self.settings.setValue(
@@ -990,9 +1049,18 @@ class BatchVideoInferenceConfigDialog(QDialog):
 
         has_hive_model = bool(self.hive_model_edit.text().strip())
         self.temporal_hive_prior_check.setEnabled(has_hive_model)
-        self.temporal_hive_window_spin.setEnabled(
+        self.temporal_hive_scoring_combo.setEnabled(
             has_hive_model and self.temporal_hive_prior_check.isChecked()
         )
+        self.temporal_hive_window_spin.setEnabled(
+            (has_hive_model and self.temporal_hive_prior_check.isChecked())
+            or bool(getattr(self, 'brood_model_edit', None) and self.brood_model_edit.text())
+        )
+        self.stabilize_temporal_hive_check.setEnabled(
+            has_hive_model and self.temporal_hive_prior_check.isChecked()
+        )
+        if hasattr(self, 'hive_overlay_combo'):
+            self._update_visualization_controls()
 
     def _update_visualization_controls(self):
         """Enable visualization options only when annotated outputs are requested."""
@@ -1001,6 +1069,13 @@ class BatchVideoInferenceConfigDialog(QDialog):
 
         enabled = self.save_visualizations_check.isChecked()
         self.visualization_format_combo.setEnabled(enabled)
+        self.hive_overlay_combo.setEnabled(enabled)
+        prior_enabled = bool(self.hive_model_edit.text().strip()) and self.temporal_hive_prior_check.isChecked()
+        for index in range(self.hive_overlay_combo.count()):
+            needs_prior = self.hive_overlay_combo.itemData(index) not in ('current', 'scored')
+            self.hive_overlay_combo.model().item(index).setEnabled(prior_enabled or not needs_prior)
+        if not prior_enabled and self.hive_overlay_combo.currentData() not in ('current', 'scored'):
+            self.hive_overlay_combo.setCurrentIndex(0)
         self.visualization_interval_spin.setEnabled(enabled)
         self.visualization_max_frames_spin.setEnabled(enabled)
         self.skip_completed_visualizations_check.setEnabled(
@@ -1140,6 +1215,11 @@ class BatchVideoInferenceConfigDialog(QDialog):
         if model_path:
             self.hive_model_edit.setText(model_path)
 
+    def browse_brood_model(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Select Brood Model', '', 'PyTorch models (*.pt)')
+        if path:
+            self.brood_model_edit.setText(path)
+
     def browse_pollen_model(self):
         """Browse for pollen segmentation model"""
         model_path, _ = QFileDialog.getOpenFileName(
@@ -1272,6 +1352,10 @@ class BatchVideoInferenceConfigDialog(QDialog):
                 QMessageBox.warning(self, "Invalid Path", "Hive model does not exist.")
                 return
 
+        if self.brood_model_edit.text() and not Path(self.brood_model_edit.text()).is_file():
+            QMessageBox.warning(self, 'Invalid Path', 'Brood model does not exist.')
+            return
+
         # Pollen model is optional
         pollen_model_path = None
         if self.pollen_model_edit.text():
@@ -1293,6 +1377,12 @@ class BatchVideoInferenceConfigDialog(QDialog):
             return
         
         output_folder = Path(self.output_folder_edit.text())
+        if self.brood_model_edit.text() and (
+                self.resume_completed_check.isChecked()
+                or (output_folder.exists() and any(output_folder.iterdir()))):
+            QMessageBox.warning(self, 'Experimental Brood Output',
+                                'Choose an empty output folder and disable Resume for brood inference.')
+            return
         if not output_folder.exists():
             output_folder.mkdir(parents=True, exist_ok=True)
 
@@ -1366,6 +1456,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
             'video_source': video_source,
             'folder_mode': self.folder_radio.isChecked(),
             'preserve_file_order': preserve_file_order,
+            'brood_model_path': self.brood_model_edit.text() or None,
             'bee_model_path': str(bee_model_path),
             'bee_model_type': bee_model_type,
             'distance_method': distance_method,
@@ -1373,8 +1464,10 @@ class BatchVideoInferenceConfigDialog(QDialog):
             'pollen_model_path': str(pollen_model_path) if pollen_model_path else None,
             'chamber_model_path': str(chamber_model_path) if chamber_model_path else None,
             'use_temporal_hive_prior': use_temporal_hive_prior,
+            'temporal_hive_scoring': self.temporal_hive_scoring_combo.currentData(),
             'temporal_hive_window_hours': self.temporal_hive_window_spin.value(),
             'temporal_hive_resolution': 256,
+            'stabilize_temporal_hive': use_temporal_hive_prior and self.stabilize_temporal_hive_check.isChecked(),
             'tracking_config': tracking_config,
             'confidence_threshold': self.confidence_spin.value(),
             'nms_iou_threshold': self.nms_iou_spin.value(),
@@ -1406,6 +1499,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
                 'video' if self.visualization_format_combo.currentText().startswith("MP4") else 'frames'
             ),
             'visualization_interval': self.visualization_interval_spin.value(),
+            'hive_overlay_mode': self.hive_overlay_combo.currentData(),
             'visualization_max_frames': self.visualization_max_frames_spin.value(),
             'skip_completed_visualizations': self.skip_completed_visualizations_check.isChecked(),
             'verbose_output': self.verbose_output_check.isChecked()

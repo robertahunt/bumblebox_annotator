@@ -14,14 +14,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 import torch
 from ultralytics import YOLO
 from training.gpu import require_cuda_device
-
-try:
-    import albumentations as A
-    from ultralytics.data.augment import Albumentations
-    ALBUMENTATIONS_AVAILABLE = True
-except ImportError:
-    ALBUMENTATIONS_AVAILABLE = False
-
+from core.coco_masks import decode_segmentation
 
 class YOLOTrainingWorkerInstanceFocused(QThread):
     """Worker thread for instance-focused YOLO training (single-instance refinement)"""
@@ -166,6 +159,7 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
         Convert COCO annotations to instance-focused cropped YOLO format.
         For each annotation, create a resized crop with ONLY that instance's mask.
         """
+        from training.raster_masks import mask_record, write_mask_labels
         # Load COCO annotations
         with open(coco_json_path, 'r') as f:
             coco_data = json.load(f)
@@ -243,15 +237,8 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
                 crop_img = img[crop_y1:crop_y2, crop_x1:crop_x2].copy()
                 
                 # Create mask for this PRIMARY instance only
-                primary_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-                
                 if 'segmentation' in ann and ann['segmentation']:
-                    segmentation = ann['segmentation'][0]
-                    pts = []
-                    for i in range(0, len(segmentation), 2):
-                        pts.append([int(segmentation[i]), int(segmentation[i + 1])])
-                    pts = np.array(pts, dtype=np.int32)
-                    cv2.fillPoly(primary_mask, [pts], 255)
+                    primary_mask = decode_segmentation(ann['segmentation'], img_h, img_w) * 255
                 else:
                     # If no segmentation, skip this annotation
                     continue
@@ -284,55 +271,14 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
                     final_crop[pad_top:pad_top+new_h, pad_left:pad_left+new_w] = resized_crop
                     final_mask[pad_top:pad_top+new_h, pad_left:pad_left+new_w] = resized_mask
                     
-                    # Update dimensions for coordinate normalization
-                    resize_w = target_size
-                    resize_h = target_size
-                    offset_x = pad_left
-                    offset_y = pad_top
-                    scale_x = new_w / crop_w
-                    scale_y = new_h / crop_h
                 else:
                     # Square resize (may distort)
                     final_crop = cv2.resize(crop_img, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
                     final_mask = cv2.resize(cropped_mask, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
                     
-                    resize_w = target_size
-                    resize_h = target_size
-                    scale_x = target_size / crop_w
-                    scale_y = target_size / crop_h
-                    offset_x = 0
-                    offset_y = 0
                 
-                # Convert mask to polygon
-                contours, _ = cv2.findContours(
-                    final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                )
-                
-                if len(contours) == 0:
-                    continue
-                
-                # Get the largest contour (primary instance)
-                main_contour = max(contours, key=cv2.contourArea)
-                
-                # Filter out very small contours
-                if cv2.contourArea(main_contour) < 10:
-                    continue
-                
-                # Simplify contour
-                perimeter = cv2.arcLength(main_contour, True)
-                epsilon = 0.001 * perimeter
-                simplified = cv2.approxPolyDP(main_contour, epsilon, True)
-                
-                # Convert to YOLO format (normalized coordinates relative to resized crop)
-                yolo_polygon = []
-                for point in simplified:
-                    px, py = point[0]
-                    norm_x = max(0.0, min(1.0, px / resize_w))
-                    norm_y = max(0.0, min(1.0, py / resize_h))
-                    yolo_polygon.extend([norm_x, norm_y])
-                
-                # Require at least 3 points (6 coordinates)
-                if len(yolo_polygon) < 6:
+                instance = mask_record(final_mask)
+                if instance is None:
                     continue
                 
                 # Generate unique filename
@@ -340,7 +286,7 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
                 video_name = coco_path.parent.name
                 frame_name = coco_path.stem
                 crop_filename = f"{video_name}_{frame_name}_inst{ann_idx:03d}.jpg"
-                label_filename = f"{video_name}_{frame_name}_inst{ann_idx:03d}.txt"
+                label_filename = f"{video_name}_{frame_name}_inst{ann_idx:03d}.json"
                 
                 # Save resized crop
                 crop_img_path = output_img_dir / crop_filename
@@ -348,11 +294,7 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
                 
                 # Save label (ONLY the primary instance)
                 label_path = output_label_dir / label_filename
-                with open(label_path, 'w') as f:
-                    # YOLO uses 0-based indexing, so bee=0.
-                    class_id = 0
-                    yolo_label = [class_id] + yolo_polygon
-                    f.write(' '.join(map(str, yolo_label)) + '\n')
+                write_mask_labels(label_path, final_mask.shape, [instance])
                 
                 crop_count += 1
         
@@ -365,7 +307,8 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
             'train': 'images/train',
             'val': 'images/val',
             'names': {0: 'bee'},
-            'nc': 1
+            'nc': 1,
+            'mask_format': 'bumblebox-coco-rle-v1',
         }
         
         yaml_path = instance_dir / 'dataset.yaml'
@@ -434,20 +377,7 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
             'mixup': 0.0,   # Disable mixup for single-instance focus
         }
         
-        # Add custom Albumentations for blur augmentation (to handle blurry videos)
-        if ALBUMENTATIONS_AVAILABLE:
-            custom_transforms = [
-                A.Blur(blur_limit=(3, 15), p=0.15),  # Gaussian blur with 15% probability
-                A.MedianBlur(blur_limit=15, p=0.15),  # Median blur with 15% probability
-            ]
-            # Monkey-patch the Albumentations class into the model's data augmentation
-            # This will be applied during data loading
-            training_params['augment'] = True  # Enable augmentation
-            model.add_callback('on_train_start', 
-                lambda trainer: setattr(trainer.train_loader.dataset, 'albumentations',
-                    Albumentations(p=1.0, transforms=custom_transforms)) 
-                    if hasattr(trainer, 'train_loader') and hasattr(trainer.train_loader, 'dataset') else None
-            )
+        training_params['augment'] = True  # Image-only blur in the raster dataset
         
         # Training callback for progress
         class ProgressCallback:
@@ -536,7 +466,13 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
         model.add_callback('on_val_end', callback.on_val_end)
         
         # Train
-        results = model.train(**training_params)
+        from training.raster_masks import RasterSegmentationTrainer, raster_training_options
+        training_params.update(raster_training_options())
+        self.stage_update.emit(
+            "Using exact instance masks with paired affine/flips and color augmentation; "
+            "mosaic, mixup, copy-paste, cutmix and perspective disabled."
+        )
+        results = model.train(trainer=RasterSegmentationTrainer, **training_params)
         
         # Return best model path
         best_model_path = output_dir / self.config.get('name', 'bee_segmentation_instance_focused') / 'weights' / 'best.pt'

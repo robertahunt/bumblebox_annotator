@@ -15,6 +15,7 @@ import re
 import sys
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,7 @@ except ImportError:
 
 from core.batch_video_processor import BatchVideoProcessor
 from core.temporal_hive_prior import TemporalHivePrior
+from core.temporal_hive_visualization import TemporalHiveOverlayWriter
 from core.video_inference_exporter import VideoInferenceExporter
 
 
@@ -97,12 +99,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nms-iou", type=float, default=0.45)
     parser.add_argument("--pixel-size-mm", type=float, default=0.0666)
     parser.add_argument("--temporal-window-hours", type=float, default=8.0)
+    parser.add_argument('--stabilize-temporal-hive', action='store_true',
+                        help='Stabilize chamber placement for temporal evidence, scores and overlays.')
+    parser.add_argument('--temporal-hive-scoring', choices=['updated', 'prior'], default='updated',
+                        help='Score contact on history plus current evidence (default), or the past-only map.')
     parser.add_argument(
         "--temporal-resolution",
         default="800x1500",
         help="Temporal hive prior resolution as WIDTHxHEIGHT, e.g. 800x1500.",
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument('--save-temporal-overlays', action='store_true',
+                        help='Cache every refreshed frame for model-free temporal hive video rendering.')
+    parser.add_argument('--temporal-overlay-timing', choices=['scored', 'prior', 'updated'], default='scored',
+                        help='Default follows contact scoring; optionally cache a different map for comparison.')
     parser.add_argument(
         "--limit",
         type=int,
@@ -405,16 +415,20 @@ def initialize_temporal_prior(
                 "Temporal-prior checkpoint does not match the completed video prefix. "
                 "Use a fresh refresh output folder for this run."
             )
-        if checkpoint_resolution != tuple(resolution) or abs(checkpoint_window - window_seconds) > 1e-6:
+        if (checkpoint_resolution != tuple(resolution) or abs(checkpoint_window - window_seconds) > 1e-6
+                or prior.stabilize_chambers != args.stabilize_temporal_hive
+                or prior.scoring_mode != args.temporal_hive_scoring):
             raise RuntimeError(
                 "Temporal-prior checkpoint settings do not match this refresh command. "
-                "Use the same temporal window/resolution, or start a fresh output folder."
+                "Use the same temporal window/resolution/stabilization/scoring mode, or start a fresh output folder."
             )
         return prior
 
     return TemporalHivePrior(
         window_seconds=window_seconds,
         resolution=resolution,
+        stabilize_chambers=args.stabilize_temporal_hive,
+        scoring_mode=args.temporal_hive_scoring,
     )
 
 
@@ -506,6 +520,10 @@ def write_config(args: argparse.Namespace, videos: List[Path], resolution: Tuple
         "pixel_size_mm": args.pixel_size_mm,
         "temporal_window_hours": args.temporal_window_hours,
         "temporal_resolution": {"width": resolution[0], "height": resolution[1]},
+        "save_temporal_overlays": args.save_temporal_overlays,
+        "temporal_overlay_timing": args.temporal_overlay_timing,
+        "stabilize_temporal_hive": args.stabilize_temporal_hive,
+        "temporal_hive_scoring": args.temporal_hive_scoring,
         "video_count": len(videos),
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -553,6 +571,14 @@ def load_models(args: argparse.Namespace):
     return hive_model, chamber_model, pollen_model
 
 
+def write_temporal_overlay_frame(writer, prior, context_id, chambers, frame_number, frame_shape, frame_time):
+    snapshots = [
+        prior.visualization_snapshot(context_id, chamber_id, chamber, frame_shape, frame_time)
+        for chamber_id, chamber in sorted(chambers.items())
+    ]
+    writer.write(frame_number, frame_shape, snapshots)
+
+
 def refresh_video(
     video_path: Path,
     rows_by_frame: Dict[int, List[Dict[str, str]]],
@@ -563,6 +589,7 @@ def refresh_video(
     pollen_model,
     temporal_prior: TemporalHivePrior,
     args: argparse.Namespace,
+    overlay_writer=None,
 ) -> Tuple[int, int]:
     video_id = video_id_for_path(video_path)
     context_id = context_id_for_path(video_path)
@@ -598,6 +625,8 @@ def refresh_video(
         prior_only=True,
     )
     processor.video_fps = fps if fps > 0 else None
+    if overlay_writer is not None:
+        overlay_writer.metadata['fps'] = processor.video_fps
 
     bee_output_rows = []
     hive_rows = []
@@ -617,6 +646,7 @@ def refresh_video(
         bees = [row_to_bee(row, frame_shape) for row in source_rows]
 
         chambers_detected = processor._detect_chambers(frame)
+        chambers_detected = processor._prepare_temporal_chambers(chambers_detected, frame_shape)
         hive_results = run_hive_model(processor, hive_model, frame)
         hive_result = hive_results[0] if hive_results else None
         hive_masks_by_chamber = processor._extract_hive_masks(hive_result, chambers_detected)
@@ -631,6 +661,15 @@ def refresh_video(
 
         hive_kdtrees = build_hive_kdtrees(hive_masks_by_chamber)
         pollen_kdtrees, pollen_masks = build_pollen_indexes(pollen_by_chamber, frame_shape)
+
+        if overlay_writer is not None and overlay_writer.metadata['timing'] == 'before_current_frame_update':
+            write_temporal_overlay_frame(overlay_writer, temporal_prior, context_id, chambers_detected,
+                                         frame_number, frame_shape, frame_time_seconds)
+
+        if temporal_prior.scoring_mode == 'updated':
+            processor._update_temporal_hive_prior(
+                chambers_detected, hive_masks_by_chamber, bees, frame_shape, frame_time_seconds,
+            )
 
         for chamber_id, hive_mask in hive_masks_by_chamber.items():
             hive_pixels = int(np.sum(hive_mask > 0)) if hive_mask is not None else 0
@@ -744,13 +783,14 @@ def refresh_video(
             bee_output_rows.append(row)
             refreshed_bee_rows += 1
 
-        processor._update_temporal_hive_prior(
-            chambers_detected,
-            hive_masks_by_chamber,
-            bees,
-            frame_shape,
-            frame_time_seconds,
-        )
+        if temporal_prior.scoring_mode == 'prior':
+            processor._update_temporal_hive_prior(
+                chambers_detected, hive_masks_by_chamber, bees, frame_shape, frame_time_seconds,
+            )
+
+        if overlay_writer is not None and overlay_writer.metadata['timing'] == 'after_current_frame_update':
+            write_temporal_overlay_frame(overlay_writer, temporal_prior, context_id, chambers_detected,
+                                         frame_number, frame_shape, frame_time_seconds)
 
         if hive_results is not None:
             del hive_results
@@ -834,13 +874,19 @@ def main() -> int:
         return 2
 
     ensure_fresh_outputs(args.output_folder, resume=args.resume)
-    write_config(args, videos, resolution)
 
     status_path = args.output_folder / "hive_refresh_status.csv"
     completed_paths = read_completed_status(status_path) if args.resume else set()
     completed_prefix = completed_prefix_count(videos, completed_paths) if args.resume else 0
     videos_to_process = videos[completed_prefix:]
     non_prefix_completed = len(completed_paths) - completed_prefix
+
+    try:
+        temporal_prior = initialize_temporal_prior(args, videos, resolution, completed_prefix)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    write_config(args, videos, resolution)
 
     target_video_ids = [video_id_for_path(video) for video in videos_to_process]
     print(f"Loading source bee detections for {len(videos_to_process)}/{len(videos)} video(s)...")
@@ -886,14 +932,10 @@ def main() -> int:
 
     print(f"✓ Loaded {row_count} bee rows to refresh")
     print(f"Temporal hive prior: {args.temporal_window_hours:.1f}h window, {resolution[0]}x{resolution[1]} map")
+    print(f"Temporal hive contact scoring: {temporal_prior.scoring_mode}")
     print(f"Pollen excluded from hive masks: {'yes' if not args.keep_pollen_in_hive else 'no'}")
 
     hive_model, chamber_model, pollen_model = load_models(args)
-    try:
-        temporal_prior = initialize_temporal_prior(args, videos, resolution, completed_prefix)
-    except RuntimeError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
 
     processed = 0
     skipped = completed_prefix
@@ -914,17 +956,32 @@ def main() -> int:
         print(f"[{global_idx}/{total}] Refreshing {video_path.name} ({sum(len(v) for v in rows_by_frame.values())} bee rows)")
         start = time.perf_counter()
         try:
-            frame_count, refreshed_rows = refresh_video(
-                video_path=video_path,
-                rows_by_frame=rows_by_frame,
-                bee_fieldnames=bee_fieldnames,
-                output_folder=args.output_folder,
-                hive_model=hive_model,
-                chamber_model=chamber_model,
-                pollen_model=pollen_model,
-                temporal_prior=temporal_prior,
-                args=args,
+            overlay_timing = (temporal_prior.scoring_mode if args.temporal_overlay_timing == 'scored'
+                              else args.temporal_overlay_timing)
+            updated_overlay = overlay_timing == 'updated'
+            cache_name = f'{video_id}_updated.zip' if updated_overlay else f'{video_id}.zip'
+            overlay_context = (
+                TemporalHiveOverlayWriter(
+                    args.output_folder / 'temporal_hive_overlays' / cache_name,
+                    video_path, context_id_for_path(video_path),
+                    provenance='reconstructed_from_saved_bee_detections',
+                    prior=temporal_prior,
+                    timing=('after_current_frame_update' if updated_overlay else 'before_current_frame_update'),
+                ) if args.save_temporal_overlays else nullcontext(None)
             )
+            with overlay_context as overlay_writer:
+                frame_count, refreshed_rows = refresh_video(
+                    video_path=video_path,
+                    rows_by_frame=rows_by_frame,
+                    bee_fieldnames=bee_fieldnames,
+                    output_folder=args.output_folder,
+                    hive_model=hive_model,
+                    chamber_model=chamber_model,
+                    pollen_model=pollen_model,
+                    temporal_prior=temporal_prior,
+                    args=args,
+                    overlay_writer=overlay_writer,
+                )
         except Exception as exc:
             elapsed = time.perf_counter() - start
             append_status(args.output_folder, {

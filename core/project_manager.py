@@ -18,7 +18,7 @@ class ProjectManager:
         self.dataset_info = {}
         
     def create_project(self, project_path: Path, project_name: str, 
-                      frames_per_video: int = 15) -> Dict:
+                      frames_per_video: int = 15, hive_annotation_scope: str = 'frame') -> Dict:
         """
         Create new project with standard folder structure
         
@@ -30,6 +30,8 @@ class ProjectManager:
         Returns:
             dict with project info
         """
+        if hive_annotation_scope not in ('frame', 'video'):
+            raise ValueError('hive_annotation_scope must be frame or video')
         self.project_path = Path(project_path)
         
         # Create folder structure
@@ -53,6 +55,7 @@ class ProjectManager:
             'created': datetime.now().isoformat(),
             'modified': datetime.now().isoformat(),
             'frames_per_video': frames_per_video,
+            'hive_annotation_scope': hive_annotation_scope,
             'version': '2.0'
         }
         

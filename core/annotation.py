@@ -9,6 +9,8 @@ from datetime import datetime
 import pickle
 from collections import OrderedDict
 import math
+from core.coco_masks import encode_mask, decode_segmentation
+from core.categories import CATEGORIES
 
 
 def sanitize_for_json(obj):
@@ -173,7 +175,7 @@ def mask_to_polygon(mask):
 class AnnotationManager:
     """Manage annotations for a project with LRU cache"""
 
-    DEFAULT_CLASS_NAMES = ['bee', 'hive', 'chamber', 'pollen']
+    DEFAULT_CLASS_NAMES = list(CATEGORIES)
     
     def __init__(self, max_cache_size=20):
         self.project_info = {}
@@ -191,6 +193,7 @@ class AnnotationManager:
             'created': datetime.now().isoformat(),
             'modified': datetime.now().isoformat(),
             'classes': self.class_names,
+            'hive_annotation_scope': project_info.get('hive_annotation_scope', 'frame'),
             'version': '1.0'
         }
         self.frame_annotations = OrderedDict()
@@ -207,7 +210,7 @@ class AnnotationManager:
         with open(annotations_file, 'r') as f:
             data = json.load(f)
             
-        self.project_info = data.get('project_info', {})
+        self.project_info = data.get('project_info', data)
         loaded_classes = data.get('classes', self.DEFAULT_CLASS_NAMES)
         self.class_names = list(dict.fromkeys(
             list(loaded_classes) +
@@ -355,8 +358,8 @@ class AnnotationManager:
                 mask_id = ann.get('mask_id', ann.get('instance_id', 0))
                 if mask_id > 0 and 'mask' in ann:
                     if ann['mask'].shape[:2] != (h, w):
-                        print(f"Warning: save_frame_annotations_png skipping annotation "
-                              f"{mask_id} – shape {ann['mask'].shape[:2]} != {(h, w)}")
+                        raise ValueError(f"Annotation {mask_id} mask shape "
+                                         f"{ann['mask'].shape[:2]} does not match {(h, w)}")
                     else:
                         # Add this instance to combined mask
                         mask_binary = (ann['mask'] > 0).astype(bool)
@@ -364,6 +367,9 @@ class AnnotationManager:
                 
                 # Save metadata (without mask) and sanitize for JSON
                 ann_meta = {k: v for k, v in ann.items() if k not in ['mask', 'mask_rle']}
+                # A combined ID PNG cannot represent overlapping instances or IDs
+                # reused across categories. Keep an exact, standard RLE as well.
+                ann_meta['mask_coco_rle'] = encode_mask(ann['mask'])
                 json_data.append(ann_meta)
             
             # Save combined mask as PNG (atomic write)
@@ -601,10 +607,16 @@ class AnnotationManager:
             mask_id = ann_meta.get('mask_id', ann_meta.get('instance_id', 0))
             if mask_id > 0:
                 # Extract this instance's mask from combined mask
-                instance_mask = (combined_mask == mask_id).astype(np.uint8) * 255
+                if 'mask_coco_rle' in ann_meta:
+                    instance_mask = decode_segmentation(
+                        ann_meta['mask_coco_rle'], *combined_mask.shape[:2]
+                    ) * 255
+                else:
+                    instance_mask = (combined_mask == mask_id).astype(np.uint8) * 255
                 
                 # Combine metadata with mask
                 ann = ann_meta.copy()
+                ann.pop('mask_coco_rle', None)
                 ann['mask'] = instance_mask
                 annotations.append(ann)
         
@@ -946,13 +958,7 @@ class AnnotationManager:
                             'iscrowd': 0
                         }
                         
-                        # Add segmentation in polygon format (COCO standard)
-                        polygons = mask_to_polygon(mask)
-                        if polygons:
-                            coco_ann['segmentation'] = polygons
-                        else:
-                            # If no valid polygons, skip this annotation
-                            continue
+                        coco_ann['segmentation'] = encode_mask(mask)
                         
                         # Add mask_id if available
                         if 'mask_id' in ann:
@@ -1094,11 +1100,7 @@ class AnnotationManager:
                             }
                             
                             # Add segmentation
-                            polygons = mask_to_polygon(mask)
-                            if polygons:
-                                coco_ann['segmentation'] = polygons
-                            else:
-                                continue  # Skip if no valid polygons
+                            coco_ann['segmentation'] = encode_mask(mask)
                             
                             # Add IDs
                             if 'mask_id' in ann:

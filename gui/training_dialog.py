@@ -4,7 +4,7 @@ Training progress dialog for YOLO model training
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QProgressBar, QTextEdit, QGroupBox,
-                             QFormLayout, QSpinBox, QComboBox, QCheckBox, QSlider)
+                             QFormLayout, QSpinBox, QComboBox, QCheckBox, QSlider, QMessageBox)
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QFont
 import matplotlib.pyplot as plt
@@ -500,17 +500,25 @@ class TrainingConfigDialog(QDialog):
             model_type_layout = QFormLayout()
             
             self.model_type_combo = QComboBox()
-            self.model_type_combo.addItems(["Bee", "Chamber", "Hive", "Pollen"])
+            self.model_type_combo.addItems(["Bee", "Chamber", "Hive", "Pollen", "Brood (5 appearance classes)"])
             self.model_type_combo.setCurrentText("Bee")
             self.model_type_combo.setToolTip(
                 "Select which annotation type to train on:\n"
                 "• Bee: Per-frame multi-instance bee annotations\n"
                 "• Chamber: Video-level chamber masks\n"
-                "• Hive: Video-level hive masks\n"
-                "• Pollen: Video-level pollen masks"
+                "• Hive: Visible nest masks (scope follows project settings)\n"
+                "• Pollen: Video-level pollen masks\n"
+                "• Brood: Five frame-specific appearance classes (experimental)"
             )
             self.model_type_combo.currentTextChanged.connect(self.on_model_type_changed)
             model_type_layout.addRow("Annotation Type:", self.model_type_combo)
+            self.brood_review_check = QCheckBox('All visible brood reviewed in train/validation frames')
+            self.brood_review_check.setToolTip(
+                'Include only frames reviewed for all five brood appearance classes. '
+                'Unlabeled visible brood would otherwise become background during training. '
+                'Label visible pixels only, not history-reconstructed or hidden surfaces.')
+            self.brood_review_check.hide()
+            model_type_layout.addRow(self.brood_review_check)
             
             model_type_group.setLayout(model_type_layout)
             layout.addWidget(model_type_group)
@@ -813,17 +821,29 @@ class TrainingConfigDialog(QDialog):
         if self.stage2 or self.sahi or self.beehavesque or self.instance_focused:
             return
 
+        self.brood_review_check.setVisible(type_text == 'Brood (5 appearance classes)')
         defaults = {
             'Bee': 'bee_segmentation',
             'Pollen': 'pollen_segmentation',
             'Hive': 'hive_segmentation',
             'Chamber': 'chamber_segmentation',
+            'Brood (5 appearance classes)': 'brood_segmentation',
         }
         known_defaults = set(defaults.values()) | {'bee_segmentation2', 'bee_segmentation_v2'}
         current_name = self.name_combo.currentText()
         if current_name in known_defaults:
             self.name_combo.setCurrentText(defaults.get(type_text, 'bee_segmentation'))
         
+    def accept(self):
+        if (hasattr(self, 'model_type_combo')
+                and self.model_type_combo.currentText() == 'Brood (5 appearance classes)'
+                and not self.brood_review_check.isChecked()):
+            QMessageBox.warning(self, 'Brood Review Required',
+                                'Review and label all visible brood stages in the selected train/validation frames, '
+                                'then confirm the review checkbox. Exclude unfinished frames.')
+            return
+        super().accept()
+
     def get_config(self):
         """Get training configuration"""
         config = {
@@ -839,8 +859,9 @@ class TrainingConfigDialog(QDialog):
         
         # Add model type for coarse YOLO training
         if not (self.stage2 or self.sahi or self.beehavesque or self.instance_focused):
-            model_type_map = {'Bee': 'bee', 'Chamber': 'chamber', 'Hive': 'hive', 'Pollen': 'pollen'}
+            model_type_map = {'Bee': 'bee', 'Chamber': 'chamber', 'Hive': 'hive', 'Pollen': 'pollen', 'Brood (5 appearance classes)': 'brood'}
             config['model_type'] = model_type_map.get(self.model_type_combo.currentText(), 'bee')
+            config['brood_reviewed'] = self.brood_review_check.isChecked()
         
         # Add SAHI/Beehavesque specific parameters
         if self.sahi or self.beehavesque:

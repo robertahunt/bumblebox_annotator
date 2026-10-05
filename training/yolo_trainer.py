@@ -2,15 +2,16 @@
 YOLO training worker for GUI integration
 """
 
+from core.categories import training_categories
+import numpy as np
 import json
 import shutil
 import yaml
-import cv2
-import numpy as np
 from pathlib import Path
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
 from training.gpu import require_cuda_device
+from core.coco_masks import decode_segmentation
 
 try:
     from ultralytics import YOLO
@@ -18,14 +19,6 @@ try:
     YOLO_AVAILABLE = True
 except ImportError:
     YOLO_AVAILABLE = False
-
-try:
-    import albumentations as A
-    from ultralytics.data.augment import Albumentations
-    ALBUMENTATIONS_AVAILABLE = True
-except ImportError:
-    ALBUMENTATIONS_AVAILABLE = False
-
 
 class YOLOTrainingWorker(QThread):
     """Background worker for YOLO model training"""
@@ -93,6 +86,8 @@ class YOLOTrainingWorker(QThread):
             
     def _prepare_yolo_dataset(self):
         """Convert COCO format to YOLO format"""
+        if self.config.get('model_type') == 'brood' and not self.config.get('brood_reviewed', False):
+            raise ValueError('Confirm that all visible brood stages are labeled in the selected training and validation frames')
         # Look for per-video JSON files in train and val folders
         train_dir = self.project_path / 'annotations/coco/train'
         val_dir = self.project_path / 'annotations/coco/val'
@@ -139,8 +134,9 @@ class YOLOTrainingWorker(QThread):
             'path': str(yolo_dir.absolute()),
             'train': 'images/train',
             'val': 'images/val',
-            'names': {0: model_type},  # Single class for the selected annotation type
-            'nc': 1
+            'names': dict(enumerate(training_categories(model_type))),
+            'nc': len(training_categories(model_type)),
+            'mask_format': 'bumblebox-coco-rle-v1',
         }
         
         with open(dataset_yaml, 'w') as f:
@@ -151,7 +147,7 @@ class YOLOTrainingWorker(QThread):
         return yolo_dir, dataset_yaml
         
     def _coco_to_yolo(self, coco_json_path, output_dir, split='train', model_type='bee'):
-        """Convert COCO format to YOLO segmentation format
+        """Convert COCO masks to lossless labels for the raster YOLO trainer.
         
         Args:
             coco_json_path: Path to COCO JSON file
@@ -159,6 +155,8 @@ class YOLOTrainingWorker(QThread):
             split: 'train' or 'val'
             model_type: 'bee', 'chamber', 'hive', or 'pollen' - filters annotations to this type
         """
+        from training.raster_masks import mask_record, write_mask_labels
+
         with open(coco_json_path, 'r') as f:
             coco = json.load(f)
         
@@ -176,22 +174,15 @@ class YOLOTrainingWorker(QThread):
                 'chamber': 3,
                 'pollen': 4,
             }
-        target_category_id = category_map.get(model_type)
-        if target_category_id is None:
-            valid_types = ', '.join(sorted(category_map)) or 'none'
-            known_model_types = {'bee', 'chamber', 'hive', 'pollen'}
-            if model_type in known_model_types:
-                raise ValueError(
-                    f"COCO file {Path(coco_json_path).name} does not define category "
-                    f"'{model_type}'. Categories found: {valid_types}. This usually "
-                    "means the COCO annotations were exported before that class was "
-                    "added to the project metadata. Re-export COCO annotations with "
-                    "Export COCO checked, then start training again."
-                )
+        selected_categories = training_categories(model_type)
+        missing = [name for name in selected_categories if name not in category_map]
+        if missing:
             raise ValueError(
-                f"Unknown model_type '{model_type}'. Expected one of: {valid_types}"
-            )
-        
+                f"COCO file {Path(coco_json_path).name} does not define category "
+                f"{', '.join(missing)!r}. Re-export COCO annotations with Export COCO checked.")
+        target_classes = {category_map[name]: index
+                          for index, name in enumerate(selected_categories)}
+
         # Create output directories
         images_dir = output_dir / 'images' / split
         labels_dir = output_dir / 'labels' / split
@@ -240,53 +231,39 @@ class YOLOTrainingWorker(QThread):
             shutil.copy2(src_img_path, dst_img_path)
             
             # Create label file
-            label_file = labels_dir / f"{video_name}_{original_name}.txt"
+            label_file = labels_dir / f"{video_name}_{original_name}.json"
             annotations = img_annotations.get(img_id, [])
             
             # Collect valid segmentation annotation lines before writing
             # Only process annotations that have actual segmentation masks (not bbox-only)
-            annotation_lines = []
+            instances = []
+            brood_stage_pixels = np.zeros((img_height, img_width), np.uint8) if model_type == 'brood' else None
             
             for ann in annotations:
                 # Filter by category - only include annotations matching the model type
-                if ann.get('category_id') != target_category_id:
+                if ann.get('category_id') not in target_classes:
                     continue
                 
-                class_id = 0  # Always 0 since we're training a single-class model
-                
-                # Only handle annotations with actual segmentation polygons
-                # Skip bbox-only annotations as they don't have real masks
+                # Skip bbox-only annotations as they don't have real masks.
                 if 'segmentation' not in ann or not ann['segmentation']:
                     continue
                 
-                # Log if annotation has multiple polygons (debugging)
-                if len(ann['segmentation']) > 1:
-                    print(f"  Note: Annotation has {len(ann['segmentation'])} polygons - writing largest one only")
-                
-                # Find the largest polygon (by number of points) to use as the main mask
-                largest_seg = max(ann['segmentation'], key=len)
-                
-                if largest_seg is None or len(largest_seg) < 6:
-                    continue
-                
-                # Normalize coordinates
-                normalized_seg = []
-                for i in range(0, len(largest_seg), 2):
-                    x = largest_seg[i] / img_width
-                    y = largest_seg[i+1] / img_height
-                    # Ensure coordinates are in valid range
-                    x = max(0.0, min(1.0, x))
-                    y = max(0.0, min(1.0, y))
-                    normalized_seg.extend([x, y])
-                
-                if len(normalized_seg) >= 6:
-                    line = f"{class_id} " + " ".join([f"{coord:.6f}" for coord in normalized_seg])
-                    annotation_lines.append(line)
+                mask = decode_segmentation(ann['segmentation'], img_height, img_width)
+                class_id = target_classes[ann['category_id']]
+                if brood_stage_pixels is not None:
+                    occupied = mask > 0
+                    if np.any(occupied & (brood_stage_pixels != 0) & (brood_stage_pixels != class_id + 1)):
+                        raise ValueError(
+                            f'Conflicting brood stages overlap in {src_img_path.name}. '
+                            'Label only the visible top surface with one brood appearance stage; hive overlap is allowed.')
+                    brood_stage_pixels[occupied] = class_id + 1
+                instance = mask_record(mask, class_id=class_id)
+                if instance is not None:
+                    instances.append(instance)
             
             # Only write label file and include image if there are valid segmentation annotations
-            if annotation_lines:
-                with open(label_file, 'w') as f:
-                    f.write('\n'.join(annotation_lines) + '\n')
+            if instances:
+                write_mask_labels(label_file, (img_height, img_width), instances)
                 converted_count += 1
             else:
                 # Remove copied image if no segmentation annotations
@@ -362,22 +339,8 @@ class YOLOTrainingWorker(QThread):
             'rect': False,
             'close_mosaic': 10,
             'visualize': False,
+            'augment': True,  # Image-only blur in the raster dataset
         }
-        
-        # Add custom Albumentations for blur augmentation (to handle blurry videos)
-        if ALBUMENTATIONS_AVAILABLE:
-            custom_transforms = [
-                A.Blur(blur_limit=(3, 15), p=0.15),  # Gaussian blur with 15% probability
-                A.MedianBlur(blur_limit=15, p=0.15),  # Median blur with 15% probability
-            ]
-            # Monkey-patch the Albumentations class into the model's data augmentation
-            # This will be applied during data loading
-            training_params['augment'] = True  # Enable augmentation
-            model.add_callback('on_train_start', 
-                lambda trainer: setattr(trainer.train_loader.dataset, 'albumentations',
-                    Albumentations(p=1.0, transforms=custom_transforms)) 
-                    if hasattr(trainer, 'train_loader') and hasattr(trainer.train_loader, 'dataset') else None
-            )
         
         # Train with callback for progress
         class ProgressCallback:
@@ -455,7 +418,14 @@ class YOLOTrainingWorker(QThread):
         model.add_callback('on_val_end', callback.on_val_end)
         
         # Train
-        results = model.train(**training_params)
+        from training.raster_masks import RasterSegmentationTrainer, raster_training_options
+        training_params.update(raster_training_options())
+        self.stage_update.emit(
+            "Using exact instance masks (holes and disconnected regions preserved). "
+            "Paired affine/flips and color augmentation enabled; mosaic, mixup, "
+            "copy-paste, cutmix and perspective disabled."
+        )
+        results = model.train(trainer=RasterSegmentationTrainer, **training_params)
         
         # Return best model path
         best_model_path = output_dir / self.config.get('name', 'bee_segmentation') / 'weights' / 'best.pt'
