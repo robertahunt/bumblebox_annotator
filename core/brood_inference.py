@@ -9,15 +9,18 @@ import zipfile
 import cv2
 import numpy as np
 
-from core.categories import BROOD_CATEGORIES, CATEGORY_COLORS
+from core.categories import (BROOD_CATEGORIES, STANDARD_BROOD_CATEGORIES, CATEGORY_COLORS,
+                             BROOD_MAP_LABELS, BROOD_UNRESOLVED_LABEL)
 
 
 def brood_model_classes(model):
     names = model.names
     items = names.items() if isinstance(names, dict) else enumerate(names)
     classes = {int(key): str(name) for key, name in items}
-    if getattr(model, 'task', None) != 'segment' or sorted(classes.values()) != sorted(BROOD_CATEGORIES):
-        raise ValueError('Brood Model must be a segmentation checkpoint trained on all five brood appearance classes')
+    supported = (sorted(BROOD_CATEGORIES), sorted(STANDARD_BROOD_CATEGORIES))
+    if getattr(model, 'task', None) != 'segment' or sorted(classes.values()) not in supported:
+        raise ValueError('Brood Model must be an eight-class brood segmentation checkpoint '
+                         '(including queen brood) or a legacy five-class brood checkpoint')
     return {key: BROOD_CATEGORIES.index(name) + 1 for key, name in classes.items()}
 
 
@@ -47,8 +50,8 @@ def paint_brood_overlay(frame, snapshots):
             continue
         labels = cv2.resize(snapshot['labels'], (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
         crop = overlay[y1:y2, x1:x2]
-        colors = {i + 2: CATEGORY_COLORS[name][::-1] for i, name in enumerate(BROOD_CATEGORIES)}
-        colors[7] = (180, 180, 180)
+        colors = {label: CATEGORY_COLORS[name][::-1] for name, label in BROOD_MAP_LABELS.items()}
+        colors[BROOD_UNRESOLVED_LABEL] = (180, 180, 180)
         for label, color in colors.items():
             selected = labels == label
             crop[selected] = (crop[selected] * 0.55 + np.asarray(color) * 0.45).astype(np.uint8)
@@ -58,7 +61,8 @@ def paint_brood_overlay(frame, snapshots):
 class BroodVideoWriter:
     """One archive and one CSV per video; optional MP4 preview, no loose frames."""
 
-    def __init__(self, folder, video_id, context, temporal_map, preview=False, preview_limit=None):
+    def __init__(self, folder, video_id, context, temporal_map, preview=False, preview_limit=None,
+                 model_classes=None):
         folder = Path(folder)
         folder.mkdir(parents=True, exist_ok=True)
         self.video_id = video_id
@@ -71,10 +75,14 @@ class BroodVideoWriter:
         self.preview = preview
         self.preview_limit = preview_limit
         self.chamber_ids = None
-        self.metadata = dict(schema_version=1, experimental=True, video_id=video_id, context=context,
+        self.metadata = dict(schema_version=2, experimental=True, video_id=video_id, context=context,
                              classes=list(BROOD_CATEGORIES), resolution=temporal_map.resolution,
-                             labels={'unknown': 0, 'background': 1, 'brood_stage_unresolved': 7,
-                                     **{name: i + 2 for i, name in enumerate(BROOD_CATEGORIES)}},
+                             model_classes=list(BROOD_CATEGORIES if model_classes is None else model_classes),
+                             labels={'unknown': 0, 'background': 1,
+                                     'brood_stage_unresolved': BROOD_UNRESOLVED_LABEL, **BROOD_MAP_LABELS},
+                             observed_labels={'background': 0, 'unobserved': 255,
+                                              **{name: i + 1 for i, name in enumerate(BROOD_CATEGORIES)}},
+                             probability_channels=['background', *BROOD_CATEGORIES],
                              window_seconds=temporal_map.window_seconds,
                              max_weight=temporal_map.max_weight, min_weight=temporal_map.min_weight,
                              stage_threshold=temporal_map.stage_threshold,
@@ -101,7 +109,7 @@ class BroodVideoWriter:
             valid &= ~geom._normalize_bee_occlusion(bees, chamber, frame.shape[:2])
             if chamber.get('temporal_unavailable', False):
                 valid[:] = False
-            for index in range(6):
+            for index in range(len(BROOD_CATEGORIES) + 1):
                 observed[valid & geom._normalize_mask(labels == index, chamber, frame.shape[:2])] = index
             np.savez(buffer, **snap, observed_labels=observed)
             self.archive.writestr(f'frame_{frame_number:06d}_chamber_{chamber_id}.npz', buffer.getvalue())

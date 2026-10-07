@@ -87,7 +87,7 @@ class YOLOTrainingWorker(QThread):
     def _prepare_yolo_dataset(self):
         """Convert COCO format to YOLO format"""
         if self.config.get('model_type') == 'brood' and not self.config.get('brood_reviewed', False):
-            raise ValueError('Confirm that all visible brood stages are labeled in the selected training and validation frames')
+            raise ValueError('Confirm that all visible brood stages, including queen brood, are labeled in the selected training and validation frames')
         # Look for per-video JSON files in train and val folders
         train_dir = self.project_path / 'annotations/coco/train'
         val_dir = self.project_path / 'annotations/coco/val'
@@ -153,7 +153,7 @@ class YOLOTrainingWorker(QThread):
             coco_json_path: Path to COCO JSON file
             output_dir: Output directory for YOLO format
             split: 'train' or 'val'
-            model_type: 'bee', 'chamber', 'hive', or 'pollen' - filters annotations to this type
+            model_type: Category key (including 'nectar'), or 'brood' for all brood stages.
         """
         from training.raster_masks import mask_record, write_mask_labels
 

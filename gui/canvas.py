@@ -2,8 +2,9 @@
 Image canvas with zoom, pan, and annotation capabilities
 """
 
-from core.categories import (CATEGORIES, BROOD_CATEGORIES, CATEGORY_COLORS, CATEGORY_LABELS,
+from core.categories import (CATEGORIES, BROOD_CATEGORIES, CATEGORY_COLORS,
                              MASK_ATTRIBUTES, category_label)
+from gui.category_menu import add_category_menu_actions
 
 import numpy as np
 import math
@@ -19,6 +20,7 @@ from pathlib import Path
 import cv2
 import time
 from core.mask_editing import enclosed_mask_region
+from core.mask_geometry import MaskGeometryCache, measure_mask
 
 
 class OutwardBBoxRectItem(QGraphicsRectItem):
@@ -91,15 +93,11 @@ class ImageCanvas(QGraphicsView):
         self.mask_opacity = 64  # Default opacity for masks (0-255) - 25%
         
         # Annotation type - determines which category is being added
-        self.current_annotation_type = 'bee'  # 'bee', 'chamber', 'hive', or 'pollen'
+        self.current_annotation_type = 'bee'
         
-        # Annotations - Separate masks allow overlapping between bee/chamber/hive/pollen
-        self.bee_mask = None  # H×W int32 array with bee instance IDs
-        self.chamber_mask = None  # H×W int32 array with chamber instance IDs
-        self.hive_mask = None  # H×W int32 array with hive instance IDs
-        self.pollen_mask = None  # H×W int32 array with pollen instance IDs
-        for category in BROOD_CATEGORIES:
-            setattr(self, f'{category}_mask', None)
+        # Separate instance-ID arrays allow masks from different categories to overlap.
+        for _, attribute in MASK_ATTRIBUTES:
+            setattr(self, attribute, None)
         
         # Legacy compatibility: provide combined view of all masks (readonly, dynamically generated)
         self._combined_mask_cache = None
@@ -123,17 +121,9 @@ class ImageCanvas(QGraphicsView):
         self.annotation_type_colors = {'bee': None, **CATEGORY_COLORS}
         self.annotation_type_visibility = {cat: cat == 'bee' for cat in CATEGORIES}
         
-        # Performance optimization: cache instance IDs and bounding boxes
+        # Performance optimization: cache instance IDs and mask geometry
         self._cached_instance_ids = None  # Cached sorted list of instance IDs
-        self._cached_bboxes = {}  # Dict mapping instance_id -> (x, y, w, h)
-        
-        # Performance optimization: cache instance IDs and bounding boxes
-        self._cached_instance_ids = None  # Cached sorted list of instance IDs
-        self._cached_bboxes = {}  # Dict mapping instance_id -> (x, y, w, h)
-        
-        # Performance optimization: cache instance IDs and bounding boxes
-        self._cached_instance_ids = None  # Cached sorted list of instance IDs
-        self._cached_bboxes = {}  # Dict mapping instance_id -> (x, y, w, h)
+        self._geometry_cache = MaskGeometryCache()
         
         # Editing isolation - temporary mask for current edit
         self.editing_mask = None  # Binary H×W mask for instance being edited
@@ -744,16 +734,24 @@ class ImageCanvas(QGraphicsView):
         return category is None or active_category is None or category == active_category
 
     def _active_brush_bbox_rect(self):
-        active_id, _ = self._active_brush_instance()
+        """Use current mask geometry, independent of bbox visibility or redraws."""
+        active_id, category = self._active_brush_instance()
         if active_id <= 0:
             return None
 
-        if active_id in self.bbox_items_map:
-            try:
-                return QRectF(self.bbox_items_map[active_id].rect())
-            except (RuntimeError, AttributeError):
-                pass
+        if active_id == self.editing_instance_id and self.editing_mask is not None:
+            mask = self.editing_mask
+        else:
+            mask_array, _ = self._get_mask_array_for_instance(active_id, category)
+            mask = (mask_array == active_id).astype(np.uint8) if mask_array is not None else None
 
+        if mask is not None:
+            # Scan the binary mask directly without allocating coordinates for every pixel.
+            x, y, width, height = cv2.boundingRect(mask)
+            if width > 0 and height > 0:
+                return QRectF(float(x), float(y), float(width), float(height))
+
+        # Box-only annotations and blank new instances do not yet have mask bounds.
         bbox = self.annotation_metadata.get(active_id, {}).get('bbox')
         if not bbox or len(bbox) < 4:
             return None
@@ -999,6 +997,7 @@ class ImageCanvas(QGraphicsView):
         self.scene.clear()
         for _category, mask_attr in MASK_ATTRIBUTES:
             setattr(self, mask_attr, None)
+        self._geometry_cache.invalidate()
         self.next_mask_id = 1
         self.mask_colors = {}
         self.positive_points = []
@@ -1035,6 +1034,7 @@ class ImageCanvas(QGraphicsView):
         self.image_item = None
         for _category, mask_attr in MASK_ATTRIBUTES:
             setattr(self, mask_attr, None)
+        self._geometry_cache.invalidate()
         self.next_mask_id = 1
         self.mask_items = []  # QGraphicsPixmapItems for visualization 
         self.mask_colors = {}  # Dict mapping instance_id -> (r,g,b) color
@@ -1430,6 +1430,7 @@ class ImageCanvas(QGraphicsView):
             masks_to_search = [
                 ('bee', self.bee_mask),
                 *[(cat, self._get_mask_array_by_category(cat)) for cat in reversed(BROOD_CATEGORIES)],
+                ('nectar', self.nectar_mask),
                 ('pollen', self.pollen_mask),
                 ('hive', self.hive_mask),
                 ('chamber', self.chamber_mask),
@@ -1507,24 +1508,16 @@ class ImageCanvas(QGraphicsView):
 
         change_category_menu = menu.addMenu(f"Change Instance {instance_id} Category")
 
-        categories = list(CATEGORY_LABELS.items())
-
         current_category = current_category or self.annotation_metadata.get(
             instance_id, {}
         ).get('category', 'bee')
 
-        for cat_id, cat_label in categories:
-            if cat_id != current_category:
-                action = QAction(cat_label, self)
-                action.triggered.connect(
-                    lambda checked=False, iid=instance_id, old_cat=current_category, new_cat=cat_id:
-                    self.change_instance_category(iid, new_cat, old_category=old_cat)
-                )
-                change_category_menu.addAction(action)
-            else:
-                action = QAction(f"{cat_label} (current)", self)
-                action.setEnabled(False)
-                change_category_menu.addAction(action)
+        actions = add_category_menu_actions(change_category_menu, current_category)
+        for category, action in actions.items():
+            action.triggered.connect(
+                lambda checked=False, iid=instance_id, old_cat=current_category, new_cat=category:
+                self.change_instance_category(iid, new_cat, old_category=old_cat)
+            )
 
     def _category_label(self, category):
         return category_label(category)
@@ -1556,13 +1549,11 @@ class ImageCanvas(QGraphicsView):
         menu.addAction(same_kind_action)
 
         new_instance_menu = menu.addMenu("New Instance")
-        for category in CATEGORIES:
-            action = QAction(self._category_label(category), self)
+        for category, action in add_category_menu_actions(new_instance_menu).items():
             action.triggered.connect(
                 lambda checked=False, cat=category:
                 self.new_instance_requested.emit(cat)
             )
-            new_instance_menu.addAction(action)
 
     def _show_category_context_menu(self, event, allow_active_fallback=False):
         """Show context menu for changing categories and creating instances."""
@@ -1750,8 +1741,8 @@ class ImageCanvas(QGraphicsView):
 
         self._combined_mask_dirty = True
         self._cached_instance_ids = None
-        self._cached_bboxes.clear()
         self._cached_overlay = None
+        self._geometry_cache.invalidate(category)
         self._clear_brush_history()
 
         self.selected_mask_idx = new_id
@@ -2433,7 +2424,6 @@ class ImageCanvas(QGraphicsView):
 
         editing_crop = self.editing_mask[min_y:max_y, min_x:max_x]
         editing_crop[allowed_pixels] = 255 if self.current_tool == 'brush' else 0
-        self._cached_bboxes.pop(instance_id, None)
         
         # Create dirty region mask for this stroke
         stroke_dirty = np.zeros(self.editing_mask.shape, dtype=bool)
@@ -2489,7 +2479,6 @@ class ImageCanvas(QGraphicsView):
 
         self._push_current_brush_undo_snapshot()
         self.editing_mask[fill_region] = 255
-        self._cached_bboxes.pop(self.editing_instance_id, None)
         self._update_editing_visualization_incremental(fill_region)
 
         if self.selected_mask_idx == self.editing_instance_id:
@@ -2543,7 +2532,6 @@ class ImageCanvas(QGraphicsView):
 
         self._push_current_brush_undo_snapshot()
         self.editing_mask[subtract_region] = 0
-        self._cached_bboxes.pop(self.editing_instance_id, None)
         self._update_editing_visualization_incremental(subtract_region)
 
         if self.selected_mask_idx == self.editing_instance_id:
@@ -2601,7 +2589,6 @@ class ImageCanvas(QGraphicsView):
         self.editing_instance_category = category
         self.selected_mask_idx = instance_id
         self.selected_instance_category = category
-        self._cached_bboxes.pop(instance_id, None)
         self._dirty_pixels = None
 
         if self._editing_overlay_cache is not None:
@@ -2725,6 +2712,7 @@ class ImageCanvas(QGraphicsView):
         
         # Add to the appropriate mask array
         mask_array[binary_mask] = mask_id
+        self._geometry_cache.invalidate(category)
         
         # Mark combined mask cache as dirty
         self._combined_mask_dirty = True
@@ -2935,6 +2923,13 @@ class ImageCanvas(QGraphicsView):
             mask_array = getattr(self, mask_attr)
             if mask_array is not None:
                 mask_array[mask_array == instance_id] = 0
+                if _category in found_categories or _category == new_category:
+                    self._geometry_cache.invalidate(_category)
+
+        # Active edits are exported through their category's mask array too.
+        # Ensure a newly used category exists before changing the edit's category.
+        if has_pixels and self._get_mask_array_by_category(new_category) is None:
+            self._set_mask_array_by_category(new_category, np.zeros(mask_shape, dtype=np.int32))
 
         if editing_matches:
             if source_pixels is not None:
@@ -2942,13 +2937,14 @@ class ImageCanvas(QGraphicsView):
             self.editing_instance_category = new_category
             self.selected_mask_idx = instance_id
             self.selected_instance_category = new_category
+            # Brush undo/redo changes pixels, not an independently chosen category.
+            snapshots = self.brush_undo_stack + self.brush_redo_stack + [self._brush_step_start_snapshot]
+            for snapshot in snapshots:
+                if snapshot is not None and snapshot['instance_id'] == instance_id:
+                    snapshot['category'] = new_category
         elif has_pixels:
             # Add instance to the new mask array with the same ID.
             new_mask_array = self._get_mask_array_by_category(new_category)
-            if new_mask_array is None:
-                h, w = source_pixels.shape
-                new_mask_array = np.zeros((h, w), dtype=np.int32)
-                self._set_mask_array_by_category(new_category, new_mask_array)
             new_mask_array[source_pixels] = instance_id
 
         self.annotation_metadata[instance_id] = old_metadata
@@ -2971,22 +2967,32 @@ class ImageCanvas(QGraphicsView):
         # Invalidate caches
         self._combined_mask_dirty = True
         self._cached_instance_ids = None
-        self._cached_bboxes.clear()
         
         # Rebuild visualization
         self.rebuild_visualizations()
         if editing_matches:
-            self._update_editing_visualization()
-        self.update_instance_labels()
-        self.instance_selected.emit(instance_id, new_category)
+            self._update_editing_visualization(update_labels=False)
         
         # Emit signal that annotations changed
         self.annotation_changed.emit()
+        self.instance_selected.emit(instance_id, new_category)
         
         print(f"Moved instance {instance_id} from {old_category_label} to {new_category}")
     
     def _mask_sources(self):
         return [(category, getattr(self, attr, None)) for category, attr in MASK_ATTRIBUTES]
+
+    def _stored_instance_ids(self, category, mask_array):
+        return self._geometry_cache.instance_ids(category, mask_array)
+
+    def get_instance_geometry(self, instance_id, category=None):
+        mask_array, category = self._get_mask_array_for_instance(instance_id, category)
+        if (instance_id == self.editing_instance_id and category == self.editing_instance_category
+                and self.editing_mask is not None):
+            # The edit buffer is also written by SAM2/refinement and undo/redo.
+            # Measure this one live buffer; only unchanged stored masks are cached.
+            return measure_mask(self.editing_mask)
+        return self._geometry_cache.geometry(category, mask_array, instance_id)
 
     def _get_mask_array_by_category(self, category):
         return getattr(self, f'{category}_mask', None) if category in CATEGORIES else None
@@ -2995,6 +3001,7 @@ class ImageCanvas(QGraphicsView):
         if category not in CATEGORIES:
             raise ValueError(f'Unknown annotation category: {category}')
         setattr(self, f'{category}_mask', mask_array)
+        self._geometry_cache.invalidate(category)
 
     def _instance_key(self, instance_id, category=None):
         """Stable key for per-instance UI state."""
@@ -3019,14 +3026,11 @@ class ImageCanvas(QGraphicsView):
             if mask_array is not None and np.any(mask_array == instance_id):
                 mask_array[mask_array == instance_id] = 0
                 removed_categories.append(category)
+                self._geometry_cache.invalidate(category)
 
         if removed_categories:
             self._combined_mask_dirty = True
             self._cached_instance_ids = None
-            self._cached_bboxes = {
-                key: value for key, value in self._cached_bboxes.items()
-                if key != instance_id and key != self._instance_key(instance_id)
-            }
             print(
                 f"Removed duplicate instance {instance_id} mask(s) from "
                 f"{', '.join(removed_categories)}; keeping {keep_category}."
@@ -3063,6 +3067,7 @@ class ImageCanvas(QGraphicsView):
                 if mask_array is not None and np.any(mask_array == instance_id):
                     mask_array[mask_array == instance_id] = 0
                     removed_categories.append(category)
+                    self._geometry_cache.invalidate(category)
 
             if removed_categories:
                 removed_messages.append(
@@ -3072,7 +3077,6 @@ class ImageCanvas(QGraphicsView):
         if removed_messages:
             self._combined_mask_dirty = True
             self._cached_instance_ids = None
-            self._cached_bboxes.clear()
             print(
                 "Cleaned duplicate category masks for instance IDs: " +
                 "; ".join(removed_messages)
@@ -3088,8 +3092,7 @@ class ImageCanvas(QGraphicsView):
         for category, mask_array in self._mask_sources():
             if mask_array is None:
                 continue
-            instance_ids = np.unique(mask_array)
-            instance_ids = instance_ids[instance_ids > 0]
+            instance_ids = self._stored_instance_ids(category, mask_array)
             for instance_id in instance_ids:
                 key = self._instance_key(int(instance_id), category)
                 if key not in seen:
@@ -3149,12 +3152,14 @@ class ImageCanvas(QGraphicsView):
         if value is None:
             for _category, mask_attr in MASK_ATTRIBUTES:
                 setattr(self, mask_attr, None)
+            self._geometry_cache.invalidate()
             self._combined_mask_cache = None
             self._combined_mask_dirty = True
         else:
             # For other values, just mark cache as dirty
             # Direct assignment not supported - use set_annotations instead
             self._combined_mask_dirty = True
+            self._geometry_cache.invalidate()
             
     def rebuild_visualizations(self):
         """Rebuild all visualizations (masks and/or bboxes) based on display flags"""
@@ -3198,10 +3203,10 @@ class ImageCanvas(QGraphicsView):
         for category, mask_array in self._mask_sources():
             if mask_array is None or not self.annotation_type_visibility.get(category, True):
                 continue
-            for instance_id in np.unique(mask_array):
+            for instance_id in self._stored_instance_ids(category, mask_array):
                 if instance_id > 0 and self.is_instance_enabled(instance_id, category):
                     mask_lookup[instance_id] = (category, mask_array)
-        render_order = ('chamber', 'hive', 'pollen') + BROOD_CATEGORIES + ('bee',)
+        render_order = ('chamber', 'hive', 'pollen', 'nectar') + BROOD_CATEGORIES + ('bee',)
         all_instance_ids = [iid for cat in render_order
                             for iid, (category, _) in mask_lookup.items() if category == cat]
 
@@ -3225,13 +3230,18 @@ class ImageCanvas(QGraphicsView):
                 color = self.ensure_instance_color(instance_id, category)
                 
                 # Apply color with appropriate opacity
-                mask_pixels = mask_array == instance_id
-                if mask_pixels.shape[:2] != (h, w):
+                if mask_array.shape[:2] != (h, w):
                     print(f"Warning: rebuild_visualizations skipping instance {instance_id} – "
-                          f"mask shape {mask_pixels.shape[:2]} != overlay shape {(h, w)}")
+                          f"mask shape {mask_array.shape[:2]} != overlay shape {(h, w)}")
                     continue
+                bbox = self.get_instance_geometry(instance_id, category).bbox
+                if bbox is None:
+                    continue
+                x, y, width, height = bbox
+                region = np.s_[y:y + height, x:x + width]
+                mask_pixels = mask_array[region] == instance_id
                 alpha = self.mask_opacity
-                overlay[mask_pixels] = [color[0], color[1], color[2], alpha]
+                overlay[region][mask_pixels] = [color[0], color[1], color[2], alpha]
             
             # Cache the overlay for incremental updates
             self._cached_overlay = overlay
@@ -3278,8 +3288,7 @@ class ImageCanvas(QGraphicsView):
             if not self.annotation_type_visibility.get(category, True):
                 continue
             
-            instance_ids = np.unique(mask_array)
-            instance_ids = instance_ids[instance_ids > 0]
+            instance_ids = self._stored_instance_ids(category, mask_array)
             
             for instance_id in instance_ids:
                 if not self.is_bbox_instance_visible(instance_id, category):
@@ -3287,8 +3296,7 @@ class ImageCanvas(QGraphicsView):
                 if instance_id in self.bbox_items_map:
                     continue  # Already drawn
                 # Get bbox from mask
-                mask = (mask_array == instance_id)
-                bbox = self.get_mask_bbox(mask.astype(np.uint8) * 255)
+                bbox = self.get_instance_geometry(instance_id, category).bbox
                 
                 if bbox is not None:
                     x, y, w, h = bbox
@@ -3455,13 +3463,18 @@ class ImageCanvas(QGraphicsView):
                 continue
             
             # Extract binary mask for this instance
-            binary_mask = (mask_array == instance_id).astype(np.uint8)
+            bbox = self.get_instance_geometry(instance_id, category).bbox
+            if bbox is None:
+                continue
+            x, y, width, height = bbox
+            binary_mask = (mask_array[y:y + height, x:x + width] == instance_id).astype(np.uint8)
             
             # Find contours (both external and internal/holes)
             contours, hierarchy = cv2.findContours(
                 binary_mask,
                 cv2.RETR_CCOMP,  # Retrieve both external and internal contours
-                cv2.CHAIN_APPROX_SIMPLE
+                cv2.CHAIN_APPROX_SIMPLE,
+                offset=(x, y),
             )
             
             if not contours:
@@ -3663,6 +3676,7 @@ class ImageCanvas(QGraphicsView):
                 ('chamber', self.chamber_mask),
                 ('hive', self.hive_mask),
                 ('pollen', self.pollen_mask),
+                ('nectar', self.nectar_mask),
                 *[(cat, self._get_mask_array_by_category(cat)) for cat in BROOD_CATEGORIES],
                 ('bee', self.bee_mask),
             ]:
@@ -3671,23 +3685,20 @@ class ImageCanvas(QGraphicsView):
                 if not self.annotation_type_visibility.get(category, True):
                     continue
 
-                instance_ids = np.unique(mask_array)
-                instance_ids = instance_ids[instance_ids > 0]
+                instance_ids = self._stored_instance_ids(category, mask_array)
                 for instance_id in instance_ids:
                     instance_id = int(instance_id)
                     if not self.is_instance_enabled(instance_id, category):
                         continue
 
-                    instance_mask = mask_array == instance_id
-                    y_coords, x_coords = np.nonzero(instance_mask)
-                    if len(y_coords) == 0:
+                    geometry = self.get_instance_geometry(instance_id, category)
+                    if geometry.centroid is None:
                         continue
 
                     self._add_instance_label(
                         instance_id,
                         category,
-                        float(np.mean(x_coords)),
-                        float(np.mean(y_coords))
+                        *geometry.centroid
                     )
                     labeled_keys.add((instance_id, category))
 
@@ -3696,14 +3707,12 @@ class ImageCanvas(QGraphicsView):
                     self.editing_instance_id, {}
                 ).get('category', self.current_annotation_type)
                 if self._is_editing_mask_visible():
-                    editing_pixels = self.editing_mask > 0
-                    if np.any(editing_pixels):
-                        y_coords, x_coords = np.nonzero(editing_pixels)
+                    geometry = self.get_instance_geometry(self.editing_instance_id, category)
+                    if geometry.centroid is not None:
                         self._add_instance_label(
                             self.editing_instance_id,
                             category,
-                            float(np.mean(x_coords)),
-                            float(np.mean(y_coords))
+                            *geometry.centroid
                         )
                         labeled_keys.add((self.editing_instance_id, category))
 
@@ -3897,7 +3906,8 @@ class ImageCanvas(QGraphicsView):
         """
         # Commit any pending edits first
         if self.editing_instance_id > 0:
-            self.commit_editing()
+            self.commit_editing(rebuild=False)
+        self._geometry_cache.invalidate()
         
         # Clear existing masks and free memory
         for mask_attr in [attr for _, attr in MASK_ATTRIBUTES]:
@@ -3957,7 +3967,6 @@ class ImageCanvas(QGraphicsView):
         
         # Clear cached data for performance optimization
         self._cached_instance_ids = None
-        self._cached_bboxes = {}
         
         # Force garbage collection to free memory
         import gc
@@ -4240,7 +4249,8 @@ class ImageCanvas(QGraphicsView):
         
         # Clear caches
         self._cached_instance_ids = None
-        self._cached_bboxes = {}
+        self._geometry_cache.invalidate()
+        self._combined_mask_dirty = True
         if self._cached_overlay is not None:
             del self._cached_overlay
             self._cached_overlay = None
@@ -4263,32 +4273,13 @@ class ImageCanvas(QGraphicsView):
         Returns:
             tuple: (x, y, width, height) or None if mask is empty/invalid
         """
-        # Check cache first
-        cache_key = self._instance_key(instance_id, category)
-        if cache_key in self._cached_bboxes:
-            return self._cached_bboxes[cache_key]
-        
-        bbox = None
-        
-        # Try to get bbox from editing mask
-        if instance_id == self.editing_instance_id and self.editing_mask is not None:
-            bbox = self.get_mask_bbox(self.editing_mask)
-        # Try to get bbox from combined_mask
-        elif instance_id > 0:
-            mask_array, resolved_category = self._get_mask_array_for_instance(instance_id, category)
-            instance_mask = mask_array == instance_id if mask_array is not None else None
-            if instance_mask is not None and np.any(instance_mask):
-                bbox = self.get_mask_bbox(instance_mask)
+        bbox = self.get_instance_geometry(instance_id, category).bbox if instance_id > 0 else None
         
         # Try to get bbox from metadata (for bbox-only annotations)
         if bbox is None and instance_id in self.annotation_metadata:
             metadata = self.annotation_metadata[instance_id]
             if 'bbox' in metadata and metadata['bbox'] != [0, 0, 0, 0]:
                 bbox = tuple(metadata['bbox'])
-        
-        # Cache the result (even if None)
-        if bbox is not None:
-            self._cached_bboxes[cache_key] = bbox
         
         return bbox
     
@@ -4321,11 +4312,7 @@ class ImageCanvas(QGraphicsView):
         # For bbox-only instances, wait until user actually starts drawing
         if self.current_tool in ['brush', 'eraser']:
             # Check if instance has segmentation data
-            mask_array, _ = self._get_mask_array_for_instance(idx, self.selected_instance_category)
-            has_segmentation = (
-                mask_array is not None and
-                np.any(mask_array == idx)
-            )
+            has_segmentation = self.get_instance_geometry(idx, self.selected_instance_category).area > 0
             if has_segmentation:
                 if zoom:
                     self.zoom_to_instance_fast(idx, category=self.selected_instance_category)
@@ -4353,22 +4340,11 @@ class ImageCanvas(QGraphicsView):
         Returns:
             tuple: (x, y, width, height) or None if mask is empty
         """
-        if mask is None or not np.any(mask):
+        if mask is None:
             return None
-        
-        # Find coordinates where mask is non-zero
-        coords = np.argwhere(mask > 0)
-        if len(coords) == 0:
-            return None
-        
-        # Get min/max coordinates (note: coords are in [row, col] format)
-        y_min, x_min = coords.min(axis=0)
-        y_max, x_max = coords.max(axis=0)
-        
-        width = x_max - x_min + 1
-        height = y_max - y_min + 1
-        
-        return (int(x_min), int(y_min), int(width), int(height))
+        binary = mask if mask.dtype == np.uint8 else (mask > 0).astype(np.uint8)
+        x, y, width, height = cv2.boundingRect(binary)
+        return (x, y, width, height) if width and height else None
     
     def zoom_to_rect(self, x, y, width, height, padding=50):
         """
@@ -4476,20 +4452,11 @@ class ImageCanvas(QGraphicsView):
             if not self.is_annotation_instance_visible(self.selected_mask_idx, category):
                 # Category is hidden, don't show selection marker
                 return
-            # Check if instance exists in combined_mask or is being edited
-            if self.selected_mask_idx == self.editing_instance_id and self.editing_mask is not None:
-                # Use editing mask
-                binary_mask = self.editing_mask
-            else:
-                mask_array, _ = self._get_mask_array_for_instance(self.selected_mask_idx, category)
-                if mask_array is None or not np.any(mask_array == self.selected_mask_idx):
-                    return
-                # Use combined mask
-                binary_mask = (mask_array == self.selected_mask_idx).astype(np.uint8) * 255
-            
-            self.add_selection_border(binary_mask)
+            geometry = self.get_instance_geometry(self.selected_mask_idx, category)
+            if geometry.centroid is not None:
+                self.add_selection_border(None, centroid=geometry.centroid)
     
-    def add_selection_border(self, mask):
+    def add_selection_border(self, mask, centroid=None):
         """Add a centroid marker for the selected mask."""
         # Remove previous marker if it exists
         if self.selection_border_item:
@@ -4514,13 +4481,11 @@ class ImageCanvas(QGraphicsView):
                 # Category is hidden, don't show selection marker
                 return
         
-        mask_pixels = mask > 0
-        if not np.any(mask_pixels):
+        if centroid is None:
+            centroid = measure_mask(mask).centroid
+        if centroid is None:
             return
-
-        y_coords, x_coords = np.nonzero(mask_pixels)
-        centroid_x = float(np.mean(x_coords))
-        centroid_y = float(np.mean(y_coords))
+        centroid_x, centroid_y = centroid
 
         radius = 6.0
         marker_item = QGraphicsEllipseItem(-radius, -radius, radius * 2, radius * 2)
@@ -4559,7 +4524,7 @@ class ImageCanvas(QGraphicsView):
         # Commit any previous edits
         if (self.editing_instance_id > 0 and
             (self.editing_instance_id != instance_id or self.editing_instance_category != category)):
-            self.commit_editing()
+            self.commit_editing(rebuild=False)
         self._clear_brush_history()
         
         # Get the appropriate mask array for this instance
@@ -4586,6 +4551,7 @@ class ImageCanvas(QGraphicsView):
             instance_pixels = mask_array == instance_id
             self.editing_mask[instance_pixels] = 255
             mask_array[instance_pixels] = 0
+            self._geometry_cache.invalidate(category)
             # Mark combined mask cache as dirty
             self._combined_mask_dirty = True
         else:
@@ -4611,7 +4577,7 @@ class ImageCanvas(QGraphicsView):
         self.rebuild_visualizations()
         
         # Show editing mask on top
-        self._update_editing_visualization()
+        self._update_editing_visualization(update_labels=False)
         self.instance_selected.emit(instance_id, category)
     
     def _should_delete_empty_editing_instance(self):
@@ -4627,7 +4593,7 @@ class ImageCanvas(QGraphicsView):
         )
         return self._editing_started_with_pixels or is_empty_placeholder
 
-    def commit_editing(self):
+    def commit_editing(self, rebuild=True):
         """Commit editing mask back to combined mask
         
         Merges the temporary editing mask back into the main combined mask.
@@ -4635,7 +4601,10 @@ class ImageCanvas(QGraphicsView):
         # Flush any pending visualization updates first
         if self._viz_update_timer.isActive():
             self._viz_update_timer.stop()
-            self._flush_pending_viz_update()
+            if rebuild:
+                self._flush_pending_viz_update()
+        if not rebuild:
+            self._dirty_pixels = None
         
         if self.editing_instance_id <= 0 or self.editing_mask is None:
             return
@@ -4650,7 +4619,7 @@ class ImageCanvas(QGraphicsView):
             ).get('category', self.current_annotation_type)
 
             if self._should_delete_empty_editing_instance():
-                self.delete_instance(instance_id, category=category)
+                self.delete_instance(instance_id, category=category, rebuild=rebuild)
                 return
 
             # Empty editing mask from a real bbox-only instance - don't commit,
@@ -4681,7 +4650,8 @@ class ImageCanvas(QGraphicsView):
                 self.editing_mask_item = None
             
             # Rebuild visualization to restore bbox-only instances
-            self.rebuild_visualizations()
+            if rebuild:
+                self.rebuild_visualizations()
             self._clear_brush_history()
             return
         
@@ -4704,6 +4674,7 @@ class ImageCanvas(QGraphicsView):
         # Merge editing mask back into appropriate mask array
         editing_pixels = self.editing_mask > 0
         mask_array[editing_pixels] = self.editing_instance_id
+        self._geometry_cache.invalidate(category)
         
         # Mark combined mask cache as dirty
         self._combined_mask_dirty = True
@@ -4751,7 +4722,8 @@ class ImageCanvas(QGraphicsView):
             self.editing_mask_item = None
         
         # Rebuild full visualization
-        self.rebuild_visualizations()
+        if rebuild:
+            self.rebuild_visualizations()
         self._clear_brush_history()
         
         self.annotation_changed.emit()
@@ -4803,6 +4775,7 @@ class ImageCanvas(QGraphicsView):
             mask_array = getattr(self, mask_attr, None)
             if mask_array is not None and np.any(mask_array == instance_id):
                 mask_array[mask_array == instance_id] = 0
+                self._geometry_cache.invalidate(_mask_category)
                 changed = True
 
         if instance_id in self.annotation_metadata:
@@ -4858,14 +4831,6 @@ class ImageCanvas(QGraphicsView):
 
         self._combined_mask_dirty = True
         self._cached_instance_ids = None
-        self._cached_bboxes = {
-            key: bbox
-            for key, bbox in self._cached_bboxes.items()
-            if not (
-                key == instance_id or
-                (isinstance(key, tuple) and len(key) > 1 and key[1] == instance_id)
-            )
-        }
 
         if rebuild:
             self.rebuild_visualizations()
@@ -4874,7 +4839,7 @@ class ImageCanvas(QGraphicsView):
 
         return changed
 
-    def _update_editing_visualization(self):
+    def _update_editing_visualization(self, update_labels=True):
         """Update visualization of the editing mask
         
         Shows the editing mask as an overlay on top of other instances.
@@ -4922,7 +4887,8 @@ class ImageCanvas(QGraphicsView):
         # Update selection border for editing mask (skip if actively drawing)
         if not self._is_actively_drawing and self.selected_mask_idx == self.editing_instance_id:
             self.add_selection_border(self.editing_mask)
-            self.update_instance_labels()
+            if update_labels:
+                self.update_instance_labels()
 
     def _is_editing_mask_visible(self):
         """Return whether the active editing overlay should be visible."""

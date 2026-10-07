@@ -13,9 +13,10 @@ import argparse
 os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
 from gui.main_window import MainWindow
+from gui.project_sync_dialog import choose_contributor
 
 
 def parse_args():
@@ -40,6 +41,10 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Bee Annotator")
     app.setOrganizationName("BeeWhere")
+
+    session = choose_contributor()
+    if session is None:
+        return
     
     # Create main window with optional checkpoints
     window = MainWindow(
@@ -48,6 +53,7 @@ def main():
         bbox_checkpoint=args.bbox_checkpoint,
         instance_focused_checkpoint=args.instance_focused_checkpoint
     )
+    window.set_contributor(session)
     
     # Load video if specified
     if args.video:
@@ -58,6 +64,7 @@ def main():
         window.load_project(args.project)
     
     window.show()
+    QTimer.singleShot(0, window.offer_sync_setup)
     
     sys.exit(app.exec())
 

@@ -1,5 +1,6 @@
 """Synthetic coverage for visible brood labels, training and experimental history."""
 
+import csv
 import io
 import json
 import os
@@ -17,14 +18,17 @@ import cv2
 import numpy as np
 import torch
 import yaml
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QPointF
+from PyQt6.QtWidgets import QApplication, QMenu
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 
 from core.annotation import AnnotationManager
 from core.annotation_scope import split_annotations
 from core.brood_inference import BroodVideoWriter, brood_evidence, brood_model_classes, paint_brood_overlay
-from core.categories import BROOD_CATEGORIES, CATEGORIES, CATEGORY_COLORS, training_categories
+from core.categories import (BROOD_CATEGORIES, STANDARD_BROOD_CATEGORIES, QUEEN_BROOD_CATEGORIES,
+                             CATEGORIES, CATEGORY_COLORS, BROOD_MODEL_LABEL, BROOD_MAP_LABELS,
+                             BROOD_UNRESOLVED_LABEL, training_categories)
 from core.coco_masks import decode_segmentation
 from core.instance_tracker import Detection
 from core.project_manager import ProjectManager
@@ -39,10 +43,10 @@ from training.yolo_trainer import YOLOTrainingWorker
 
 def stage_masks():
     masks = []
-    for i in range(5):
+    for i in range(len(BROOD_CATEGORIES)):
         mask = np.zeros((64, 64), np.uint8)
-        mask[8:56, 2 + 12 * i:10 + 12 * i] = 1
-        mask[22:26, 4 + 12 * i:8 + 12 * i] = 0
+        mask[8:56, 2 + 7 * i:7 + 7 * i] = 1
+        mask[22:26, 3 + 7 * i:5 + 7 * i] = 0
         masks.append(mask)
     return masks
 
@@ -63,10 +67,12 @@ class BroodAnnotationTests(unittest.TestCase):
 
     def test_category_ids_and_frame_scope(self):
         self.assertEqual(CATEGORIES[:4], ('bee', 'hive', 'chamber', 'pollen'))
+        self.assertEqual(CATEGORIES[4:9], STANDARD_BROOD_CATEGORIES)
+        self.assertEqual(CATEGORIES[9:12], QUEEN_BROOD_CATEGORIES)
         self.assertEqual(training_categories('brood'), BROOD_CATEGORIES)
         for scope in ('frame', 'video'):
             frame, shared = split_annotations(self.annotations(), {'hive_annotation_scope': scope})
-            self.assertEqual(len(frame), 5)
+            self.assertEqual(len(frame), 8)
             self.assertFalse(shared)
 
     def test_canvas_overlap_color_visibility_and_roundtrip(self):
@@ -96,10 +102,63 @@ class BroodAnnotationTests(unittest.TestCase):
         self.assertFalse(np.any(canvas.brood_late_mask == 2))
         self.assertTrue(np.all(canvas.hive_mask == 1))
 
+    def test_legacy_project_appends_queen_classes_without_renumbering(self):
+        ProjectManager().create_project(self.root, 'legacy brood')
+        path = self.root / 'annotations/project.json'
+        info = json.loads(path.read_text())
+        old_classes = list(CATEGORIES[:9]) + ['custom_category']
+        info['classes'] = old_classes
+        path.write_text(json.dumps(info))
+        manager = AnnotationManager()
+        manager.load_project(self.root)
+        self.assertEqual(manager.class_names, old_classes + list(QUEEN_BROOD_CATEGORIES) + ['nectar'])
+
+    def test_canvas_category_menu_reclassifies_brood_as_queen_without_copying(self):
+        canvas = ImageCanvas()
+        self.addCleanup(canvas.close)
+        canvas.load_image(np.zeros((64, 64), np.uint8))
+        source = stage_masks()[0] * 255
+        canvas.set_annotations([dict(mask_id=22, category='brood_middle', mask=source)])
+        canvas.set_tool('brush')
+        canvas.start_editing_instance(22, category='brood_middle')
+        self.assertTrue(canvas._start_brush_stroke_at(QPointF(4, 40)))
+        canvas.draw_on_mask(QPointF(4, 40), QPointF(15, 40))
+        canvas._finish_brush_history_step()
+        canvas.is_drawing = False
+        edited = canvas.editing_mask.copy()
+        menu = QMenu()
+        self.addCleanup(menu.close)
+        canvas._add_change_category_menu(menu, 22, 'brood_middle')
+        change = menu.actions()[0].menu()
+        queen = next(a.menu() for a in change.actions() if a.text() == 'Queen brood')
+        self.assertEqual([a.data() for a in queen.actions()], list(QUEEN_BROOD_CATEGORIES))
+        queen.actions()[0].trigger()
+        annotations = canvas.get_annotations()
+        self.assertEqual(len(annotations), 1)
+        self.assertEqual(annotations[0]['mask_id'], 22)
+        self.assertEqual(annotations[0]['category'], 'queen_brood_middle')
+        np.testing.assert_array_equal(annotations[0]['mask'], edited)
+        canvas.undo()
+        self.assertEqual(canvas.editing_instance_category, 'queen_brood_middle')
+        np.testing.assert_array_equal(canvas.get_annotations()[0]['mask'], source)
+        canvas.redo()
+        self.assertEqual(canvas.editing_instance_category, 'queen_brood_middle')
+        np.testing.assert_array_equal(canvas.get_annotations()[0]['mask'], edited)
+
     def test_toolbar_and_training_selection(self):
         toolbar = AnnotationToolbar()
         self.addCleanup(toolbar.close)
         self.assertEqual(set(toolbar.brood_visibility_actions), set(BROOD_CATEGORIES))
+        self.assertEqual([a.data() for a in toolbar.brood_visibility_button.menu().actions()],
+                         list(STANDARD_BROOD_CATEGORIES))
+        self.assertEqual([a.data() for a in toolbar.queen_brood_visibility_button.menu().actions()],
+                         list(QUEEN_BROOD_CATEGORIES))
+        menus = [a.text() for a in toolbar.new_instance_menu.actions() if a.menu()]
+        self.assertEqual(menus, ['Brood', 'Queen brood'])
+        created = []
+        toolbar.new_instance_requested.connect(created.append)
+        toolbar.new_instance_actions['queen_brood_late'].trigger()
+        self.assertEqual(created, ['queen_brood_late'])
         self.assertTrue(all(not a.isChecked() for a in toolbar.brood_visibility_actions.values()))
         seen = []
         toolbar.annotation_type_visibility_changed.connect(lambda *args: seen.append(args))
@@ -107,7 +166,7 @@ class BroodAnnotationTests(unittest.TestCase):
         self.assertEqual(seen, [('brood_late', True)])
         dialog = TrainingConfigDialog()
         self.addCleanup(dialog.close)
-        dialog.model_type_combo.setCurrentText('Brood (5 appearance classes)')
+        dialog.model_type_combo.setCurrentText(BROOD_MODEL_LABEL)
         self.assertEqual(dialog.get_config()['model_type'], 'brood')
         with patch('gui.training_dialog.QMessageBox.warning') as warning:
             dialog.accept()
@@ -127,6 +186,8 @@ class BroodAnnotationTests(unittest.TestCase):
                 window.new_instance(category)
                 self.assertEqual(window.canvas.current_annotation_type, category)
                 self.assertTrue(window.toolbar.brood_visibility_actions[category].isChecked())
+                window.canvas.draw_on_mask(QPointF(8, 8), QPointF(12, 12))
+                self.assertEqual(window._live_canvas_annotation_counts()[category], 1)
             with patch.object(BatchVideoInferenceConfigDialog, '_restore_last_settings'):
                 dialog = BatchVideoInferenceConfigDialog()
             dialog.brood_model_edit.setText('/tmp/test-brood.pt')
@@ -155,14 +216,14 @@ class BroodAnnotationTests(unittest.TestCase):
     def test_source_export_and_multiclass_conversion(self):
         path = self.prepare_dataset()
         data = json.loads(path.read_text())
-        self.assertEqual([c['name'] for c in data['categories']][-5:], list(BROOD_CATEGORIES))
+        self.assertEqual([c['name'] for c in data['categories']][4:12], list(BROOD_CATEGORIES))
         worker = YOLOTrainingWorker(self.root, {'model_type': 'brood', 'brood_reviewed': True})
         _, dataset_path = worker._prepare_yolo_dataset()
         config = yaml.safe_load(dataset_path.read_text())
-        self.assertEqual(config['nc'], 5)
+        self.assertEqual(config['nc'], 8)
         self.assertEqual(config['names'], dict(enumerate(BROOD_CATEGORIES)))
         record = json.loads(next((self.root / 'yolo_format/labels/train').glob('*.json')).read_text())
-        self.assertEqual([i['cls'] for i in record['instances']], list(range(5)))
+        self.assertEqual([i['cls'] for i in record['instances']], list(range(8)))
         for item, mask in zip(record['instances'], stage_masks()):
             np.testing.assert_array_equal(decode_segmentation(item['segmentation'], 64, 64), mask)
 
@@ -175,13 +236,22 @@ class BroodAnnotationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Conflicting brood stages'):
             worker._coco_to_yolo(path, self.root / 'converted', 'train', 'brood')
 
+    def test_queen_and_standard_brood_overlap_is_rejected(self):
+        path = self.prepare_dataset()
+        data = json.loads(path.read_text())
+        data['annotations'][5]['segmentation'] = data['annotations'][2]['segmentation']
+        path.write_text(json.dumps(data))
+        worker = YOLOTrainingWorker(self.root, {})
+        with self.assertRaisesRegex(ValueError, 'Conflicting brood stages'):
+            worker._coco_to_yolo(path, self.root / 'converted', 'train', 'brood')
+
     def test_training_requires_review_before_touching_dataset(self):
         worker = YOLOTrainingWorker(self.root, {'model_type': 'brood'})
         with self.assertRaisesRegex(ValueError, 'all visible brood'):
             worker._prepare_yolo_dataset()
         self.assertFalse((self.root / 'yolo_format').exists())
 
-    def test_five_class_training_checkpoint(self):
+    def test_eight_class_training_checkpoint(self):
         self.prepare_dataset()
         worker = YOLOTrainingWorker(self.root, {'model_type': 'brood', 'brood_reviewed': True})
         _, path = worker._prepare_yolo_dataset()
@@ -193,7 +263,7 @@ class BroodAnnotationTests(unittest.TestCase):
                         batch=2, workers=0, device='cpu', amp=False, pretrained=False,
                         plots=False, project=str(self.root / 'runs'), name='brood', **raster_training_options())
         reloaded = YOLO(str(model.trainer.best))
-        self.assertEqual(brood_model_classes(reloaded), {i: i + 1 for i in range(5)})
+        self.assertEqual(brood_model_classes(reloaded), {i: i + 1 for i in range(8)})
 
 
 class BroodHistoryTests(unittest.TestCase):
@@ -265,12 +335,84 @@ class BroodHistoryTests(unittest.TestCase):
         self.assertFalse(other['labels'].any())
 
     def test_model_validation_and_prediction_conflicts(self):
-        with self.assertRaisesRegex(ValueError, 'five brood'):
+        with self.assertRaisesRegex(ValueError, 'brood segmentation'):
             brood_model_classes(SimpleNamespace(task='segment', names={0: 'bee'}))
         masks = torch.ones((2, 16, 16))
         result = SimpleNamespace(masks=SimpleNamespace(data=masks), boxes=SimpleNamespace(cls=torch.tensor([0, 1])))
         labels = brood_evidence(result, (16, 16), {0: 1, 1: 2})
         self.assertTrue(np.all(labels == 255))
+
+    def test_legacy_models_and_reordered_classes_keep_stable_evidence_values(self):
+        legacy = SimpleNamespace(task='segment', names=list(STANDARD_BROOD_CATEGORIES))
+        self.assertEqual(brood_model_classes(legacy), {i: i + 1 for i in range(5)})
+        names = dict(enumerate(reversed(BROOD_CATEGORIES)))
+        model = SimpleNamespace(task='segment', names=names)
+        self.assertEqual(brood_model_classes(model),
+                         {i: BROOD_CATEGORIES.index(name) + 1 for i, name in names.items()})
+        for names in (QUEEN_BROOD_CATEGORIES, BROOD_CATEGORIES[:-1], (*BROOD_CATEGORIES[:-1], 'bee')):
+            with self.assertRaises(ValueError):
+                brood_model_classes(SimpleNamespace(task='segment', names=names))
+
+    def test_queen_prediction_maps_and_overlap_preserve_unresolved_value(self):
+        self.assertEqual(BROOD_UNRESOLVED_LABEL, 7)
+        self.assertEqual(list(BROOD_MAP_LABELS.values()), [2, 3, 4, 5, 6, 8, 9, 10])
+        for category in QUEEN_BROOD_CATEGORIES:
+            with self.subTest(category=category):
+                history = TemporalBroodMap(resolution=(16, 16))
+                raw_class = BROOD_CATEGORIES.index(category)
+                result = SimpleNamespace(masks=SimpleNamespace(data=torch.ones((1, 16, 16))),
+                                         boxes=SimpleNamespace(cls=torch.tensor([raw_class])))
+                ids = brood_model_classes(SimpleNamespace(task='segment', names=BROOD_CATEGORIES))
+                labels = brood_evidence(result, (16, 16), ids)
+                self.assertTrue(np.all(labels == raw_class + 1))
+                for time in (0, 1):
+                    snap = history.update('queen', 0, self.chamber, labels, [], (16, 16), time)
+                self.assertEqual(snap['probability'].shape, (9, 16, 16))
+                self.assertTrue(np.all(snap['labels'] == BROOD_MAP_LABELS[category]))
+                bee = Detection(np.array([4, 4, 12, 12]))
+                overlap = history.bee_overlap(snap, bee, self.chamber, (16, 16))
+                self.assertEqual(overlap[category + '_fraction'], 1)
+                self.assertEqual(overlap['brood_fraction'], 1)
+                self.assertEqual(overlap['unresolved_fraction'], 0)
+                frame = np.full((16, 16, 3), 80, np.uint8)
+                painted = paint_brood_overlay(frame, [snap])
+                expected = (frame[0, 0] * .55 + np.array(CATEGORY_COLORS[category][::-1]) * .45).astype(np.uint8)
+                np.testing.assert_array_equal(painted[0, 0], expected)
+
+    def test_unresolved_history_is_not_misclassified_as_queen(self):
+        self.update(0, np.full_like(self.labels, 3))
+        snap = self.update(1, np.full_like(self.labels, 6))
+        self.assertTrue(np.all(snap['labels'] == 7))
+        bee = Detection(np.array([4, 4, 12, 12]))
+        overlap = self.history.bee_overlap(snap, bee, self.chamber, (16, 16))
+        self.assertEqual(overlap['unresolved_fraction'], 1)
+        self.assertEqual(overlap['queen_brood_middle_fraction'], 0)
+
+    def test_queen_archive_records_observations_channels_and_csv(self):
+        with tempfile.TemporaryDirectory() as temp:
+            frame = np.full((16, 16, 3), 80, np.uint8)
+            labels = np.full_like(self.labels, 8)
+            writer = BroodVideoWriter(temp, 'queen', 'test', self.history)
+            writer.write(1, frame, labels, {0: self.chamber}, [], 0, 6)
+            writer.write(2, frame, labels, {0: self.chamber}, [], 1, 6)
+            bee = Detection(np.array([4, 4, 12, 12]), instance_id=1)
+            writer.write(3, frame, labels, {0: self.chamber}, [bee], 2, 6)
+            writer.close(complete=True)
+            with zipfile.ZipFile(Path(temp) / 'queen_brood_maps.zip') as archive:
+                metadata = json.loads(archive.read('metadata.json'))
+                self.assertEqual(metadata['schema_version'], 2)
+                self.assertEqual(metadata['labels']['queen_brood_late'], 10)
+                self.assertEqual(metadata['labels']['brood_stage_unresolved'], 7)
+                self.assertEqual(metadata['probability_channels'], ['background', *BROOD_CATEGORIES])
+                self.assertEqual(metadata['observed_labels']['queen_brood_late'], 8)
+                self.assertEqual(metadata['model_classes'], list(BROOD_CATEGORIES))
+                with np.load(io.BytesIO(archive.read('frame_000002_chamber_0.npz'))) as snap:
+                    self.assertTrue(np.all(snap['observed_labels'] == 8))
+                    self.assertTrue(np.all(snap['labels'] == 10))
+            with (Path(temp) / 'queen_brood_overlap.csv').open() as stream:
+                row = next(csv.DictReader(stream))
+            self.assertEqual(float(row['queen_brood_late_fraction']), 1)
+            self.assertEqual(float(row['unresolved_fraction']), 0)
 
     def test_archive_preview_and_updated_overlap(self):
         with tempfile.TemporaryDirectory() as temp:

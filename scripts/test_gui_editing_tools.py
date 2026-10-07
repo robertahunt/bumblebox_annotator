@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused regression tests for bbox resizing and protected brush zones."""
+"""Focused regression tests for canvas editing, stroke guards, and protected zones."""
 
 import os
 import sys
@@ -15,6 +15,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
+from core.categories import CATEGORIES
 from gui.canvas import ImageCanvas
 from gui.toolbar import AnnotationToolbar
 
@@ -172,6 +173,31 @@ class EditingToolTests(unittest.TestCase):
         canvas.undo()
         np.testing.assert_array_equal(canvas.editing_mask, original)
 
+    def test_one_pixel_diagonal_fill_and_subtract_support_undo_redo(self):
+        for subtract in (False, True):
+            with self.subTest(subtract=subtract):
+                canvas = self.make_canvas(initial_value=255 if subtract else 0)
+                self.addCleanup(canvas.close)
+                self.addCleanup(canvas._viz_update_timer.stop)
+                canvas.current_tool = "eraser" if subtract else "brush"
+                canvas.brush_size = 1
+                points = [QPointF(x, y) for x, y in ((50, 20), (80, 50), (50, 80), (20, 50))]
+                for start, end in zip(points, points[1:] + points[:1]):
+                    canvas.draw_on_mask(start, end)
+                canvas._flush_pending_viz_update()
+                original = canvas.editing_mask.copy()
+                expected = original.copy()
+                y, x = np.indices(expected.shape)
+                expected[np.abs(x - 50) + np.abs(y - 50) < 30] = 0 if subtract else 255
+
+                action = canvas.subtract_enclosed_region_at if subtract else canvas.fill_enclosed_region_at
+                self.assertTrue(action(QPointF(50, 50)))
+                np.testing.assert_array_equal(canvas.editing_mask, expected)
+                canvas.undo()
+                np.testing.assert_array_equal(canvas.editing_mask, original)
+                canvas.redo()
+                np.testing.assert_array_equal(canvas.editing_mask, expected)
+
     def test_space_toggle_preserves_class_instance_and_bbox_switches(self):
         canvas = self.make_canvas(initial_value=255)
         canvas.set_annotation_type_visibility('bee', False)
@@ -207,6 +233,157 @@ class EditingToolTests(unittest.TestCase):
         canvas.load_image(np.ones((1000, 1000), dtype=np.uint8), preserve_view=True)
         after = canvas.get_view_state()
         self.assertEqual(before, after)
+
+    def make_stroke_guard_canvas(self, category="bee"):
+        canvas = ImageCanvas()
+        self.addCleanup(canvas.close)
+        self.addCleanup(canvas._viz_update_timer.stop)
+        canvas.load_image(np.zeros((400, 800), dtype=np.uint8))
+        mask = np.zeros((400, 800), dtype=np.uint8)
+        mask[100:120, 100:120] = 255
+        canvas.set_annotations([
+            {"mask_id": 1, "category": category, "mask": mask,
+             "bbox": [100, 100, 20, 20]}
+        ])
+        canvas.set_annotation_type_visibility(category, True)
+        canvas.set_tool("brush")
+        canvas.start_editing_instance(1, category=category)
+        canvas.brush_size = 7
+        return canvas
+
+    def test_stroke_guard_follows_live_mask_with_boxes_hidden_for_all_categories(self):
+        for category in CATEGORIES:
+            for tool in ("brush", "eraser"):
+                with self.subTest(category=category, tool=tool):
+                    canvas = self.make_stroke_guard_canvas(category)
+                    canvas.draw_on_mask(QPointF(110, 110), QPointF(400, 110))
+                    canvas._flush_pending_viz_update()
+                    canvas.set_annotation_overlay_visibility(True, False)
+                    canvas.set_tool(tool)
+
+                    self.assertTrue(canvas._can_start_brush_stroke_at(QPointF(390, 110)))
+                    self.assertTrue(canvas._can_start_brush_stroke_at(QPointF(450, 110)))
+                    self.assertFalse(canvas._can_start_brush_stroke_at(QPointF(700, 110)))
+                    self.assertTrue(canvas._start_brush_stroke_at(QPointF(390, 110)))
+                    self.assertEqual(canvas.annotation_metadata[1]["bbox"], [100, 100, 20, 20])
+
+    def test_stroke_guard_does_not_wait_for_bbox_redraw(self):
+        canvas = self.make_stroke_guard_canvas()
+        canvas.set_annotation_overlay_visibility(True, True)
+        canvas.draw_on_mask(QPointF(110, 110), QPointF(400, 110))
+        self.assertLess(canvas.bbox_items_map[1].rect().right(), 200)
+        self.assertTrue(canvas._can_start_brush_stroke_at(QPointF(390, 110)))
+
+    def test_stroke_guard_uses_selected_category_mask_before_editing(self):
+        canvas = self.make_stroke_guard_canvas("pollen")
+        canvas.draw_on_mask(QPointF(110, 110), QPointF(400, 110))
+        canvas.commit_editing()
+        canvas.set_annotation_overlay_visibility(True, False)
+        self.assertEqual(canvas.editing_instance_id, -1)
+        # Another category must not enlarge the active instance's boundary.
+        canvas.bee_mask = np.zeros((400, 800), dtype=np.int32)
+        canvas.bee_mask[100:120, 650:750] = 2
+        self.assertTrue(canvas._can_start_brush_stroke_at(QPointF(390, 110)))
+        self.assertFalse(canvas._can_start_brush_stroke_at(QPointF(700, 110)))
+        self.assertTrue(canvas._start_brush_stroke_at(QPointF(390, 110)))
+        self.assertEqual(canvas.editing_instance_category, "pollen")
+
+    def test_stroke_guard_follows_undo_redo_and_erasing(self):
+        canvas = self.make_stroke_guard_canvas()
+        canvas.set_annotation_overlay_visibility(True, False)
+        self.assertTrue(canvas._start_brush_stroke_at(QPointF(110, 110)))
+        canvas.draw_on_mask(QPointF(110, 110), QPointF(400, 110))
+        canvas._finish_brush_history_step()
+        canvas.is_drawing = False
+        canvas._flush_pending_viz_update()
+        self.assertTrue(canvas._can_start_brush_stroke_at(QPointF(390, 110)))
+        canvas.undo()
+        self.assertFalse(canvas._can_start_brush_stroke_at(QPointF(390, 110)))
+        canvas.redo()
+        self.assertTrue(canvas._can_start_brush_stroke_at(QPointF(390, 110)))
+        canvas.set_tool("eraser")
+        canvas.brush_size = 15
+        self.assertTrue(canvas._start_brush_stroke_at(QPointF(400, 110)))
+        canvas.draw_on_mask(QPointF(400, 110), QPointF(180, 110))
+        self.assertFalse(canvas._can_start_brush_stroke_at(QPointF(390, 110)))
+        self.assertTrue(canvas._can_start_brush_stroke_at(QPointF(190, 110)))
+
+    def test_stroke_guard_preserves_bbox_only_and_explicit_new_instance_behavior(self):
+        canvas = self.make_stroke_guard_canvas()
+        canvas.editing_mask[:] = 0
+        canvas.annotation_metadata[1]["bbox_only"] = True
+        canvas.set_annotation_overlay_visibility(True, False)
+        self.assertTrue(canvas._can_start_brush_stroke_at(QPointF(110, 110)))
+        self.assertFalse(canvas._can_start_brush_stroke_at(QPointF(390, 110)))
+
+        # A deliberately created blank instance still allows its first stroke anywhere.
+        canvas.annotation_metadata[1]["bbox"] = [0, 0, 0, 0]
+        self.assertTrue(canvas._start_brush_stroke_at(QPointF(700, 110)))
+        canvas.draw_on_mask(QPointF(700, 110), QPointF(710, 110))
+        self.assertFalse(canvas._can_start_brush_stroke_at(QPointF(110, 110)))
+
+    def test_stroke_guard_never_creates_an_instance_without_selection(self):
+        canvas = ImageCanvas()
+        self.addCleanup(canvas.close)
+        canvas.load_image(np.zeros((400, 800), dtype=np.uint8))
+        canvas.set_tool("brush")
+        self.assertFalse(canvas._start_brush_stroke_at(QPointF(300, 110)))
+        self.assertEqual(canvas.get_instance_entries(), [])
+
+    def test_brush_and_eraser_mouse_strokes_restart_in_extended_mask(self):
+        for tool in ("brush", "eraser"):
+            with self.subTest(tool=tool):
+                canvas = self.make_stroke_guard_canvas()
+                canvas.resize(900, 500)
+                canvas.show()
+                self.app.processEvents()
+                canvas.draw_on_mask(QPointF(110, 110), QPointF(400, 110))
+                canvas._flush_pending_viz_update()
+                canvas.set_annotation_overlay_visibility(True, False)
+                canvas.set_tool(tool)
+                start = canvas.mapFromScene(QPointF(390, 110))
+                end = canvas.mapFromScene(QPointF(390, 140))
+                QTest.mousePress(canvas.viewport(), Qt.MouseButton.LeftButton, pos=start)
+                self.assertTrue(canvas.is_drawing)
+                QTest.mouseMove(canvas.viewport(), end)
+                QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.LeftButton, pos=end)
+                self.assertFalse(canvas.is_drawing)
+                self.assertEqual(canvas.editing_mask[110, 390], 255 if tool == "brush" else 0)
+                self.assertEqual(canvas.editing_mask[130, 390], 255 if tool == "brush" else 0)
+                self.assertEqual(canvas.editing_instance_id, 1)
+                self.assertEqual(len(canvas.get_instance_entries()), 1)
+
+    def test_nearby_instance_still_needs_three_taps_without_painting_or_erasing(self):
+        for tool in ("brush", "eraser"):
+            with self.subTest(tool=tool):
+                canvas = self.make_stroke_guard_canvas()
+                canvas.draw_on_mask(QPointF(110, 110), QPointF(400, 110))
+                canvas._flush_pending_viz_update()
+                original_active = canvas.editing_mask.copy()
+                canvas.pollen_mask = np.zeros((400, 800), dtype=np.int32)
+                canvas.pollen_mask[100:120, 440:460] = 2
+                original_target = (canvas.pollen_mask == 2).astype(np.uint8) * 255
+                canvas.annotation_metadata[2] = {"mask_id": 2, "category": "pollen"}
+                canvas.set_annotation_type_visibility("pollen", True)
+                canvas.set_annotation_overlay_visibility(True, False)
+                canvas.set_tool(tool)
+                canvas.resize(900, 500)
+                canvas.show()
+                self.app.processEvents()
+                scene_pos = QPointF(450, 110)
+                self.assertTrue(canvas._can_start_brush_stroke_at(scene_pos))
+                target = canvas.mapFromScene(scene_pos)
+
+                QTest.mouseClick(canvas.viewport(), Qt.MouseButton.LeftButton, pos=target)
+                QTest.mouseDClick(canvas.viewport(), Qt.MouseButton.LeftButton, pos=target)
+                self.assertEqual(canvas.editing_instance_id, 1)
+                np.testing.assert_array_equal(canvas.editing_mask, original_active)
+                QTest.mouseClick(canvas.viewport(), Qt.MouseButton.LeftButton, pos=target)
+
+                self.assertEqual(canvas.editing_instance_id, 2)
+                self.assertEqual(canvas.editing_instance_category, "pollen")
+                np.testing.assert_array_equal(canvas.editing_mask, original_target)
+                np.testing.assert_array_equal(canvas.bee_mask == 1, original_active > 0)
 
     def test_can_switch_instances_after_erasing_active_mask_entirely(self):
         canvas = ImageCanvas()

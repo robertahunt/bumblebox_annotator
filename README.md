@@ -24,6 +24,10 @@ conda activate bee_annotator
 pip install -r requirements.txt
 ```
 
+## Segmentation Models
+
+[BeeWhere segmentation models!](https://drive.google.com/drive/folders/1EDx2Gp3tX8OQCpdNEyMcNlSrJFp3Y0RC?usp=sharing) contains the `models` folder from the `2026_CV4E` project. Download the checkpoints you need and load them through the app's model controls.
+
 ## Usage
 
 ```bash
@@ -34,9 +38,16 @@ Proposed reusable arena editing, chamber-position review, and image alignment to
 
 See [video import and frame selection](docs/video_import.md) for full-video or sampled extraction and how unfinished annotations affect training.
 
+See [importing between projects](docs/project_import.md) to copy selected frames and annotations, including converting frame-specific hive masks into an editable video-wide mask.
+
 See [ArUco tag size measurement](docs/aruco_tag_measurement.md) to measure minimum and maximum tag sizes before batch optimization.
 
 See [batch hive masks and exports](docs/hive_exports.md) for the difference between video overlays, per-video summaries, and temporal hive priors.
+
+See [nectar source segmentation](docs/nectar_segmentation.md) to annotate nectar sources, train a nectar-only model, and run it on the current frame.
+
+See [contributors and optional project sync](docs/project_sync.md) for session attribution,
+external-folder setup, versioned backups, and collaboration safeguards.
 
 ## Project Structure
 

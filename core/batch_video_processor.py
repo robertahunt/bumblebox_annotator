@@ -20,6 +20,7 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 from core.brood_inference import BroodVideoWriter, brood_model_classes, brood_evidence
+from core.categories import BROOD_CATEGORIES
 from core.instance_tracker import Detection
 from core.marker_detector import MarkerDetector
 from core.temporal_hive_prior import TemporalHiveOverlap, TemporalChamberStabilizer
@@ -249,7 +250,7 @@ class BatchVideoProcessor:
                 spatial metrics, interactions, and CSV row storage.
             hive_overlay_mode: Scoring map (default), current detections, past-only, comparison or updated history.
             temporal_overlay_path: Optional compressed history cache for visualized frames.
-            brood_model: Optional five-class appearance segmentation model.
+            brood_model: Optional brood appearance segmentation model (eight or legacy five classes).
             temporal_brood_map: Shared experimental brood history, separate from hive maps.
             brood_preview: Write a separate history-informed brood MP4.
         """
@@ -1137,6 +1138,10 @@ class BatchVideoProcessor:
             raise ValueError('Brood history requires a valid video FPS')
         if self._brood_writer is None:
             context = self.brood_context_id
+            model_classes = [BROOD_CATEGORIES[index - 1] for index in sorted(self._brood_classes.values())]
+            if len(model_classes) < len(BROOD_CATEGORIES):
+                self._log('Legacy five-class brood model: queen brood is not distinguished. '
+                          'Train an eight-class brood model for queen-specific results.')
             if self.video_start_time_seconds is None:
                 # Without a wall-clock timestamp, never mix histories from different videos.
                 context = str(Path(self.video_path).resolve())
@@ -1144,7 +1149,8 @@ class BatchVideoProcessor:
             self._brood_writer = BroodVideoWriter(
                 self.output_folder / 'brood', self.video_id, context,
                 self.temporal_brood_map, preview=self.brood_preview,
-                preview_limit=self.streaming_visualization_max_frames or self.store_masks_until_frame)
+                preview_limit=self.streaming_visualization_max_frames or self.store_masks_until_frame,
+                model_classes=model_classes)
         kwargs = dict(conf=self.confidence_threshold, iou=self.nms_iou_threshold,
                       retina_masks=True, verbose=False)
         if TORCH_AVAILABLE:

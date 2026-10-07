@@ -9,8 +9,23 @@ from datetime import datetime
 import pickle
 from collections import OrderedDict
 import math
+from functools import wraps
+from threading import RLock
+from copy import deepcopy
 from core.coco_masks import encode_mask, decode_segmentation
 from core.categories import CATEGORIES
+from core.contributors import AnnotationAttributor
+
+
+_ACTIVE_CONTRIBUTOR = object()
+
+
+def serialized_save(method):
+    @wraps(method)
+    def save(self, *args, **kwargs):
+        with self._save_lock:
+            return method(self, *args, **kwargs)
+    return save
 
 
 def sanitize_for_json(obj):
@@ -185,6 +200,9 @@ class AnnotationManager:
         self.unsaved_changes = False
         self.image_width = 0
         self.image_height = 0
+        self.contributor_session = None
+        self.attributor = AnnotationAttributor()
+        self._save_lock = RLock()
         
     def new_project(self, project_info):
         """Create a new project"""
@@ -438,7 +456,9 @@ class AnnotationManager:
                 os.unlink(temp_json_path)
             raise e
     
-    def save_frame_annotations(self, project_path, video_id, frame_idx, annotations):
+    @serialized_save
+    def save_frame_annotations(self, project_path, video_id, frame_idx, annotations,
+                               contributor=_ACTIVE_CONTRIBUTOR):
         """Save annotations for a single frame (uses PNG+JSON format for masks, separate bbox folder for bbox-only)
         
         Args:
@@ -447,6 +467,13 @@ class AnnotationManager:
             frame_idx: Frame index within the video
             annotations: List of annotation dicts (with or without masks)
         """
+        session = self.contributor_session if contributor is _ACTIVE_CONTRIBUTOR else contributor
+        attribution_key = (str(Path(project_path).resolve()), video_id, int(frame_idx))
+        source_annotations = annotations
+        annotations = self.attributor.prepare(
+            attribution_key, annotations,
+            lambda: self.load_frame_annotations(project_path, video_id, frame_idx), session)
+
         # Separate bbox-only annotations from mask-based annotations
         mask_annotations = []
         bbox_only_annotations = []
@@ -503,11 +530,18 @@ class AnnotationManager:
             self.save_bbox_annotations(project_path, video_id, frame_idx, bboxes_to_save)
         else:
             # No annotations at all - delete bbox file if it exists
-            from pathlib import Path
             bbox_file = Path(project_path) / 'annotations' / 'bbox' / video_id / f'frame_{frame_idx:06d}.json'
             if bbox_file.exists():
                 bbox_file.unlink()
                 print(f"Deleted bbox file (no annotations): {bbox_file}")
+        if session:
+            self.attributor.committed(attribution_key, annotations)
+            for source, saved in zip(source_annotations, annotations):
+                if saved.get('provenance'):
+                    source['provenance'] = deepcopy(saved['provenance'])
+        else:
+            self.attributor.baselines.pop(attribution_key, None)
+        return annotations
     
     def load_frame_annotations_pickle(self, project_path, video_id, frame_idx):
         """Load annotations for a single frame from pickle format (legacy)
@@ -618,6 +652,7 @@ class AnnotationManager:
                 ann = ann_meta.copy()
                 ann.pop('mask_coco_rle', None)
                 ann['mask'] = instance_mask
+                ann.setdefault('provenance', {'created_by': None, 'created_at': None})
                 annotations.append(ann)
         
         return annotations
@@ -646,6 +681,8 @@ class AnnotationManager:
             # Filter out bboxes that were derived from masks (we already have those from PNG+JSON)
             # Only keep bbox-only annotations
             bbox_only = [ann for ann in bbox_annotations if ann.get('bbox_only', False) and not ann.get('from_mask', False)]
+            for ann in bbox_only:
+                ann.setdefault('provenance', {'created_by': None, 'created_at': None})
             
             # Combine mask annotations with bbox-only annotations
             return mask_annotations + bbox_only
@@ -1119,7 +1156,9 @@ class AnnotationManager:
         
         return output_path
 
-    def save_video_annotations(self, project_path, video_id, annotations):
+    @serialized_save
+    def save_video_annotations(self, project_path, video_id, annotations,
+                               contributor=_ACTIVE_CONTRIBUTOR):
         """Save video-level annotations (chamber, hive, and pollen) shared across all frames.
 
         Chamber, hive, and pollen are stored in **separate** PNG files so their pixels can
@@ -1139,6 +1178,13 @@ class AnnotationManager:
         import os
         from pathlib import Path
         project_path = Path(project_path)
+
+        session = self.contributor_session if contributor is _ACTIVE_CONTRIBUTOR else contributor
+        attribution_key = (str(project_path.resolve()), video_id, 'video')
+        source_annotations = annotations
+        annotations = self.attributor.prepare(
+            attribution_key, annotations,
+            lambda: self.load_video_annotations(project_path, video_id)[0], session)
 
         png_dir = project_path / 'annotations/png' / video_id
         json_dir = project_path / 'annotations/json' / video_id
@@ -1235,6 +1281,15 @@ class AnnotationManager:
                 os.unlink(tmp_path)
             raise e
 
+        if session:
+            self.attributor.committed(attribution_key, annotations)
+            for source, saved in zip(source_annotations, annotations):
+                if saved.get('provenance'):
+                    source['provenance'] = deepcopy(saved['provenance'])
+        else:
+            self.attributor.baselines.pop(attribution_key, None)
+        return annotations
+
     def load_video_annotations(self, project_path, video_id):
         """Load video-level annotations (chamber, hive, and pollen) shared across all frames.
 
@@ -1296,6 +1351,7 @@ class AnnotationManager:
             mask_id = ann_meta.get('mask_id', 0)
             category = ann_meta.get('category', 'chamber')
             ann = ann_meta.copy()
+            ann.setdefault('provenance', {'created_by': None, 'created_at': None})
 
             if not ann_meta.get('bbox_only', False) and mask_id > 0:
                 # Prefer per-category PNG; fall back to legacy combined PNG

@@ -158,6 +158,14 @@ class TrainingMaskCopyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Select'):
             selected_copy_masks([], [], self.manager.project_info)
 
+    def test_queen_brood_can_copy_as_frame_specific_mask_in_legacy_projects(self):
+        source = annotation(category='queen_brood_middle')
+        sources = selected_copy_masks([source], [(22, 'queen_brood_middle')], {})
+        merged, copied, skipped = merge_copied_masks([], sources, (32, 32))
+        self.assertEqual(copied, [(22, 'queen_brood_middle')])
+        self.assertFalse(skipped)
+        np.testing.assert_array_equal(merged[0]['mask'], source['mask'])
+
     def test_matching_mask_skipped_or_explicitly_replaced(self):
         original = annotation(np.fliplr(nest_mask()).copy())
         bee = annotation(category='bee', mask_id=4)
@@ -270,9 +278,9 @@ class TrainingMaskCopyTests(unittest.TestCase):
 class SaveQueueCopyTests(unittest.TestCase):
     def test_wait_includes_inflight_saves_even_when_queue_is_empty(self):
         entered, release, drained = threading.Event(), threading.Event(), threading.Event()
-        manager = Mock()
+        manager = Mock(contributor_session=None)
 
-        def save(*args):
+        def save(*args, **kwargs):
             entered.set()
             release.wait(5)
 
@@ -297,13 +305,14 @@ class SaveQueueCopyTests(unittest.TestCase):
             worker.wait(5000)
 
     def test_failed_save_releases_queue_and_stopped_worker_is_rejected(self):
-        manager = Mock()
+        manager = Mock(contributor_session=None)
         manager.save_frame_annotations.side_effect = OSError('test failure')
         worker = SaveWorker(manager)
         worker.start()
         try:
             worker.add_save_task('/tmp', 'video', 0, [])
-            worker.wait_until_idle()
+            with self.assertRaisesRegex(OSError, 'test failure'):
+                worker.wait_until_idle()
             self.assertEqual(worker.save_queue.unfinished_tasks, 0)
         finally:
             worker.stop()

@@ -257,7 +257,8 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.brood_model_edit = QLineEdit()
         self.brood_model_edit.setReadOnly(True)
         self.brood_model_edit.setToolTip(
-            'Experimental five-class appearance model. Requires an empty output folder and Resume disabled. '
+            'Experimental eight-class appearance model including queen brood; legacy five-class models also supported. '
+            'Requires an empty output folder and Resume disabled. '
             'Creates separate history-informed brood maps; does not infer chronological age.')
         brood_layout.addWidget(self.brood_model_edit)
         self.brood_model_edit.textChanged.connect(self._update_temporal_hive_controls)

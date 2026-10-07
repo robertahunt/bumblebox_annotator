@@ -2,6 +2,8 @@
 Training progress dialog for YOLO model training
 """
 
+from core.categories import BROOD_MODEL_LABEL
+
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QProgressBar, QTextEdit, QGroupBox,
                              QFormLayout, QSpinBox, QComboBox, QCheckBox, QSlider, QMessageBox)
@@ -500,7 +502,7 @@ class TrainingConfigDialog(QDialog):
             model_type_layout = QFormLayout()
             
             self.model_type_combo = QComboBox()
-            self.model_type_combo.addItems(["Bee", "Chamber", "Hive", "Pollen", "Brood (5 appearance classes)"])
+            self.model_type_combo.addItems(["Bee", "Chamber", "Hive", "Pollen", "Nectar source", BROOD_MODEL_LABEL])
             self.model_type_combo.setCurrentText("Bee")
             self.model_type_combo.setToolTip(
                 "Select which annotation type to train on:\n"
@@ -508,13 +510,14 @@ class TrainingConfigDialog(QDialog):
                 "• Chamber: Video-level chamber masks\n"
                 "• Hive: Visible nest masks (scope follows project settings)\n"
                 "• Pollen: Video-level pollen masks\n"
-                "• Brood: Five frame-specific appearance classes (experimental)"
+                "• Nectar source: Frame-specific visible nectar source masks\n"
+                "• Brood: Eight frame-specific appearance classes, including queen brood (experimental)"
             )
             self.model_type_combo.currentTextChanged.connect(self.on_model_type_changed)
             model_type_layout.addRow("Annotation Type:", self.model_type_combo)
             self.brood_review_check = QCheckBox('All visible brood reviewed in train/validation frames')
             self.brood_review_check.setToolTip(
-                'Include only frames reviewed for all five brood appearance classes. '
+                'Include only frames reviewed for all eight brood appearance classes, including queen brood. '
                 'Unlabeled visible brood would otherwise become background during training. '
                 'Label visible pixels only, not history-reconstructed or hidden surfaces.')
             self.brood_review_check.hide()
@@ -792,6 +795,7 @@ class TrainingConfigDialog(QDialog):
             self.name_combo.addItems([
                 'bee_segmentation',
                 'pollen_segmentation',
+                'nectar_segmentation',
                 'hive_segmentation',
                 'chamber_segmentation',
                 'bee_segmentation2',
@@ -821,13 +825,14 @@ class TrainingConfigDialog(QDialog):
         if self.stage2 or self.sahi or self.beehavesque or self.instance_focused:
             return
 
-        self.brood_review_check.setVisible(type_text == 'Brood (5 appearance classes)')
+        self.brood_review_check.setVisible(type_text == BROOD_MODEL_LABEL)
         defaults = {
             'Bee': 'bee_segmentation',
             'Pollen': 'pollen_segmentation',
+            'Nectar source': 'nectar_segmentation',
             'Hive': 'hive_segmentation',
             'Chamber': 'chamber_segmentation',
-            'Brood (5 appearance classes)': 'brood_segmentation',
+            BROOD_MODEL_LABEL: 'brood_segmentation',
         }
         known_defaults = set(defaults.values()) | {'bee_segmentation2', 'bee_segmentation_v2'}
         current_name = self.name_combo.currentText()
@@ -836,10 +841,10 @@ class TrainingConfigDialog(QDialog):
         
     def accept(self):
         if (hasattr(self, 'model_type_combo')
-                and self.model_type_combo.currentText() == 'Brood (5 appearance classes)'
+                and self.model_type_combo.currentText() == BROOD_MODEL_LABEL
                 and not self.brood_review_check.isChecked()):
             QMessageBox.warning(self, 'Brood Review Required',
-                                'Review and label all visible brood stages in the selected train/validation frames, '
+                                'Review and label all visible brood stages, including queen brood, in the selected train/validation frames, '
                                 'then confirm the review checkbox. Exclude unfinished frames.')
             return
         super().accept()
@@ -859,7 +864,8 @@ class TrainingConfigDialog(QDialog):
         
         # Add model type for coarse YOLO training
         if not (self.stage2 or self.sahi or self.beehavesque or self.instance_focused):
-            model_type_map = {'Bee': 'bee', 'Chamber': 'chamber', 'Hive': 'hive', 'Pollen': 'pollen', 'Brood (5 appearance classes)': 'brood'}
+            model_type_map = {'Bee': 'bee', 'Chamber': 'chamber', 'Hive': 'hive', 'Pollen': 'pollen',
+                              'Nectar source': 'nectar', BROOD_MODEL_LABEL: 'brood'}
             config['model_type'] = model_type_map.get(self.model_type_combo.currentText(), 'bee')
             config['brood_reviewed'] = self.brood_review_check.isChecked()
         

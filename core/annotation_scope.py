@@ -10,7 +10,7 @@ def frame_categories(project_info):
     scope = info.get('hive_annotation_scope', 'video')
     if scope not in ('frame', 'video'):
         raise ValueError(f"Unknown hive_annotation_scope: {scope!r}")
-    return ({'bee', 'hive'} if scope == 'frame' else {'bee'}) | set(BROOD_CATEGORIES)
+    return ({'bee', 'hive'} if scope == 'frame' else {'bee'}) | {'nectar'} | set(BROOD_CATEGORIES)
 
 
 def read_project_info(project_path):

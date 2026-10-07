@@ -38,11 +38,17 @@ from .batch_video_inference_dialog import BatchVideoInferenceConfigDialog, Batch
 from .batch_video_inference_worker import BatchVideoInferenceWorker
 from .tracking_visualization_dialog import TrackingVisualizationConfigDialog, TrackingVisualizationWorker
 from .tracking_sequences_panel import TrackingSequencesPanel
+from .project_sync_dialog import (ProjectSyncDialog, SyncProgressDialog, choose_contributor,
+                                  setting_json, save_setting)
+from .project_import_dialog import ProjectImportDialog
+from core.project_sync import sync_project
+from core.contributors import utc_now, provenance_records
 from .tracking_validation_dialog import TrackingValidationConfigDialog, TrackingValidationProgressDialog
 from .tracking_validation_worker import TrackingValidationWorker
 from core.video_processor import VideoProcessor
 from core.annotation import AnnotationManager
-from core.categories import CATEGORIES, BROOD_CATEGORIES, BROOD_SHORT_LABELS, CATEGORY_LABELS, category_label, training_categories
+from core.categories import CATEGORIES, BROOD_CATEGORIES, BROOD_SHORT_LABELS, BROOD_MODEL_LABEL, category_label, training_categories
+from gui.category_menu import add_category_menu_actions
 from core.annotation_scope import split_annotations, merge_annotations, frame_categories
 from core.annotation_copy import training_copy_targets, selected_copy_masks, merge_copied_masks
 from core.project_manager import ProjectManager
@@ -67,16 +73,20 @@ class SaveWorker(QThread):
     error_occurred = pyqtSignal(str)
     save_started = pyqtSignal(int)  # Emits frame_idx when save starts
     save_completed = pyqtSignal(int)  # Emits frame_idx when save completes
+    attribution_saved = pyqtSignal(str, str, int, object)
     
     def __init__(self, annotation_manager):
         super().__init__()
         self.annotation_manager = annotation_manager
         self.save_queue = queue.Queue()
         self.running = True
+        self.failed_tasks = {}
         
     def add_save_task(self, project_path, video_id, frame_idx, annotations):
         """Queue a save task"""
-        self.save_queue.put((project_path, video_id, frame_idx, annotations))
+        session = getattr(self.annotation_manager, 'contributor_session', None)
+        self.save_queue.put((project_path, video_id, frame_idx, annotations,
+                             dict(session) if session else None))
         
     def run(self):
         """Process save tasks in background"""
@@ -84,18 +94,23 @@ class SaveWorker(QThread):
             try:
                 # Wait for save task with timeout
                 try:
-                    project_path, video_id, frame_idx, annotations = self.save_queue.get(timeout=0.1)
+                    project_path, video_id, frame_idx, annotations, session = self.save_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
                     
                 # Perform the save
                 try:
                     self.save_started.emit(frame_idx)
-                    self.annotation_manager.save_frame_annotations(
-                        project_path, video_id, frame_idx, annotations
+                    saved = self.annotation_manager.save_frame_annotations(
+                        project_path, video_id, frame_idx, annotations, contributor=session
                     )
+                    if session:
+                        self.attribution_saved.emit(str(project_path), video_id, frame_idx,
+                                                    provenance_records(saved))
+                    self.failed_tasks.pop((str(project_path), video_id, frame_idx), None)
                     self.save_completed.emit(frame_idx)
                 except Exception as e:
+                    self.failed_tasks[(str(project_path), video_id, frame_idx)] = str(e)
                     self.error_occurred.emit(f"Save failed for frame {frame_idx}: {str(e)}")
                 finally:
                     self.save_queue.task_done()
@@ -103,11 +118,13 @@ class SaveWorker(QThread):
             except Exception as e:
                 self.error_occurred.emit(f"Worker error: {str(e)}")
                 
-    def wait_until_idle(self):
+    def wait_until_idle(self, raise_errors=True):
         """Finish queued and in-flight writes before synchronous annotation copies."""
         if self.save_queue.unfinished_tasks and (not self.running or not self.isRunning()):
             raise RuntimeError('The annotation save worker is not running.')
         self.save_queue.join()
+        if raise_errors and self.failed_tasks:
+            raise OSError('Some annotation saves failed: ' + '; '.join(self.failed_tasks.values()))
 
     def stop(self):
         """Stop the worker thread"""
@@ -139,6 +156,7 @@ class MainWindow(QMainWindow):
         self.save_worker.error_occurred.connect(self.on_save_error)
         self.save_worker.save_started.connect(self.on_save_started)
         self.save_worker.save_completed.connect(self.on_save_completed)
+        self.save_worker.attribution_saved.connect(self._receive_saved_attribution)
         self.save_worker.start()
         
         # Initialize frame cache with background preloading
@@ -205,6 +223,8 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self.setup_shortcuts()
         self.load_settings()
+        self.contributor_session = None
+        self._sync_in_progress = False
     
     def on_save_error(self, error_msg):
         """Handle save errors from background thread"""
@@ -286,6 +306,7 @@ class MainWindow(QMainWindow):
         self.toolbar.show_bboxes_changed.connect(self.on_show_bboxes_changed)
         self.toolbar.annotation_type_changed.connect(self.on_annotation_type_changed)
         self.toolbar.annotation_type_visibility_changed.connect(self.on_annotation_type_visibility_changed)
+        self.toolbar.annotation_group_visibility_changed.connect(self.on_annotation_group_visibility_changed)
         
         # Synchronize canvas visibility with toolbar checkbox initial states
         # (in case signals fired before connections were made)
@@ -296,6 +317,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_annotation_type_visibility('hive', self.toolbar.show_hives_checkbox.isChecked(), rebuild=False)
         self.canvas.set_annotation_type_visibility('chamber', self.toolbar.show_chambers_checkbox.isChecked(), rebuild=False)
         self.canvas.set_annotation_type_visibility('pollen', self.toolbar.show_pollen_checkbox.isChecked(), rebuild=False)
+        self.canvas.set_annotation_type_visibility('nectar', self.toolbar.show_nectar_checkbox.isChecked(), rebuild=False)
         self.canvas.set_brush_cursor_preview_enabled(self.toolbar.brush_cursor_checkbox.isChecked())
         self.toolbar.set_measurement_scale(None)
         
@@ -342,6 +364,7 @@ class MainWindow(QMainWindow):
         self.hive_chamber_toolbar.hive_inference_requested.connect(self.run_hive_inference)
         self.hive_chamber_toolbar.chamber_inference_requested.connect(self.run_chamber_inference)
         self.hive_chamber_toolbar.pollen_inference_requested.connect(self.run_pollen_inference)
+        self.hive_chamber_toolbar.nectar_inference_requested.connect(self.run_nectar_inference)
         self.hive_chamber_toolbar.both_inference_requested.connect(self.run_hive_chamber_both)
         
         # Create layout
@@ -418,6 +441,10 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_label = QLabel("Ready")
         self.status_bar.addPermanentWidget(self.status_label)
+        self.contributor_label = QLabel('Contributor: not selected')
+        self.contributor_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.contributor_label.setMaximumWidth(280)
+        self.status_bar.addWidget(self.contributor_label)
         self._init_done_counter_overlay()
 
     def _init_done_counter_overlay(self):
@@ -760,6 +787,10 @@ class MainWindow(QMainWindow):
         add_video_action.setShortcut("Ctrl+I")
         add_video_action.triggered.connect(self.show_add_video_dialog)
         file_menu.addAction(add_video_action)
+
+        import_project_action = QAction('Import From Project...', self)
+        import_project_action.triggered.connect(self.import_project_data)
+        file_menu.addAction(import_project_action)
         
         file_menu.addSeparator()
         
@@ -767,6 +798,10 @@ class MainWindow(QMainWindow):
         save_action.setShortcut(QKeySequence.StandardKey.Save)
         save_action.triggered.connect(self.save_annotations)
         file_menu.addAction(save_action)
+
+        self.sync_project_action = QAction('Sync Project Now...', self)
+        self.sync_project_action.triggered.connect(self.sync_current_project)
+        file_menu.addAction(self.sync_project_action)
         
         export_coco_action = QAction("Export &COCO Format...", self)
         export_coco_action.triggered.connect(self.export_coco_format)
@@ -959,7 +994,7 @@ class MainWindow(QMainWindow):
         toolbars_menu.addAction(self.yolo_bbox_toolbar_action)
         
         # Hive & Chamber Toolbar toggle
-        self.hive_chamber_toolbar_action = QAction("&Hive && Chamber Toolbar", self)
+        self.hive_chamber_toolbar_action = QAction("&Hive, Chamber, Pollen && Nectar Toolbar", self)
         self.hive_chamber_toolbar_action.setCheckable(True)
         self.hive_chamber_toolbar_action.setChecked(False)  # Hidden by default
         self.hive_chamber_toolbar_action.triggered.connect(self.toggle_hive_chamber_toolbar)
@@ -970,6 +1005,107 @@ class MainWindow(QMainWindow):
         hide_visible_toolbars_action = QAction("&Hide Checked Visible Toolbars", self)
         hide_visible_toolbars_action.triggered.connect(self.hide_checked_visible_top_toolbars)
         toolbars_menu.addAction(hide_visible_toolbars_action)
+
+        settings_menu = menubar.addMenu('&Settings')
+        contributor_action = QAction('Change Contributor...', self)
+        contributor_action.triggered.connect(self.change_contributor)
+        settings_menu.addAction(contributor_action)
+        sync_action = QAction('Project Sync...', self)
+        sync_action.triggered.connect(self.configure_project_sync)
+        settings_menu.addAction(sync_action)
+
+    def set_contributor(self, session):
+        self.contributor_session = dict(session)
+        self.annotation_manager.contributor_session = dict(session)
+        self.contributor_label.setText('Contributor: ' + session['name'])
+        self.contributor_label.setToolTip('Active contributor: ' + session['name'])
+
+    def _receive_saved_attribution(self, project, video, frame, records):
+        if (str(self.project_path) != project or self.current_video_id != video or
+                (frame >= 0 and frame != self._get_frame_idx_in_video(self.current_frame_idx))):
+            return
+        for record in records:
+            metadata = self.canvas.annotation_metadata.get(record['mask_id'])
+            if metadata is not None and metadata.get('category', 'bee') == record['category']:
+                metadata['provenance'] = record['provenance']
+
+    def change_contributor(self):
+        try:
+            # Finish the previous person's edits before changing the session identity.
+            self.save_worker.wait_until_idle(raise_errors=False)
+            if self.project_path:
+                self._save_annotation_sources()
+            self.save_worker.wait_until_idle()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Save Before Switching Contributor', str(exc))
+            return
+        session = choose_contributor(self)
+        if session:
+            self.set_contributor(session)
+
+    def offer_sync_setup(self):
+        settings = QSettings()
+        if settings.value('project_sync/setup_offered', False, type=bool):
+            return
+        question = QMessageBox(self)
+        question.setWindowTitle('Optional Project Sync')
+        question.setText('Keep a separate copy of your annotation projects in an external or shared folder?')
+        setup = question.addButton('Set Up Sync', QMessageBox.ButtonRole.AcceptRole)
+        question.addButton('Not Now', QMessageBox.ButtonRole.RejectRole)
+        question.exec()
+        settings.setValue('project_sync/setup_offered', True)
+        if question.clickedButton() is setup:
+            self.configure_project_sync()
+
+    def configure_project_sync(self):
+        dialog = ProjectSyncDialog(self.project_path, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.sync_requested:
+            self.sync_current_project()
+
+    def sync_current_project(self):
+        if self._sync_in_progress:
+            return
+        if not self.project_path:
+            QMessageBox.information(self, 'No Project', 'Open a project before syncing.')
+            return
+        if not self.contributor_session:
+            self.change_contributor()
+            if not self.contributor_session:
+                return
+        source = str(Path(self.project_path).resolve())
+        projects = setting_json('project_sync/projects', {})
+        configuration = setting_json('project_sync/destination', {})
+        if not projects.get(source, {}).get('enabled') or not configuration.get('root_id'):
+            dialog = ProjectSyncDialog(self.project_path, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            projects = setting_json('project_sync/projects', {})
+            configuration = setting_json('project_sync/destination', {})
+            if not projects.get(source, {}).get('enabled'):
+                return
+        if self.is_playing:
+            self.toggle_play()
+        self._sync_in_progress = True
+        try:
+            self.save_worker.wait_until_idle(raise_errors=False)
+            self._save_annotation_sources(force=True, refresh_next_id=True)
+            self.save_worker.wait_until_idle()
+            session = dict(self.contributor_session)
+            result = SyncProgressDialog(
+                'Sync Project',
+                lambda progress, cancelled: sync_project(
+                    source, configuration, session, progress, cancelled), self).run()
+            projects[source].update(last_success=utc_now(), last_error='', last_path=result['path'])
+            self.status_label.setText(f"Sync complete: {result['copied_files']} changed files")
+            QMessageBox.information(self, 'Sync Complete',
+                                    'Verified project copy:\n' + result['path'])
+        except Exception as exc:
+            projects.setdefault(source, {})['last_error'] = str(exc)
+            self.status_label.setText('Sync failed; local annotations remain saved')
+            QMessageBox.warning(self, 'Sync Not Completed', str(exc))
+        finally:
+            save_setting('project_sync/projects', projects)
+            self._sync_in_progress = False
     
     def toggle_annotation_toolbar(self):
         """Toggle visibility of annotation toolbar"""
@@ -1024,7 +1160,7 @@ class MainWindow(QMainWindow):
                 self.yolo_instance_focused_toolbar_action
             ),
             ("YOLO bbox", self.yolo_bbox_toolbar, self.yolo_bbox_toolbar_action),
-            ("Hive/Chamber/Pollen", self.hive_chamber_toolbar, self.hive_chamber_toolbar_action),
+            ("Hive/Chamber/Pollen/Nectar", self.hive_chamber_toolbar, self.hive_chamber_toolbar_action),
         ]
 
     def hide_checked_visible_top_toolbars(self):
@@ -3460,6 +3596,9 @@ class MainWindow(QMainWindow):
         if not self.project_path:
             return {'saved_any': False, 'reason': 'no_project'}
 
+        if not use_background:
+            self.save_worker.wait_until_idle(raise_errors=False)
+
         target_video_id = video_id or self.current_video_id
         if not target_video_id:
             return {'saved_any': False, 'reason': 'no_video'}
@@ -3504,18 +3643,24 @@ class MainWindow(QMainWindow):
                     frame_idx_in_video, frame_annotations
                 )
             else:
-                self.annotation_manager.save_frame_annotations(
+                saved = self.annotation_manager.save_frame_annotations(
                     self.project_path, target_video_id,
                     frame_idx_in_video, frame_annotations
                 )
+                self._receive_saved_attribution(str(self.project_path), target_video_id,
+                                                frame_idx_in_video, provenance_records(saved))
+                self.save_worker.failed_tasks.pop(
+                    (str(self.project_path), target_video_id, frame_idx_in_video), None)
             saved_files.append('frame')
             if frame_key is not None:
                 self.dirty_frame_annotation_keys.discard(frame_key)
 
         if save_video:
-            self.annotation_manager.save_video_annotations(
+            saved = self.annotation_manager.save_video_annotations(
                 self.project_path, target_video_id, video_level_annotations
             )
+            self._receive_saved_attribution(str(self.project_path), target_video_id,
+                                            -1, provenance_records(saved))
             saved_files.append('video-level')
             self.dirty_video_annotation_ids.discard(target_video_id)
 
@@ -3850,6 +3995,47 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
             
+    def import_project_data(self):
+        """Import saved copies, then discard stale canvas/cache data before reload."""
+        if not self.project_path:
+            QMessageBox.information(self, 'No Project', 'Open the destination project before importing.')
+            return
+        if self.is_playing:
+            self.toggle_play()
+        try:
+            self.save_worker.wait_until_idle(raise_errors=False)
+            self._save_annotation_sources(refresh_next_id=True)
+            self.save_worker.wait_until_idle()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Save Failed', str(exc))
+            return
+        # A background annotation read must not repopulate old metadata after import.
+        self.preload_worker.stop()
+        self.preload_worker.join()
+        try:
+            dialog = ProjectImportDialog(self.project_path, self.contributor_session, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.result:
+                return
+            self.current_frame_modified = False
+            self.dirty_frame_annotation_keys.clear()
+            self.dirty_video_annotation_ids.clear()
+            self.current_video_id = None
+            self.current_frame_idx = -1
+            self.canvas.clear_image()
+            self.annotation_manager.clear_cache()
+            self.annotation_manager.attributor.baselines.clear()
+            self.frame_cache.clear()
+            self.video_next_mask_id.clear()
+            self.load_project(self.project_path)
+            self.status_label.setText('Project data imported')
+            QMessageBox.information(self, 'Import Complete',
+                                    'Copied frames and annotations are ready for review.\n'
+                                    'Re-export COCO before training.\n\n'
+                                    'Import record and originals:\n' + dialog.result['backup'])
+        finally:
+            self.preload_worker = PreloadWorker(self.frame_cache, self.annotation_manager)
+            self.preload_worker.start()
+
     def import_video(self):
         """Import video and extract frames"""
         video_path, _ = QFileDialog.getOpenFileName(
@@ -4791,6 +4977,14 @@ class MainWindow(QMainWindow):
         # controlled independently by the show/hide checkboxes.
         self.update_instance_list_from_canvas()
     
+    def on_annotation_group_visibility_changed(self, categories, visible):
+        """Apply a group switch without redrawing full-frame masks for every child."""
+        for category in categories:
+            self.canvas.set_annotation_type_visibility(category, visible, rebuild=False)
+        self.canvas.rebuild_visualizations()
+        self.update_instance_list_from_canvas()
+        self.canvas.setFocus()
+
     def on_annotation_type_visibility_changed(self, annotation_type, visible):
         """Handle annotation type visibility checkbox change from toolbar"""
         self.canvas.set_annotation_type_visibility(annotation_type, visible)
@@ -5189,6 +5383,9 @@ class MainWindow(QMainWindow):
     def update_instance_list_from_canvas(self):
         """Update the instance list widget from current canvas masks"""
         from PyQt6.QtWidgets import QListWidgetItem
+
+        # An immediate refresh also satisfies any queued annotation-change refresh.
+        self._instance_list_update_timer.stop()
         
         self._instance_list_updating = True
         self.instance_list.clear()
@@ -5207,7 +5404,8 @@ class MainWindow(QMainWindow):
         
         # Get ArUco tracking from video-level annotations
         instance_to_aruco = self._get_instance_to_aruco_map()
-        self.canvas.set_aruco_instance_labels(instance_to_aruco, rebuild=False)
+        if instance_to_aruco != self.canvas.aruco_instance_labels:
+            self.canvas.set_aruco_instance_labels(instance_to_aruco)
         
         instance_entries = self.canvas.get_instance_entries()
         
@@ -5223,27 +5421,16 @@ class MainWindow(QMainWindow):
             metadata = self.canvas.annotation_metadata.get(instance_id, {})
             
             # Determine category prefix
-            category_prefix_map = {'bee': 'B', 'hive': 'H', 'chamber': 'C', 'pollen': 'P', **BROOD_SHORT_LABELS}
+            category_prefix_map = {'bee': 'B', 'hive': 'H', 'chamber': 'C', 'pollen': 'P', 'nectar': 'N', **BROOD_SHORT_LABELS}
             prefix = category_prefix_map.get(category, category_label(category))
             class_visible = self.canvas.annotation_type_visibility.get(category, True)
             
-            # Determine if instance has segmentation or is bbox-only
-            # Check all three mask arrays for this instance
-            mask_array, _ = self.canvas._get_mask_array_for_instance(instance_id, category)
-            has_segmentation = (
-                (instance_id == self.canvas.editing_instance_id and
-                 category == self.canvas.editing_instance_category and
-                 self.canvas.editing_mask is not None) or
-                (mask_array is not None and np.any(mask_array == instance_id))
-            )
-            
-            # Calculate area from appropriate source
-            if (instance_id == self.canvas.editing_instance_id and
-                category == self.canvas.editing_instance_category and
-                self.canvas.editing_mask is not None):
-                area = np.sum(self.canvas.editing_mask > 0)
-            elif mask_array is not None and has_segmentation:
-                area = np.sum(mask_array == instance_id)
+            geometry = self.canvas.get_instance_geometry(instance_id, category)
+            editing = (instance_id == self.canvas.editing_instance_id and
+                       category == self.canvas.editing_instance_category and
+                       self.canvas.editing_mask is not None)
+            if editing or geometry.area:
+                area = geometry.area
             else:
                 # Bbox-only: calculate area from bbox (width * height)
                 bbox = metadata.get('bbox', [0, 0, 0, 0])
@@ -5274,18 +5461,17 @@ class MainWindow(QMainWindow):
                 if class_visible else
                 f"Turn on {category_label(category)} visibility first; the class switch overrides this row."
             )
+            provenance = metadata.get('provenance', {})
+            if provenance:
+                creator = (provenance.get('created_by') or {}).get('name', 'Unknown')
+                editor = (provenance.get('last_modified_by') or {}).get('name', 'Unknown')
+                item.setToolTip(item.toolTip() + f'\nCreated by: {creator}\nLast edited by: {editor}')
             self.instance_list.addItem(item)
             
             if instance_id == active_instance_id and category == active_instance_category:
                 row_to_select = current_row
             current_row += 1
         
-        # Update instance labels on canvas if they are currently visible
-        if self.canvas.labels_visible:
-            self.canvas.update_instance_labels()
-        if self.canvas.aruco_labels_visible:
-            self.canvas.update_aruco_labels()
-
         # Restore selection
         if row_to_select >= 0:
             self.instance_list.blockSignals(True)
@@ -5791,15 +5977,19 @@ class MainWindow(QMainWindow):
 
         # Commit any active editing before switching instance/type
         instance_id = item_data.get('id')
+        will_edit_target = (
+            item_type in CATEGORIES and instance_id is not None and
+            self.canvas.current_tool in {'brush', 'eraser'} and
+            self.canvas.get_instance_geometry(instance_id, item_type).area > 0)
         if (self.canvas.editing_instance_id > 0 and
             (self.canvas.editing_instance_id != instance_id or
-             self.canvas.editing_instance_category != item_type)):
+             self.canvas.editing_instance_category != item_type) and not will_edit_target):
             self.canvas.commit_editing()
 
         # Handle chamber/hive/pollen instance selection
         if item_type in CATEGORIES and item_type != 'bee':
             # Switch to that annotation mode
-            self._sync_annotation_type_control(item_type)
+            self._sync_annotation_type_control(item_type, preserve_active_edit=will_edit_target)
             
             # Select the instance
             instance_id = item_data.get('id')
@@ -5816,7 +6006,7 @@ class MainWindow(QMainWindow):
         if item_type == 'bee':
             instance_id = item_data.get('id')
             if instance_id is not None:
-                self._sync_annotation_type_control('bee')
+                self._sync_annotation_type_control('bee', preserve_active_edit=will_edit_target)
                 self.canvas.set_selected_instance(instance_id, category='bee', zoom=False)
                 self.canvas.highlight_instance(instance_id, category='bee')
                 self.status_label.setText(f"Selected instance {instance_id} - Use Brush/Eraser to edit")
@@ -6155,23 +6345,12 @@ class MainWindow(QMainWindow):
                 instance_id = item_data.get('id')
                 current_category = item_data.get('type', 'bee')
                 
-                from PyQt6.QtGui import QAction
                 change_category_menu = menu.addMenu(f"Change Category")
-                
-                # Add actions for each category (except current one)
-                categories = list(CATEGORY_LABELS.items())
-                
-                category_actions = {}
-                for cat_id, cat_label in categories:
-                    if cat_id != current_category:
-                        action = QAction(cat_label, menu)
-                        change_category_menu.addAction(action)
-                        category_actions[action] = cat_id
-                    else:
-                        # Show current category as disabled
-                        action = QAction(f"{cat_label} (current)", menu)
-                        action.setEnabled(False)
-                        change_category_menu.addAction(action)
+                category_actions = {
+                    action: category for category, action in
+                    add_category_menu_actions(change_category_menu, current_category).items()
+                    if category != current_category
+                }
             else:
                 category_actions = {}
             
@@ -6741,7 +6920,8 @@ class MainWindow(QMainWindow):
             self.canvas.annotation_metadata[new_instance_id] = {
                 'bbox': [0, 0, 0, 0],  # Placeholder bbox
                 'bbox_only': True,
-                'category': current_category
+                'category': current_category,
+                'source': 'manual',
             }
         
         # Invalidate cached instance IDs so new instance appears in list
@@ -6753,6 +6933,8 @@ class MainWindow(QMainWindow):
 
         if current_category in BROOD_CATEGORIES:
             self.toolbar.brood_visibility_actions[current_category].setChecked(True)
+        elif current_category == 'nectar':
+            self.toolbar.show_nectar_checkbox.setChecked(True)
         self.canvas.set_instance_visible(new_instance_id, current_category, True, rebuild=False)
 
         self.toolbar.set_tool('brush')
@@ -7072,6 +7254,8 @@ class MainWindow(QMainWindow):
             # Use current category for propagated masks
             category = self.canvas.current_annotation_type
             self.canvas.add_mask(mask, mask_id, color, rebuild_viz=rebuild_viz, category=category)
+            propagated_id = mask_id if mask_id is not None else self.canvas.next_mask_id - 1
+            self.canvas.annotation_metadata[propagated_id]['source'] = 'sam2_propagated'
         
         # Register any new colors that were generated
         self._register_canvas_colors()
@@ -7337,6 +7521,7 @@ class MainWindow(QMainWindow):
                     'hive': 'Hive model slot',
                     'chamber': 'Chamber model slot',
                     'pollen': 'Pollen model slot',
+                    'nectar': 'Nectar model slot',
                 }
                 target_label = target_labels.get(model_type, 'coarse YOLO toolbar')
                 msg += f"Would you like to load the new {model_type} model into the {target_label}?"
@@ -7363,6 +7548,11 @@ class MainWindow(QMainWindow):
                             self.hive_chamber_toolbar_action.setChecked(True)
                         elif model_type == 'pollen':
                             self.hive_chamber_toolbar._load_pollen_checkpoint_from_path(model_path, show_dialogs=False)
+                            self.hive_chamber_toolbar.show()
+                            self.hive_chamber_toolbar_action.setChecked(True)
+                        elif model_type == 'nectar':
+                            if not self.hive_chamber_toolbar._load_nectar_checkpoint_from_path(model_path, show_dialogs=True):
+                                return
                             self.hive_chamber_toolbar.show()
                             self.hive_chamber_toolbar_action.setChecked(True)
                         else:
@@ -7591,7 +7781,9 @@ class MainWindow(QMainWindow):
         # Show configuration dialog
         config_dialog = TrainingConfigDialog(self, current_model_path)
         config_dialog.model_type_combo.removeItem(
-            config_dialog.model_type_combo.findText('Brood (5 appearance classes)'))
+            config_dialog.model_type_combo.findText(BROOD_MODEL_LABEL))
+        config_dialog.model_type_combo.removeItem(
+            config_dialog.model_type_combo.findText('Nectar source'))
         if config_dialog.exec():
             config = config_dialog.get_config()
             
@@ -8952,6 +9144,7 @@ class MainWindow(QMainWindow):
                     color = self.video_mask_colors[self.current_video_id].get(track_id)
                     rebuild_viz = (i == len(matched_detections) - 1)
                     self.canvas.add_mask(detection.mask, mask_id=track_id, color=color, rebuild_viz=rebuild_viz, category=current_category)
+                    self.canvas.annotation_metadata[track_id]['source'] = 'yolo_tracked'
                 
                 # Register any new colors
                 self._register_canvas_colors()
@@ -8980,6 +9173,7 @@ class MainWindow(QMainWindow):
                     mask_id = next_id + i
                     rebuild_viz = (i == len(detections) - 1)
                     self.canvas.add_mask(detection.mask, mask_id=mask_id, rebuild_viz=rebuild_viz, category=current_category)
+                    self.canvas.annotation_metadata[mask_id]['source'] = 'yolo'
                 
                 self._register_canvas_colors()
                 
@@ -9355,16 +9549,25 @@ class MainWindow(QMainWindow):
         
         self._run_hive_chamber_inference_impl(model, 'pollen', "Pollen")
     
+    def run_nectar_inference(self):
+        model = self.hive_chamber_toolbar.get_nectar_model()
+        if model is None:
+            QMessageBox.warning(self, "Model Not Loaded", "Please load a Nectar model first.")
+            return
+        self.toolbar.show_nectar_checkbox.setChecked(True)
+        self._run_hive_chamber_inference_impl(model, 'nectar', "Nectar source")
+
     def run_hive_chamber_both(self):
-        """Run hive, chamber, and pollen detection (whichever models are loaded)"""
+        """Run the loaded structure and resource models on the current frame."""
         hive_model = self.hive_chamber_toolbar.get_hive_model()
         chamber_model = self.hive_chamber_toolbar.get_chamber_model()
         pollen_model = self.hive_chamber_toolbar.get_pollen_model()
+        nectar_model = self.hive_chamber_toolbar.get_nectar_model()
         
-        if hive_model is None and chamber_model is None and pollen_model is None:
+        if all(model is None for model in (hive_model, chamber_model, pollen_model, nectar_model)):
             QMessageBox.warning(
                 self, "Models Not Loaded",
-                "Please load at least one model (Hive, Chamber, or Pollen) first."
+                "Please load at least one model (Hive, Chamber, Pollen, or Nectar) first."
             )
             return
         
@@ -9375,6 +9578,8 @@ class MainWindow(QMainWindow):
             self._run_hive_chamber_inference_impl(chamber_model, 'chamber', "Chamber", show_dialog=False)
         if pollen_model is not None:
             self._run_hive_chamber_inference_impl(pollen_model, 'pollen', "Pollen", show_dialog=True)
+        if nectar_model is not None:
+            self.run_nectar_inference()
     
     def _run_hive_chamber_inference_impl(self, model, category, display_name, show_dialog=True):
         """Implementation of hive/chamber/pollen inference
@@ -9488,6 +9693,7 @@ class MainWindow(QMainWindow):
                 rebuild_viz = (i == len(detections) - 1)
                 self.canvas.add_mask(detection.mask, mask_id=mask_id, rebuild_viz=rebuild_viz, 
                                    category=category)
+                self.canvas.annotation_metadata[mask_id]['source'] = 'yolo'
             
             # Update next ID for all categories of this video to avoid future conflicts
             if self.current_video_id:
@@ -11393,7 +11599,7 @@ class MainWindow(QMainWindow):
             
             # Clear cached instance data
             self.canvas._cached_instance_ids = None
-            self.canvas._cached_bboxes = {}
+            self.canvas._geometry_cache.invalidate()
             
             # Update metadata and calculate statistics
             total_area_diff = 0

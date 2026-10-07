@@ -5,7 +5,7 @@ import math
 
 import numpy as np
 
-from core.categories import BROOD_CATEGORIES
+from core.categories import BROOD_CATEGORIES, BROOD_MAP_LABELS, BROOD_UNRESOLVED_LABEL
 from core.temporal_hive_prior import TemporalHivePrior
 
 
@@ -20,8 +20,9 @@ class _BroodState:
 class TemporalBroodMap:
     """Bounded recent evidence per chamber pixel, not a biological age model.
 
-    Input labels: 0=observed background, 1..5=appearance classes, 255=unobserved.
-    Output labels: 0=unknown, 1=background, 2..6=classes, 7=brood/stage unresolved.
+    Input labels: 0=background, 1..N=appearance classes, 255=unobserved.
+    Output labels: 0=unknown, 1=background, class values from BROOD_MAP_LABELS,
+    7=brood/stage unresolved (preserved for compatibility with older maps).
     Uncertain appearance classes are ordinary classes, not missing observations.
     """
 
@@ -44,13 +45,13 @@ class TemporalBroodMap:
         if time_seconds is None or not math.isfinite(time_seconds):
             raise ValueError('Temporal brood maps require a valid frame time')
         if labels is not None:
-            if labels.shape != tuple(frame_shape) or not np.isin(labels, [0, 1, 2, 3, 4, 5, 255]).all():
-                raise ValueError('Brood evidence must be a full-frame label image (0..5 or 255)')
+            if labels.shape != tuple(frame_shape) or not np.isin(labels, [*range(len(BROOD_CATEGORIES) + 1), 255]).all():
+                raise ValueError(f'Brood evidence must be a full-frame label image (0..{len(BROOD_CATEGORIES)} or 255)')
         key = (str(context), int(chamber_id))
         shape = self.resolution[::-1]
         state = self.states.get(key)
         if state is None:
-            state = _BroodState(np.zeros((6, *shape), np.float32),
+            state = _BroodState(np.zeros((len(BROOD_CATEGORIES) + 1, *shape), np.float32),
                                 np.zeros(shape, np.float32),
                                 np.full(shape, -np.inf), float(time_seconds))
             self.states[key] = state
@@ -74,7 +75,7 @@ class TemporalBroodMap:
         factor = np.where(valid, np.minimum(factor, 1), 1)
         state.counts *= factor
         state.weight *= factor
-        for index in range(6):
+        for index in range(len(BROOD_CATEGORIES) + 1):
             state.counts[index] += normalize(labels == index) & valid
         state.weight[valid] += 1
         state.last_seen[valid] = float(time_seconds)
@@ -96,9 +97,10 @@ class TemporalBroodMap:
         labels = np.zeros(state.weight.shape, np.uint8)
         labels[known & (presence < 0.5)] = 1
         brood = known & (presence >= 0.5)
-        labels[brood] = 7
+        labels[brood] = BROOD_UNRESOLVED_LABEL
         resolved = brood & (stage_confidence >= self.stage_threshold)
-        stage = probability[1:].argmax(axis=0) + 2
+        class_labels = np.array([BROOD_MAP_LABELS[cat] for cat in BROOD_CATEGORIES], np.uint8)
+        stage = class_labels[probability[1:].argmax(axis=0)]
         labels[resolved] = stage[resolved]
         return dict(labels=labels, probability=probability, weight=state.weight.copy(),
                     last_seen=state.last_seen.copy(), chamber_id=int(chamber_id),
@@ -112,7 +114,7 @@ class TemporalBroodMap:
         n_bee, n_known = int(mask.sum()), int(known.sum())
         values = {'known_fraction': n_known / n_bee if n_bee else None}
         values['brood_fraction'] = float((known & (labels >= 2)).sum() / n_known) if n_known else None
-        for index, category in enumerate(BROOD_CATEGORIES, 2):
+        for category, index in BROOD_MAP_LABELS.items():
             values[category + '_fraction'] = float((known & (labels == index)).sum() / n_known) if n_known else None
-        values['unresolved_fraction'] = float((known & (labels == 7)).sum() / n_known) if n_known else None
+        values['unresolved_fraction'] = float((known & (labels == BROOD_UNRESOLVED_LABEL)).sum() / n_known) if n_known else None
         return values

@@ -164,14 +164,30 @@ class ProjectManager:
         for split in ['train', 'val', 'test', 'inference']:
             folder = self.project_path / 'input_data' / split
             if folder.exists():
-                for video_file in folder.glob('*.mp4'):
-                    videos[split].append(video_file.stem)
-                # Also check for other video formats
-                for ext in ['*.avi', '*.mov', '*.mkv', '*.mjpeg', '*.mjpg']:
-                    for video_file in folder.glob(ext):
+                for video_file in folder.iterdir():
+                    if video_file.is_file() and video_file.suffix.lower() in ('.mp4', '.avi', '.mov', '.mkv', '.mjpeg', '.mjpg'):
                         videos[split].append(video_file.stem)
         
+        registered = {video for items in videos.values() for video in items}
+        for video, split in self._imported_frame_splits().items():
+            if video not in registered:
+                videos[split].append(video)
         return videos
+
+    def _imported_frame_splits(self):
+        """Frame-only imports remain usable without an original video copy."""
+        result = {}
+        for metadata_file in (self.project_path / 'frames').glob('*/video_metadata.json'):
+            try:
+                with metadata_file.open() as handle:
+                    metadata = json.load(handle)
+                split = metadata.get('split')
+                if (metadata.get('project_import') and split in ('train', 'val', 'test', 'inference')
+                        and any(metadata_file.parent.glob('frame_*.jpg'))):
+                    result[metadata_file.parent.name] = split
+            except (OSError, ValueError, TypeError):
+                continue
+        return result
     
     def get_video_path(self, video_id: str) -> Optional[Path]:
         """Get full path to video file"""
@@ -223,7 +239,7 @@ class ProjectManager:
             if (self.project_path / 'input_data/inference' / f'{video_id}{ext}').exists():
                 return 'inference'
         
-        return None
+        return self._imported_frame_splits().get(video_id)
     
     def move_video(self, video_id: str, to_split: str) -> bool:
         """Move video between train, val, test, and inference folders"""
@@ -233,10 +249,19 @@ class ProjectManager:
         # Find current location
         current_path = self.get_video_path(video_id)
         if not current_path:
-            return False
+            if video_id not in self._imported_frame_splits():
+                return False
+            from core.project_sync import _read_json, _write_json
+            path = self.get_frames_dir(video_id) / 'video_metadata.json'
+            metadata = _read_json(path)
+            metadata['split'] = to_split
+            _write_json(path, metadata)
+            self._update_dataset_info()
+            return True
         
         # Determine destination
         dest_folder = self.project_path / 'input_data' / to_split
+        dest_folder.mkdir(parents=True, exist_ok=True)
         dest_path = dest_folder / current_path.name
         
         # Move file
@@ -263,6 +288,7 @@ class ProjectManager:
         
         # Save to file
         info_path = self.project_path / 'annotations/coco/dataset_info.json'
+        info_path.parent.mkdir(parents=True, exist_ok=True)
         with open(info_path, 'w') as f:
             json.dump(self.dataset_info, f, indent=2)
     
@@ -520,16 +546,7 @@ class ProjectManager:
     
     def get_videos_by_split(self, split: str) -> List[str]:
         """Get list of video IDs for a specific split"""
-        split_dir = self.project_path / f'input_data/{split}'
-        if not split_dir.exists():
-            return []
-        
-        video_ids = []
-        for video_file in split_dir.glob('*'):
-            if video_file.suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv', '.mjpeg']:
-                video_ids.append(video_file.stem)
-        
-        return sorted(video_ids)
+        return sorted(set(self.scan_videos().get(split, [])))
     
     def get_dataset_statistics(self) -> Dict:
         """Get statistics about the dataset"""

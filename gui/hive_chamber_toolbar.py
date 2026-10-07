@@ -1,23 +1,25 @@
 """
-Hive and Chamber YOLO inference toolbar for running trained hive/chamber models
+YOLO inference toolbar for structure and resource segmentation models.
 """
 
-from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QToolButton, QPushButton,
+from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QToolButton, QPushButton,
                              QLabel, QFileDialog, QMessageBox, QFrame)
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
 
 
 class HiveChamberToolbar(QWidget):
-    """Toolbar for Hive, Chamber, and Pollen YOLO model inference"""
+    """Toolbar for Hive, Chamber, Pollen, and Nectar YOLO model inference."""
     
     # Signals for running inference
     hive_inference_requested = pyqtSignal()  # Signal to request hive inference on current frame
     chamber_inference_requested = pyqtSignal()  # Signal to request chamber inference on current frame
     pollen_inference_requested = pyqtSignal()  # Signal to request pollen inference on current frame
-    both_inference_requested = pyqtSignal()  # Signal to run all three models on current frame
+    nectar_inference_requested = pyqtSignal()
+    both_inference_requested = pyqtSignal()  # Signal to run all loaded models on current frame
     
-    def __init__(self, parent=None, hive_checkpoint_path=None, chamber_checkpoint_path=None, pollen_checkpoint_path=None):
+    def __init__(self, parent=None, hive_checkpoint_path=None, chamber_checkpoint_path=None,
+                 pollen_checkpoint_path=None, nectar_checkpoint_path=None):
         super().__init__(parent)
         
         self.hive_model_path = None
@@ -26,6 +28,8 @@ class HiveChamberToolbar(QWidget):
         self.chamber_model = None
         self.pollen_model_path = None
         self.pollen_model = None
+        self.nectar_model_path = None
+        self.nectar_model = None
         
         self.init_ui()
         
@@ -36,15 +40,19 @@ class HiveChamberToolbar(QWidget):
             self._load_chamber_checkpoint_from_path(chamber_checkpoint_path)
         if pollen_checkpoint_path:
             self._load_pollen_checkpoint_from_path(pollen_checkpoint_path)
+        if nectar_checkpoint_path:
+            self._load_nectar_checkpoint_from_path(nectar_checkpoint_path)
         
     def init_ui(self):
         """Initialize UI"""
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
+        rows = QVBoxLayout(self)
+        rows.setContentsMargins(5, 5, 5, 5)
+        layout = QHBoxLayout()
+        rows.addLayout(layout)
         layout.setSpacing(10)
         
         # Section label
-        layout.addWidget(QLabel("<b>Hive/Chamber/Pollen Detection:</b>"))
+        layout.addWidget(QLabel("<b>Structure Detection:</b>"))
         
         # === Hive Model Section ===
         
@@ -88,9 +96,12 @@ class HiveChamberToolbar(QWidget):
         self.chamber_inference_btn.setEnabled(False)  # Disabled until model is loaded
         self.chamber_inference_btn.clicked.connect(self.on_chamber_inference_requested)
         layout.addWidget(self.chamber_inference_btn)
-        
-        # Separator
-        layout.addWidget(self.create_separator())
+
+        layout.addStretch()
+        layout = QHBoxLayout()
+        layout.setSpacing(10)
+        rows.addLayout(layout)
+        layout.addWidget(QLabel("<b>Resource Detection:</b>"))
         
         # === Pollen Model Section ===
         
@@ -111,6 +122,20 @@ class HiveChamberToolbar(QWidget):
         self.pollen_inference_btn.setEnabled(False)  # Disabled until model is loaded
         self.pollen_inference_btn.clicked.connect(self.on_pollen_inference_requested)
         layout.addWidget(self.pollen_inference_btn)
+
+        layout.addWidget(self.create_separator())
+        self.load_nectar_btn = QPushButton("Load Nectar Model...")
+        self.load_nectar_btn.setToolTip("Load a nectar source segmentation checkpoint (.pt)")
+        self.load_nectar_btn.clicked.connect(self.load_nectar_checkpoint)
+        layout.addWidget(self.load_nectar_btn)
+        self.nectar_status_label = QLabel("Not loaded")
+        self.nectar_status_label.setStyleSheet("color: gray; font-style: italic;")
+        layout.addWidget(self.nectar_status_label)
+        self.nectar_inference_btn = QPushButton("Run Nectar")
+        self.nectar_inference_btn.setToolTip("Detect nectar sources on the current frame")
+        self.nectar_inference_btn.setEnabled(False)
+        self.nectar_inference_btn.clicked.connect(self.nectar_inference_requested.emit)
+        layout.addWidget(self.nectar_inference_btn)
         
         # Separator
         layout.addWidget(self.create_separator())
@@ -119,7 +144,7 @@ class HiveChamberToolbar(QWidget):
         
         # Run all button
         self.both_inference_btn = QPushButton("Run All")
-        self.both_inference_btn.setToolTip("Run all loaded models (hive, chamber, pollen) on the current frame")
+        self.both_inference_btn.setToolTip("Run all loaded models (hive, chamber, pollen, nectar) on the current frame")
         self.both_inference_btn.setEnabled(False)  # Disabled until at least one model is loaded
         self.both_inference_btn.clicked.connect(self.on_both_inference_requested)
         layout.addWidget(self.both_inference_btn)
@@ -316,11 +341,48 @@ class HiveChamberToolbar(QWidget):
             else:
                 print(f"Failed to load pollen model: {str(e)}")
     
+    def load_nectar_checkpoint(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select YOLO Nectar Source Checkpoint", str(Path.home()),
+            "PyTorch Model Files (*.pt);;All Files (*)")
+        if file_path:
+            self._load_nectar_checkpoint_from_path(file_path, show_dialogs=True)
+
+    def _load_nectar_checkpoint_from_path(self, file_path, show_dialogs=False):
+        try:
+            from ultralytics import YOLO
+            model = YOLO(file_path)
+            names = model.names
+            names = list(names.values()) if isinstance(names, dict) else list(names)
+            if model.task != 'segment' or names != ['nectar']:
+                raise ValueError("Expected a segmentation model trained on the 'nectar' class. "
+                                 "Choose Nectar source in Train YOLO Model.")
+            self.nectar_model = model
+            self.nectar_model_path = Path(file_path)
+            self.nectar_status_label.setText(self.nectar_model_path.name)
+            self.nectar_status_label.setStyleSheet("color: green;")
+            self.nectar_inference_btn.setEnabled(True)
+            self._update_both_button()
+            if show_dialogs:
+                QMessageBox.information(self, "Nectar Model Loaded",
+                                        f"Loaded nectar source model: {self.nectar_model_path.name}")
+            return True
+        except Exception as exc:
+            if show_dialogs:
+                QMessageBox.critical(self, "Load Failed", f"Failed to load nectar model:\n{exc}")
+            else:
+                print(f"Failed to load nectar model: {exc}")
+            return False
+
+    def get_nectar_model(self):
+        return self.nectar_model
+
     def _update_both_button(self):
         """Update the 'Run All' button based on whether any models are loaded"""
         any_loaded = (self.hive_model is not None or 
                      self.chamber_model is not None or 
-                     self.pollen_model is not None)
+                     self.pollen_model is not None or
+                     self.nectar_model is not None)
         self.both_inference_btn.setEnabled(any_loaded)
         
     def on_hive_inference_requested(self):

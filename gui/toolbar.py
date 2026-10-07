@@ -2,13 +2,24 @@
 Annotation toolbar with tools and controls
 """
 
-from core.categories import BROOD_CATEGORIES, BROOD_DESCRIPTIONS, CATEGORY_LABELS, category_label
+from core.categories import (STANDARD_BROOD_CATEGORIES, QUEEN_BROOD_CATEGORIES,
+                             BROOD_DESCRIPTIONS, CATEGORY_LABELS, category_label)
+from gui.category_menu import add_category_menu_actions
 
 import math
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QToolButton, QButtonGroup,
                              QSlider, QLabel, QSpinBox, QCheckBox, QMenu, QComboBox)
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtCore import Qt, pyqtSignal, QSignalBlocker
+from PyQt6.QtGui import QIcon
+
+
+class _VisibilityGroupCheckBox(QCheckBox):
+    """Show mixed child states, but let a click choose only all-on or all-off."""
+
+    def nextCheckState(self):
+        self.setCheckState(
+            Qt.CheckState.Unchecked if self.checkState() == Qt.CheckState.Checked
+            else Qt.CheckState.Checked)
 
 
 class AnnotationToolbar(QWidget):
@@ -27,6 +38,7 @@ class AnnotationToolbar(QWidget):
     show_bboxes_changed = pyqtSignal(bool)
     annotation_type_changed = pyqtSignal(str)  # Annotation type selection (bee/hive/chamber)
     annotation_type_visibility_changed = pyqtSignal(str, bool)  # annotation_type, visible
+    annotation_group_visibility_changed = pyqtSignal(object, bool)  # categories, visible
     clear_no_draw_zones_requested = pyqtSignal()
     set_measurement_scale_requested = pyqtSignal()
     clear_measurement_scale_requested = pyqtSignal()
@@ -118,22 +130,57 @@ class AnnotationToolbar(QWidget):
         self.show_pollen_checkbox.setStyleSheet("QCheckBox { background-color: rgba(255, 165, 0, 50); padding: 2px; }")
         self.show_pollen_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('pollen', state))
         row1.addWidget(self.show_pollen_checkbox)
+
+        self.show_nectar_checkbox = QCheckBox("Nectar")
+        self.show_nectar_checkbox.setChecked(False)
+        self.show_nectar_checkbox.setToolTip("Show/hide nectar source annotations (frame-specific)")
+        self.show_nectar_checkbox.setStyleSheet("QCheckBox { background-color: rgba(0, 180, 160, 50); padding: 2px; }")
+        self.show_nectar_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('nectar', state))
+        row1.addWidget(self.show_nectar_checkbox)
         
         self.brood_visibility_actions = {}
-        self.brood_visibility_button = QToolButton()
-        self.brood_visibility_button.setText("Brood")
-        self.brood_visibility_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        brood_menu = QMenu(self.brood_visibility_button)
-        for category in BROOD_CATEGORIES:
-            action = brood_menu.addAction(category_label(category))
-            action.setToolTip(BROOD_DESCRIPTIONS[category])
-            action.setCheckable(True)
-            action.setChecked(False)
-            action.toggled.connect(
-                lambda checked, cat=category: self.annotation_type_visibility_changed.emit(cat, checked))
-            self.brood_visibility_actions[category] = action
-        self.brood_visibility_button.setMenu(brood_menu)
-        row1.addWidget(self.brood_visibility_button)
+        self.brood_visibility_groups = {}
+        self.brood_visibility_checkboxes = {}
+        for name, title, categories in (
+            ('brood', 'Brood', STANDARD_BROOD_CATEGORIES),
+            ('queen_brood', 'Queen brood', QUEEN_BROOD_CATEGORIES),
+        ):
+            self.brood_visibility_groups[name] = categories
+            group = QWidget()
+            group_layout = QHBoxLayout(group)
+            group_layout.setContentsMargins(0, 0, 0, 0)
+            group_layout.setSpacing(2)
+            checkbox = _VisibilityGroupCheckBox()
+            checkbox.setTristate(True)
+            checkbox.setAccessibleName(f'{title} visibility')
+            checkbox.setToolTip(
+                f'{title}: checked = all subclasses on; partial = some on; unchecked = all off.\n'
+                'Click an unchecked or partial box to turn all on; click a checked box to turn all off.\n'
+                'Global mask/box visibility and individual instance switches still apply.')
+            checkbox.stateChanged.connect(
+                lambda state, group_name=name: self._set_brood_group_visibility(group_name, state))
+            self.brood_visibility_checkboxes[name] = checkbox
+            setattr(self, f'{name}_visibility_checkbox', checkbox)
+            group_layout.addWidget(checkbox)
+            button = QToolButton()
+            button.setText(title)
+            button.setToolTip(f'Choose individual {title.lower()} subclasses to show')
+            button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            brood_menu = QMenu(button)
+            for category in categories:
+                action = brood_menu.addAction(category_label(category))
+                action.setData(category)
+                action.setToolTip(BROOD_DESCRIPTIONS[category])
+                action.setCheckable(True)
+                action.setChecked(False)
+                action.toggled.connect(
+                    lambda checked, cat=category, group_name=name:
+                        self._on_brood_subclass_visibility_changed(group_name, cat, checked))
+                self.brood_visibility_actions[category] = action
+            button.setMenu(brood_menu)
+            setattr(self, f'{name}_visibility_button', button)
+            group_layout.addWidget(button)
+            row1.addWidget(group)
 
         # Keep old checkboxes for backward compatibility with segmentation/bbox view modes
         self.segmentation_checkbox = QCheckBox("Segmentations")
@@ -217,14 +264,11 @@ class AnnotationToolbar(QWidget):
         self.new_instance_btn.setToolTip("Choose object type for a new instance")
         self.new_instance_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.new_instance_menu = QMenu(self.new_instance_btn)
-        for category, label in CATEGORY_LABELS.items():
-            action = QAction(label, self.new_instance_menu)
-            if category in BROOD_DESCRIPTIONS:
-                action.setToolTip(BROOD_DESCRIPTIONS[category])
+        self.new_instance_actions = add_category_menu_actions(self.new_instance_menu)
+        for category, action in self.new_instance_actions.items():
             action.triggered.connect(
                 lambda checked=False, cat=category: self.new_instance_requested.emit(cat)
             )
-            self.new_instance_menu.addAction(action)
         self.new_instance_btn.setMenu(self.new_instance_menu)
         row2.addWidget(self.new_instance_btn)
         
@@ -433,6 +477,32 @@ class AnnotationToolbar(QWidget):
         type_map = {label: category for category, label in CATEGORY_LABELS.items()}
         return type_map.get(type_text, 'bee')
     
+    def _sync_brood_group_checkbox(self, group_name):
+        checks = [self.brood_visibility_actions[cat].isChecked()
+                  for cat in self.brood_visibility_groups[group_name]]
+        state = (Qt.CheckState.Checked if all(checks) else
+                 Qt.CheckState.PartiallyChecked if any(checks) else Qt.CheckState.Unchecked)
+        checkbox = self.brood_visibility_checkboxes[group_name]
+        with QSignalBlocker(checkbox):
+            checkbox.setCheckState(state)
+
+    def _on_brood_subclass_visibility_changed(self, group_name, category, checked):
+        self._sync_brood_group_checkbox(group_name)
+        self.annotation_type_visibility_changed.emit(category, checked)
+
+    def _set_brood_group_visibility(self, group_name, state):
+        if state == Qt.CheckState.PartiallyChecked.value:
+            return
+        visible = state == Qt.CheckState.Checked.value
+        categories = self.brood_visibility_groups[group_name]
+        # Update all menu checks first, then request one canvas/sidebar refresh.
+        for category in categories:
+            action = self.brood_visibility_actions[category]
+            with QSignalBlocker(action):
+                action.setChecked(visible)
+        self._sync_brood_group_checkbox(group_name)
+        self.annotation_group_visibility_changed.emit(categories, visible)
+
     def on_annotation_type_visibility_changed(self, annotation_type, state):
         """Handle annotation type visibility checkbox"""
         visible = (state == Qt.CheckState.Checked.value)

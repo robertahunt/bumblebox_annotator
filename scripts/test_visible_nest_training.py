@@ -74,7 +74,7 @@ class VisibleNestTests(unittest.TestCase):
         return frames
 
     def test_new_project_scope_and_dialog(self):
-        self.assertEqual(frame_categories(self.manager.project_info), {'bee', 'hive'} | set(BROOD_CATEGORIES))
+        self.assertEqual(frame_categories(self.manager.project_info), {'bee', 'hive', 'nectar'} | set(BROOD_CATEGORIES))
         dialog = ProjectDialog(default_dir=self.root)
         self.assertEqual(dialog.get_project_info()['hive_annotation_scope'], 'frame')
         dialog.hive_scope_combo.setCurrentIndex(1)
@@ -83,7 +83,7 @@ class VisibleNestTests(unittest.TestCase):
 
     def test_legacy_projects_keep_shared_hives(self):
         for info in ({}, {'project_info': {}}, {'hive_annotation_scope': 'video'}):
-            self.assertEqual(frame_categories(info), {'bee'} | set(BROOD_CATEGORIES))
+            self.assertEqual(frame_categories(info), {'bee', 'nectar'} | set(BROOD_CATEGORIES))
             frame, shared = split_annotations([{'category': 'hive'}, {'category': 'bee'}], info)
             self.assertEqual(frame, [{'category': 'bee'}])
             self.assertEqual(shared, [{'category': 'hive'}])
@@ -93,7 +93,7 @@ class VisibleNestTests(unittest.TestCase):
         info = self.root / 'annotations/project.json'
         info.write_text(json.dumps({'name': 'old project'}))
         self.manager.load_project(self.root)
-        self.assertEqual(frame_categories(self.manager.project_info), {'bee'} | set(BROOD_CATEGORIES))
+        self.assertEqual(frame_categories(self.manager.project_info), {'bee', 'nectar'} | set(BROOD_CATEGORIES))
         before = (self.root / 'annotations/json/video/video_annotations.json').read_bytes()
         paths = export_coco_per_video(self.root, ['video'], 'train')
         coco = json.loads(paths[0].read_text())

@@ -7,6 +7,8 @@ import numpy as np
 def enclosed_mask_region(mask, point, *, filled=False, protected_mask=None):
     """Return editable pixels in the clicked enclosed component, or None.
 
+    Fill travels through edge-sharing pixels only, so a one-pixel diagonal
+    brush or eraser outline remains a barrier.
     Enclosure is checked before excluding protected pixels, so a protection zone
     cannot turn an open outline into a fillable region. The input is not changed.
     """
@@ -24,7 +26,7 @@ def enclosed_mask_region(mask, point, *, filled=False, protected_mask=None):
         return None
     source = np.where(mask > 0, 255, 0).astype(np.uint8)
     flood_mask = np.zeros((height + 2, width + 2), dtype=np.uint8)
-    cv2.floodFill(source, flood_mask, (x, y), 128, flags=8)
+    cv2.floodFill(source, flood_mask, (x, y), 128, flags=4)
     region = source == 128
     if (region[0].any() or region[-1].any()
             or region[:, 0].any() or region[:, -1].any()):

@@ -137,7 +137,7 @@ def parse_args():
     parser.add_argument("--bee-model", type=Path, default=saved["bee_model"] or Path("best.pt"))
     parser.add_argument("--hive-model", type=Path, default=saved["hive_model"])
     parser.add_argument("--pollen-model", type=Path, default=saved["pollen_model"])
-    parser.add_argument("--brood-model", type=Path, help="Experimental five-class brood model; requires a fresh output folder (no resume)")
+    parser.add_argument("--brood-model", type=Path, help="Experimental eight-class brood model including queen brood (legacy five-class models supported); requires a fresh output folder (no resume)")
     parser.add_argument("--chamber-model", type=Path, default=saved["chamber_model"])
     parser.add_argument("--tag-map", type=Path, default=saved["tag_map"], help="Simple allowlist or per-MC-pair CSV")
     parser.add_argument("--exclude-tags", type=Path, default=saved["exclude_tags"])
