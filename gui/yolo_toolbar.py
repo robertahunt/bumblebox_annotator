@@ -2,10 +2,12 @@
 YOLO inference toolbar for running trained model predictions
 """
 
-from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QToolButton, QPushButton,
+from PyQt6.QtWidgets import (QWidget, QToolButton, QPushButton,
                              QLabel, QFileDialog, QMessageBox)
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
+
+from .toolbar import FlowLayout
 
 
 class YOLOToolbar(QWidget):
@@ -30,9 +32,7 @@ class YOLOToolbar(QWidget):
         
     def init_ui(self):
         """Initialize UI"""
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(10)
+        layout = FlowLayout(self, margin=5, hspacing=10, vspacing=4)
         
         # YOLO Model section label
         layout.addWidget(QLabel("<b>Use Coarse-Grained YOLO to Find Bees:</b>"))
@@ -88,7 +88,6 @@ class YOLOToolbar(QWidget):
         self.process_video_btn.clicked.connect(self.on_process_video_requested)
         layout.addWidget(self.process_video_btn)
         
-        layout.addStretch()
         
     def create_separator(self):
         """Create a vertical separator"""

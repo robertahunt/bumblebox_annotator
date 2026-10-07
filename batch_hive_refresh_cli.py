@@ -465,7 +465,7 @@ def ensure_fresh_outputs(output_folder: Path, resume: bool):
     for filename in [
         "bee_detections_hive_refreshed.csv",
         "hive_detections_hive_refreshed.csv",
-        "pollen_detections_hive_refreshed.csv",
+        "pollen_frame_summary_hive_refreshed.csv",
         "temporal_hive_priors_hive_refreshed.csv",
         "hive_refresh_status.csv",
     ]:
@@ -809,7 +809,7 @@ def refresh_video(
         hive_rows,
     )
     append_rows(
-        output_folder / "pollen_detections_hive_refreshed.csv",
+        output_folder / "pollen_frame_summary_hive_refreshed.csv",
         ["video_id", "chamber_id", "frame_number", "pollen_count", "pollen_pixels", "pollen_area_mm2"],
         pollen_rows,
     )
@@ -925,7 +925,7 @@ def main() -> int:
         append=args.resume,
     )
     write_header_if_needed(
-        args.output_folder / "pollen_detections_hive_refreshed.csv",
+        args.output_folder / "pollen_frame_summary_hive_refreshed.csv",
         ["video_id", "chamber_id", "frame_number", "pollen_count", "pollen_pixels", "pollen_area_mm2"],
         append=args.resume,
     )

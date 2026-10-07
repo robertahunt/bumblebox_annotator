@@ -24,7 +24,7 @@ from core.instance_tracker import Detection
 from core.marker_detector import MarkerDetector
 from core.temporal_hive_prior import TemporalHiveOverlap, TemporalChamberStabilizer
 from core.temporal_hive_visualization import TemporalHiveOverlayWriter, resolve_hive_overlay_mode
-from utils.validation_metrics import distance_between_masks, mask_to_simplified_polygon, polygon_to_string
+from utils.validation_metrics import distance_between_masks, mask_to_polygons_string
 
 
 @dataclass
@@ -204,7 +204,8 @@ class BatchVideoProcessor:
                  prior_only: bool = False, hive_overlay_mode: str = 'scored',
                  temporal_overlay_path: Optional[Path] = None,
                  brood_model=None, temporal_brood_map=None, brood_preview=False,
-                 brood_context_id=None):
+                 brood_context_id=None,
+                 polygon_epsilon: float = 2.0):
         """
         Args:
             video_path: Path to video file
@@ -252,6 +253,7 @@ class BatchVideoProcessor:
             brood_model: Optional five-class appearance segmentation model.
             temporal_brood_map: Shared experimental brood history, separate from hive maps.
             brood_preview: Write a separate history-informed brood MP4.
+            polygon_epsilon: Contour simplification percentage for CSV polygons
         """
         self.video_path = video_path
         self.video_id = video_id
@@ -260,6 +262,7 @@ class BatchVideoProcessor:
         self.hive_model = hive_model
         self.chamber_model = chamber_model
         self.pollen_model = pollen_model
+        self.polygon_epsilon = polygon_epsilon
         self.brood_model = brood_model
         self.temporal_brood_map = temporal_brood_map
         self.brood_preview = brood_preview
@@ -362,6 +365,11 @@ class BatchVideoProcessor:
         # Running export counts survive visualization cleanup without retaining every frame.
         self.accumulated_hive_masks: Dict[Tuple[str, int], Dict] = {}
         self.accumulated_chamber_masks: Dict[Tuple[str, int], Dict] = {}
+        # Per-instance counts are keyed by (video_id, chamber_id, instance_id), with
+        # instances numbered left-to-right within each chamber.
+        self.accumulated_hive_instance_masks: Dict[Tuple[str, int, int], Dict] = {}
+        self.accumulated_pollen_masks: Dict[Tuple[str, int], Dict] = {}
+        self.accumulated_pollen_instance_masks: Dict[Tuple[str, int, int], Dict] = {}
         
         # Per-frame visualization data
         self.chambers_by_frame: Dict[int, Dict] = {}  # frame_number -> chambers_detected
@@ -755,6 +763,12 @@ class BatchVideoProcessor:
             hive_results[0] if hive_results is not None else None,
             chambers_detected
         )
+        hive_instance_masks_by_chamber = {}
+        if not self.prior_only:
+            hive_instance_masks_by_chamber = self._extract_hive_instance_masks(
+                hive_results[0] if hive_results is not None else None,
+                chambers_detected
+            )
         # Delete YOLO result objects to free GPU memory immediately
         if hive_results is not None:
             del hive_results
@@ -775,6 +789,10 @@ class BatchVideoProcessor:
             t0 = time.perf_counter()
             hive_masks_by_chamber = self._exclude_pollen_from_hive_masks(
                 hive_masks_by_chamber,
+                pollen_by_chamber,
+            )
+            hive_instance_masks_by_chamber = self._exclude_pollen_from_hive_instance_masks(
+                hive_instance_masks_by_chamber,
                 pollen_by_chamber,
             )
             self._record_timing('hive_pollen_exclusion', time.perf_counter() - t0, frame_timings)
@@ -805,7 +823,13 @@ class BatchVideoProcessor:
             self._record_timing('temporal_hive_prior', time.perf_counter() - t0, frame_timings)
 
         if not self.prior_only:
-            self._accumulate_export_masks(hive_masks_by_chamber, chambers_detected)
+            self._accumulate_export_masks(
+                hive_masks_by_chamber,
+                chambers_detected,
+                hive_instance_masks_by_chamber=hive_instance_masks_by_chamber,
+                pollen_by_chamber=pollen_by_chamber if self.pollen_model is not None else None,
+                frame_shape=frame.shape[:2],
+            )
 
             # 9. Save chamber frame data (hive pixels per chamber)
             for chamber_id, hive_mask in hive_masks_by_chamber.items():
@@ -1194,8 +1218,59 @@ class BatchVideoProcessor:
                 self._temporal_overlay_failed = True
                 self._log(f'Temporal hive overlay cache failed: {exc}')
 
-    def _accumulate_export_masks(self, hive_masks_by_chamber: Dict, chambers_detected: Dict):
+    def _accumulate_instance_masks(self, accumulated: Dict, chamber_id: int, masks: List[np.ndarray]):
+        """Accumulate separate instances by their sorted per-chamber instance index."""
+        for instance_idx, mask in enumerate(masks, 1):
+            if mask is None:
+                continue
+            key = (self.video_id, chamber_id, instance_idx)
+            if key not in accumulated:
+                accumulated[key] = {
+                    'accumulated_mask': np.zeros(mask.shape, dtype=np.uint32),
+                    'frame_count': 0,
+                    'shape': mask.shape,
+                }
+            data = accumulated[key]
+            data['accumulated_mask'] += mask > 0
+            data['frame_count'] += 1
+
+    def _accumulate_export_masks(self, hive_masks_by_chamber: Dict, chambers_detected: Dict,
+                                 hive_instance_masks_by_chamber: Optional[Dict] = None,
+                                 pollen_by_chamber: Optional[Dict] = None,
+                                 frame_shape: Optional[Tuple[int, int]] = None):
         """Accumulate each analyzed frame once, independently of visualization storage."""
+        for chamber_id, masks in (hive_instance_masks_by_chamber or {}).items():
+            self._accumulate_instance_masks(self.accumulated_hive_instance_masks, chamber_id, masks)
+
+        # pollen_by_chamber is None when no pollen model is loaded.
+        for chamber_id, pollen_balls in (pollen_by_chamber or {}).items():
+            pollen_masks = [
+                pollen['mask'] for pollen in sorted(
+                    pollen_balls,
+                    key=lambda pollen: tuple(
+                        pollen.get('centroid') or self._mask_centroid(pollen.get('mask'), pollen.get('bbox'))
+                    ),
+                )
+                if pollen.get('mask') is not None and np.any(pollen['mask'] > 0)
+            ]
+            self._accumulate_instance_masks(self.accumulated_pollen_instance_masks, chamber_id, pollen_masks)
+
+            shape = pollen_masks[0].shape[:2] if pollen_masks else frame_shape
+            if shape is None:
+                continue
+            key = (self.video_id, chamber_id)
+            if key not in self.accumulated_pollen_masks:
+                self.accumulated_pollen_masks[key] = {
+                    'accumulated_mask': np.zeros(shape, dtype=np.uint32),
+                    'frame_count': 0,
+                    'shape': shape,
+                }
+            data = self.accumulated_pollen_masks[key]
+            combined_mask = self._combined_pollen_mask(pollen_balls, data['shape'])
+            if combined_mask is not None:
+                data['accumulated_mask'] += combined_mask > 0
+            data['frame_count'] += 1
+
         for chamber_id, mask in hive_masks_by_chamber.items():
             if mask is None:
                 continue
@@ -1228,6 +1303,61 @@ class BatchVideoProcessor:
             centroid = chamber_info.get('centroid')
             if centroid is not None:
                 data['accumulated_centroid'] += np.asarray(centroid, dtype=np.float64)
+
+    def _extract_hive_instance_masks(self, hive_result, chambers_detected: Dict) -> Dict[int, List[np.ndarray]]:
+        """
+        Extract separate hive segmentation instance masks per chamber.
+
+        Instances are sorted left-to-right within each chamber so downstream averaging can
+        assign stable per-chamber instance ids.
+        """
+        chamber_ids = list(chambers_detected.keys()) if chambers_detected else [0]
+        hive_instances_by_chamber = {chamber_id: [] for chamber_id in chamber_ids}
+
+        if hive_result is None or hive_result.masks is None or len(hive_result.masks) == 0:
+            return hive_instances_by_chamber
+
+        for idx in range(len(hive_result.masks)):
+            mask = hive_result.masks.data[idx].detach().cpu().numpy()
+            if mask.shape[:2] != hive_result.orig_shape[:2]:
+                mask = cv2.resize(
+                    mask,
+                    (hive_result.orig_shape[1], hive_result.orig_shape[0]),
+                    interpolation=cv2.INTER_NEAREST
+                )
+            mask = (mask > 0.5).astype(np.uint8)
+
+            if not np.any(mask > 0):
+                continue
+
+            if not chambers_detected:
+                hive_instances_by_chamber[0].append(mask)
+                continue
+
+            best_chamber_id = None
+            best_overlap = 0
+            for chamber_id, chamber_info in chambers_detected.items():
+                chamber_mask = chamber_info.get('mask')
+                if chamber_mask is None:
+                    continue
+                overlap = int(np.logical_and(chamber_mask > 0, mask > 0).sum())
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_chamber_id = chamber_id
+
+            if best_chamber_id is not None and best_overlap > 0:
+                hive_instances_by_chamber[best_chamber_id].append(mask)
+
+        def centroid_sort_key(mask):
+            coords = np.argwhere(mask > 0)
+            if len(coords) == 0:
+                return (float('inf'), float('inf'))
+            return (float(np.mean(coords[:, 1])), float(np.mean(coords[:, 0])))
+
+        for chamber_id in hive_instances_by_chamber:
+            hive_instances_by_chamber[chamber_id].sort(key=centroid_sort_key)
+
+        return hive_instances_by_chamber
 
     def _extract_hive_masks(self, hive_result, chambers_detected: Dict) -> Dict[int, Optional[np.ndarray]]:
         """
@@ -1495,6 +1625,24 @@ class BatchVideoProcessor:
             corrected_mask[pollen_mask > 0] = 0
             corrected[chamber_id] = corrected_mask
 
+        return corrected
+
+    def _exclude_pollen_from_hive_instance_masks(
+        self,
+        hive_instance_masks_by_chamber: Dict[int, List[np.ndarray]],
+        pollen_by_chamber: Dict[int, List[Dict]],
+    ) -> Dict[int, List[np.ndarray]]:
+        """Remove pollen pixels from separate hive instances chamber-by-chamber."""
+        corrected = {}
+        for chamber_id, masks in hive_instance_masks_by_chamber.items():
+            pollen_balls = pollen_by_chamber.get(chamber_id, [])
+            corrected[chamber_id] = []
+            for mask in masks:
+                pollen_mask = self._combined_pollen_mask(pollen_balls, mask.shape[:2])
+                if pollen_mask is not None:
+                    mask = mask.copy()
+                    mask[pollen_mask > 0] = 0
+                corrected[chamber_id].append(mask)
         return corrected
     
     def _process_bee_detections(self, bee_detections: List[Detection], frame_number: int,
@@ -2410,8 +2558,7 @@ class BatchVideoProcessor:
         if mask is None:
             return ""
 
-        polygon = mask_to_simplified_polygon((mask > 0).astype(np.uint8), epsilon_percent=2.0)
-        return polygon_to_string(polygon)
+        return mask_to_polygons_string((mask > 0).astype(np.uint8), epsilon_percent=self.polygon_epsilon)
 
     def _calculate_centroid_distance_matrix(self, centroids: List[Tuple[float, float]]) -> np.ndarray:
         """Calculate all pairwise centroid distances for one chamber."""
@@ -2902,6 +3049,18 @@ class BatchVideoProcessor:
     def get_accumulated_chamber_masks(self) -> Dict[Tuple[str, int], Dict]:
         """Get full-video chamber counts and centroid sums for CSV export."""
         return self.accumulated_chamber_masks
+
+    def get_accumulated_hive_instance_masks(self) -> Dict[Tuple[str, int, int], Dict]:
+        """Get full-video counts for separate hive instances."""
+        return self.accumulated_hive_instance_masks
+
+    def get_accumulated_pollen_masks(self) -> Dict[Tuple[str, int], Dict]:
+        """Get full-video pollen counts per chamber."""
+        return self.accumulated_pollen_masks
+
+    def get_accumulated_pollen_instance_masks(self) -> Dict[Tuple[str, int, int], Dict]:
+        """Get full-video counts for separate pollen instances."""
+        return self.accumulated_pollen_instance_masks
     
     def get_bee_masks_by_frame(self) -> Dict[int, Dict[int, Optional[np.ndarray]]]:
         """Get bee masks per frame per bee_id"""

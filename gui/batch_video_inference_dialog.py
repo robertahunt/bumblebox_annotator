@@ -51,8 +51,9 @@ class BatchVideoInferenceConfigDialog(QDialog):
             "• bee_identity_segments.csv - Track stretches scored by ArUco identity support<br>"
             "• pollen_detections.csv - Per-frame pollen counts/pixels by chamber when a pollen model is provided<br>"
             "• bee_velocity.csv - Average velocity and frame transitions per bee<br>"
-            "• hive_detections.csv - Averaged hive pixels and centroid per chamber (when hive model is provided)<br>"
-            "• chamber_detections.csv - Averaged chamber pixels and centroid per chamber<br>"
+            "• hive_detections.csv - Averaged hive pixels, centroid, and polygon per hive instance (when hive model is provided)<br>"
+            "• pollen_detections.csv - Averaged pollen pixels, centroid, and polygon per pollen instance (when pollen model is provided)<br>"
+            "• chamber_detections.csv - Averaged chamber pixels, centroid, and polygon per chamber instance<br>"
             "• temporal_hive_priors.csv - Stable chamber-normalized hive perimeter (when temporal prior is enabled)<br>"
             "• Optional: Annotated MP4 videos or frame images with tracking trails"
         )
@@ -646,6 +647,13 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.save_visualizations_check.stateChanged.connect(self._update_visualization_controls)
         self.resume_completed_check.stateChanged.connect(self._update_visualization_controls)
         output_layout.addWidget(self.save_visualizations_check)
+
+        self.high_resolution_polygons_check = QCheckBox("Output high resolution polygons")
+        self.high_resolution_polygons_check.setChecked(False)
+        self.high_resolution_polygons_check.setToolTip(
+            "Use lighter polygon simplification in CSV outputs. Files will be larger, but contours will preserve more detail."
+        )
+        output_layout.addWidget(self.high_resolution_polygons_check)
 
         viz_form = QFormLayout()
         viz_form.setContentsMargins(20, 0, 0, 0)
@@ -1495,6 +1503,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
             'resume_completed_videos': self.resume_completed_check.isChecked(),
             'resume_ignore_config_mismatch': self.resume_ignore_config_mismatch_check.isChecked(),
             'save_visualizations': self.save_visualizations_check.isChecked(),
+            'high_resolution_polygons': self.high_resolution_polygons_check.isChecked(),
             'visualization_format': (
                 'video' if self.visualization_format_combo.currentText().startswith("MP4") else 'frames'
             ),

@@ -15,6 +15,7 @@ import torch
 from ultralytics import YOLO
 from training.gpu import require_cuda_device
 from core.coco_masks import decode_segmentation
+from .carbon_tracking import CarbonTrainingRun
 
 class YOLOTrainingWorkerInstanceFocused(QThread):
     """Worker thread for instance-focused YOLO training (single-instance refinement)"""
@@ -30,6 +31,7 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
         self.project_path = Path(project_path)
         self.config = config
         self.should_stop = False
+        self._last_carbon_metrics = {}
         
     def stop(self):
         """Request training to stop"""
@@ -465,17 +467,36 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
         model.add_callback('on_train_epoch_end', callback.on_train_epoch_end)
         model.add_callback('on_val_end', callback.on_val_end)
         
-        # Train
         from training.raster_masks import RasterSegmentationTrainer, raster_training_options
         training_params.update(raster_training_options())
         self.stage_update.emit(
             "Using exact instance masks with paired affine/flips and color augmentation; "
             "mosaic, mixup, copy-paste, cutmix and perspective disabled."
         )
-        results = model.train(trainer=RasterSegmentationTrainer, **training_params)
-        
-        # Return best model path
-        best_model_path = output_dir / self.config.get('name', 'bee_segmentation_instance_focused') / 'weights' / 'best.pt'
+
+        training_name = self.config.get('name', 'bee_segmentation_instance_focused')
+        carbon_run = CarbonTrainingRun(
+            self.project_path,
+            model_kind="yolo_instance_focused",
+            training_name=training_name,
+            config=training_params,
+        )
+
+        carbon_run.start()
+        try:
+            # Train
+            results = model.train(trainer=RasterSegmentationTrainer, **training_params)
+
+            # Return best model path
+            best_model_path = output_dir / training_name / 'weights' / 'best.pt'
+            status = "cancelled" if self.should_stop else "completed"
+            carbon_run.finish(status=status, model_path=best_model_path)
+            self._last_carbon_metrics = carbon_run.metrics_for_final_report()
+        except Exception as exc:
+            carbon_run.finish(status="failed", error=f"{type(exc).__name__}: {exc}")
+            self._last_carbon_metrics = carbon_run.metrics_for_final_report()
+            raise
+
         return best_model_path
     
     def _get_final_metrics(self, model_path):
@@ -496,8 +517,9 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
                     'precision': last_row.get('metrics/precision(B)', 0.0),
                     'recall': last_row.get('metrics/recall(B)', 0.0),
                 }
+                metrics.update(self._last_carbon_metrics)
                 return metrics
         except (ImportError, Exception) as e:
             print(f"Could not parse metrics: {e}")
         
-        return {}
+        return dict(self._last_carbon_metrics)

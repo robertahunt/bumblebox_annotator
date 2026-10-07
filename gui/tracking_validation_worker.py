@@ -16,7 +16,9 @@ from scipy.optimize import linear_sum_assignment
 from collections import defaultdict
 import copy
 
+from core.aruco_tracking_identity import ArucoTrackingIdentityManager
 from core.instance_tracker import InstanceTracker, Detection, Track
+from utils.validation_metrics import mask_to_simplified_polygon, polygon_to_string
 
 
 class SimpleIoUTracker:
@@ -230,6 +232,9 @@ class TrackingValidationWorker(QThread):
         self.main_window = main_window
         self.config = config
         self.should_stop = False
+        self._external_aruco_index = None
+        self._external_aruco_path = None
+        self._external_aruco_video_ids = None
     
     def stop(self):
         """Request worker to stop"""
@@ -245,6 +250,18 @@ class TrackingValidationWorker(QThread):
                 self.log_message.emit("Detection Source: Ground Truth Annotations (perfect detections)")
             else:
                 self.log_message.emit(f"Detection Source: Model ({Path(self.config['model_path']).name})")
+            self.log_message.emit(
+                f"ArUco tracking guidance: {'Enabled' if self.config.get('enable_aruco', False) else 'Disabled'}"
+            )
+            if self.config.get('enable_aruco', False):
+                aruco_source = self.config.get('aruco_source', 'builtin')
+                if aruco_source == 'external':
+                    self.log_message.emit(
+                        f"ArUco source: external CSV ({self.config.get('external_aruco_path', '')})"
+                    )
+                    self._load_external_aruco_index()
+                else:
+                    self.log_message.emit("ArUco source: built-in detector")
             self.log_message.emit(f"Sequences: {len(self.config['sequences'])}")
             self.log_message.emit(f"Algorithms: {', '.join(self.config['algorithms'].keys())}")
             self.log_message.emit("")
@@ -355,7 +372,30 @@ class TrackingValidationWorker(QThread):
         if self.config.get('save_visualizations', False):
             viz_folder = results_folder / 'visualizations' / f"{sequence.sequence_id}_{algo_name}"
             viz_folder.mkdir(parents=True, exist_ok=True)
+
+        aruco_identity = None
+        use_aruco_tracking = self.config.get('enable_aruco', False)
+        requested_aruco_source = self.config.get('aruco_source', 'builtin')
+        aruco_source = requested_aruco_source
+        external_aruco_available = False
+        if use_aruco_tracking:
+            aruco_identity = ArucoTrackingIdentityManager(
+                log_callback=self.log_message.emit,
+                verbose_output=False
+            )
+            if requested_aruco_source == 'external':
+                external_aruco_available = self._external_aruco_available_for_video(sequence.video_id)
+                if not external_aruco_available:
+                    aruco_source = 'builtin'
+                    self.log_message.emit(
+                        f"    No external ArUco CSV rows found for {sequence.video_id}; "
+                        "falling back to built-in detector"
+                    )
+                else:
+                    self.log_message.emit(f"    Using external ArUco CSV rows for {sequence.video_id}")
         
+        video_aruco_tracking = self._load_video_aruco_tracking(sequence.video_id)
+
         # Load ground truth for all frames  
         gt_frames = {}
         for frame_idx in sequence.frame_range:
@@ -379,6 +419,20 @@ class TrackingValidationWorker(QThread):
         id_mapping = {}  # Maps predicted_id -> gt_id (established in first frame)
         frame_metrics = []
         prev_frame_positions = {}  # Maps gt_id -> centroid position for tracking lines
+        processed_frames = []
+
+        def merge_validation_tracks(source_id: int, target_id: int, aruco_code: str):
+            """Retroactively apply ArUco re-identification to processed validation frames."""
+            for processed in processed_frames:
+                for det in processed['detections']:
+                    if det.instance_id == source_id:
+                        det.instance_id = target_id
+                if source_id in processed.get('aruco_detections', {}):
+                    processed['aruco_detections'][target_id] = processed['aruco_detections'].pop(source_id)
+            self.log_message.emit(
+                f"    ArUco re-identification: merged track {source_id} into {target_id} "
+                f"(ArUco {aruco_code})"
+            )
         
         for frame_idx in sequence.frame_range:
             # Load frame image
@@ -398,7 +452,7 @@ class TrackingValidationWorker(QThread):
             if use_ground_truth:
                 # Use ground truth annotations as perfect detections
                 gt_annotations = gt_frames[frame_idx]
-                detections = self._gt_to_detections(gt_annotations)
+                detections = self._gt_to_detections(gt_annotations, frame.shape)
                 self.log_message.emit(f"    Using {len(detections)} ground truth detections")
             else:
                 # Run detection model
@@ -434,34 +488,137 @@ class TrackingValidationWorker(QThread):
                 # Simple trackers return detections directly with IDs set
                 detections = tracker.update(detections)
                 self.log_message.emit(f"    Tracked {len(detections)} objects")
-            
-            # Match to ground truth and calculate metrics
-            gt_annotations = gt_frames[frame_idx]
-            
-            if frame_idx == sequence.start_frame:
-                # First frame - establish ID mapping
-                self.log_message.emit(f"    Establishing ID mapping in first frame...")
+
+            aruco_detections = {}
+            aruco_match_stats = {}
+            if aruco_identity is not None:
+                if aruco_source == 'external':
+                    external_markers = self._get_external_aruco_records(
+                        sequence.video_id, frame_idx, frame_path
+                    )
+                    marker_codes, aruco_detections, aruco_match_stats = self._match_external_aruco_to_bees(
+                        external_markers, detections, frame_idx=frame_idx
+                    )
+                    if external_markers and len(aruco_detections) != len(external_markers):
+                        self._log_external_aruco_match_stats(
+                            frame_idx, external_markers, detections, aruco_match_stats
+                        )
+                    aruco_identity.apply_bee_aruco_codes(
+                        bee_detections=detections,
+                        frame_count=frame_idx,
+                        marker_codes=marker_codes,
+                        merge_callback=merge_validation_tracks
+                    )
+                    aruco_detections = self._remap_aruco_detections_after_identity_update(
+                        aruco_detections,
+                        detections,
+                        aruco_identity,
+                    )
+                else:
+                    aruco_detections = aruco_identity.detect_bee_aruco_codes(
+                        frame=frame,
+                        bee_detections=detections,
+                        frame_count=frame_idx,
+                        merge_callback=merge_validation_tracks
+                    )
+
+            processed_frames.append({
+                'frame_idx': frame_idx,
+                'frame_path': frame_path,
+                'detections': detections,
+                'gt_annotations': gt_frames[frame_idx],
+                'aruco_detections': aruco_detections,
+                'aruco_match_stats': aruco_match_stats if aruco_source == 'external' else {},
+            })
+
+        mapping_initialized = False
+        sequence_detection_rows = []
+        sequence_aruco_summary = defaultdict(int)
+        sequence_aruco_summary['aruco_requested_source'] = requested_aruco_source if use_aruco_tracking else 'disabled'
+        sequence_aruco_summary['aruco_detection_source'] = aruco_source if use_aruco_tracking else 'disabled'
+        sequence_aruco_summary['external_aruco_available'] = bool(external_aruco_available)
+        sequence_aruco_summary['external_aruco_fallback_to_builtin'] = (
+            requested_aruco_source == 'external' and aruco_source == 'builtin'
+        )
+        for processed in processed_frames:
+            frame_idx = processed['frame_idx']
+            detections = processed['detections']
+            gt_annotations = processed['gt_annotations']
+            aruco_detections = processed.get('aruco_detections', {})
+
+            if not mapping_initialized:
+                self.log_message.emit(f"    Establishing ID mapping in first evaluated frame...")
                 self.log_message.emit(f"    Detections have IDs: {[d.instance_id for d in detections]}")
                 id_mapping = self._establish_id_mapping(detections, gt_annotations)
                 self.log_message.emit(f"    ID mapping: {id_mapping}")
-            
-            # Calculate frame metrics
-            # Make a copy of id_mapping before metrics (for visualization to detect switches)
+                mapping_initialized = True
+
             id_mapping_before_metrics = id_mapping.copy()
-            
+            detection_status_for_export = self._classify_detections(
+                detections, gt_annotations, id_mapping_before_metrics.copy()
+            )
+
             metrics = self._calculate_frame_metrics(
                 detections, gt_annotations, id_mapping
             )
             frame_metrics.append(metrics)
-            
-            # Save visualization if enabled (use mapping from before metrics update)
-            if viz_folder is not None:
-                self._save_frame_visualization(
-                    frame, detections, gt_annotations, id_mapping_before_metrics, 
-                    prev_frame_positions, frame_idx, viz_folder, metrics
+
+            rows, aruco_summary = self._build_detection_export_rows(
+                sequence=sequence,
+                algo_name=algo_name,
+                frame_idx=frame_idx,
+                detections=detections,
+                gt_annotations=gt_annotations,
+                detection_status=detection_status_for_export,
+                aruco_detections=aruco_detections,
+                aruco_identity=aruco_identity,
+                video_aruco_tracking=video_aruco_tracking
+            )
+            if self.config.get('export_bee_detections', False):
+                sequence_detection_rows.extend(rows)
+            for key, value in aruco_summary.items():
+                sequence_aruco_summary[key] += value
+            if aruco_source == 'external':
+                match_stats = processed.get('aruco_match_stats', {})
+                sequence_aruco_summary['num_external_csv_aruco_rows'] += match_stats.get('csv_aruco_rows', 0)
+                sequence_aruco_summary['num_external_csv_noid_rows'] += match_stats.get('csv_noid_rows', 0)
+                sequence_aruco_summary['num_external_csv_aruco_or_noid_rows'] += match_stats.get('csv_rows', 0)
+                sequence_aruco_summary['num_external_csv_linked_aruco_rows'] += match_stats.get('linked_aruco_rows', 0)
+                sequence_aruco_summary['num_external_csv_linked_noid_rows'] += match_stats.get('linked_noid_rows', 0)
+                sequence_aruco_summary['num_external_csv_aruco_detections'] += aruco_summary.get(
+                    'num_aruco_detections', 0
                 )
-            
-            # Update previous frame positions for next iteration
+                sequence_aruco_summary['num_external_csv_noid_detections'] += aruco_summary.get(
+                    'num_noid_detections', 0
+                )
+                sequence_aruco_summary['num_external_csv_aruco_or_noid_detections'] += aruco_summary.get(
+                    'num_aruco_or_noid_detections', 0
+                )
+            elif aruco_source == 'builtin':
+                sequence_aruco_summary['num_builtin_aruco_detections'] += aruco_summary.get(
+                    'num_aruco_detections', 0
+                )
+                sequence_aruco_summary['num_builtin_noid_detections'] += aruco_summary.get(
+                    'num_noid_detections', 0
+                )
+                sequence_aruco_summary['num_builtin_aruco_or_noid_detections'] += aruco_summary.get(
+                    'num_aruco_or_noid_detections', 0
+                )
+
+            if viz_folder is not None:
+                frame = cv2.imread(str(processed['frame_path']))
+                if frame is not None:
+                    aruco_assignments = (
+                        aruco_identity.bee_to_aruco.copy()
+                        if aruco_identity is not None
+                        else {}
+                    )
+                    self._save_frame_visualization(
+                        frame, detections, gt_annotations, id_mapping_before_metrics,
+                        prev_frame_positions, frame_idx, viz_folder, metrics,
+                        aruco_assignments
+                    )
+
             current_frame_positions = {}
             for gt in gt_annotations:
                 gt_id = gt.get('mask_id', gt.get('instance_id'))
@@ -471,8 +628,11 @@ class TrackingValidationWorker(QThread):
                         current_frame_positions[gt_id] = centroid
             prev_frame_positions = current_frame_positions
         
+        if self.config.get('export_bee_detections', False) and sequence_detection_rows:
+            self._append_bee_detection_rows(results_folder, algo_name, sequence_detection_rows)
+
         # Aggregate sequence metrics
-        return self._aggregate_sequence_metrics(frame_metrics, sequence)
+        return self._aggregate_sequence_metrics(frame_metrics, sequence, sequence_aruco_summary)
     
     def _yolo_to_detections(self, yolo_result) -> List[Detection]:
         """Convert YOLO results to Detection objects"""
@@ -503,7 +663,14 @@ class TrackingValidationWorker(QThread):
                                     interpolation=cv2.INTER_NEAREST)
                     if idx == 0:
                         print(f"[MASK RESIZE] After resize: {mask.shape}")
-                mask = (mask > 0.5).astype(np.uint8)
+                mask = ((mask > 0.5).astype(np.uint8)) * 255
+            elif self.config.get('enable_aruco', False):
+                frame_height, frame_width = yolo_result.orig_shape[:2]
+                mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+                x1, y1, x2, y2 = bbox.astype(int)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(frame_width, x2), min(frame_height, y2)
+                mask[y1:y2, x1:x2] = 255
             
             det = Detection(
                 bbox=bbox,
@@ -516,7 +683,7 @@ class TrackingValidationWorker(QThread):
         
         return detections
     
-    def _gt_to_detections(self, gt_annotations) -> List[Detection]:
+    def _gt_to_detections(self, gt_annotations, frame_shape=None) -> List[Detection]:
         """Convert ground truth annotations to Detection objects"""
         detections = []
         
@@ -545,6 +712,16 @@ class TrackingValidationWorker(QThread):
                 bbox = self._mask_to_bbox(mask)
             else:
                 continue  # Skip if no mask or bbox
+
+            if mask is None and self.config.get('enable_aruco', False) and frame_shape is not None:
+                frame_height, frame_width = frame_shape[:2]
+                mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+                x1, y1, x2, y2 = bbox.astype(int)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(frame_width, x2), min(frame_height, y2)
+                mask[y1:y2, x1:x2] = 255
+            elif mask is not None and mask.max() <= 1:
+                mask = (mask.astype(np.uint8)) * 255
             
             det = Detection(
                 bbox=bbox,
@@ -642,6 +819,8 @@ class TrackingValidationWorker(QThread):
             'id_switches': 0,
             'total_iou': 0.0,
             'matched_count': 0,
+            'num_bee_detections': len(detections),
+            'num_gt_bees': len(gt_annotations),
         }
         
         if not gt_annotations:
@@ -834,15 +1013,650 @@ class TrackingValidationWorker(QThread):
                 bbox[1] + bbox[3]  # y2 = y + height
             ]
         return bbox
+
+    def _load_external_aruco_index(self):
+        """Load external ArUco detections from a CSV file or folder of CSV files."""
+        external_path = self.config.get('external_aruco_path', '')
+        if not external_path:
+            return self._empty_external_aruco_index()
+
+        target_video_ids = self._external_aruco_target_video_ids()
+        if (
+            self._external_aruco_index is not None
+            and self._external_aruco_path == external_path
+            and self._external_aruco_video_ids == target_video_ids
+        ):
+            return self._external_aruco_index
+
+        path = Path(external_path)
+        if path.is_file():
+            csv_paths = [path]
+        elif path.is_dir():
+            csv_paths = self._find_external_aruco_csv_paths(path, target_video_ids)
+        else:
+            self.log_message.emit(f"  WARNING: External ArUco path does not exist: {path}")
+            self._external_aruco_index = self._empty_external_aruco_index()
+            self._external_aruco_path = external_path
+            self._external_aruco_video_ids = target_video_ids
+            return self._external_aruco_index
+
+        index = self._empty_external_aruco_index()
+        skipped_rows = 0
+        skipped_files = 0
+
+        for csv_path in csv_paths:
+            loaded_from_file = 0
+            try:
+                with open(csv_path, 'r', newline='') as f:
+                    reader = csv.DictReader(f)
+                    if not reader.fieldnames:
+                        skipped_files += 1
+                        continue
+
+                    for row in reader:
+                        record = self._external_aruco_record_from_row(row, csv_path)
+                        if not record:
+                            skipped_rows += 1
+                            continue
+                        self._add_external_aruco_record(index, record)
+                        loaded_from_file += 1
+            except Exception as e:
+                skipped_files += 1
+                self.log_message.emit(f"  WARNING: Could not read external ArUco CSV {csv_path}: {e}")
+
+            if loaded_from_file:
+                index['total_records'] += loaded_from_file
+
+        self._external_aruco_index = index
+        self._external_aruco_path = external_path
+        self._external_aruco_video_ids = target_video_ids
+        self.log_message.emit(
+            f"  Loaded {index['total_records']} external ArUco detection rows "
+            f"from {len(csv_paths)} CSV file(s)"
+        )
+        if skipped_files or skipped_rows:
+            self.log_message.emit(
+                f"  External ArUco skipped {skipped_files} file(s), {skipped_rows} row(s)"
+            )
+        return index
+
+    def _external_aruco_target_video_ids(self):
+        """Return selected validation video IDs for targeted external CSV discovery."""
+        video_ids = {
+            getattr(sequence, 'video_id', None)
+            for sequence in self.config.get('sequences', [])
+        }
+        return frozenset(video_id for video_id in video_ids if video_id)
+
+    def _find_external_aruco_csv_paths(self, folder, target_video_ids):
+        """Find likely external ArUco CSVs without opening unrelated files."""
+        if not target_video_ids:
+            return sorted(folder.rglob('*.csv'))
+
+        if len(target_video_ids) > 20:
+            csv_paths = [
+                csv_path for csv_path in folder.rglob('*.csv')
+                if any(video_id in csv_path.name for video_id in target_video_ids)
+            ]
+        else:
+            csv_paths = set()
+            for video_id in sorted(target_video_ids):
+                csv_paths.update(folder.rglob(f"*{video_id}*.csv"))
+            csv_paths = sorted(csv_paths)
+
+        self.log_message.emit(
+            f"  External ArUco CSV search: {len(csv_paths)} candidate file(s) "
+            f"for {len(target_video_ids)} selected video(s)"
+        )
+        return csv_paths
+
+    def _empty_external_aruco_index(self):
+        """Return the empty index structure used for external ArUco detections."""
+        return {
+            'by_frame': defaultdict(list),
+            'by_stem': defaultdict(list),
+            'videos': set(),
+            'total_records': 0,
+        }
+
+    def _external_aruco_record_from_row(self, row, csv_path):
+        """Normalize one external ArUco CSV row into a small marker record."""
+        code = self._row_value(row, ('tag_id', 'ID', 'aruco_id', 'aruco_code', 'marker_id'))
+        if code.upper() == 'X' or csv_path.stem.lower().endswith('_noid'):
+            code = 'noID'
+        if code == "":
+            return None
+
+        x_value = self._row_value(
+            row,
+            ('center_x', 'centroidX', 'aruco_centroidX', 'centerX', 'x')
+        )
+        y_value = self._row_value(
+            row,
+            ('center_y', 'centroidY', 'aruco_centroidY', 'centerY', 'y')
+        )
+        instance_id = self._parse_optional_int(
+            self._row_value(row, ('instance_id', 'bee_id', 'mask_id', 'track_id'))
+        )
+
+        if (x_value == "" or y_value == "") and instance_id is None:
+            return None
+
+        x = self._parse_optional_float(x_value)
+        y = self._parse_optional_float(y_value)
+        if (x_value != "" or y_value != "") and (x is None or y is None):
+            return None
+
+        frame_number = self._parse_optional_int(
+            self._row_value(row, ('frame', 'frame_number', 'frame_idx', 'frame_index', 'image_index'))
+        )
+        path_value = self._row_value(
+            row,
+            ('image_path', 'relative_image_path', 'filename', 'file', 'source_csv')
+        )
+        video_id = self._row_value(row, ('video_id', 'video', 'source_video'))
+        image_stem = ""
+        if path_value:
+            image_stem = Path(path_value).stem
+            if not video_id:
+                video_id = self._video_id_from_external_stem(image_stem)
+
+        source_csv_value = self._row_value(row, ('source_csv', 'source_csv_path'))
+        if not video_id and source_csv_value:
+            video_id = self._video_id_from_external_stem(Path(source_csv_value).stem)
+        if not video_id:
+            video_id = self._video_id_from_external_stem(csv_path.stem)
+
+        return {
+            'code': str(code).strip(),
+            'x': x,
+            'y': y,
+            'instance_id': instance_id,
+            'frame_number': frame_number,
+            'video_id': video_id,
+            'image_stem': image_stem,
+            'source_csv': str(csv_path),
+        }
+
+    def _add_external_aruco_record(self, index, record):
+        """Add one normalized external ArUco record to all useful lookup keys."""
+        frame_number = record.get('frame_number')
+        video_id = record.get('video_id') or ""
+        image_stem = record.get('image_stem') or ""
+
+        if frame_number is not None:
+            if video_id:
+                index['by_frame'][(video_id, frame_number)].append(record)
+            else:
+                index['by_frame'][("", frame_number)].append(record)
+
+        if image_stem:
+            index['by_stem'][image_stem].append(record)
+            if video_id:
+                index['by_stem'][f"{video_id}/{image_stem}"].append(record)
+
+        if video_id:
+            index['videos'].add(video_id)
+
+    def _external_aruco_available_for_video(self, video_id):
+        """Return True when the external CSV index has rows for this video."""
+        if not video_id:
+            return False
+        index = self._load_external_aruco_index()
+        return video_id in index.get('videos', set())
+
+    def _get_external_aruco_records(self, video_id, frame_idx, frame_path):
+        """Return external ArUco records for one validation frame."""
+        index = self._load_external_aruco_index()
+        frame_stem = frame_path.stem
+        candidate_records = []
+        candidate_records.extend(index['by_frame'].get((video_id, frame_idx), []))
+        if not candidate_records:
+            candidate_records.extend(index['by_frame'].get(("", frame_idx), []))
+
+        candidate_records.extend(index['by_stem'].get(f"{video_id}/{frame_stem}", []))
+        candidate_records.extend(index['by_stem'].get(frame_stem, []))
+
+        deduped = []
+        seen = set()
+        for record in candidate_records:
+            if not self._external_aruco_record_matches_frame(
+                record, video_id, frame_idx, frame_stem
+            ):
+                continue
+            key = (
+                record.get('code'),
+                record.get('x'),
+                record.get('y'),
+                record.get('instance_id'),
+                record.get('source_csv')
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(record)
+        return deduped
+
+    def _remap_aruco_detections_after_identity_update(
+        self,
+        aruco_detections,
+        detections,
+        aruco_identity
+    ):
+        """Keep external CSV detections distinct from persistent ArUco assignments.
+
+        External CSV rows are first linked to the track ID present before ArUco
+        identity correction. If a real-code detection triggers a track merge,
+        the Detection object is rewritten to the persistent target ID. In that
+        one case, move the raw detection to the target ID so it still exports on
+        the visible row. Do not add other applied/persistent ArUco assignments:
+        those belong in aruco_code, not aruco_detected.
+        """
+        current_ids = {det.instance_id for det in detections if det.instance_id is not None}
+        remapped = {}
+
+        for instance_id, code in aruco_detections.items():
+            if instance_id in current_ids:
+                remapped[instance_id] = code
+                continue
+
+            if code == 'noID' or aruco_identity is None:
+                continue
+
+            target_id = aruco_identity.aruco_to_bee.get(str(code))
+            if target_id in current_ids:
+                remapped[target_id] = code
+
+        return remapped
+
+    def _external_aruco_record_matches_frame(self, record, video_id, frame_idx, frame_stem):
+        """Return True when a normalized external CSV row belongs to this frame."""
+        record_video_id = record.get('video_id') or ""
+        if record_video_id and video_id and record_video_id != video_id:
+            return False
+
+        record_frame = record.get('frame_number')
+        if record_frame is not None:
+            return int(record_frame) == int(frame_idx)
+
+        image_stem = record.get('image_stem') or ""
+        if image_stem:
+            return image_stem == frame_stem
+
+        return False
+
+    def _match_external_aruco_to_bees(self, marker_records, detections, frame_idx=None):
+        """Match external marker centers to tracked bee detections."""
+        markers_by_instance = defaultdict(list)
+        stats = {
+            'csv_rows': len(marker_records),
+            'csv_aruco_rows': sum(
+                1 for marker in marker_records
+                if marker.get('code') and marker.get('code') != 'noID'
+            ),
+            'csv_noid_rows': sum(
+                1 for marker in marker_records
+                if marker.get('code') == 'noID'
+            ),
+            'matched_mask': 0,
+            'matched_bbox': 0,
+            'matched_instance_id': 0,
+            'linked_aruco_rows': 0,
+            'linked_noid_rows': 0,
+            'unmatched': 0,
+            'ambiguous': 0,
+            'multi_code_instances': 0,
+        }
+
+        for marker in marker_records:
+            code = marker.get('code')
+            if not code:
+                continue
+
+            matched_ids = []
+            match_source = None
+            x = marker.get('x')
+            y = marker.get('y')
+            if x is not None and y is not None:
+                mask_matched_ids = []
+                bbox_matched_ids = []
+                for det in detections:
+                    if det.instance_id is None:
+                        continue
+                    match_type = self._point_detection_match_type(x, y, det)
+                    if match_type == 'mask':
+                        mask_matched_ids.append(det.instance_id)
+                    elif match_type == 'bbox':
+                        bbox_matched_ids.append(det.instance_id)
+                matched_ids = mask_matched_ids if mask_matched_ids else bbox_matched_ids
+                match_source = 'mask' if mask_matched_ids else 'bbox'
+            elif marker.get('instance_id') is not None:
+                matched_ids.append(marker['instance_id'])
+                match_source = 'instance_id'
+
+            unique_matched_ids = set(matched_ids)
+            if len(unique_matched_ids) == 0:
+                stats['unmatched'] += 1
+                continue
+            if len(unique_matched_ids) != 1:
+                stats['ambiguous'] += 1
+                continue
+
+            if match_source == 'mask':
+                stats['matched_mask'] += 1
+            elif match_source == 'bbox':
+                stats['matched_bbox'] += 1
+            elif match_source == 'instance_id':
+                stats['matched_instance_id'] += 1
+
+            if code == 'noID':
+                stats['linked_noid_rows'] += 1
+            else:
+                stats['linked_aruco_rows'] += 1
+
+            markers_by_instance[matched_ids[0]].append(str(code))
+
+        marker_codes = {}
+        detected_codes = {}
+        for instance_id, codes in markers_by_instance.items():
+            unique_codes = sorted(set(codes))
+            real_codes = [code for code in unique_codes if code != 'noID']
+            if len(real_codes) == 1:
+                detected_codes[instance_id] = real_codes[0]
+                marker_codes[instance_id] = real_codes[0]
+            elif len(real_codes) == 0 and unique_codes == ['noID']:
+                detected_codes[instance_id] = 'noID'
+            else:
+                stats['multi_code_instances'] += 1
+        stats['exported_detections'] = len(detected_codes)
+        return marker_codes, detected_codes, stats
+
+    def _log_external_aruco_match_stats(self, frame_idx, marker_records, detections, stats):
+        """Log why external ArUco rows were not linked to bee detections."""
+        matched_total = (
+            stats.get('matched_mask', 0) +
+            stats.get('matched_bbox', 0) +
+            stats.get('matched_instance_id', 0)
+        )
+        self.log_message.emit(
+            f"    Frame {frame_idx}: external ArUco rows={stats.get('csv_rows', 0)}, "
+            f"linked={matched_total}, exported={stats.get('exported_detections', 0)}, "
+            f"mask={stats.get('matched_mask', 0)}, bbox={stats.get('matched_bbox', 0)}, "
+            f"unmatched={stats.get('unmatched', 0)}, ambiguous={stats.get('ambiguous', 0)}, "
+            f"multi-code bees={stats.get('multi_code_instances', 0)}"
+        )
+
+        if stats.get('unmatched', 0) and detections:
+            samples = []
+            for marker in marker_records[:3]:
+                x = marker.get('x')
+                y = marker.get('y')
+                if x is None or y is None:
+                    continue
+                nearest = self._nearest_detection_distance(x, y, detections)
+                if nearest is not None:
+                    bee_id, distance = nearest
+                    samples.append(
+                        f"{marker.get('code')}@({x:.1f},{y:.1f})->ID:{bee_id} {distance:.1f}px"
+                    )
+            if samples:
+                self.log_message.emit("      Nearest bee samples: " + "; ".join(samples))
+
+    def _nearest_detection_distance(self, x, y, detections):
+        """Return nearest detection ID and bbox-center distance to a point."""
+        nearest = None
+        for det in detections:
+            if det.instance_id is None or det.bbox is None:
+                continue
+            x1, y1, x2, y2 = det.bbox
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            distance = float(np.linalg.norm(np.array([x, y]) - np.array([cx, cy])))
+            if nearest is None or distance < nearest[1]:
+                nearest = (det.instance_id, distance)
+        return nearest
+
+    def _point_detection_match_type(self, x, y, det):
+        """Return whether a marker center matches a detection by mask or bbox."""
+        x1, y1, x2, y2 = det.bbox
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            return None
+
+        if det.mask is not None:
+            xi = int(round(x))
+            yi = int(round(y))
+            if 0 <= yi < det.mask.shape[0] and 0 <= xi < det.mask.shape[1]:
+                if det.mask[yi, xi] > 0:
+                    return 'mask'
+
+        return 'bbox'
+
+    def _row_value(self, row, candidates):
+        """Get a CSV row value using case-insensitive candidate column names."""
+        lower_to_key = {str(key).lower(): key for key in row.keys()}
+        for candidate in candidates:
+            key = lower_to_key.get(str(candidate).lower())
+            if key is not None:
+                value = row.get(key, "")
+                if value is None:
+                    return ""
+                value = str(value).strip()
+                if value.lower() in {'nan', 'none', 'null'}:
+                    return ""
+                return value
+        return ""
+
+    def _parse_optional_float(self, value):
+        if value == "" or value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_optional_int(self, value):
+        if value == "" or value is None:
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    def _video_id_from_external_stem(self, stem):
+        """Infer a likely video ID from an external filename stem."""
+        if not stem:
+            return ""
+        lower_stem = stem.lower()
+        for suffix in ('_raw', '_noid', '_aruco_detections', '_detections'):
+            if lower_stem.endswith(suffix):
+                return stem[:-len(suffix)]
+        return stem
+
+    def _load_video_aruco_tracking(self, video_id):
+        """Load optional video-level GT mapping as bee instance ID -> ArUco code."""
+        video_annotations_path = (
+            self.main_window.project_path / 'annotations' / 'json' /
+            video_id / 'video_annotations.json'
+        )
+        if not video_annotations_path.exists():
+            return {}
+
+        try:
+            with open(video_annotations_path, 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            self.log_message.emit(
+                f"  WARNING: Could not load video-level ArUco tracking for {video_id}: {e}"
+            )
+            return {}
+
+        # Stored on disk as ArUco code -> bee instance ID.
+        aruco_tracking = data.get('aruco_tracking', {})
+        return {str(gt_id): str(aruco_code) for aruco_code, gt_id in aruco_tracking.items()}
+
+    def _get_gt_aruco_code(self, gt_annotation, gt_id=None, video_aruco_tracking=None):
+        """Return the GT ArUco code attached to a matched bee annotation, if available."""
+        if gt_id is not None and video_aruco_tracking:
+            aruco_code = video_aruco_tracking.get(str(gt_id), "")
+            if aruco_code:
+                return aruco_code
+
+        if gt_annotation:
+            marker = gt_annotation.get('marker')
+            if isinstance(marker, dict) and marker.get('type') == 'aruco':
+                marker_id = marker.get('id', marker.get('marker_id'))
+                if marker_id is not None:
+                    return str(marker_id)
+
+            for key in ('aruco_code', 'aruco_id', 'marker_id'):
+                if gt_annotation.get(key) is not None:
+                    return str(gt_annotation[key])
+
+        return ""
+
+    def _aruco_tracking_status(self, tracking_status, aruco_code, gt_aruco_code):
+        """Classify tracked ArUco identity against the matched GT bee identity."""
+        if tracking_status == 'FP':
+            return 'unmatched_detection'
+        if not gt_aruco_code:
+            return 'no_gt_aruco'
+        if aruco_code and aruco_code == gt_aruco_code:
+            return 'true_positive_aruco_tracked'
+        if aruco_code and aruco_code != gt_aruco_code:
+            return 'false_positive_aruco_tracked'
+        return 'false_negative_aruco_tracked'
+
+    def _mask_polygon_string(self, mask) -> str:
+        """Convert a binary mask to the same polygon string format used by batch export."""
+        if mask is None or not np.any(mask > 0):
+            return ""
+
+        polygon = mask_to_simplified_polygon(mask.astype(np.uint8), epsilon_percent=2.0)
+        return polygon_to_string(polygon) if polygon else ""
+
+    def _build_detection_export_rows(
+        self,
+        sequence,
+        algo_name,
+        frame_idx,
+        detections,
+        gt_annotations,
+        detection_status,
+        aruco_detections,
+        aruco_identity,
+        video_aruco_tracking
+    ):
+        """Build detailed per-bee rows and ArUco tracking summary counts for one frame."""
+        rows = []
+        aruco_summary = defaultdict(int)
+
+        for det in detections:
+            tracking_status, matched_gt_id, matched_gt_idx, iou = detection_status.get(
+                id(det), ('FP', None, None, 0.0)
+            )
+            matched_gt = (
+                gt_annotations[matched_gt_idx]
+                if matched_gt_idx is not None and 0 <= matched_gt_idx < len(gt_annotations)
+                else None
+            )
+            gt_aruco_code = self._get_gt_aruco_code(
+                matched_gt,
+                gt_id=matched_gt_id,
+                video_aruco_tracking=video_aruco_tracking
+            )
+            aruco_code = ""
+            if aruco_identity is not None and det.instance_id is not None:
+                aruco_code = aruco_identity.bee_to_aruco.get(det.instance_id, "")
+            aruco_detected = ""
+            if det.instance_id is not None:
+                aruco_detected = aruco_detections.get(det.instance_id, "")
+
+            if aruco_detected:
+                aruco_summary['num_aruco_or_noid_detections'] += 1
+                if aruco_detected == 'noID':
+                    aruco_summary['num_noid_detections'] += 1
+                else:
+                    aruco_summary['num_aruco_detections'] += 1
+
+            aruco_status = self._aruco_tracking_status(
+                tracking_status=tracking_status,
+                aruco_code=aruco_code,
+                gt_aruco_code=gt_aruco_code
+            )
+            if aruco_status in {
+                'true_positive_aruco_tracked',
+                'false_positive_aruco_tracked',
+                'false_negative_aruco_tracked'
+            }:
+                aruco_summary[f'num_{aruco_status}'] += 1
+
+            bbox_x, bbox_y, bbox_x2, bbox_y2 = det.bbox
+            bbox_width = bbox_x2 - bbox_x
+            bbox_height = bbox_y2 - bbox_y
+            if det.mask is not None:
+                centroid = self._get_centroid(det.mask, det.bbox)
+                centroid_x, centroid_y = centroid if centroid is not None else ("", "")
+            else:
+                centroid_x = (bbox_x + bbox_x2) / 2
+                centroid_y = (bbox_y + bbox_y2) / 2
+
+            rows.append({
+                'video_id': sequence.video_id,
+                'sequence_id': sequence.sequence_id,
+                'algorithm': algo_name,
+                'frame_number': frame_idx,
+                'bee_id': det.instance_id if det.instance_id is not None else "",
+                'aruco_code': aruco_code,
+                'aruco_detected': aruco_detected,
+                'gt_aruco_code': gt_aruco_code,
+                'aruco_tracking_status': aruco_status,
+                'tracking_status': tracking_status,
+                'matched_gt_id': matched_gt_id if matched_gt_id is not None else "",
+                'match_iou': f"{iou:.4f}" if iou else "",
+                'bbox_x': f"{bbox_x:.2f}",
+                'bbox_y': f"{bbox_y:.2f}",
+                'bbox_width': f"{bbox_width:.2f}",
+                'bbox_height': f"{bbox_height:.2f}",
+                'confidence': f"{det.confidence:.4f}",
+                'centroid_x': f"{centroid_x:.2f}" if centroid_x != "" else "",
+                'centroid_y': f"{centroid_y:.2f}" if centroid_y != "" else "",
+                'pred_polygon': self._mask_polygon_string(det.mask)
+            })
+
+        return rows, aruco_summary
+
+    def _bee_detection_export_fieldnames(self):
+        """Column order for detailed validation bee detection CSVs."""
+        return [
+            'video_id', 'sequence_id', 'algorithm', 'frame_number',
+            'bee_id', 'aruco_code', 'aruco_detected', 'gt_aruco_code',
+            'aruco_tracking_status', 'tracking_status', 'matched_gt_id', 'match_iou',
+            'bbox_x', 'bbox_y', 'bbox_width', 'bbox_height', 'confidence',
+            'centroid_x', 'centroid_y', 'pred_polygon'
+        ]
+
+    def _append_bee_detection_rows(self, results_folder, algo_name, rows):
+        """Append detailed per-bee detection rows for an algorithm."""
+        csv_path = results_folder / f"{algo_name}_bee_detections.csv"
+        write_header = not csv_path.exists()
+
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self._bee_detection_export_fieldnames())
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
     
-    def _aggregate_sequence_metrics(self, frame_metrics, sequence):
+    def _aggregate_sequence_metrics(self, frame_metrics, sequence, aruco_summary=None):
         """Aggregate frame metrics into sequence metrics"""
+        aruco_summary = aruco_summary or {}
         total_tp = sum(m['tp'] for m in frame_metrics)
         total_fp = sum(m['fp'] for m in frame_metrics)
         total_fn = sum(m['fn'] for m in frame_metrics)
         total_id_switches = sum(m['id_switches'] for m in frame_metrics)
         total_iou = sum(m['total_iou'] for m in frame_metrics)
         total_matched = sum(m['matched_count'] for m in frame_metrics)
+        num_bee_detections = sum(m.get('num_bee_detections', 0) for m in frame_metrics)
+        num_gt_bees = sum(m.get('num_gt_bees', 0) for m in frame_metrics)
         
         # TP = all detection matches (IoU > threshold, regardless of ID)
         # IDTP = identity true positives (IoU match + correct ID)
@@ -887,6 +1701,35 @@ class TrackingValidationWorker(QThread):
             'idtp': total_idtp,  # Identity TP (IoU match + correct ID) - varies by tracker quality
             'fp': total_fp,
             'fn': total_fn,
+            'num_bee_detections': int(num_bee_detections),
+            'num_gt_bees': int(num_gt_bees),
+            'num_aruco_detections': int(aruco_summary.get('num_aruco_detections', 0)),
+            'num_noid_detections': int(aruco_summary.get('num_noid_detections', 0)),
+            'num_aruco_or_noid_detections': int(aruco_summary.get('num_aruco_or_noid_detections', 0)),
+            'num_external_csv_aruco_rows': int(aruco_summary.get('num_external_csv_aruco_rows', 0)),
+            'num_external_csv_noid_rows': int(aruco_summary.get('num_external_csv_noid_rows', 0)),
+            'num_external_csv_aruco_or_noid_rows': int(aruco_summary.get('num_external_csv_aruco_or_noid_rows', 0)),
+            'num_external_csv_linked_aruco_rows': int(aruco_summary.get('num_external_csv_linked_aruco_rows', 0)),
+            'num_external_csv_linked_noid_rows': int(aruco_summary.get('num_external_csv_linked_noid_rows', 0)),
+            'num_external_csv_aruco_detections': int(aruco_summary.get('num_external_csv_aruco_detections', 0)),
+            'num_external_csv_noid_detections': int(aruco_summary.get('num_external_csv_noid_detections', 0)),
+            'num_external_csv_aruco_or_noid_detections': int(
+                aruco_summary.get('num_external_csv_aruco_or_noid_detections', 0)
+            ),
+            'num_builtin_aruco_detections': int(aruco_summary.get('num_builtin_aruco_detections', 0)),
+            'num_builtin_noid_detections': int(aruco_summary.get('num_builtin_noid_detections', 0)),
+            'num_builtin_aruco_or_noid_detections': int(
+                aruco_summary.get('num_builtin_aruco_or_noid_detections', 0)
+            ),
+            'num_true_positive_aruco_tracked': int(aruco_summary.get('num_true_positive_aruco_tracked', 0)),
+            'num_false_positive_aruco_tracked': int(aruco_summary.get('num_false_positive_aruco_tracked', 0)),
+            'num_false_negative_aruco_tracked': int(aruco_summary.get('num_false_negative_aruco_tracked', 0)),
+            'aruco_requested_source': aruco_summary.get('aruco_requested_source', 'disabled'),
+            'aruco_detection_source': aruco_summary.get('aruco_detection_source', 'disabled'),
+            'external_aruco_available': bool(aruco_summary.get('external_aruco_available', False)),
+            'external_aruco_fallback_to_builtin': bool(
+                aruco_summary.get('external_aruco_fallback_to_builtin', False)
+            ),
         }
     
     def _update_aggregate_metrics(self, algorithm_results):
@@ -909,6 +1752,53 @@ class TrackingValidationWorker(QThread):
                 'precision': np.mean([s['precision'] for s in sequences]),
                 'recall': np.mean([s['recall'] for s in sequences]),
                 'id_switches': sum([s['id_switches'] for s in sequences]),
+                'num_bee_detections': sum([s.get('num_bee_detections', 0) for s in sequences]),
+                'num_gt_bees': sum([s.get('num_gt_bees', 0) for s in sequences]),
+                'num_aruco_detections': sum([s.get('num_aruco_detections', 0) for s in sequences]),
+                'num_noid_detections': sum([s.get('num_noid_detections', 0) for s in sequences]),
+                'num_aruco_or_noid_detections': sum([s.get('num_aruco_or_noid_detections', 0) for s in sequences]),
+                'num_external_csv_aruco_rows': sum([s.get('num_external_csv_aruco_rows', 0) for s in sequences]),
+                'num_external_csv_noid_rows': sum([s.get('num_external_csv_noid_rows', 0) for s in sequences]),
+                'num_external_csv_aruco_or_noid_rows': sum([
+                    s.get('num_external_csv_aruco_or_noid_rows', 0) for s in sequences
+                ]),
+                'num_external_csv_linked_aruco_rows': sum([
+                    s.get('num_external_csv_linked_aruco_rows', 0) for s in sequences
+                ]),
+                'num_external_csv_linked_noid_rows': sum([
+                    s.get('num_external_csv_linked_noid_rows', 0) for s in sequences
+                ]),
+                'num_external_csv_aruco_detections': sum([
+                    s.get('num_external_csv_aruco_detections', 0) for s in sequences
+                ]),
+                'num_external_csv_noid_detections': sum([
+                    s.get('num_external_csv_noid_detections', 0) for s in sequences
+                ]),
+                'num_external_csv_aruco_or_noid_detections': sum([
+                    s.get('num_external_csv_aruco_or_noid_detections', 0) for s in sequences
+                ]),
+                'num_builtin_aruco_detections': sum([s.get('num_builtin_aruco_detections', 0) for s in sequences]),
+                'num_builtin_noid_detections': sum([s.get('num_builtin_noid_detections', 0) for s in sequences]),
+                'num_builtin_aruco_or_noid_detections': sum([
+                    s.get('num_builtin_aruco_or_noid_detections', 0) for s in sequences
+                ]),
+                'num_true_positive_aruco_tracked': sum([s.get('num_true_positive_aruco_tracked', 0) for s in sequences]),
+                'num_false_positive_aruco_tracked': sum([s.get('num_false_positive_aruco_tracked', 0) for s in sequences]),
+                'num_false_negative_aruco_tracked': sum([s.get('num_false_negative_aruco_tracked', 0) for s in sequences]),
+                'num_sequences_external_aruco_used': sum([
+                    s.get('aruco_detection_source') == 'external' for s in sequences
+                ]),
+                'num_sequences_external_aruco_missing': sum([
+                    s.get('external_aruco_fallback_to_builtin', False) for s in sequences
+                ]),
+                'external_aruco_used_video_ids': sorted({
+                    s.get('video_id') for s in sequences
+                    if s.get('aruco_detection_source') == 'external'
+                }),
+                'external_aruco_missing_video_ids': sorted({
+                    s.get('video_id') for s in sequences
+                    if s.get('external_aruco_fallback_to_builtin', False)
+                }),
             }
         
         return averages
@@ -923,7 +1813,30 @@ class TrackingValidationWorker(QThread):
                 writer = csv.DictWriter(f, fieldnames=[
                     'sequence_id', 'video_id', 'start_frame', 'end_frame',
                     'mota', 'motp', 'idf1', 'precision', 'recall', 
-                    'id_switches', 'tp', 'idtp', 'fp', 'fn'
+                    'id_switches', 'tp', 'idtp', 'fp', 'fn',
+                    'num_bee_detections',
+                    'num_gt_bees',
+                    'num_aruco_detections',
+                    'num_noid_detections',
+                    'num_aruco_or_noid_detections',
+                    'num_external_csv_aruco_rows',
+                    'num_external_csv_noid_rows',
+                    'num_external_csv_aruco_or_noid_rows',
+                    'num_external_csv_linked_aruco_rows',
+                    'num_external_csv_linked_noid_rows',
+                    'num_external_csv_aruco_detections',
+                    'num_external_csv_noid_detections',
+                    'num_external_csv_aruco_or_noid_detections',
+                    'num_builtin_aruco_detections',
+                    'num_builtin_noid_detections',
+                    'num_builtin_aruco_or_noid_detections',
+                    'num_true_positive_aruco_tracked',
+                    'num_false_positive_aruco_tracked',
+                    'num_false_negative_aruco_tracked',
+                    'aruco_requested_source',
+                    'aruco_detection_source',
+                    'external_aruco_available',
+                    'external_aruco_fallback_to_builtin'
                 ])
                 writer.writeheader()
                 writer.writerows(results['sequences'])
@@ -947,6 +1860,45 @@ class TrackingValidationWorker(QThread):
                 'average_precision': float(np.mean([s['precision'] for s in sequences])),
                 'average_recall': float(np.mean([s['recall'] for s in sequences])),
                 'total_id_switches': sum([s['id_switches'] for s in sequences]),
+                'num_bee_detections': sum([s.get('num_bee_detections', 0) for s in sequences]),
+                'num_gt_bees': sum([s.get('num_gt_bees', 0) for s in sequences]),
+                'num_aruco_detections': sum([s.get('num_aruco_detections', 0) for s in sequences]),
+                'num_noid_detections': sum([s.get('num_noid_detections', 0) for s in sequences]),
+                'num_aruco_or_noid_detections': sum([s.get('num_aruco_or_noid_detections', 0) for s in sequences]),
+                'num_external_csv_aruco_rows': sum([s.get('num_external_csv_aruco_rows', 0) for s in sequences]),
+                'num_external_csv_noid_rows': sum([s.get('num_external_csv_noid_rows', 0) for s in sequences]),
+                'num_external_csv_aruco_or_noid_rows': sum([
+                    s.get('num_external_csv_aruco_or_noid_rows', 0) for s in sequences
+                ]),
+                'num_external_csv_linked_aruco_rows': sum([
+                    s.get('num_external_csv_linked_aruco_rows', 0) for s in sequences
+                ]),
+                'num_external_csv_linked_noid_rows': sum([
+                    s.get('num_external_csv_linked_noid_rows', 0) for s in sequences
+                ]),
+                'num_external_csv_aruco_detections': sum([
+                    s.get('num_external_csv_aruco_detections', 0) for s in sequences
+                ]),
+                'num_external_csv_noid_detections': sum([
+                    s.get('num_external_csv_noid_detections', 0) for s in sequences
+                ]),
+                'num_external_csv_aruco_or_noid_detections': sum([
+                    s.get('num_external_csv_aruco_or_noid_detections', 0) for s in sequences
+                ]),
+                'num_builtin_aruco_detections': sum([s.get('num_builtin_aruco_detections', 0) for s in sequences]),
+                'num_builtin_noid_detections': sum([s.get('num_builtin_noid_detections', 0) for s in sequences]),
+                'num_builtin_aruco_or_noid_detections': sum([
+                    s.get('num_builtin_aruco_or_noid_detections', 0) for s in sequences
+                ]),
+                'num_true_positive_aruco_tracked': sum([s.get('num_true_positive_aruco_tracked', 0) for s in sequences]),
+                'num_false_positive_aruco_tracked': sum([s.get('num_false_positive_aruco_tracked', 0) for s in sequences]),
+                'num_false_negative_aruco_tracked': sum([s.get('num_false_negative_aruco_tracked', 0) for s in sequences]),
+                'num_sequences_external_aruco_used': sum([
+                    s.get('aruco_detection_source') == 'external' for s in sequences
+                ]),
+                'num_sequences_external_aruco_missing': sum([
+                    s.get('external_aruco_fallback_to_builtin', False) for s in sequences
+                ]),
             }
         
         summary_path = results_folder / "summary.json"
@@ -1063,11 +2015,13 @@ class TrackingValidationWorker(QThread):
         
         return None
     
-    def _save_frame_visualization(self, frame, detections, gt_annotations, id_mapping, 
-                                  prev_frame_positions, frame_idx, viz_folder, metrics):
+    def _save_frame_visualization(self, frame, detections, gt_annotations, id_mapping,
+                                  prev_frame_positions, frame_idx, viz_folder, metrics,
+                                  aruco_assignments=None):
         """Save visualization of tracking for one frame"""
         # Create a copy of the frame for drawing
         viz_frame = frame.copy()
+        aruco_assignments = aruco_assignments or {}
         
         # Use a copy of id_mapping so we can update it without affecting the original
         id_mapping = id_mapping.copy()
@@ -1139,6 +2093,13 @@ class TrackingValidationWorker(QThread):
                 # Draw segmentation mask contours
                 contours, _ = cv2.findContours(det.mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(viz_frame, contours, -1, color, thickness)
+
+                pred_polygon = mask_to_simplified_polygon(det.mask.astype(np.uint8), epsilon_percent=2.0)
+                if pred_polygon and len(pred_polygon) >= 3:
+                    polygon_points = np.array(pred_polygon, dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(viz_frame, [polygon_points], True, (255, 255, 0), 2)
+                    for point in pred_polygon:
+                        cv2.circle(viz_frame, (int(point[0]), int(point[1])), 3, (255, 255, 0), -1)
             else:
                 # Fall back to bounding box if no mask
                 x1, y1, x2, y2 = det.bbox
@@ -1155,7 +2116,11 @@ class TrackingValidationWorker(QThread):
                     label_pos = (int(x1), int(y1) - 10)
                 
                 label_color = color
-                cv2.putText(viz_frame, f"ID:{det.instance_id}", label_pos, 
+                aruco_code = aruco_assignments.get(det.instance_id, "")
+                label = f"ID:{det.instance_id}"
+                if aruco_code:
+                    label += f" A:{aruco_code}"
+                cv2.putText(viz_frame, label, label_pos,
                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, label_color, 2)
         
         # Add legend

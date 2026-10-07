@@ -51,6 +51,7 @@ class BatchVideoInferenceWorker(QThread):
         'bee_identity_segments.csv',
         'bee_velocity.csv',
         'pollen_detections.csv',
+        'pollen_frame_summary.csv',
         'hive_detections.csv',
         'chamber_detections.csv',
         'temporal_hive_priors.csv',
@@ -83,6 +84,12 @@ class BatchVideoInferenceWorker(QThread):
         # Accumulated masks for averaging
         # Format: {(video_id, chamber_id): {'accumulated_mask': np.ndarray, 'frame_count': int, 'shape': tuple}}
         self.accumulated_hive_masks = {}
+        # Format: {(video_id, chamber_id, hive_instance_id): {'accumulated_mask': np.ndarray, 'frame_count': int, 'shape': tuple}}
+        self.accumulated_hive_instance_masks = {}
+        # Format: {(video_id, chamber_id): {'accumulated_mask': np.ndarray, 'frame_count': int, 'shape': tuple}}
+        self.accumulated_pollen_masks = {}
+        # Format: {(video_id, chamber_id, pollen_instance_id): {'accumulated_mask': np.ndarray, 'frame_count': int, 'shape': tuple}}
+        self.accumulated_pollen_instance_masks = {}
         # Format: {(video_id, chamber_id): {'accumulated_mask': np.ndarray, 'frame_count': int, 'shape': tuple}}
         self.accumulated_chamber_masks = {}
         
@@ -110,6 +117,10 @@ class BatchVideoInferenceWorker(QThread):
         """Emit detailed diagnostic output only when verbose mode is enabled."""
         if self.verbose_output:
             self.log_message.emit(message)
+
+    def _polygon_epsilon(self) -> float:
+        """Return contour simplification epsilon percentage for CSV polygons."""
+        return 0.01 if self.config.get('high_resolution_polygons', False) else 2.0
 
     def _temporal_hive_resolution(self) -> tuple:
         """Return temporal prior resolution as (width, height)."""
@@ -853,6 +864,7 @@ class BatchVideoInferenceWorker(QThread):
             required.append('hive_detections.csv')
         if self.config.get('pollen_model_path'):
             required.append('pollen_detections.csv')
+            required.append('pollen_frame_summary.csv')
         return [name for name in required if not (output_folder / name).exists()]
 
     def _load_completed_video_paths(self, video_files: List[Path]) -> set:
@@ -1712,6 +1724,7 @@ class BatchVideoInferenceWorker(QThread):
             pixel_size_mm=self.config.get('pixel_size_mm'),
             exclude_pollen_from_hive=self.config.get('exclude_pollen_from_hive', True),
             hive_overlay_mode=hive_overlay_mode,
+            polygon_epsilon=self._polygon_epsilon(),
             brood_model=self.brood_model,
             temporal_brood_map=self.temporal_brood_map,
             brood_preview=visualization_enabled,
@@ -1951,10 +1964,19 @@ class BatchVideoInferenceWorker(QThread):
     def _collect_mask_summaries(self, processor: BatchVideoProcessor):
         """Keep running export counts, not the disposable visualization mask cache."""
         self.accumulated_hive_masks.update(processor.get_accumulated_hive_masks())
+        self.accumulated_hive_instance_masks.update(processor.get_accumulated_hive_instance_masks())
+        self.accumulated_pollen_masks.update(processor.get_accumulated_pollen_masks())
+        self.accumulated_pollen_instance_masks.update(processor.get_accumulated_pollen_instance_masks())
         self.accumulated_chamber_masks.update(processor.get_accumulated_chamber_masks())
         self.accumulated_data_size_mb = sum(
             data['accumulated_mask'].nbytes
-            for masks in (self.accumulated_hive_masks, self.accumulated_chamber_masks)
+            for masks in (
+                self.accumulated_hive_masks,
+                self.accumulated_hive_instance_masks,
+                self.accumulated_pollen_masks,
+                self.accumulated_pollen_instance_masks,
+                self.accumulated_chamber_masks,
+            )
             for data in masks.values()
         ) / (1024 * 1024)
 
@@ -1981,7 +2003,7 @@ class BatchVideoInferenceWorker(QThread):
                 return False
 
         output_folder = Path(self.config['output_folder'])
-        exporter = VideoInferenceExporter(output_folder)
+        exporter = VideoInferenceExporter(output_folder, polygon_epsilon=self._polygon_epsilon())
         if self.temporal_hive_prior is not None:
             try:
                 csv_path = exporter.export_temporal_hive_priors(self.temporal_hive_prior.summaries())
@@ -2021,6 +2043,9 @@ class BatchVideoInferenceWorker(QThread):
         self.all_pollen_frame_data.clear()
         self.all_bee_trajectories.clear()
         self.accumulated_hive_masks.clear()
+        self.accumulated_hive_instance_masks.clear()
+        self.accumulated_pollen_masks.clear()
+        self.accumulated_pollen_instance_masks.clear()
         self.accumulated_chamber_masks.clear()
         self.accumulated_data_size_mb = 0
         gc.collect()
@@ -2037,6 +2062,9 @@ class BatchVideoInferenceWorker(QThread):
             self.all_pollen_frame_data,
             self.all_bee_trajectories,
             self.accumulated_hive_masks,
+            self.accumulated_hive_instance_masks,
+            self.accumulated_pollen_masks,
+            self.accumulated_pollen_instance_masks,
             self.accumulated_chamber_masks,
         ))
 
@@ -2061,7 +2089,7 @@ class BatchVideoInferenceWorker(QThread):
             return True
         
         # Create exporter
-        exporter = VideoInferenceExporter(output_folder)
+        exporter = VideoInferenceExporter(output_folder, polygon_epsilon=self._polygon_epsilon())
         
         # Export all CSVs
         try:
@@ -2075,6 +2103,9 @@ class BatchVideoInferenceWorker(QThread):
                 self.all_chamber_frame_data,
                 self.all_pollen_frame_data,
                 self.accumulated_hive_masks,
+                self.accumulated_hive_instance_masks,
+                self.accumulated_pollen_masks,
+                self.accumulated_pollen_instance_masks,
                 self.accumulated_chamber_masks,
                 export_hive_detections=self.config.get('hive_model_path') is not None,
                 export_pollen_detections=self.config.get('pollen_model_path') is not None,

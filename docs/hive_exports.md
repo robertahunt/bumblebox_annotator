@@ -7,8 +7,13 @@ displaying that same map. Raw detections and past-only scoring remain available.
 | Representation | Meaning |
 | --- | --- |
 | Current-frame hive mask | The current frame's YOLO hive mask, with detected pollen removed when pollen exclusion is enabled. This can fluctuate between frames. |
-| `hive_detections.csv` | One majority-vote mask summary per video/chamber, reporting area in original-image pixels and the resulting centroid. A pixel must appear in more than half of the accumulated masks. |
+| `hive_detections.csv` | One majority-vote mask summary per video/chamber/hive instance, reporting area in original-image pixels, the resulting centroid and a polygon. Instances are numbered left-to-right within each chamber. A pixel must appear in more than half of that instance's accumulated masks. |
 | Temporal hive map | A rolling chamber-normalized estimate combining history and current usable evidence. Bee contact is evaluated after the current update by default, or before it in legacy past-only mode. It is not a fixed mask for the whole video. |
+
+`pollen_detections.csv` has the same per-instance shape for pollen, and
+`chamber_detections.csv` adds a polygon per chamber. Per-frame pollen counts and
+areas are written to `pollen_frame_summary.csv`. **Output high resolution
+polygons** uses lighter contour simplification for all CSV polygons.
 
 `bee_detections.csv` contains the frame-specific temporal overlap/status fields.
 `temporal_hive_priors.csv` contains the final map summaries per context/chamber,
