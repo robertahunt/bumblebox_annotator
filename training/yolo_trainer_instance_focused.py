@@ -45,6 +45,8 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
             
             train_jsons = list(train_dir.glob('*.json')) if train_dir.exists() else []
             val_jsons = list(val_dir.glob('*.json')) if val_dir.exists() else []
+            from core.import_review import validate_coco_reviews
+            validate_coco_reviews(self.project_path, train_jsons + val_jsons)
             
             if not train_jsons and not val_jsons:
                 raise FileNotFoundError(

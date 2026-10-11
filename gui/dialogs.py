@@ -239,7 +239,13 @@ class ProjectDialog(QDialog):
         form.addRow("Nest / hive labels:", self.hive_scope_combo)
         
         layout.addLayout(form)
-        
+        from gui.annotation_policy_dialog import PolicyTable
+        self.policy_table = PolicyTable({'hive_annotation_scope': 'frame'}, self, new=True)
+        layout.addWidget(self.policy_table)
+        self.hive_scope_combo.currentIndexChanged.connect(
+            lambda unused: self.policy_table.set_hive_scope(self.hive_scope_combo.currentData()))
+        self.resize(1000, 690)
+
         # Buttons
         button_layout = QHBoxLayout()
         
@@ -268,6 +274,7 @@ class ProjectDialog(QDialog):
             'name': self.name_edit.text(),
             'path': self.path_edit.text(),
             'hive_annotation_scope': self.hive_scope_combo.currentData(),
+            'annotation_policy': {'version': 1, 'categories': self.policy_table.entries()},
         }
         
         return info

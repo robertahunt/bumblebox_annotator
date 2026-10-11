@@ -18,7 +18,8 @@ class ProjectManager:
         self.dataset_info = {}
         
     def create_project(self, project_path: Path, project_name: str, 
-                      frames_per_video: int = 15, hive_annotation_scope: str = 'frame') -> Dict:
+                      frames_per_video: int = 15, hive_annotation_scope: str = 'frame',
+                      annotation_policy=None) -> Dict:
         """
         Create new project with standard folder structure
         
@@ -58,6 +59,9 @@ class ProjectManager:
             'hive_annotation_scope': hive_annotation_scope,
             'version': '2.0'
         }
+        from core.annotation_policy import category_policies, default_policy
+        project_info['annotation_policy'] = annotation_policy or default_policy(project_info)
+        category_policies(project_info)
         
         # Save project.json
         with open(self.project_path / 'annotations/project.json', 'w') as f:

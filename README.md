@@ -36,9 +36,12 @@ python main.py
 
 Proposed reusable arena editing, chamber-position review, and image alignment tools are described in the [arena review work-in-progress outline](docs/wip/arena_review/README.md).
 
+New projects show each category's annotation scope and label meaning. **Project > Annotation Policy...** reopens these settings; old projects keep their original scopes and show unconfirmed meanings. See the [annotation-policy status and roadmap](docs/wip/annotation_policy.md) for working features and remaining experimental/planned functionality.
+
 See [video import and frame selection](docs/video_import.md) for full-video or sampled extraction and how unfinished annotations affect training.
 
 See [importing between projects](docs/project_import.md) to copy selected frames and annotations, including converting frame-specific hive masks into an editable video-wide mask.
+Import previews disclose scope/meaning conflicts. **Project > Imported Frame Review...** opens the review queue; correct each affected frame and check **Imported labels reviewed for this frame** before training/export.
 
 See [ArUco tag size measurement](docs/aruco_tag_measurement.md) to measure minimum and maximum tag sizes before batch optimization.
 
@@ -76,7 +79,7 @@ bee_annotator/
 ## Experimental Brood Workflow
 
 See [Brood Segmentation](docs/brood_segmentation.md) for visible-only brood labels,
-five-class training, and optional history-informed batch maps.
+eight-class training (including queen brood), and optional experimental history-informed batch maps.
 
 ## License
 

@@ -89,6 +89,8 @@ class ProjectImportGuiTests(unittest.TestCase):
             preview = ImportPreviewDialog(plan)
             self.assertFalse(preview.import_button.isEnabled())
             preview.confirm_scope.setChecked(True)
+            self.assertFalse(preview.import_button.isEnabled())
+            preview.confirm_review.setChecked(True)
             self.assertTrue(preview.import_button.isEnabled())
             preview.show()
             self.app.processEvents()
@@ -105,6 +107,8 @@ class ProjectImportGuiTests(unittest.TestCase):
             preview.confirm_scope.setChecked(True)
             self.assertFalse(preview.import_button.isEnabled())
             preview.confirm_replace.setChecked(True)
+            self.assertFalse(preview.import_button.isEnabled())
+            preview.confirm_review.setChecked(True)
             self.assertTrue(preview.import_button.isEnabled())
             preview.close()
         finally:

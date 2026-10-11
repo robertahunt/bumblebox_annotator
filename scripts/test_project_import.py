@@ -11,6 +11,8 @@ import cv2
 import numpy as np
 
 from core.annotation import AnnotationManager
+from core.annotation_policy import default_policy
+from core.import_review import complete_review
 from core.contributors import new_session
 from core.project_import import inspect_project, prepare_import
 from core.project_manager import ProjectManager
@@ -73,6 +75,8 @@ class ProjectImportTests(unittest.TestCase):
         path = project / 'annotations/project.json'
         data = _read_json(path)
         data['hive_annotation_scope'] = scope
+        data.pop('annotation_policy', None)
+        data['annotation_policy'] = default_policy(data)
         _write_json(path, data)
 
     def test_preview_changes_neither_project_and_defaults_to_first_nonempty_frame(self):
@@ -349,6 +353,8 @@ class ProjectImportTests(unittest.TestCase):
     def test_export_after_frame_only_import_includes_expected_training_frames(self):
         self.set_scope(self.dest, 'frame')
         self.plan().apply()
+        for index in (2, 5):
+            complete_review(self.dest, 'video', index, self.session)
         exported = export_coco_per_video(self.dest, ['video'], 'train')
         self.assertTrue(exported)
         data = _read_json(self.dest / 'annotations/coco/train/video.json')
@@ -358,6 +364,10 @@ class ProjectImportTests(unittest.TestCase):
 
     def test_shared_only_import_does_not_change_existing_export_eligibility(self):
         self.plan().apply()
+        with self.assertRaisesRegex(ValueError, 'need review'):
+            export_coco_per_video(self.dest, ['video'], 'train')
+        for index in (2, 5):
+            complete_review(self.dest, 'video', index, self.session)
         self.assertEqual(export_coco_per_video(self.dest, ['video'], 'train'), [])
 
 

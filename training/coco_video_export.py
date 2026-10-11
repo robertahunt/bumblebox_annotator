@@ -12,6 +12,8 @@ from typing import List, Dict
 from core.categories import CATEGORIES
 from core.annotation_scope import frame_categories, read_project_info, merge_annotations
 from core.coco_masks import encode_mask, decode_segmentation
+from core.annotation_policy import category_policies
+from core.import_review import require_reviewed, selected_frames, export_review_metadata
 
 
 def export_coco_per_video(project_path: Path, video_ids: List[str], 
@@ -49,6 +51,8 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
     project_path = Path(project_path)
     project_info = read_project_info(project_path)
     per_frame_categories = frame_categories(project_info)
+    policies = category_policies(project_info)
+    require_reviewed(project_path, selected_frames(project_path, video_ids))
     
     # Create category name to ID mapping
     category_name_to_id = {name: i + 1 for i, name in enumerate(class_names)}
@@ -94,7 +98,8 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                 'contributor': 'BeeWhere Annotator',
                 'date_created': datetime.now().isoformat(),
                 'video_name': video_name,
-                'split': split_name
+                'split': split_name,
+                'annotation_policy': policies,
             },
             'licenses': [{
                 'id': 1,
@@ -284,7 +289,8 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                 'height': frame_height,
                 'license': 1,
                 'date_captured': '',
-                'frame_index': frame_idx
+                'frame_index': frame_idx,
+                'import_review_signature': export_review_metadata(project_path, video_name, frame_idx),
             })
             
             # Add annotations for this frame
@@ -422,6 +428,8 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
     project_path = Path(project_path)
     project_info = read_project_info(project_path)
     per_frame_categories = frame_categories(project_info)
+    policies = category_policies(project_info)
+    require_reviewed(project_path, selected_frames(project_path, video_ids))
 
     # Create category name to ID mapping
     category_name_to_id = {name: i + 1 for i, name in enumerate(class_names)}
@@ -433,7 +441,8 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
             'year': datetime.now().year,
             'contributor': 'BeeWhere Annotator',
             'date_created': datetime.now().isoformat(),
-            'has_tracking': True  # Flag indicating tracking information is present
+            'has_tracking': True,  # Flag indicating tracking information is present
+            'annotation_policy': policies,
         },
         'licenses': [{
             'id': 1,
@@ -646,7 +655,8 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
                 'license': 1,
                 'date_captured': '',
                 'video_id': video_id_int,  # Link to video
-                'frame_index': frame_idx   # Temporal ordering
+                'frame_index': frame_idx,  # Temporal ordering
+                'import_review_signature': export_review_metadata(project_path, video_name, frame_idx),
             })
             
             # Add annotations for this frame

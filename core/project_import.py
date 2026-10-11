@@ -13,6 +13,8 @@ import numpy as np
 
 from core.annotation import AnnotationManager
 from core.annotation_scope import frame_categories, merge_annotations, read_project_info
+from core.annotation_policy import category_policies, policy_text
+from core.import_review import REVIEW_FILE, read_reviews, add_review, review_status
 from core.categories import CATEGORIES, category_label
 from core.contributors import utc_now
 from core.project_manager import ProjectManager
@@ -48,7 +50,7 @@ def _snapshot(project):
             if path.is_file():
                 stat = path.stat()
                 result[path.relative_to(project).as_posix()] = (stat.st_size, stat.st_mtime_ns)
-    for name in ('annotations/project.json', 'annotations/project_sync.json'):
+    for name in ('annotations/project.json', 'annotations/project_sync.json', REVIEW_FILE):
         path = _safe_child(project, name)
         if path.exists():
             stat = path.stat()
@@ -163,6 +165,8 @@ class PreparedImport:
         self.deletions = set()
         self.rows = []
         self.warnings = []
+        self.policy_conflicts = []
+        self.review_required = False
         self.source_state = _snapshot(source)
         self.destination_state = _snapshot(destination)
         self.identifier = utc_now().replace(':', '-') + '-' + uuid4().hex[:8]
@@ -292,14 +296,40 @@ def prepare_import(source, destination, selections, categories, *, split='preser
     dest_info = read_project_info(destination)
     dest_local = frame_categories(dest_info)
     source_local = frame_categories(catalog['info'])
+    source_policies = category_policies(catalog['info'])
+    dest_policies = category_policies(dest_info)
     progress = progress or (lambda message: None)
     cancelled = cancelled or (lambda: False)
+    reviews = read_reviews(destination)
+    source_reviews = read_reviews(source)
     plan = PreparedImport(source, destination)
     manager = AnnotationManager()
     dest_manager = ProjectManager(destination)
     identity = source / 'annotations/project_sync.json'
     source_id = _read_json(identity).get('project_id') if identity.exists() else None
     timestamp = utc_now()
+
+    def record_review(video, index, category, shared=False):
+        source_policy, dest_policy = source_policies[category], dest_policies[category]
+        reasons = []
+        if source_policy['scope'] != dest_policy['scope']:
+            reasons.append('Annotation scope differs')
+        if source_policy['meaning'] != dest_policy['meaning']:
+            reasons.append('Label meaning differs')
+        if 'unconfirmed' in (source_policy['meaning'], dest_policy['meaning']):
+            reasons.append('Label meaning is not confirmed')
+        if review_status(source, video, index, source_reviews, catalog['info']) == 'pending':
+            reasons.append('Source frame still has unfinished import review')
+        requirement = {'import_id': plan.identifier, 'imported_at': timestamp,
+                       'source_project': str(source), 'source_frame': index,
+                       'source_policy': source_policy, 'destination_policy': dest_policy,
+                       'reasons': reasons or ['Verify copied labels in the destination frame']}
+        add_review(reviews, video, index, category, requirement, shared=shared)
+        plan.review_required = True
+        record = {'video': video, 'frame': index, 'category': category,
+                  'source_policy': policy_text(source_policy), 'destination_policy': policy_text(dest_policy),
+                  'reason': '; '.join(requirement['reasons'])}
+        plan.policy_conflicts.append(record)
     try:
         for video, indices in selected.items():
             if video not in catalog['videos'] or any(i not in catalog['videos'][video]['frames'] for i in indices):
@@ -369,6 +399,9 @@ def prepare_import(source, destination, selections, categories, *, split='preser
                     'imported_by': ({'id': contributor['id'], 'name': contributor['name']} if contributor else None),
                     'source_scope': source_scope, 'destination_scope': target_scope,
                     'scope_review_required': source_scope != target_scope,
+                    'source_policy': source_policies[ann.get('category', 'bee')],
+                    'destination_policy': dest_policies[ann.get('category', 'bee')],
+                    'review_import_id': plan.identifier,
                 })
                 result['provenance'] = provenance
                 return result
@@ -415,6 +448,7 @@ def prepare_import(source, destination, selections, categories, *, split='preser
                                 for a in annotations]
                 replaced_shared.add(category)
                 shared_changed = True
+                record_review(video, index, category, shared=True)
                 if category in source_local:
                     plan.warnings.append(f'{video}: {category_label(category)} from frame {index} will apply to '
                                          'the whole video. Other frames are not combined; review occlusion gaps and alignment.')
@@ -467,6 +501,7 @@ def prepare_import(source, destination, selections, categories, *, split='preser
                         result += [imported(a, index, 'frame' if category in source_local else 'video', 'frame')
                                    for a in incoming]
                         changed = True
+                        record_review(video, index, category)
                         if category not in source_local:
                             plan.warnings.append(f'{video} frame {index}: copied video-wide {category_label(category)} '
                                                  'into a frame-specific mask; review visible pixels before training.')
@@ -504,6 +539,14 @@ def prepare_import(source, destination, selections, categories, *, split='preser
                               'frame_indices': indices,
                               'category': '', 'instances': len(indices), 'action': f'Copy/retain ({target_split})'})
         plan.warnings = list(dict.fromkeys(plan.warnings))
+        if plan.review_required:
+            path = plan.staging / REVIEW_FILE
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _write_json(path, reviews)
+            plan.files[REVIEW_FILE] = path
+            plan.warnings.append('Imported labels require per-frame review before training/export. '
+                                 'Shared-mask changes affect every extracted frame of that video, including '
+                                 'frames extracted later. Completing one frame does not approve the others.')
         plan.check_unchanged()
         return plan
     except BaseException:

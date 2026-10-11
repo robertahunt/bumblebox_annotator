@@ -40,6 +40,23 @@ class ImportPreviewDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table, 1)
+        self.policy_table = QTableWidget(len(plan.policy_conflicts), 5)
+        self.policy_table.setHorizontalHeaderLabels(['Video / frame', 'Category', 'Source policy',
+                                                     'Destination policy', 'Review reason'])
+        self.policy_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.policy_table.setWordWrap(True)
+        self.policy_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.policy_table.verticalHeader().hide()
+        for row, record in enumerate(plan.policy_conflicts):
+            values = [f'{record["video"]} / {record["frame"]}', category_label(record['category']),
+                      record['source_policy'], record['destination_policy'], record['reason']]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.policy_table.setItem(row, column, item)
+        self.policy_table.resizeRowsToContents()
+        self.policy_table.setVisible(plan.review_required)
+        layout.addWidget(self.policy_table, 1)
         warnings = QTextEdit()
         warnings.setReadOnly(True)
         warnings.setPlainText('\n\n'.join(plan.warnings))
@@ -52,6 +69,9 @@ class ImportPreviewDialog(QDialog):
         self.confirm_replace = QCheckBox('Replace the listed destination categories (originals will be backed up)')
         self.confirm_replace.setVisible(any(r['action'] == 'Replace' for r in plan.rows))
         layout.addWidget(self.confirm_replace)
+        self.confirm_review = QCheckBox('Review imported labels on each affected frame before training/export')
+        self.confirm_review.setVisible(plan.review_required)
+        layout.addWidget(self.confirm_review)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.import_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         self.import_button.setText('Import Copies')
@@ -59,12 +79,13 @@ class ImportPreviewDialog(QDialog):
         buttons.rejected.connect(self.reject)
         self.confirm_scope.toggled.connect(self.update_confirmation)
         self.confirm_replace.toggled.connect(self.update_confirmation)
+        self.confirm_review.toggled.connect(self.update_confirmation)
         layout.addWidget(buttons)
         self.update_confirmation()
 
     def update_confirmation(self):
         self.import_button.setEnabled(all(box.isHidden() or box.isChecked()
-                                          for box in (self.confirm_scope, self.confirm_replace)))
+                                          for box in (self.confirm_scope, self.confirm_replace, self.confirm_review)))
 
 
 class ProjectImportDialog(QDialog):

@@ -15,6 +15,7 @@ from copy import deepcopy
 from core.coco_masks import encode_mask, decode_segmentation
 from core.categories import CATEGORIES
 from core.contributors import AnnotationAttributor
+from core.annotation_policy import default_policy, category_policies
 
 
 _ACTIVE_CONTRIBUTOR = object()
@@ -214,6 +215,9 @@ class AnnotationManager:
             'hive_annotation_scope': project_info.get('hive_annotation_scope', 'frame'),
             'version': '1.0'
         }
+        self.project_info['annotation_policy'] = deepcopy(
+            project_info.get('annotation_policy') or default_policy(self.project_info))
+        category_policies(self.project_info)
         self.frame_annotations = OrderedDict()
         self.unsaved_changes = True
         

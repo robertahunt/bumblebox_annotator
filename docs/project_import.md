@@ -12,7 +12,13 @@ unsaved canvas. Do not edit either project from a second process during import.
    selected categories. Replacement affects only categories present in the
    imported annotations, not unrelated labels or blank source categories.
 5. Select **Preview Import...**. Check the source frame, category, scope, counts,
-   and action for every row, then confirm **Import Copies**.
+   action, and source/destination label meanings for every row. Confirm the
+   review requirement (plus scope conversion/replacement when applicable), then
+   select **Import Copies**.
+6. Open **Project > Imported Frame Review...** or **Review Queue...** below the
+   image. Open a pending frame, correct its labels to match the destination
+   policy, then check **Imported labels reviewed for this frame** and confirm.
+   Correct labels may be approved without making an unnecessary edit.
 
 The source is unchanged. Copies are independent, not symlinks or hard links.
 Models, sync identities/settings, COCO exports, imaging-setup calibration, tracking
@@ -48,6 +54,47 @@ Video-wide masks can also be copied into a frame-specific project. Those pixels
 are copied exactly, not corrected for occlusion; review every selected frame
 before using them as visible-surface training labels.
 
+## Policy Conflicts and Completion
+
+**Project > Annotation Policy...** separates where labels are stored from what
+their pixels mean: visible surfaces, full object extent, or not yet confirmed.
+Legacy projects retain their existing scope, with meaning unconfirmed. Confirm
+the destination meanings before completing their imported-frame reviews.
+Changing a meaning records intent and does not transform any mask pixels.
+
+Each imported annotation category gets a review requirement, even if its source
+and destination policies match. The preview explains scope differences, meaning
+differences, unknown legacy meanings, and unfinished reviews in the source.
+Copies that keep existing destination annotations do not add or reset a review
+for those annotations. Image-only copies do not create label review tasks.
+
+- Frame-specific imports require review on their selected copied frames.
+- Shared-mask imports require individual review on **all extracted frames** of
+  that video, including existing frames and frames extracted later. Completing
+  one frame never approves the rest of the video.
+- Completion is saved with contributor and time in
+  `annotations/import_review.json`, included in normal project sync.
+- Changes to saved frame annotation files, relevant shared annotation files,
+  image pixels, or relevant policy reopen completion. Checks are conservative:
+  an edit to another category in the same annotation file can also reopen review.
+  Unsaved GUI edits immediately clear the displayed check; saved fingerprints
+  determine persistent completion on reload.
+- Uncheck the completion box to reopen a frame manually. Review and training
+  selection are separate: select only frames you intend to use for training.
+
+COCO export refuses selected pending frames before replacing existing exports.
+Finish those reviews or deselect those training frames, then re-export. GUI YOLO
+(segmentation, bounding-box, instance-focused) and SAM2 training also check cached
+COCO review metadata, so stale exports cannot bypass a pending review for images
+they contain. Models, losses, batch sizes, and resolution settings are unchanged.
+
+This is a prospective import-review workflow, not an audit of historical manual
+labels or copies made before this feature. Such old imports are not automatically
+backfilled into the queue. Policy confirmation alone cannot certify those pixels;
+review them separately or explicitly re-import the desired labels with replacement
+and a backup. Older app versions and external training scripts do not enforce this
+new review metadata.
+
 ## Frames Without Original Videos
 
 **Copy original videos** is optional and off by default. Imported frame-only
@@ -59,7 +106,7 @@ selections. Unselected source frames are not silently marked for training.
 
 Video-based tools require the original video, and propagation/tracking across
 nonconsecutive extracted frames has the same limitations as sampled video import.
-This importer does not change training or COCO eligibility rules. In particular,
+Review completion does not change the underlying COCO eligibility rules. In particular,
 the existing exporter only adds shared video masks to frames with a per-frame
 annotation. A shared-hive-only import is editable, but does not by itself create
 eligible training frames. Re-export COCO after reviewing imported labels.

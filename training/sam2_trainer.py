@@ -182,6 +182,8 @@ class SAM2TrainingWorker(QThread):
             raise FileNotFoundError("Training annotations not found. Export COCO annotations first.")
         
         train_jsons = list(train_dir.glob('*.json'))
+        from core.import_review import validate_coco_reviews
+        validate_coco_reviews(self.project_path, train_jsons)
         if not train_jsons:
             raise FileNotFoundError("No COCO JSON files found in training directory.")
         
@@ -228,6 +230,8 @@ class SAM2TrainingWorker(QThread):
             return
         
         val_jsons = list(val_dir.glob('*.json'))
+        from core.import_review import validate_coco_reviews
+        validate_coco_reviews(self.project_path, val_jsons)
         if not val_jsons:
             print("Warning: No COCO JSON files found in validation directory.")
             return

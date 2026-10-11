@@ -41,6 +41,10 @@ from .tracking_sequences_panel import TrackingSequencesPanel
 from .project_sync_dialog import (ProjectSyncDialog, SyncProgressDialog, choose_contributor,
                                   setting_json, save_setting)
 from .project_import_dialog import ProjectImportDialog
+from .annotation_policy_dialog import AnnotationPolicyDialog, ImportedFrameReviewDialog
+from core.annotation_policy import category_policies, policy_signature, policy_text, guidance
+from core.annotation_scope import read_project_info
+from core.import_review import read_reviews, frame_task, review_status, complete_review
 from core.project_sync import sync_project
 from core.contributors import utc_now, provenance_records
 from .tracking_validation_dialog import TrackingValidationConfigDialog, TrackingValidationProgressDialog
@@ -376,6 +380,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.yolo_instance_focused_toolbar)
         layout.addWidget(self.yolo_bbox_toolbar)
         layout.addWidget(self.hive_chamber_toolbar)
+        self.policy_label = QLabel('Annotation policy: no project')
+        self.policy_label.setWordWrap(True)
+        layout.addWidget(self.policy_label)
         layout.addWidget(self.canvas)
         
         # Create frame navigation controls at the bottom
@@ -413,6 +420,18 @@ class MainWindow(QMainWindow):
         nav_layout.addWidget(self.frame_slider)
         
         layout.addLayout(nav_layout)
+        review_layout = QHBoxLayout()
+        self.frame_review_check = QCheckBox('Imported labels reviewed for this frame')
+        self.frame_review_check.setEnabled(False)
+        self.frame_review_check.clicked.connect(self.mark_import_review)
+        review_layout.addWidget(self.frame_review_check)
+        self.import_review_label = QLabel('')
+        self.import_review_label.setWordWrap(True)
+        review_layout.addWidget(self.import_review_label, 1)
+        review_button = QPushButton('Review Queue...')
+        review_button.clicked.connect(self.show_import_reviews)
+        review_layout.addWidget(review_button)
+        layout.addLayout(review_layout)
         self.setCentralWidget(central_widget)
         
         # Hide YOLO toolbars by default
@@ -1013,6 +1032,123 @@ class MainWindow(QMainWindow):
         sync_action = QAction('Project Sync...', self)
         sync_action.triggered.connect(self.configure_project_sync)
         settings_menu.addAction(sync_action)
+        project_menu = menubar.addMenu('&Project')
+        policy_action = QAction('Annotation Policy...', self)
+        policy_action.triggered.connect(self.show_annotation_policy)
+        project_menu.addAction(policy_action)
+        review_action = QAction('Imported Frame Review...', self)
+        review_action.triggered.connect(self.show_import_reviews)
+        project_menu.addAction(review_action)
+
+    def _update_annotation_policy_label(self):
+        if not hasattr(self, 'policy_label') or not self.project_path:
+            return
+        category = self.canvas.current_annotation_type
+        try:
+            entry = category_policies(self.annotation_manager.project_info)[category]
+            self.policy_label.setText(category_label(category) + ' | ' + policy_text(entry))
+            self.policy_label.setToolTip(guidance(entry))
+        except (ValueError, KeyError) as exc:
+            self.policy_label.setText('Annotation policy needs attention')
+            self.policy_label.setToolTip(str(exc))
+
+    def show_annotation_policy(self, checked=False, *, automatic=False):
+        if not self.project_path:
+            return
+        import hashlib
+        try:
+            key = 'annotation_policy_seen/' + hashlib.sha256(str(self.project_path.resolve()).encode()).hexdigest()
+            signature = policy_signature(read_project_info(self.project_path))
+            if automatic and QSettings().value(key) == signature:
+                return
+            old = getattr(self, '_policy_dialog', None)
+            if old is not None:
+                old.close()
+            self._policy_dialog = AnnotationPolicyDialog(
+                self.project_path, getattr(self, 'contributor_session', None), self)
+            self._policy_dialog.policy_saved.connect(self._annotation_policy_saved)
+            self._policy_dialog.show()
+            QSettings().setValue(key, signature)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Annotation Policy Unavailable', str(exc))
+
+    def _annotation_policy_saved(self):
+        data = read_project_info(self.project_path)
+        self.annotation_manager.project_info = data.get('project_info', data)
+        self.coco_export_dirty = True
+        self._update_annotation_policy_label()
+        self._update_import_review_controls()
+
+    def _update_import_review_controls(self):
+        if not hasattr(self, 'frame_review_check'):
+            return
+        check = self.frame_review_check
+        check.setChecked(False)
+        check.setEnabled(False)
+        self.import_review_label.clear()
+        if not self.project_path or not self.current_video_id or self.current_frame_idx < 0:
+            return
+        try:
+            index = self._get_frame_idx_in_video(self.current_frame_idx)
+            records = read_reviews(self.project_path)
+            task = frame_task(records, self.current_video_id, index)
+            if task is None:
+                return
+            status = review_status(self.project_path, self.current_video_id, index, records)
+            check.setEnabled(True)
+            check.setChecked(status == 'complete' and not self.current_frame_modified)
+            self.import_review_label.setText('Review complete' if check.isChecked() else 'Pending review before training/export')
+            self.import_review_label.setToolTip('\n'.join(
+                f"{category_label(c)}: {'; '.join(r['reasons'])}" for c, r in task['requirements'].items()))
+        except Exception as exc:
+            self.import_review_label.setText('Review unavailable: ' + str(exc))
+
+    def mark_import_review(self, checked):
+        if not self.project_path or not self.current_video_id:
+            return
+        try:
+            self._save_annotation_sources()
+            self.save_worker.wait_until_idle()
+            index = self._get_frame_idx_in_video(self.current_frame_idx)
+            if checked:
+                policies = category_policies(read_project_info(self.project_path))
+                task = frame_task(read_reviews(self.project_path), self.current_video_id, index)
+                description = '\n'.join(category_label(c) + ': ' + policy_text(policies[c])
+                                        for c in task['requirements'])
+                reply = QMessageBox.question(self, 'Complete Frame Review',
+                    f'Frame {index}: confirm the imported labels now match the destination policy.\n\n'
+                    + description + '\n\nThis completes only this frame, not other frames sharing its masks.',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel)
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            complete_review(self.project_path, self.current_video_id, index,
+                            getattr(self, 'contributor_session', None), complete=checked)
+            self.coco_export_dirty = True
+        except Exception as exc:
+            QMessageBox.warning(self, 'Frame Review Not Saved', str(exc))
+        finally:
+            self._update_import_review_controls()
+
+    def show_import_reviews(self):
+        if not self.project_path:
+            return
+        try:
+            self._save_annotation_sources()
+            self.save_worker.wait_until_idle()
+            dialog = ImportedFrameReviewDialog(self.project_path, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.target:
+                return
+            video, index = dialog.target
+            if self.current_video_id != video:
+                self.load_video_frames(video)
+            for list_index, path in enumerate(self.frames):
+                if Path(path).parent.name == video and Path(path).stem == f'frame_{index:06d}':
+                    self.load_frame(list_index)
+                    return
+            QMessageBox.warning(self, 'Frame Unavailable', f'{video}: frame {index} is not available.')
+        except Exception as exc:
+            QMessageBox.warning(self, 'Review Queue Unavailable', str(exc))
 
     def set_contributor(self, session):
         self.contributor_session = dict(session)
@@ -3567,6 +3703,9 @@ class MainWindow(QMainWindow):
         """Mark the current annotation source files as needing a save."""
         self.current_frame_modified = True
         self.coco_export_dirty = True
+        if hasattr(self, 'frame_review_check') and self.frame_review_check.isEnabled():
+            self.frame_review_check.setChecked(False)
+            self.import_review_label.setText('Labels changed; review again after saving')
 
         if include_frame:
             frame_key = self._frame_annotation_key()
@@ -3832,6 +3971,9 @@ class MainWindow(QMainWindow):
         """Create a new project"""
         dialog = ProjectDialog(self, mode='new', default_dir=self.default_projects_dir)
         if dialog.exec():
+            old_policy_dialog = getattr(self, '_policy_dialog', None)
+            if old_policy_dialog is not None:
+                old_policy_dialog.close()
             project_info = dialog.get_project_info()
             project_name = project_info['name']
             self._reset_imaging_setup_cache()
@@ -3841,18 +3983,20 @@ class MainWindow(QMainWindow):
             self.project_path = base_path / project_name
             
             # Use ProjectManager to create new project structure
-            self.project_manager.create_project(
+            saved_info = self.project_manager.create_project(
                 self.project_path, 
                 project_name,
                 frames_per_video=15,  # Default, user can change per video
-                hive_annotation_scope=project_info['hive_annotation_scope']
+                hive_annotation_scope=project_info['hive_annotation_scope'],
+                annotation_policy=project_info['annotation_policy'],
             )
             
             # Set marker detector debug folder
             debug_folder = self.project_path / 'marker_debug'
             self.marker_detector.set_debug_folder(str(debug_folder))
             
-            self.annotation_manager.new_project(project_info)
+            self.annotation_manager.new_project(saved_info)
+            self._update_annotation_policy_label()
             self.status_label.setText(
                 f"Project created: {self.project_path.name} "
                 f"(ready to add videos)"
@@ -3951,6 +4095,9 @@ class MainWindow(QMainWindow):
             
     def load_project(self, path):
         """Load a project from path"""
+        old_policy = getattr(self, '_policy_dialog', None)
+        if old_policy is not None:
+            old_policy.close()
         self.project_path = Path(path)
         self._reset_imaging_setup_cache()
         
@@ -3974,6 +4121,7 @@ class MainWindow(QMainWindow):
         try:
             # Load project annotations
             self.annotation_manager.load_project(self.project_path)
+            category_policies(self.annotation_manager.project_info)
             
             # Update video list
             self.update_video_list()
@@ -3990,6 +4138,9 @@ class MainWindow(QMainWindow):
             )
             self._reset_done_counter_baseline()
             self.add_recent_project(self.project_path)
+            self._update_annotation_policy_label()
+            self._update_import_review_controls()
+            self.show_annotation_policy(automatic=True)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load project: {str(e)}")
             import traceback
@@ -4723,6 +4874,7 @@ class MainWindow(QMainWindow):
                 # Save current project state for restoration
                 self._save_project_state()
                 self._update_frame_navigation_buttons()
+                self._update_import_review_controls()
                 
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to load frame: {str(e)}")
@@ -4971,6 +5123,7 @@ class MainWindow(QMainWindow):
     def on_annotation_type_changed(self, annotation_type):
         """Handle annotation type selection change from toolbar"""
         self.canvas.set_annotation_type(annotation_type)
+        self._update_annotation_policy_label()
         print(f"Annotation type changed to: {annotation_type}")
         
         # Annotation type chooses what new edits create; class visibility is
@@ -5948,6 +6101,7 @@ class MainWindow(QMainWindow):
             self.canvas.current_annotation_type = category
         else:
             self.canvas.set_annotation_type(category, rebuild=False)
+        self._update_annotation_policy_label()
 
     def on_instance_changed(self, idx):
         """Handle instance selection change
