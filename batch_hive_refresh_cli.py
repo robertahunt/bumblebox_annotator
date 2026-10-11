@@ -222,25 +222,22 @@ def polygon_to_mask(polygon_text: str, frame_shape: Tuple[int, int]) -> Optional
     if not text:
         return None
 
-    numbers = []
-    for token in re.split(r"[\s,]+", text):
-        if not token:
-            continue
+    contours = []
+    for contour in text.split('|'):
         try:
-            numbers.append(float(token))
+            numbers = [float(token) for token in re.split(r"[\s,]+", contour.strip()) if token]
         except ValueError:
             return None
-
-    if len(numbers) < 6 or len(numbers) % 2:
-        return None
-
-    points = np.asarray(numbers, dtype=np.float32).reshape(-1, 2)
-    points[:, 0] = np.clip(points[:, 0], 0, frame_shape[1] - 1)
-    points[:, 1] = np.clip(points[:, 1], 0, frame_shape[0] - 1)
-    points = np.rint(points).astype(np.int32)
+        if len(numbers) < 6 or len(numbers) % 2 or not np.isfinite(numbers).all():
+            return None
+        points = np.asarray(numbers, dtype=np.float64).reshape(-1, 2)
+        points[:, 0] = np.clip(points[:, 0], 0, frame_shape[1] - 1)
+        points[:, 1] = np.clip(points[:, 1], 0, frame_shape[0] - 1)
+        contours.append(np.rint(points).astype(np.int32))
 
     mask = np.zeros(frame_shape, dtype=np.uint8)
-    cv2.fillPoly(mask, [points], 255)
+    for points in contours:
+        cv2.fillPoly(mask, [points], 255)
     return mask if np.any(mask > 0) else None
 
 
@@ -465,7 +462,7 @@ def ensure_fresh_outputs(output_folder: Path, resume: bool):
     for filename in [
         "bee_detections_hive_refreshed.csv",
         "hive_detections_hive_refreshed.csv",
-        "pollen_detections_hive_refreshed.csv",
+        "pollen_frame_summary_hive_refreshed.csv",
         "temporal_hive_priors_hive_refreshed.csv",
         "hive_refresh_status.csv",
     ]:
@@ -809,7 +806,7 @@ def refresh_video(
         hive_rows,
     )
     append_rows(
-        output_folder / "pollen_detections_hive_refreshed.csv",
+        output_folder / "pollen_frame_summary_hive_refreshed.csv",
         ["video_id", "chamber_id", "frame_number", "pollen_count", "pollen_pixels", "pollen_area_mm2"],
         pollen_rows,
     )
@@ -925,7 +922,7 @@ def main() -> int:
         append=args.resume,
     )
     write_header_if_needed(
-        args.output_folder / "pollen_detections_hive_refreshed.csv",
+        args.output_folder / "pollen_frame_summary_hive_refreshed.csv",
         ["video_id", "chamber_id", "frame_number", "pollen_count", "pollen_pixels", "pollen_area_mm2"],
         append=args.resume,
     )

@@ -2,10 +2,12 @@
 YOLO inference toolbar for structure and resource segmentation models.
 """
 
-from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QToolButton, QPushButton,
+from PyQt6.QtWidgets import (QWidget, QToolButton, QPushButton,
                              QLabel, QFileDialog, QMessageBox, QFrame)
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
+
+from .toolbar import FlowLayout
 
 
 class HiveChamberToolbar(QWidget):
@@ -45,11 +47,7 @@ class HiveChamberToolbar(QWidget):
         
     def init_ui(self):
         """Initialize UI"""
-        rows = QVBoxLayout(self)
-        rows.setContentsMargins(5, 5, 5, 5)
-        layout = QHBoxLayout()
-        rows.addLayout(layout)
-        layout.setSpacing(10)
+        layout = FlowLayout(self, margin=5, hspacing=10, vspacing=4)
         
         # Section label
         layout.addWidget(QLabel("<b>Structure Detection:</b>"))
@@ -97,10 +95,7 @@ class HiveChamberToolbar(QWidget):
         self.chamber_inference_btn.clicked.connect(self.on_chamber_inference_requested)
         layout.addWidget(self.chamber_inference_btn)
 
-        layout.addStretch()
-        layout = QHBoxLayout()
-        layout.setSpacing(10)
-        rows.addLayout(layout)
+        layout.addWidget(self.create_separator())
         layout.addWidget(QLabel("<b>Resource Detection:</b>"))
         
         # === Pollen Model Section ===
@@ -149,7 +144,6 @@ class HiveChamberToolbar(QWidget):
         self.both_inference_btn.clicked.connect(self.on_both_inference_requested)
         layout.addWidget(self.both_inference_btn)
         
-        layout.addStretch()
         
     def create_separator(self):
         """Create a vertical separator"""

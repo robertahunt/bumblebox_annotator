@@ -2,7 +2,9 @@
 
 Status: the initial policy interface and per-frame import review are implemented
 on `integration/annotation-batch` (2026-10-11). Remaining unchecked tasks are
-planned, not functional. The mainline merge is still separate and pending.
+planned, not functional. Mainline through `56c9a18` is now incorporated into the
+integration worktree; see the compatibility checklist below. This is not yet a
+user-validated production release.
 
 Project creation shows scope and meaning for every category. Existing projects
 show their policy on first opening (and after it changes), with **Project >
@@ -142,21 +144,27 @@ the policy layer accurately describes today's behavior.
   identities separate from appearance labels. None is implemented by the
   current temporal stage maps.
 
-## Merge Prerequisites
+## Mainline Compatibility
 
-The mainline integration review identified these pending compatibility fixes.
-Resolve them separately from training-memory optimization:
+The October 11 integration addresses these compatibility boundaries separately
+from any training-memory optimization:
 
-- [ ] Route mainline's ArUco CSV blocking-save helper through the scope-aware
+- [x] Route mainline's ArUco CSV blocking-save helper through the scope-aware
   save path; preserve brood/queen/nectar, frame-specific hive, attribution, and
   queued-save ordering.
-- [ ] Teach the hive-refresh polygon reader to accept mainline's pipe-separated
+- [x] Teach the hive-refresh polygon reader to accept mainline's pipe-separated
   disconnected contours without falling back silently to bounding boxes.
-- [ ] Preserve mainline's pollen output naming, but protect old output folders
+- [x] Preserve mainline's pollen output naming, but protect old output folders
   from reset/append across incompatible schemas. Keep old per-frame summaries
   distinct from new per-instance results, and correct the batch dialog wording.
-- [ ] Combine wrapping toolbars with the newer category and grouped-visibility
+- [x] Combine wrapping toolbars with the newer category and grouped-visibility
   controls, then verify the merged application on disposable projects.
+- [x] Extend Project Overview to count frame-specific hive, brood, queen brood,
+  and nectar labels on selected frames without double-counting derived boxes.
+
+Regression coverage is in `scripts/test_mainline_compatibility.py`, in addition
+to the existing policy/import/editing suites. Offscreen GUI checks do not replace
+the user acceptance testing still listed above.
 
 Mark tasks complete only with implementation and verification evidence. Keep
 private datasets, model checkpoints, and experimental analysis outputs out of

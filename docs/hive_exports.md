@@ -7,8 +7,33 @@ displaying that same map. Raw detections and past-only scoring remain available.
 | Representation | Meaning |
 | --- | --- |
 | Current-frame hive mask | The current frame's YOLO hive mask, with detected pollen removed when pollen exclusion is enabled. This can fluctuate between frames. |
-| `hive_detections.csv` | One majority-vote mask summary per video/chamber, reporting area in original-image pixels and the resulting centroid. A pixel must appear in more than half of the accumulated masks. |
+| `hive_detections.csv` | One majority-vote mask summary per video/chamber/hive instance, reporting area in original-image pixels, the resulting centroid and a polygon. Instances are numbered left-to-right within each chamber. A pixel must appear in more than half of that instance's accumulated masks. |
 | Temporal hive map | A rolling chamber-normalized estimate combining history and current usable evidence. Bee contact is evaluated after the current update by default, or before it in legacy past-only mode. It is not a fixed mask for the whole video. |
+
+`pollen_detections.csv` has the same per-instance shape for pollen, and
+`chamber_detections.csv` adds a polygon per chamber. Per-frame pollen counts and
+areas are written to `pollen_frame_summary.csv`. **Output high resolution
+polygons** uses lighter contour simplification for all CSV polygons.
+
+### CSV Compatibility
+
+The October 2026 mainline format makes `hive_detections.csv` and
+`pollen_detections.csv` per-instance summaries, with an instance ID, pixel count,
+centroid and polygon. Older `pollen_detections.csv` files contained per-frame
+counts/areas; scripts reading those measurements must now read
+`pollen_frame_summary.csv`. Hive-only refresh writes the corresponding
+`pollen_frame_summary_hive_refreshed.csv`.
+
+Batch startup and CSV export reject incompatible existing hive, pollen or
+chamber headers before resetting or appending those results. Select a **new
+output folder** for the new format. This does not migrate old CSVs or change
+the usual reset/resume behavior for compatible outputs.
+
+Disconnected contour strings use `|` between polygons. Hive refresh accepts
+both these strings and older single polygons, preserving disconnected regions
+instead of falling back to a bounding box. These are simplified external
+contours: interior holes are not encoded. They are not a replacement for the
+exact raster masks/RLE used by the training annotation workflow.
 
 `bee_detections.csv` contains the frame-specific temporal overlap/status fields.
 `temporal_hive_priors.csv` contains the final map summaries per context/chamber,

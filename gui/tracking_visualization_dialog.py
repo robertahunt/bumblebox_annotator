@@ -493,6 +493,7 @@ class TrackingVisualizationWorker(QThread):
                 video_id=video_path.stem,
                 bee_model=bee_model,
                 hive_model=hive_model,
+                pollen_model=None,
                 chamber_model=chamber_model,
                 tracker=tracker,
                 confidence_threshold=self.config['confidence_threshold'],

@@ -73,6 +73,7 @@ class BatchMaskExportTests(unittest.TestCase):
         processor._yolo_to_detections = Mock(return_value=[])
         processor._apply_tracking = Mock(return_value=[])
         processor._extract_hive_masks = Mock(side_effect=[{0: mask} for mask in self.hive_masks])
+        processor._extract_hive_instance_masks = Mock(return_value={})
         visualizer = Mock()
         visualizer.annotate_live_frame.side_effect = lambda **kwargs: kwargs['frame'].copy()
         processor._streaming_visualizer = visualizer
@@ -236,6 +237,41 @@ class BatchMaskExportTests(unittest.TestCase):
             self.assertEqual(set(worker.accumulated_hive_masks), {(video_id, 0)})
             self.assertTrue(worker._export_csvs(append=True, clear_after=True))
         self.assert_summary_rows(Path(worker.config['output_folder']), ('first', 'second'))
+
+    def test_instance_rows_and_both_pollen_csvs_are_exported(self):
+        left = np.zeros((8, 8), dtype=np.uint8)
+        left[1:3, 1:3] = 1
+        right = np.zeros((8, 8), dtype=np.uint8)
+        right[1:3, 5:7] = 1
+        pollen_mask = np.zeros((8, 8), dtype=np.uint8)
+        pollen_mask[5:7, 5:7] = 255
+        processor = self.make_processor(pollen_model=Mock())
+        processor._extract_hive_instance_masks = Mock(return_value={0: [left, right]})
+        processor._detect_pollen_balls = Mock(return_value=[
+            {'pollen_id': 1, 'mask': pollen_mask, 'pixels': 4, 'centroid': (5.5, 5.5)},
+        ])
+        self.assertTrue(processor.process())
+
+        worker = self.make_worker(pollen_model_path='synthetic-pollen.pt')
+        worker._collect_mask_summaries(processor)
+        worker.all_pollen_frame_data.extend(processor.get_pollen_frame_data())
+        self.assertTrue(worker._export_csvs(append=True, clear_after=True))
+        self.assertFalse(worker._has_pending_export_data())
+
+        folder = Path(worker.config['output_folder'])
+        hive = self.read_rows(folder / 'hive_detections.csv')
+        self.assertEqual([(row['hive_instance_id'], row['hive_pixels'], row['centroid_x']) for row in hive],
+                         [('1', '4', '1.50'), ('2', '4', '5.50')])
+        self.assertTrue(all(row['hive_polygon'] for row in hive))
+        pollen = self.read_rows(folder / 'pollen_detections.csv')
+        self.assertEqual([(row['pollen_instance_id'], row['pollen_pixels'], row['centroid_x']) for row in pollen],
+                         [('1', '4', '5.50')])
+        self.assertTrue(pollen[0]['pollen_polygon'])
+        summary = self.read_rows(folder / 'pollen_frame_summary.csv')
+        self.assertEqual([(row['pollen_count'], row['pollen_pixels']) for row in summary], [('1', '4')] * 3)
+        chamber = self.read_rows(folder / 'chamber_detections.csv')
+        self.assertEqual(chamber[0]['chamber_instance_id'], '0')
+        self.assertTrue(chamber[0]['chamber_polygon'])
 
     def test_prior_only_replay_does_not_accumulate_export_masks(self):
         prior = TemporalHivePrior(resolution=(8, 8), cleanup_kernel_size=0, min_component_pixels=0)

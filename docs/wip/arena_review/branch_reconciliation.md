@@ -46,6 +46,42 @@ validated production release.
 See [video import](../../video_import.md) and
 [tag measurement](../../aruco_tag_measurement.md) for the new workflows.
 
+## October 11 Mainline Reconciliation
+
+The policy/import-review work was checkpointed as `af40f9e` before merging
+`origin/master` at `56c9a18` into `integration/annotation-batch`. The default
+upstream branch is named `master`. This integration does not itself update it.
+
+- Retained the newer brood, queen brood and nectar categories, scope-aware
+  annotations, temporal workflows, project imports, contributor attribution,
+  optional external sync, and per-frame import review.
+- Brought in mainline's wrapping toolbars, ArUco CSV loading and identity work,
+  tracking/frame-validation improvements, Project Overview, per-instance
+  structure exports, and best-effort training carbon tracking.
+- Routed ArUco CSV saves through the canonical save path so frame-specific hive
+  and newer categories survive with their attribution and review requirements.
+- Combined wrapping layouts with grouped visibility and nectar model controls.
+  Project Overview now distinguishes shared-video annotations from frame-specific
+  object counts, including newer categories. Counts are not review certification.
+- Adopted mainline's pollen file naming: `pollen_detections.csv` is per-instance,
+  while `pollen_frame_summary.csv` is per-frame. Added header checks before
+  reset/append and taught hive refresh to read disconnected contour strings.
+  See [CSV compatibility](../../hive_exports.md#csv-compatibility).
+
+Focused merge checks live in `scripts/test_mainline_compatibility.py`, alongside
+the existing synthetic/offscreen suites. The combined October 11 run passed
+367 tests, including annotation policies, imports/review, sync, editing,
+categories, exact training masks, temporal exports, ArUco measurement, CSV
+compatibility, registration and validation-review helpers. Merged GUI/toolbars
+were also inspected in offscreen screenshots. Tests use disposable projects and
+do not alter research datasets. Physical-tablet and real GPU/batch acceptance tests
+remain outstanding. Carbon estimates require the `carbontracker` dependency;
+its best-effort fallback does not verify actual energy measurement here.
+
+Next: test a disposable real project, review the combined branch, then decide
+whether to merge it into `master`. No training-memory tuning is included in this
+reconciliation.
+
 ## Verification and Launch
 
 Run from the integration worktree, with the usual application dependencies:
