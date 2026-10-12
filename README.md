@@ -15,14 +15,15 @@ Written using Claude Sonnet 4.5
 
 ## Installation
 
-```bash
-# Create conda environment
-conda create -n bee_annotator python=3.10 -y
-conda activate bee_annotator
+Follow the [new-computer setup guide](docs/setup.md) for the pinned Linux/NVIDIA
+environment, CPU-only alternative, CUDA verification, optional SAM2, and project
+transfer steps. Clone `integration/annotation-batch` to use this integration
+version; the upstream default branch is still `master`.
 
-# Install dependencies
-pip install -r requirements.txt
-```
+Use a fresh environment and the supplied `constraints-linux-py310.txt`. Install
+the matching PyTorch/torchvision pair first, then the constrained requirements.
+Do not use the legacy `install.sh` or `install.ps1` for this version: they target
+an older CUDA setup and install unpinned SAM2.
 
 ## Segmentation Models
 
@@ -45,7 +46,26 @@ Import previews disclose scope/meaning conflicts. **Project > Imported Frame Rev
 
 See [ArUco tag size measurement](docs/aruco_tag_measurement.md) to measure minimum and maximum tag sizes before batch optimization.
 
+Batch ArUco **Detection workers** runs the parameter bank concurrently within each
+frame (default ceiling: 8). In `batch_video_inference_cli.py`, use
+`--aruco-detection-workers 8`, or `1` for serial execution. This is separate from
+**Optimization workers** / `--aruco-workers`, which controls the initial sweep.
+The actual concurrency is limited by the bank size, available CPUs, and OpenCV's
+existing thread count, and is printed in the run log. More workers can use more
+RAM. All parameter sets and their merge order are preserved; changing this option
+does not invalidate completed results for resume. Stop finishes the current
+frame, then cleans up the workers. OpenCV's global threading and training settings
+are not changed; interactive annotation detection remains serial.
+
 See [batch hive masks and exports](docs/hive_exports.md) for the difference between video overlays, per-video summaries, and temporal hive priors.
+
+For CLI batch inference, `--fps-override 4.3` uses a measured acquisition rate
+instead of container metadata for frame timing and annotated playback. It does not
+resample video or change the 1-based CSV frame numbers. Without this option the
+container rate is used. Choose a fresh output folder when changing timing;
+resume treats a changed override as an analysis configuration change.
+`bee_velocity.csv` remains in pixels/frame: multiply by FPS and `--pixel-size-mm`
+to convert to mm/second.
 
 See [nectar source segmentation](docs/nectar_segmentation.md) to annotate nectar sources, train a nectar-only model, and run it on the current frame.
 

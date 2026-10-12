@@ -298,11 +298,14 @@ class BatchVideoInferenceWorker(QThread):
             'verbose_output',
             'temporal_hive_checkpointing',
             'temporal_hive_checkpoint_path',
+            'aruco_detection_workers',
         }
         if ignore_visualization:
             ignored_keys.update(self.VISUALIZATION_SIGNATURE_KEYS)
         drop_keys = set(drop_keys or ())
         config_items = dict(self.config)
+        if config_items.get('fps_override') is None:
+            config_items.pop('fps_override', None)
         if visualization_overrides:
             config_items.update(visualization_overrides)
         if not config_items.get('brood_model_path'):
@@ -1599,6 +1602,7 @@ class BatchVideoInferenceWorker(QThread):
             pixel_size_mm=self.config.get('pixel_size_mm'),
             exclude_pollen_from_hive=self.config.get('exclude_pollen_from_hive', True),
             prior_only=True,
+            fps_override=self.config.get('fps_override'),
         )
 
         start = time.perf_counter()
@@ -1717,6 +1721,7 @@ class BatchVideoInferenceWorker(QThread):
             streaming_visualization_format=visualization_format,
             aruco_dicts=aruco_runtime_config.get('aruco_dicts'),
             aruco_params_bank=aruco_runtime_config.get('aruco_params_bank'),
+            aruco_detection_workers=self.config.get('aruco_detection_workers', 8),
             allowed_tag_ids=aruco_runtime_config.get('allowed_tag_ids'),
             excluded_tag_ids=aruco_runtime_config.get('excluded_tag_ids'),
             temporal_hive_prior=self.temporal_hive_prior,
@@ -1726,6 +1731,7 @@ class BatchVideoInferenceWorker(QThread):
             exclude_pollen_from_hive=self.config.get('exclude_pollen_from_hive', True),
             hive_overlay_mode=hive_overlay_mode,
             polygon_epsilon=self._polygon_epsilon(),
+            fps_override=self.config.get('fps_override'),
             brood_model=self.brood_model,
             temporal_brood_map=self.temporal_brood_map,
             brood_preview=visualization_enabled,
@@ -1940,7 +1946,7 @@ class BatchVideoInferenceWorker(QThread):
                 video_folder = output_folder / 'annotated_videos'
                 suffix = "_partial_annotated.mp4" if partial else "_annotated.mp4"
                 video_output_path = video_folder / f"{video_id}{suffix}"
-                success = viz_gen.generate_video(video_output_path)
+                success = viz_gen.generate_video(video_output_path, fps=processor.video_fps)
                 if success:
                     self.log_message.emit(f"  ✓ Saved annotated video to: annotated_videos/{video_output_path.name}")
                     self.log_message.emit(f"    Output video: {video_output_path}")

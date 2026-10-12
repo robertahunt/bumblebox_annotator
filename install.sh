@@ -1,5 +1,6 @@
 #!/bin/bash
 # Installation script for Bee Annotator
+# Legacy installer: use docs/setup.md for integration/annotation-batch.
 
 set -e  # Exit on error
 

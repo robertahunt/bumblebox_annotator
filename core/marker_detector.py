@@ -7,6 +7,9 @@ within bee segmentation masks for robust tracking and identification.
 
 import cv2
 import numpy as np
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, Any, List, Tuple, Union
 from dataclasses import dataclass
 
@@ -68,7 +71,8 @@ class MarkerDetector:
         enable_aruco: bool = True,
         enable_qr: bool = True,
         debug: bool = False,
-        debug_folder: Optional[str] = None
+        debug_folder: Optional[str] = None,
+        detection_workers: int = 1,
     ):
         """
         Initialize marker detector.
@@ -81,10 +85,15 @@ class MarkerDetector:
             min_confidence: Minimum detection confidence threshold (0-1, default 0.2 for small markers)
             enable_aruco: Enable ArUco marker detection
             enable_qr: Enable QR code detection
+            detection_workers: Maximum concurrent full-frame ArUco detector calls.
         """
         self.min_confidence = min_confidence
         self.enable_aruco = enable_aruco
         self.enable_qr = enable_qr
+        if isinstance(detection_workers, bool) or int(detection_workers) != detection_workers or detection_workers < 1:
+            raise ValueError('ArUco detection workers must be a positive integer')
+        self.detection_workers = int(detection_workers)
+        self._aruco_lock = threading.Lock()
         self.allowed_tag_ids = {int(tag_id) for tag_id in allowed_tag_ids} if allowed_tag_ids else None
         self.excluded_tag_ids = {int(tag_id) for tag_id in excluded_tag_ids} if excluded_tag_ids else set()
         self.aruco_param_bank = self._normalize_aruco_param_bank(aruco_params)
@@ -164,6 +173,51 @@ class MarkerDetector:
         if self.allowed_tag_ids is None:
             return True
         return int(marker_id) in self.allowed_tag_ids
+
+    def _aruco_jobs(self):
+        return [
+            (dict_name, entry)
+            for dict_name in self.aruco_dicts_to_try
+            for entry in self.aruco_detectors.get(dict_name, [])
+        ]
+
+    @property
+    def effective_detection_workers(self) -> int:
+        jobs = self._aruco_jobs()
+        # Repeated dictionary names can refer to the same native detector.
+        if len({id(entry['detector']) for _, entry in jobs}) != len(jobs):
+            return 1
+        try:
+            cpu_count = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            cpu_count = os.cpu_count() or 1
+        native_threads = max(1, cv2.getNumThreads())
+        return max(1, min(self.detection_workers, len(jobs), cpu_count // native_threads))
+
+    @staticmethod
+    def _detect_aruco_job(job, image):
+        dict_name, entry = job
+        corners, ids, _ = entry['detector'].detectMarkers(image)
+        # Rejected contours are unused here and can be large on full-size frames.
+        return dict_name, entry, corners, ids
+
+    def _detect_aruco_bank(self, image):
+        """Run the complete bank, returning results in dictionary/parameter order."""
+        # Prevent concurrent frames or ROI calls from sharing native detector state.
+        with self._aruco_lock:
+            jobs = self._aruco_jobs()
+            workers = self.effective_detection_workers
+            if workers == 1:
+                return [self._detect_aruco_job(job, image) for job in jobs]
+            executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='aruco-detect')
+            try:
+                futures = [executor.submit(self._detect_aruco_job, job, image) for job in jobs]
+                # Completion order must not change confidence ties or duplicate merging.
+                return [future.result() for future in futures]
+            finally:
+                # Native calls cannot be interrupted. Finish them before returning or
+                # raising, and never leave workers alive for a subsequent training run.
+                executor.shutdown(wait=True, cancel_futures=True)
     
     def set_debug_folder(self, folder_path: str):
         """Set or update the debug folder path
@@ -356,7 +410,8 @@ class MarkerDetector:
             for detector_entry in detector_entries:
                 detector = detector_entry['detector']
                 try:
-                    corners, ids, rejected = detector.detectMarkers(roi_image)
+                    with self._aruco_lock:
+                        corners, ids, rejected = detector.detectMarkers(roi_image)
                     
                     if ids is not None and len(ids) > 0:
                         # Check each detected marker
@@ -614,41 +669,32 @@ class MarkerDetector:
 
         aruco_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
         
-        for dict_name in dicts_to_try:
-            if dict_name not in self.aruco_detectors:
+        for dict_name, detector_entry, corners, ids in self._detect_aruco_bank(aruco_image):
+            if ids is not None and len(ids) > 0:
                 if self.debug:
-                    print(f"  ✗ {dict_name}: detector not available")
-                continue
+                    label = detector_entry.get('label', '')
+                    print(f"  {dict_name}/{label}: Found {len(ids)} marker(s) - IDs: {ids.flatten().tolist()}")
 
-            for detector_entry in self.aruco_detectors[dict_name]:
-                detector = detector_entry['detector']
-                corners, ids, rejected = detector.detectMarkers(aruco_image)
-                
-                if ids is not None and len(ids) > 0:
-                    if self.debug:
-                        label = detector_entry.get('label', '')
-                        print(f"  {dict_name}/{label}: Found {len(ids)} marker(s) - IDs: {ids.flatten().tolist()}")
-                    
-                    for i, marker_id in enumerate(ids):
-                        marker_id_int = int(marker_id[0])
-                        if not self._marker_id_allowed(marker_id_int):
-                            continue
+                for i, marker_id in enumerate(ids):
+                    marker_id_int = int(marker_id[0])
+                    if not self._marker_id_allowed(marker_id_int):
+                        continue
 
-                        marker_corners = corners[i][0]  # Shape: (4, 2)
-                        center = marker_corners.mean(axis=0)
-                        
-                        # Calculate confidence
-                        area = cv2.contourArea(marker_corners)
-                        confidence = min(1.0, np.sqrt(area) / 70.0)
-                        
-                        all_markers.append({
-                            'marker_id': marker_id_int,
-                            'center': center,
-                            'corners': marker_corners,
-                            'dict_name': dict_name,
-                            'param_label': detector_entry.get('label', ''),
-                            'confidence': confidence
-                        })
+                    marker_corners = corners[i][0]  # Shape: (4, 2)
+                    center = marker_corners.mean(axis=0)
+
+                    # Calculate confidence
+                    area = cv2.contourArea(marker_corners)
+                    confidence = min(1.0, np.sqrt(area) / 70.0)
+
+                    all_markers.append({
+                        'marker_id': marker_id_int,
+                        'center': center,
+                        'corners': marker_corners,
+                        'dict_name': dict_name,
+                        'param_label': detector_entry.get('label', ''),
+                        'confidence': confidence
+                    })
         
         stats['total_markers'] = len(all_markers)
         

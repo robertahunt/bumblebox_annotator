@@ -1,4 +1,5 @@
 # Installation script for Bee Annotator (Windows)
+# Legacy installer: see docs/setup.md; the reference setup is Linux-specific.
 
 Write-Host "====================================" -ForegroundColor Green
 Write-Host "Bee Annotator Installation" -ForegroundColor Green

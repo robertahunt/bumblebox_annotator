@@ -244,6 +244,8 @@ class ProjectDialog(QDialog):
         layout.addWidget(self.policy_table)
         self.hive_scope_combo.currentIndexChanged.connect(
             lambda unused: self.policy_table.set_hive_scope(self.hive_scope_combo.currentData()))
+        self.policy_table.hive_scope_changed.connect(
+            lambda scope: self.hive_scope_combo.setCurrentIndex(self.hive_scope_combo.findData(scope)))
         self.resize(1000, 690)
 
         # Buttons

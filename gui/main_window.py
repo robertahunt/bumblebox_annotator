@@ -44,7 +44,8 @@ from .project_sync_dialog import (ProjectSyncDialog, SyncProgressDialog, choose_
                                   setting_json, save_setting)
 from .project_import_dialog import ProjectImportDialog
 from .annotation_policy_dialog import AnnotationPolicyDialog, ImportedFrameReviewDialog
-from core.annotation_policy import category_policies, policy_signature, policy_text, guidance
+from core.annotation_policy import (category_policies, policy_needs_confirmation,
+                                    policy_signature, policy_text, guidance)
 from core.annotation_scope import read_project_info
 from core.import_review import read_reviews, frame_task, review_status, complete_review
 from core.project_sync import sync_project
@@ -1063,29 +1064,37 @@ class MainWindow(QMainWindow):
             self.policy_label.setText('Annotation policy needs attention')
             self.policy_label.setToolTip(str(exc))
 
+    def _annotation_policy_seen_key(self):
+        import hashlib
+        return 'annotation_policy_seen/' + hashlib.sha256(str(self.project_path.resolve()).encode()).hexdigest()
+
     def show_annotation_policy(self, checked=False, *, automatic=False):
         if not self.project_path:
             return
-        import hashlib
         try:
-            key = 'annotation_policy_seen/' + hashlib.sha256(str(self.project_path.resolve()).encode()).hexdigest()
-            signature = policy_signature(read_project_info(self.project_path))
-            if automatic and QSettings().value(key) == signature:
-                return
+            key = self._annotation_policy_seen_key()
+            info = read_project_info(self.project_path)
+            signature = policy_signature(info)
+            pending = policy_needs_confirmation(info)
             old = getattr(self, '_policy_dialog', None)
             if old is not None:
                 old.close()
+            if automatic and not pending and QSettings().value(key) == signature:
+                return
             self._policy_dialog = AnnotationPolicyDialog(
                 self.project_path, getattr(self, 'contributor_session', None), self)
             self._policy_dialog.policy_saved.connect(self._annotation_policy_saved)
             self._policy_dialog.show()
-            QSettings().setValue(key, signature)
+            if not pending:
+                QSettings().setValue(key, signature)
         except Exception as exc:
             QMessageBox.warning(self, 'Annotation Policy Unavailable', str(exc))
 
     def _annotation_policy_saved(self):
         data = read_project_info(self.project_path)
         self.annotation_manager.project_info = data.get('project_info', data)
+        if not policy_needs_confirmation(data):
+            QSettings().setValue(self._annotation_policy_seen_key(), policy_signature(data))
         self.coco_export_dirty = True
         self._update_annotation_policy_label()
         self._update_import_review_controls()

@@ -484,6 +484,16 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.aruco_dictionary_combo.setCurrentText("Auto 4x4 dictionaries")
         aruco_form.addRow("Dictionary:", self.aruco_dictionary_combo)
 
+        self.aruco_detection_workers_spin = QSpinBox()
+        self.aruco_detection_workers_spin.setRange(1, max(1, os.cpu_count() or 1))
+        self.aruco_detection_workers_spin.setValue(min(8, os.cpu_count() or 1))
+        self.aruco_detection_workers_spin.setToolTip(
+            "Maximum concurrent detector calls per frame; 1 runs serially. "
+            "Limited by the detector bank, available CPUs, and OpenCV's existing thread count. "
+            "More workers may use more RAM. Separate from parameter optimization workers."
+        )
+        aruco_form.addRow("Detection workers:", self.aruco_detection_workers_spin)
+
         self.aruco_optimize_check = QCheckBox("Optimize parameter bank before each video")
         self.aruco_optimize_check.setChecked(False)
         self.aruco_optimize_check.setToolTip(
@@ -850,6 +860,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.aruco_sample_frames_spin.setValue(self._setting_int("aruco/sample_frames", 12))
         self.aruco_max_combinations_spin.setValue(self._setting_int("aruco/max_combinations", 750))
         self.aruco_workers_spin.setValue(self._setting_int("aruco/workers", self.aruco_workers_spin.value()))
+        self.aruco_detection_workers_spin.setValue(self._setting_int("aruco/detection_workers", self.aruco_detection_workers_spin.value()))
         self.aruco_bank_size_spin.setValue(self._setting_int("aruco/bank_size", 5))
         self.aruco_expected_tags_spin.setValue(self._setting_float("aruco/expected_tags", 0.0))
         self.aruco_tag_list_edit.setText(self._setting_text("aruco/tag_list_path", ""))
@@ -920,6 +931,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
         self.settings.setValue("aruco/sample_frames", self.aruco_sample_frames_spin.value())
         self.settings.setValue("aruco/max_combinations", self.aruco_max_combinations_spin.value())
         self.settings.setValue("aruco/workers", self.aruco_workers_spin.value())
+        self.settings.setValue("aruco/detection_workers", self.aruco_detection_workers_spin.value())
         self.settings.setValue("aruco/bank_size", self.aruco_bank_size_spin.value())
         self.settings.setValue("aruco/expected_tags", self.aruco_expected_tags_spin.value())
         self.settings.setValue("aruco/tag_list_path", self.aruco_tag_list_edit.text())
@@ -982,6 +994,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
         aruco_enabled = self.enable_aruco_check.isChecked()
         optimize_enabled = aruco_enabled and self.aruco_optimize_check.isChecked()
         base_controls = [
+            self.aruco_detection_workers_spin,
             self.aruco_dictionary_combo,
             self.aruco_optimize_check,
             self.aruco_tag_list_edit,
@@ -1483,6 +1496,7 @@ class BatchVideoInferenceConfigDialog(QDialog):
             'compute_spatial_metrics': self.compute_spatial_metrics_check.isChecked(),
             'pixel_size_mm': self.pixel_size_mm_spin.value() if self.pixel_size_mm_spin.value() > 0 else None,
             'enable_aruco': self.enable_aruco_check.isChecked(),
+            'aruco_detection_workers': self.aruco_detection_workers_spin.value(),
             'aruco_dictionary': aruco_dictionary,
             'aruco_dictionary_mode': aruco_dictionary_mode,
             'tag_list_path': tag_list_path or None,

@@ -24,6 +24,7 @@ from core.temporal_hive_visualization import TemporalHiveOverlayReader, Temporal
 from core.video_inference_exporter import VideoInferenceExporter
 from gui.batch_video_inference_worker import BatchVideoInferenceWorker
 import batch_hive_refresh_cli as refresh_cli
+import batch_video_inference_cli as inference_cli
 
 
 class BatchMaskExportTests(unittest.TestCase):
@@ -109,6 +110,80 @@ class BatchMaskExportTests(unittest.TestCase):
     def read_rows(self, path):
         with path.open(newline='') as handle:
             return list(csv.DictReader(handle))
+
+    def test_fps_override_controls_time_and_streaming_without_resampling(self):
+        processor = self.make_processor(
+            fps_override=4.3, video_start_time_seconds=100.0,
+            streaming_visualization_path=self.root / 'annotated.mp4',
+        )
+        with patch('core.batch_video_processor.cv2.VideoWriter') as writer:
+            writer.return_value.isOpened.return_value = True
+            self.assertTrue(processor.process())
+        self.assertEqual(processor.video_fps, 4.3)
+        self.assertEqual(processor.frame_count, 3)
+        self.assertAlmostEqual(processor._frame_time_seconds(1), 100.0)
+        self.assertAlmostEqual(processor._frame_time_seconds(3), 100.0 + 2 / 4.3)
+        self.assertEqual(writer.call_args.args[2], 4.3)
+        self.assertEqual(writer.return_value.write.call_count, 3)
+
+    def test_no_override_preserves_container_fps(self):
+        processor = self.make_processor()
+        self.assertTrue(processor.process())
+        self.assertEqual(processor.video_fps, 10.0)
+
+    def test_invalid_fps_override_rejected(self):
+        for value in (0, -1, float('nan'), float('inf'), -float('inf')):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.make_processor(fps_override=value)
+
+    def test_cli_fps_override_validation_and_config(self):
+        import argparse
+        for value in ('0', '-1', 'nan', 'inf', 'invalid'):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                inference_cli.positive_fps(value)
+        video = self.root / 'sample.mp4'
+        model = self.root / 'bee.pt'
+        video.touch()
+        model.touch()
+        defaults = inference_cli.load_saved_defaults()
+        defaults.update({key: None for key in (
+            'bee_model', 'hive_model', 'pollen_model', 'chamber_model', 'tag_map', 'exclude_tags')})
+        arguments = ['cli', '--video', str(video), '--bee-model', str(model),
+                     '--output-folder', str(self.root / 'output')]
+        with patch.object(inference_cli, 'load_saved_defaults', return_value=defaults):
+            with patch.object(sys, 'argv', arguments):
+                self.assertIsNone(inference_cli.build_config(inference_cli.parse_args())['fps_override'])
+            with patch.object(sys, 'argv', arguments + ['--fps-override', '4.3']):
+                self.assertEqual(inference_cli.build_config(inference_cli.parse_args())['fps_override'], 4.3)
+
+    def test_fps_override_reaches_worker_processing(self):
+        worker = self.make_worker(fps_override=4.3)
+        _, processor = self.run_worker_video(worker)
+        self.assertEqual(processor.video_fps, 4.3)
+
+    def test_fps_override_reaches_prior_replay(self):
+        worker = self.make_worker(fps_override=4.3)
+        worker.temporal_hive_prior = Mock()
+        with patch('gui.batch_video_inference_worker.BatchVideoProcessor') as factory:
+            factory.return_value.get_timing_summary.return_value = {}
+            worker._replay_temporal_hive_prior(self.root / 'sample.mp4', None, Mock(), None, None, 1, 1)
+        self.assertEqual(factory.call_args.kwargs['fps_override'], 4.3)
+
+    def test_fps_override_reaches_fallback_video_renderer(self):
+        worker = self.make_worker(fps_override=4.3)
+        processor = self.make_processor(fps_override=4.3)
+        self.assertTrue(processor.process())
+        with patch('gui.batch_video_inference_worker.VisualizationGenerator') as renderer:
+            worker._generate_visualizations(self.root / 'sample.mp4', 'sample', processor)
+        self.assertEqual(renderer.return_value.generate_video.call_args.kwargs['fps'], 4.3)
+
+    def test_fps_override_changes_resume_compatibility_only_when_set(self):
+        original = self.make_worker()
+        default = self.make_worker(fps_override=None)
+        overridden = self.make_worker(fps_override=4.3)
+        for attribute in ('config_signature', 'analysis_config_signature'):
+            self.assertEqual(getattr(original, attribute), getattr(default, attribute))
+            self.assertNotEqual(getattr(original, attribute), getattr(overridden, attribute))
 
     def test_refresh_caches_past_only_maps_without_bee_model_or_tracking(self):
         prior = TemporalHivePrior(resolution=(8, 8), min_prior_weight=1,

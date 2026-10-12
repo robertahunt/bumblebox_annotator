@@ -1,26 +1,35 @@
 """Project label intent and imported-frame review controls."""
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QSignalBlocker
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                             QDialogButtonBox, QHeaderView, QLabel, QMessageBox,
                             QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from core.annotation_policy import (MEANINGS, SCOPES, category_policies, default_policy,
-                                    guidance, policy_text, save_policy, temporal_support)
+                                    guidance, policy_needs_confirmation, policy_text,
+                                    save_policy, temporal_support)
 from core.annotation_scope import read_project_info
-from core.categories import CATEGORIES, category_label
+from core.categories import CATEGORIES, BROOD_CATEGORIES, category_label
 from core.import_review import review_rows
 
 
 class PolicyTable(QWidget):
+    hive_scope_changed = pyqtSignal(str)
+
     def __init__(self, info, parent=None, *, new=False):
         super().__init__(parent)
         self.new = new
         self.info = info
         self.meanings = {}
+        self.scopes = {}
+        self.groups = {}
+        for category in CATEGORIES:
+            group = 'brood' if category in BROOD_CATEGORIES else category
+            self.groups.setdefault(group, []).append(category)
+        self.rows = list(self.groups)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.table = QTableWidget(len(CATEGORIES), 4)
+        self.table = QTableWidget(len(self.rows), 4)
         self.table.setHorizontalHeaderLabels(['Category', 'Saved scope', 'Label meaning', 'Temporal analysis'])
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -28,21 +37,39 @@ class PolicyTable(QWidget):
         self.table.setWordWrap(True)
         self.table.setMinimumHeight(280)
         entries = default_policy(info)['categories'] if new else category_policies(info)
-        for row, category in enumerate(CATEGORIES):
-            for column, text in ((0, category_label(category)), (1, SCOPES[entries[category]['scope']]),
-                                 (3, temporal_support(category))):
+        for row, group in enumerate(self.rows):
+            members = self.groups[group]
+            category = members[0]
+            label = 'Brood' if group == 'brood' else category_label(category)
+            for column, text in ((0, label), (3, temporal_support(category))):
                 item = QTableWidgetItem(text)
                 item.setToolTip(text)
                 self.table.setItem(row, column, item)
+            if group == 'brood':
+                self.table.item(row, 0).setToolTip('All brood and queen brood stages; segmentation labels remain separate.')
+            scope_combo = QComboBox()
+            saved_scope = entries[category]['scope']
+            for key, scope_label in SCOPES.items():
+                scope_combo.addItem(scope_label, key)
+                if key != saved_scope and not (new and group == 'hive'):
+                    tip = 'Requires project import conversion' if group == 'hive' else 'Not implemented yet'
+                    scope_combo.setItemData(scope_combo.findData(key), tip, Qt.ItemDataRole.ToolTipRole)
+            scope_combo.setCurrentIndex(scope_combo.findData(saved_scope))
+            scope_combo.currentIndexChanged.connect(lambda unused, g=group: self._scope_requested(g))
+            self.table.setCellWidget(row, 1, scope_combo)
+            self.scopes[group] = scope_combo
             combo = QComboBox()
+            meanings = {entries[c]['meaning'] for c in members}
+            if len(meanings) > 1:
+                combo.addItem('Mixed (keep existing)', None)
             for key, label in MEANINGS.items():
                 combo.addItem(label, key)
-            combo.setCurrentIndex(combo.findData(entries[category]['meaning']))
-            combo.currentIndexChanged.connect(lambda unused, c=category: self.update_guidance(c))
+            combo.setCurrentIndex(combo.findData(next(iter(meanings))) if len(meanings) == 1 else 0)
+            combo.currentIndexChanged.connect(lambda unused, g=group: self.update_guidance(g))
             self.table.setCellWidget(row, 2, combo)
-            self.meanings[category] = combo
+            self.meanings[group] = combo
         self.table.resizeRowsToContents()
-        self.table.cellClicked.connect(lambda row, column: self.update_guidance(CATEGORIES[row]))
+        self.table.cellClicked.connect(lambda row, column: self.update_guidance(self.rows[row]))
         layout.addWidget(self.table)
         self.help = QLabel()
         self.help.setWordWrap(True)
@@ -52,21 +79,64 @@ class PolicyTable(QWidget):
 
     def entries(self):
         entries = category_policies(self.info)
-        for category, combo in self.meanings.items():
-            entries[category]['meaning'] = combo.currentData()
+        for group, combo in self.meanings.items():
+            # A mixed legacy group stays unchanged until the user chooses a common meaning.
+            if combo.currentData() is not None:
+                for category in self.groups[group]:
+                    entries[category]['meaning'] = combo.currentData()
         return entries
 
-    def update_guidance(self, category):
+    def update_guidance(self, group):
         if hasattr(self, 'help'):
-            self.help.setText(category_label(category) + ': ' + guidance(self.entries()[category]))
+            if group == 'brood' and self.meanings[group].currentData() is None:
+                self.help.setText('Brood: saved stage meanings differ. They remain unchanged until you choose '
+                                  'a common meaning for all brood and queen brood stages.')
+            else:
+                label = 'Brood (all brood and queen brood stages)' if group == 'brood' else category_label(group)
+                self.help.setText(label + ': ' + guidance(self.entries()[self.groups[group][0]]))
+
+    def _scope_requested(self, group):
+        combo = self.scopes[group]
+        saved = category_policies(self.info)[self.groups[group][0]]['scope']
+        requested = combo.currentData()
+        if requested == saved:
+            return
+        if self.new and group == 'hive':
+            self.set_hive_scope(requested)
+            return
+        with QSignalBlocker(combo):
+            combo.setCurrentIndex(combo.findData(saved))
+        self.update_guidance(group)
+        if group == 'hive':
+            title = 'Hive Scope Conversion Required'
+            message = (
+                'Hive annotations support both scopes, but an existing project cannot switch them here.\n\n'
+                f'Create a destination project with hive scope "{SCOPES[requested]}", then use '
+                'File > Import From Project... in that project to preview and convert copies of the annotations.')
+        else:
+            label = 'Brood (all brood and queen brood stages)' if group == 'brood' else category_label(group)
+            title = 'Scope Not Implemented'
+            message = f'Sorry, "{SCOPES[requested]}" annotations for {label} have not been implemented yet.'
+        QMessageBox.information(
+            self, title, message + f'\n\nScope remains "{SCOPES[saved]}". '
+            'Your masks and saved scope have not been changed.')
 
     def set_hive_scope(self, scope):
+        if scope not in SCOPES:
+            raise ValueError(f'Unknown hive scope: {scope}')
+        combo = self.scopes['hive']
+        if not self.new:
+            combo.setCurrentIndex(combo.findData(scope))
+            return
+        if scope == category_policies(self.info)['hive']['scope']:
+            return
         self.info = {'hive_annotation_scope': scope}
-        row = CATEGORIES.index('hive')
-        self.table.item(row, 1).setText(SCOPES[scope])
+        with QSignalBlocker(combo):
+            combo.setCurrentIndex(combo.findData(scope))
         self.meanings['hive'].setCurrentIndex(self.meanings['hive'].findData(
             'visible' if scope == 'frame' else 'full_extent'))
         self.update_guidance('hive')
+        self.hive_scope_changed.emit(scope)
 
 
 class AnnotationPolicyDialog(QDialog):
@@ -83,15 +153,28 @@ class AnnotationPolicyDialog(QDialog):
         label.setWordWrap(True)
         label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(label)
-        self.policy = PolicyTable(read_project_info(project), self)
+        info = read_project_info(project)
+        pending = policy_needs_confirmation(info)
+        self.reminder_label = QLabel(
+            'Annotation policy setup is incomplete. Choose label meanings for all categories and save to finish. '
+            'Until then, this reminder will return when you reopen this project, including after restarting the app.')
+        self.reminder_label.setWordWrap(True)
+        self.reminder_label.setVisible(pending)
+        layout.addWidget(self.reminder_label)
+        self.policy = PolicyTable(info, self)
         layout.addWidget(self.policy)
-        note = QLabel('Scope is fixed for existing projects. Use Import From Project for scope conversion. '
+        note = QLabel('Saved scopes cannot be changed here. Hive scope conversion is available through Import From Project; '
+                      'alternate scopes for the other categories are not implemented yet. '
                       'Temporal maps are batch outputs, not training labels. Changing label meaning does not edit masks.')
         note.setWordWrap(True)
         layout.addWidget(note)
         self.confirm = QCheckBox('These meanings describe my intended labels; imported conflicts still need frame review')
         layout.addWidget(self.confirm)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Close)
+        self.defer_button = buttons.button(QDialogButtonBox.StandardButton.Close)
+        if pending:
+            self.defer_button.setText('Remind Me Later')
+            self.defer_button.setToolTip('Close without saving these choices. Remind me when this project is reopened.')
         self.save_button = buttons.button(QDialogButtonBox.StandardButton.Save)
         self.save_button.setEnabled(False)
         self.confirm.toggled.connect(self.save_button.setEnabled)

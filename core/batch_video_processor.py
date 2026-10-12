@@ -206,7 +206,9 @@ class BatchVideoProcessor:
                  temporal_overlay_path: Optional[Path] = None,
                  brood_model=None, temporal_brood_map=None, brood_preview=False,
                  brood_context_id=None,
-                 polygon_epsilon: float = 2.0):
+                 polygon_epsilon: float = 2.0,
+                 fps_override: Optional[float] = None,
+                 aruco_detection_workers: int = 8):
         """
         Args:
             video_path: Path to video file
@@ -255,7 +257,12 @@ class BatchVideoProcessor:
             temporal_brood_map: Shared experimental brood history, separate from hive maps.
             brood_preview: Write a separate history-informed brood MP4.
             polygon_epsilon: Contour simplification percentage for CSV polygons
+            fps_override: Measured source FPS for timing and playback, without resampling.
+            aruco_detection_workers: Maximum concurrent ArUco detector calls per frame.
         """
+        self.fps_override = float(fps_override) if fps_override is not None else None
+        if self.fps_override is not None and (not np.isfinite(self.fps_override) or self.fps_override <= 0):
+            raise ValueError('FPS override must be a finite positive number')
         self.video_path = video_path
         self.video_id = video_id
         self.output_folder = Path(output_folder) if output_folder is not None else None
@@ -347,7 +354,8 @@ class BatchVideoProcessor:
                 enable_qr=False,  # Disable QR codes for performance
                 min_confidence=0.2,
                 debug=False,  # Disabled for performance (detect_aruco_in_bee_instances is much faster)
-                debug_folder=None
+                debug_folder=None,
+                detection_workers=aruco_detection_workers,
             )
         
         # Data storage
@@ -613,7 +621,17 @@ class BatchVideoProcessor:
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        self.video_fps = fps if fps > 0 else None
+        self.video_fps = self.fps_override if self.fps_override is not None else (
+            fps if np.isfinite(fps) and fps > 0 else None
+        )
+        if self.fps_override is not None:
+            self._log(f'  Source FPS: {self.video_fps:g} (override; container reports {fps:g})')
+        if self.marker_detector is not None:
+            self._log(
+                f'  ArUco detection workers: {self.marker_detector.effective_detection_workers} '
+                f'(requested {self.marker_detector.detection_workers}; '
+                f'OpenCV threads unchanged: {cv2.getNumThreads()})'
+            )
         if self.max_frames is not None and total_frames > 0:
             total_frames = min(total_frames, self.max_frames)
         frame_number = 0

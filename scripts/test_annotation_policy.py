@@ -10,7 +10,8 @@ import cv2
 import numpy as np
 
 from core.annotation import AnnotationManager
-from core.annotation_policy import category_policies, default_policy, save_policy, temporal_support
+from core.annotation_policy import (category_policies, default_policy, policy_needs_confirmation,
+                                    save_policy, temporal_support)
 from core.categories import CATEGORIES
 from core.contributors import new_session
 from core.import_review import (REVIEW_FILE, complete_review, read_reviews, require_reviewed,
@@ -60,6 +61,17 @@ class PolicyFixture(unittest.TestCase):
 
 
 class AnnotationPolicyTests(PolicyFixture):
+    def test_confirmation_is_based_on_all_saved_meanings_not_dialog_history(self):
+        self.assertTrue(policy_needs_confirmation({}))
+        self.assertFalse(policy_needs_confirmation(self.source_info))
+        info = deepcopy(self.source_info)
+        info['annotation_policy']['categories']['queen_brood_late']['meaning'] = 'unconfirmed'
+        self.assertTrue(policy_needs_confirmation(info))
+        info['annotation_policy']['categories'].pop('nectar')
+        self.assertTrue(policy_needs_confirmation({'project_info': info}))
+        info['annotation_policy']['categories']['queen_brood_late']['meaning'] = 'visible'
+        self.assertTrue(policy_needs_confirmation(info))
+
     def test_new_and_legacy_intent_are_distinct(self):
         self.assertEqual(category_policies(self.source_info)['hive'], {'scope': 'frame', 'meaning': 'visible'})
         self.assertEqual(category_policies(self.dest_info)['hive'], {'scope': 'video', 'meaning': 'full_extent'})

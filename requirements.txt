@@ -7,13 +7,14 @@ opencv-python-headless>=4.8.0  # Headless version to avoid Qt conflicts
 numpy>=1.24.0
 Pillow>=10.0.0
 
-# SAM2
-torch>=2.0.0,<2.5.0
-torchvision>=0.15.0,<0.20.0
-# SAM2 must be installed separately: pip install git+https://github.com/facebookresearch/segment-anything-2.git
+# Install this matching pair from the desired PyTorch index first (docs/setup.md).
+torch==2.10.0
+torchvision==0.25.0
+# Optional SAM2 has a pinned source revision in requirements-sam2.txt.
 
 # Deep Learning Training
-ultralytics>=8.4.16,<9.0.0  # Raster-mask training adapter tested with 8.4.16
+ultralytics-opencv-headless==8.4.16  # Same Python API, without conflicting OpenCV Qt libraries
+lap>=0.5.13  # Tracking assignment; install up front instead of at first use
 transformers>=4.35.0,<5.0.0  # For Mask2Former
 # detectron2 must be installed separately if needed: pip install 'git+https://github.com/facebookresearch/detectron2.git'
 albumentations>=1.3.0,<2.0.0

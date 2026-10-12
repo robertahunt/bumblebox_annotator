@@ -8,9 +8,28 @@ user-validated production release.
 
 Project creation shows scope and meaning for every category. Existing projects
 show their policy on first opening (and after it changes), with **Project >
-Annotation Policy...** available anytime. An active-category summary appears
+Annotation Policy...** available anytime. Missing policies or any **Not yet
+confirmed** meanings trigger the setup reminder every time the project is
+reopened, including after restarting the app. **Remind Me Later**, the window's
+close button, and saving partial choices do not silence that reminder. Only
+fully specified saved meanings stop it; no masks or scopes are converted.
+An active-category summary appears
 above the image. Import warnings and the **Imported Frame Review...** queue are
 described in [the import workflow](../project_import.md).
+
+The policy table groups all brood and queen brood stages under one **Brood**
+row. Choosing a label meaning applies it to every stage; segmentation categories
+and stored category IDs remain separate. Projects with different stage meanings
+show **Mixed (keep existing)** and retain them until a common meaning is chosen.
+
+Every **Saved scope** cell has a dropdown. Unsupported alternatives display a
+"not implemented yet" popup and restore the existing value: shared-video bee,
+brood (including queen brood) and nectar, or frame-specific chamber and pollen.
+For existing projects, hive scope changes instead explain the supported
+**File > Import From Project...** conversion workflow and restore the saved
+value. None of these popups converts masks or saves a different scope.
+When creating a project, both hive scopes are supported; the table's hive scope
+and the **Nest / hive labels** control stay synchronized.
 
 ## Working Today
 
@@ -25,8 +44,8 @@ described in [the import workflow](../project_import.md).
 
 The current scope rules live in [annotation_scope.py](../../core/annotation_scope.py).
 New projects default to frame-specific hive labels. Older projects without the
-`hive_annotation_scope` setting retain video-wide hives. There is no universal
-per-category scope selector. Versioned `annotation_policy` metadata now records
+`hive_annotation_scope` setting retain video-wide hives. The scope dropdowns do
+not implement arbitrary per-category scope changes. Versioned `annotation_policy` metadata records
 each category's scope and intended label meaning in `annotations/project.json`.
 Legacy meanings are unconfirmed, not inferred from their scope or pixels.
 
@@ -82,8 +101,9 @@ All unchecked items below are pending, not available functionality.
   scope and meaning. Show unavailable features as "Planned - not available" or
   explanatory text, never as usable switches.
 - [x] Show the saved policy on first project opening and after policy changes;
-  keep it accessible through a Project > Annotation Policy action. Avoid a
-  mandatory repeated dialog on every ordinary reopen.
+  keep it accessible through a Project > Annotation Policy action. Remind on
+  every reopen while meanings are unconfirmed, but allow postponing with
+  Remind Me Later. Fully specified policies do not repeatedly prompt.
 - [x] Show the active category's policy near its controls, for example
   "Hive | This frame | Visible surfaces", with concise contextual guidance.
 - [x] Distinguish available temporal analysis from whether it is actually enabled

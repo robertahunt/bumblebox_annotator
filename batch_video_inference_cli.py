@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import math
 import os
 import sys
 from pathlib import Path
@@ -118,9 +119,31 @@ def load_saved_defaults():
         "aruco_max_combinations": int_value("aruco/max_combinations", 45),
         "aruco_bank_size": int_value("aruco/bank_size", 6),
         "aruco_workers": int_value("aruco/workers", max(1, min(15, (os.cpu_count() or 2) - 1))),
+        "aruco_detection_workers": max(1, int_value("aruco/detection_workers", 8)),
         "aruco_expected_tags": float_value("aruco/expected_tags", 0.0),
         "aruco_sweep_overrides": aruco_sweep_overrides,
     }
+
+
+def positive_worker_count(value):
+    try:
+        count = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError('Worker count must be a positive integer') from exc
+    if count < 1:
+        raise argparse.ArgumentTypeError('Worker count must be a positive integer')
+    return count
+
+
+def positive_fps(value):
+    """Reject unusable acquisition rates before starting inference."""
+    try:
+        fps = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError('FPS must be a finite positive number') from exc
+    if not math.isfinite(fps) or fps <= 0:
+        raise argparse.ArgumentTypeError('FPS must be a finite positive number')
+    return fps
 
 
 def parse_args():
@@ -146,6 +169,8 @@ def parse_args():
     parser.add_argument("--nms-iou", type=float, default=0.45)
     parser.add_argument("--distance-method", default="centroid")
     parser.add_argument("--pixel-size-mm", type=float, default=0.0666)
+    parser.add_argument('--fps-override', type=positive_fps, default=None,
+                        help='Measured source FPS for timing and annotated playback; does not resample frames.')
     parser.add_argument("--temporal-window-hours", type=float, default=8.0)
     parser.add_argument('--stabilize-temporal-hive', action='store_true',
                         help='Smooth chamber placement for temporal hive evidence, scores and overlays.')
@@ -174,6 +199,10 @@ def parse_args():
     parser.add_argument("--aruco-max-combinations", type=int, default=saved["aruco_max_combinations"])
     parser.add_argument("--aruco-bank-size", type=int, default=saved["aruco_bank_size"])
     parser.add_argument("--aruco-workers", type=int, default=saved["aruco_workers"])
+    parser.add_argument('--aruco-detection-workers', type=positive_worker_count,
+                        default=saved['aruco_detection_workers'],
+                        help='Concurrent ArUco detector calls per frame (default: saved setting or 8; 1 = serial). '
+                             'Separate from --aruco-workers, which controls parameter optimization.')
     parser.add_argument("--expected-tags", type=float, default=saved["aruco_expected_tags"])
     parser.add_argument(
         "--aruco-sweep-min-perimeter",
@@ -370,7 +399,9 @@ def build_config(args):
         "max_frames": args.analysis_max_frames if args.analysis_max_frames and args.analysis_max_frames > 0 else None,
         "compute_spatial_metrics": True,
         "pixel_size_mm": args.pixel_size_mm if args.pixel_size_mm > 0 else None,
+        "fps_override": getattr(args, 'fps_override', None),
         "enable_aruco": not args.no_aruco,
+        "aruco_detection_workers": args.aruco_detection_workers,
         "aruco_dictionary": args.aruco_dictionary,
         "aruco_dictionary_mode": "single",
         "tag_list_path": str(args.tag_map.expanduser()) if args.tag_map else None,

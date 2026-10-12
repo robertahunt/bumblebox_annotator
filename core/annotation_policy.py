@@ -74,6 +74,11 @@ def policy_signature(info):
     return hashlib.sha256(json.dumps(category_policies(info), sort_keys=True).encode()).hexdigest()
 
 
+def policy_needs_confirmation(info):
+    """Missing/partial policies remain unfinished, regardless of local dialog history."""
+    return any(entry['meaning'] == 'unconfirmed' for entry in category_policies(info).values())
+
+
 def save_policy(project, entries, contributor=None):
     """Confirm intent only. Scope conversion is deliberately not a settings operation."""
     info = read_project_info(project)
