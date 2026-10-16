@@ -41,14 +41,19 @@ from .batch_video_inference_worker import BatchVideoInferenceWorker
 from .tracking_visualization_dialog import TrackingVisualizationConfigDialog, TrackingVisualizationWorker
 from .tracking_sequences_panel import TrackingSequencesPanel
 from .project_sync_dialog import (ProjectSyncDialog, SyncProgressDialog, choose_contributor,
-                                  setting_json, save_setting)
+                                  setting_json, save_setting, working_project_path,
+                                  confirm_separate_backup, confirm_publication)
 from .project_import_dialog import ProjectImportDialog
 from .annotation_policy_dialog import AnnotationPolicyDialog, ImportedFrameReviewDialog
 from core.annotation_policy import (category_policies, policy_needs_confirmation,
                                     policy_signature, policy_text, guidance)
 from core.annotation_scope import read_project_info
 from core.import_review import read_reviews, frame_task, review_status, complete_review
-from core.project_sync import sync_project
+from core.project_sync import (SyncConflictError, require_working_project, require_no_update,
+                               sync_project, update_journal_path, publication_estimate)
+from core.project_update import published_versions
+from .project_update_dialog import ProjectUpdateDialog
+from .project_rollback_dialog import ProjectRollbackDialog
 from core.contributors import utc_now, provenance_records
 from .tracking_validation_dialog import TrackingValidationConfigDialog, TrackingValidationProgressDialog
 from .tracking_validation_worker import TrackingValidationWorker
@@ -823,9 +828,16 @@ class MainWindow(QMainWindow):
         save_action.triggered.connect(self.save_annotations)
         file_menu.addAction(save_action)
 
-        self.sync_project_action = QAction('Sync Project Now...', self)
+        self.sync_project_action = QAction('Publish Project Backup...', self)
         self.sync_project_action.triggered.connect(self.sync_current_project)
         file_menu.addAction(self.sync_project_action)
+
+        self.update_project_action = QAction('Update Local Copy...', self)
+        self.update_project_action.triggered.connect(self.update_current_project)
+        file_menu.addAction(self.update_project_action)
+        rollback_action = QAction('Local Rollback History...', self)
+        rollback_action.triggered.connect(lambda: self.update_current_project(history=True))
+        file_menu.addAction(rollback_action)
         
         export_coco_action = QAction("Export &COCO Format...", self)
         export_coco_action.triggered.connect(self.export_coco_format)
@@ -1084,9 +1096,9 @@ class MainWindow(QMainWindow):
             self._policy_dialog = AnnotationPolicyDialog(
                 self.project_path, getattr(self, 'contributor_session', None), self)
             self._policy_dialog.policy_saved.connect(self._annotation_policy_saved)
+            self._policy_dialog.policy_reviewed.connect(
+                lambda reviewed, seen_key=key: QSettings().setValue(seen_key, reviewed))
             self._policy_dialog.show()
-            if not pending:
-                QSettings().setValue(key, signature)
         except Exception as exc:
             QMessageBox.warning(self, 'Annotation Policy Unavailable', str(exc))
 
@@ -1215,8 +1227,95 @@ class MainWindow(QMainWindow):
 
     def configure_project_sync(self):
         dialog = ProjectSyncDialog(self.project_path, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.sync_requested:
-            self.sync_current_project()
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            if dialog.update_requested:
+                self.update_current_project()
+            elif dialog.sync_requested:
+                self.sync_current_project()
+
+    def _discard_annotation_view(self):
+        """Drop old in-memory data before opening a replaced/restored project."""
+        policy = getattr(self, '_policy_dialog', None)
+        if policy is not None:
+            policy.close()
+        self.current_frame_modified = False
+        self.dirty_frame_annotation_keys.clear()
+        self.dirty_video_annotation_ids.clear()
+        self.current_video_id = None
+        self.current_frame_idx = -1
+        self.canvas.clear_image()
+        self.annotation_manager.clear_cache()
+        self.annotation_manager.attributor.baselines.clear()
+        self.frame_cache.clear()
+        self.video_next_mask_id.clear()
+
+    def update_current_project(self, history=False):
+        if self._sync_in_progress:
+            return
+        if not self.project_path:
+            QMessageBox.information(self, 'No Project', 'Open a local project before updating.')
+            return
+        configuration = setting_json('project_sync/destination', {})
+        if not history and not configuration.get('root_id'):
+            QMessageBox.information(self, 'Choose a Shared Folder',
+                                    'Configure and test the folder in Settings > Project Sync first.')
+            return
+        source = Path(self.project_path).resolve()
+        if self.is_playing:
+            self.toggle_play()
+        self._sync_in_progress = True
+        paused_timers = []
+        preload_stopped = False
+        try:
+            require_no_update(source)
+            self.save_worker.wait_until_idle(raise_errors=False)
+            self._save_annotation_sources()
+            self.save_worker.wait_until_idle()
+            self.preload_worker.stop()
+            self.preload_worker.join()
+            preload_stopped = True
+            for name in ('_instance_list_update_timer', 'done_counter_update_timer'):
+                timer = getattr(self, name, None)
+                if timer is not None and timer.isActive():
+                    paused_timers.append(timer)
+                    timer.stop()
+            if history:
+                dialog = ProjectRollbackDialog(source, configuration, self)
+            else:
+                versions = SyncProgressDialog('Read Published Versions',
+                    lambda progress, cancelled: published_versions(source, configuration), self).run()
+                dialog = ProjectUpdateDialog(source, configuration, versions, self)
+            dialog.exec()
+            result = dialog.update_result
+            if result and result.get('updated'):
+                require_no_update(source)
+                self._discard_annotation_view()
+                self.load_project(source)
+                self.coco_export_dirty = True
+                projects = setting_json('project_sync/projects', {})
+                projects.setdefault(str(source), {}).update(
+                    last_update=utc_now(), last_update_backup=result['backup'])
+                save_setting('project_sync/projects', projects)
+                self.status_label.setText('Local project updated; rollback bundle retained')
+                QMessageBox.information(self, 'Local Copy Updated',
+                    'Re-export COCO before training.\n\nPrevious affected files:\n' + result['backup'] +
+                    '\n\nUse File > Local Rollback History to review or undo.')
+        except Exception as exc:
+            QMessageBox.warning(self, 'Local Update Not Completed', str(exc))
+        finally:
+            if update_journal_path(source).exists() or update_journal_path(source).is_symlink():
+                # Never let a stale canvas write into a partially/completely replaced copy.
+                self._discard_annotation_view()
+                self.project_path = None
+                self.centralWidget().setEnabled(False)
+                self.status_label.setText('Local update requires recovery; reopen this project via File > Recent Projects')
+            if preload_stopped:
+                self.preload_worker = PreloadWorker(self.frame_cache, self.annotation_manager)
+                self.preload_worker.start()
+            for timer in paused_timers:
+                if self.project_path:
+                    timer.start()
+            self._sync_in_progress = False
 
     def sync_current_project(self):
         if self._sync_in_progress:
@@ -1235,6 +1334,9 @@ class MainWindow(QMainWindow):
             dialog = ProjectSyncDialog(self.project_path, self)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
+            if dialog.update_requested:
+                self.update_current_project()
+                return
             projects = setting_json('project_sync/projects', {})
             configuration = setting_json('project_sync/destination', {})
             if not projects.get(source, {}).get('enabled'):
@@ -1247,14 +1349,34 @@ class MainWindow(QMainWindow):
             self._save_annotation_sources(force=True, refresh_next_id=True)
             self.save_worker.wait_until_idle()
             session = dict(self.contributor_session)
-            result = SyncProgressDialog(
-                'Sync Project',
-                lambda progress, cancelled: sync_project(
-                    source, configuration, session, progress, cancelled), self).run()
+            estimate = SyncProgressDialog('Estimate Backup Storage',
+                lambda progress, cancelled: publication_estimate(source, configuration, session,
+                                                                  progress, cancelled), self).run()
+            if not confirm_publication(self, estimate, configuration):
+                return
+            try:
+                result = SyncProgressDialog(
+                    'Publish Project Backup',
+                    lambda progress, cancelled: sync_project(
+                        source, configuration, session, progress, cancelled), self).run()
+            except SyncConflictError as exc:
+                if not confirm_separate_backup(self, exc):
+                    self.status_label.setText('Publishing cancelled; local work remains saved')
+                    return
+                result = SyncProgressDialog(
+                    'Publish Separate Backup',
+                    lambda progress, cancelled: sync_project(
+                        source, configuration, session, progress, cancelled,
+                        separate_backup=True), self).run()
             projects[source].update(last_success=utc_now(), last_error='', last_path=result['path'])
-            self.status_label.setText(f"Sync complete: {result['copied_files']} changed files")
-            QMessageBox.information(self, 'Sync Complete',
-                                    'Verified project copy:\n' + result['path'])
+            title = 'Separate Backup Saved' if result['separate_backup'] else 'Backup Published'
+            detail = ('\n\nNo latest pointer was changed. This copy still needs reconciliation.'
+                      if result['separate_backup'] else '')
+            self.status_label.setText(f"{title}: {result['copied_files']} changed files")
+            if result.get('warning'):
+                QMessageBox.warning(self, title, result['warning'] + '\n\n' + result['path'])
+            else:
+                QMessageBox.information(self, title, 'Verified backup:\n' + result['path'] + detail)
         except Exception as exc:
             projects.setdefault(source, {})['last_error'] = str(exc)
             self.status_label.setText('Sync failed; local annotations remain saved')
@@ -3767,6 +3889,7 @@ class MainWindow(QMainWindow):
         """Save dirty source annotation files without regenerating derived COCO files."""
         if not self.project_path:
             return {'saved_any': False, 'reason': 'no_project'}
+        require_no_update(self.project_path)
 
         if not use_background:
             self.save_worker.wait_until_idle(raise_errors=False)
@@ -4004,10 +4127,16 @@ class MainWindow(QMainWindow):
         """Create a new project"""
         dialog = ProjectDialog(self, mode='new', default_dir=self.default_projects_dir)
         if dialog.exec():
+            project_info = dialog.get_project_info()
+            try:
+                require_working_project(Path(project_info['path']) / project_info['name'])
+                require_no_update(Path(project_info['path']) / project_info['name'])
+            except ValueError as exc:
+                QMessageBox.warning(self, 'Choose a Working Folder', str(exc))
+                return
             old_policy_dialog = getattr(self, '_policy_dialog', None)
             if old_policy_dialog is not None:
                 old_policy_dialog.close()
-            project_info = dialog.get_project_info()
             project_name = project_info['name']
             self._reset_imaging_setup_cache()
             
@@ -4029,6 +4158,7 @@ class MainWindow(QMainWindow):
             self.marker_detector.set_debug_folder(str(debug_folder))
             
             self.annotation_manager.new_project(saved_info)
+            self.centralWidget().setEnabled(True)
             self._update_annotation_policy_label()
             self.status_label.setText(
                 f"Project created: {self.project_path.name} "
@@ -4056,7 +4186,7 @@ class MainWindow(QMainWindow):
         existing_projects = []
         for project in self.recent_projects:
             project_path = Path(project)
-            if project_path.exists():
+            if project_path.exists() or update_journal_path(project_path).exists():
                 existing_projects.append(str(project_path))
 
         if existing_projects != self.recent_projects:
@@ -4099,7 +4229,7 @@ class MainWindow(QMainWindow):
     def open_recent_project(self, path):
         """Open a project from the recent projects menu."""
         project_path = Path(path)
-        if not project_path.exists():
+        if not project_path.exists() and not update_journal_path(project_path).exists():
             QMessageBox.warning(
                 self,
                 "Project Not Found",
@@ -4128,6 +4258,27 @@ class MainWindow(QMainWindow):
             
     def load_project(self, path):
         """Load a project from path"""
+        try:
+            path = working_project_path(path, self, self.default_projects_dir)
+            if path is None:
+                return
+            changing_project = self.project_path and Path(self.project_path).resolve() != Path(path).resolve()
+            if changing_project:
+                if self.is_playing:
+                    self.toggle_play()
+                self.save_worker.wait_until_idle(raise_errors=False)
+                self._save_annotation_sources()
+                self.save_worker.wait_until_idle()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Project Not Opened', str(exc))
+            return
+        if changing_project:
+            # Cache keys are video/frame IDs, which can recur in a restored copy.
+            self.preload_worker.stop()
+            self.preload_worker.join()
+            self._discard_annotation_view()
+            self.preload_worker = PreloadWorker(self.frame_cache, self.annotation_manager)
+            self.preload_worker.start()
         old_policy = getattr(self, '_policy_dialog', None)
         if old_policy is not None:
             old_policy.close()
@@ -4155,6 +4306,7 @@ class MainWindow(QMainWindow):
             # Load project annotations
             self.annotation_manager.load_project(self.project_path)
             category_policies(self.annotation_manager.project_info)
+            self.centralWidget().setEnabled(True)
             
             # Update video list
             self.update_video_list()
@@ -4200,16 +4352,7 @@ class MainWindow(QMainWindow):
             dialog = ProjectImportDialog(self.project_path, self.contributor_session, self)
             if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.result:
                 return
-            self.current_frame_modified = False
-            self.dirty_frame_annotation_keys.clear()
-            self.dirty_video_annotation_ids.clear()
-            self.current_video_id = None
-            self.current_frame_idx = -1
-            self.canvas.clear_image()
-            self.annotation_manager.clear_cache()
-            self.annotation_manager.attributor.baselines.clear()
-            self.frame_cache.clear()
-            self.video_next_mask_id.clear()
+            self._discard_annotation_view()
             self.load_project(self.project_path)
             self.status_label.setText('Project data imported')
             QMessageBox.information(self, 'Import Complete',
@@ -4817,8 +4960,8 @@ class MainWindow(QMainWindow):
                                 f"  Updated max_mask_id cache for {self.current_video_id}: "
                                 f"{cached_max_id} -> {max_id} (scan took {t_elapsed:.0f}ms)"
                             )
-                        self._save_max_mask_id_to_metadata(self.current_video_id, max_id)
-                        
+                        # Loading is read-only: persist this cache only with explicit saves/edits.
+                        # Otherwise merely viewing a restored copy creates sync conflicts.
                         self.video_next_mask_id[self.current_video_id] = max_id + 1
                     
                     # Set canvas next_mask_id from video tracking
@@ -12447,6 +12590,9 @@ class MainWindow(QMainWindow):
             
     def closeEvent(self, event):
         """Handle window close event"""
+        if self._sync_in_progress:
+            event.ignore()
+            return
         should_save_current_frame = False
         has_pending_canvas_edit = (
             hasattr(self, 'canvas')

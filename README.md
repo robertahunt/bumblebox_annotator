@@ -70,7 +70,8 @@ to convert to mm/second.
 See [nectar source segmentation](docs/nectar_segmentation.md) to annotate nectar sources, train a nectar-only model, and run it on the current frame.
 
 See [contributors and optional project sync](docs/project_sync.md) for session attribution,
-external-folder setup, versioned backups, and collaboration safeguards.
+external-folder setup, deduplicated versioned backups, previewed changed-file
+updates, local rollback history, and collaboration safeguards.
 
 ## Project Structure
 

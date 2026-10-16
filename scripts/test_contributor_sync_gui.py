@@ -13,16 +13,26 @@ from unittest.mock import Mock, patch
 import cv2
 import numpy as np
 from PyQt6.QtCore import QSettings, QTimer
-from PyQt6.QtWidgets import QApplication, QComboBox, QDialogButtonBox, QMessageBox
+from PyQt6.QtWidgets import QApplication, QComboBox, QDialogButtonBox, QMessageBox, QPushButton
 
 from core.annotation import AnnotationManager
 from core.contributors import new_session
 from core.project_manager import ProjectManager
-from core.project_sync import test_destination as probe_destination
+from core.project_sync import (SyncConflictError, _read_json, _write_json, restore_project,
+                               sync_project, test_destination as _probe_destination)
 from gui.main_window import MainWindow, SaveWorker
 from gui.project_sync_dialog import (ProjectSyncDialog, SyncProgressDialog, choose_contributor,
-                                     save_setting, setting_json)
+                                     save_setting, setting_json, working_project_path)
 from scripts.test_project_sync import annotation
+
+
+def probe_destination(path):
+    configuration = _probe_destination(path)
+    configuration['storage_mode'] = 'full'
+    rollback = Path(path).parent / 'rollbacks'
+    rollback.mkdir(exist_ok=True)
+    configuration['rollback_root'] = str(rollback)
+    return configuration
 
 
 class ContributorSyncGuiTests(unittest.TestCase):
@@ -40,6 +50,8 @@ class ContributorSyncGuiTests(unittest.TestCase):
         self.stack = ExitStack()
         self.stack.enter_context(patch('gui.project_sync_dialog.QSettings', lambda: self.settings))
         self.stack.enter_context(patch('gui.main_window.QSettings', lambda: self.settings))
+        self.stack.enter_context(patch('gui.main_window.confirm_publication', return_value=True))
+        self.stack.enter_context(patch('core.project_delta.default_rollback_root', lambda: self.base / 'rollbacks'))
         self.window = None
 
     def tearDown(self):
@@ -84,6 +96,7 @@ class ContributorSyncGuiTests(unittest.TestCase):
         self.assertEqual(first['id'], second['id'])
         self.assertNotEqual(first['session_id'], second['session_id'])
         self.assertNotEqual(second['id'], third['id'])
+        self.assertEqual(first['device'], second['device'])
         self.assertEqual(len(setting_json('contributors/profiles', {})), 2)
 
     def test_cancel_contributor_does_not_create_identity(self):
@@ -205,6 +218,137 @@ class ContributorSyncGuiTests(unittest.TestCase):
         saved = AnnotationManager().load_frame_annotations(output, 'video', 0)[0]
         self.assertEqual(saved['provenance']['created_by']['name'], 'August')
         self.assertFalse(window._sync_in_progress)
+
+    def test_restore_prompt_cancellation_does_not_load_or_modify_backup(self):
+        window = self.make_window()
+        window._save_annotation_sources()
+        configuration = probe_destination(self.remote)
+        published = Path(sync_project(self.source, configuration, window.contributor_session)['path'])
+        before = {p: p.read_bytes() for p in published.rglob('*') if p.is_file()}
+        with patch('gui.project_sync_dialog.QMessageBox') as message:
+            box = message.return_value
+            create, cancel = object(), object()
+            box.addButton.side_effect = [create, cancel]
+            box.clickedButton.return_value = cancel
+            window.load_project(published)
+        self.assertEqual(window.project_path, self.source)
+        self.assertFalse((published / 'marker_debug').exists())
+        self.assertEqual(before, {p: p.read_bytes() for p in published.rglob('*') if p.is_file()})
+
+    def test_restore_prompt_creates_and_opens_verified_local_copy(self):
+        window = self.make_window()
+        window._save_annotation_sources()
+        configuration = probe_destination(self.remote)
+        published = Path(sync_project(self.source, configuration, window.contributor_session)['path'])
+        destination = self.base / 'restored'
+        with patch('gui.project_sync_dialog.QMessageBox') as message, \
+                patch('gui.project_sync_dialog.QFileDialog.getSaveFileName', return_value=(str(destination), '')):
+            box = message.return_value
+            create, cancel = object(), object()
+            box.addButton.side_effect = [create, cancel]
+            box.clickedButton.return_value = create
+            window.load_project(published)
+        self.assertEqual(window.project_path, destination)
+        self.assertTrue((destination / 'annotations/project.json').is_file())
+        self.assertFalse((published / 'marker_debug').exists())
+
+    def test_pending_archive_and_container_are_blocked_before_loading(self):
+        window = self.make_window()
+        probe_destination(self.remote)
+        pending = self.remote / '.pending-test' / 'project'
+        pending.mkdir(parents=True)
+        with patch.object(QMessageBox, 'warning') as warning:
+            window.load_project(pending)
+            window.load_project(self.remote)
+        self.assertEqual(warning.call_count, 2)
+        self.assertEqual(window.project_path, self.source)
+        self.assertEqual(list(pending.iterdir()), [])
+
+    def test_switching_copies_saves_pending_work_and_discards_old_frame_cache(self):
+        window = self.make_window()
+        configuration = probe_destination(self.remote)
+        published = Path(sync_project(self.source, configuration, window.contributor_session)['path'])
+        destination = self.base / 'restored'
+        restore_project(published, destination)
+        frame = destination / 'frames/video/frame_000000.jpg'
+        cv2.imwrite(str(frame), np.full((32, 40, 3), 200, np.uint8))
+        window.load_project(destination)
+        self.assertEqual(window.project_path, destination)
+        self.assertTrue(np.all(window.canvas.current_image == 200))
+        self.assertEqual(len(AnnotationManager().load_frame_annotations(self.source, 'video', 0)), 1)
+        self.assertEqual(AnnotationManager().load_frame_annotations(destination, 'video', 0), [])
+
+    def test_failed_save_keeps_current_project_open(self):
+        window = self.make_window()
+        other = self.base / 'other'
+        ProjectManager().create_project(other, 'Other')
+        with patch.object(window, '_save_annotation_sources', side_effect=OSError('disk full')), \
+                patch.object(QMessageBox, 'warning') as warning:
+            window.load_project(other)
+        self.assertEqual(window.project_path, self.source)
+        self.assertIn('disk full', warning.call_args.args[2])
+
+    def test_conflict_exception_survives_worker_thread(self):
+        def fail(progress, cancelled):
+            raise SyncConflictError('outdated copy')
+        with self.assertRaises(SyncConflictError):
+            SyncProgressDialog('Conflict', fail).run()
+
+    def test_stale_gui_publish_can_cancel_or_save_separate_backup(self):
+        window = self.make_window()
+        configuration = probe_destination(self.remote)
+        save_setting('project_sync/destination', configuration)
+        save_setting('project_sync/projects', {str(self.source): {'enabled': True}})
+        with patch.object(QMessageBox, 'information'):
+            window.sync_current_project()
+        output = setting_json('project_sync/projects', {})[str(self.source)]['last_path']
+        other = self.base / 'other'
+        restore_project(output, other)
+        (other / 'annotations/new.json').write_text('new')
+        sync_project(other, configuration, window.contributor_session)
+        latest = next(self.remote.rglob('latest.json'))
+        before = latest.read_bytes()
+        with patch('gui.main_window.confirm_separate_backup', return_value=False) as confirm:
+            window.sync_current_project()
+            confirm.assert_called_once()
+        self.assertEqual(latest.read_bytes(), before)
+        with patch('gui.main_window.confirm_separate_backup', return_value=True), \
+                patch.object(QMessageBox, 'information') as notice, patch.object(QMessageBox, 'warning') as warning:
+            window.sync_current_project()
+            warning.assert_not_called()
+        self.assertEqual(notice.call_args.args[1], 'Separate Backup Saved')
+        self.assertEqual(latest.read_bytes(), before)
+        self.assertFalse(window._sync_in_progress)
+
+    def test_profile_export_import_retains_contributor_but_not_device_identity(self):
+        first = self.choose('August')
+        profile_file = self.base / 'profile.json'
+
+        def export():
+            dialog = self.app.activeModalWidget()
+            next(b for b in dialog.findChildren(QPushButton) if b.text() == 'Export Profile...').click()
+            dialog.reject()
+
+        with patch('gui.project_sync_dialog.QFileDialog.getSaveFileName', return_value=(str(profile_file), '')):
+            QTimer.singleShot(0, export)
+            self.assertIsNone(choose_contributor())
+        profile = _read_json(profile_file)
+        self.assertEqual(profile['id'], first['id'])
+        self.assertNotIn('device', profile)
+        self.settings.clear()
+
+        def import_and_start():
+            dialog = self.app.activeModalWidget()
+            next(b for b in dialog.findChildren(QPushButton) if b.text() == 'Import Profile...').click()
+            dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
+
+        with patch('gui.project_sync_dialog.QFileDialog.getOpenFileName', return_value=(str(profile_file), '')), \
+                patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
+            QTimer.singleShot(0, import_and_start)
+            second = choose_contributor()
+        self.assertEqual(first['id'], second['id'])
+        self.assertNotEqual(first['device']['id'], second['device']['id'])
+        self.assertNotEqual(first['session_id'], second['session_id'])
 
     def test_failed_sync_does_not_disable_local_saving(self):
         window = self.make_window()

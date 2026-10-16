@@ -49,6 +49,20 @@ class AttributionTests(unittest.TestCase):
         self.assertEqual(saved['origin'], 'manual')
         self.assertEqual(source['provenance'], saved)
 
+    def test_device_attribution_follows_the_editor_not_the_copied_profile(self):
+        self.manager.contributor_session = new_session('August', self.august['id'],
+                                                       device={'id': 'desktop', 'name': 'Workstation'})
+        saved = self.save([annotation()])
+        self.assertEqual(saved[0]['provenance']['last_modified_device']['id'], 'desktop')
+        self.manager.contributor_session = new_session('August', self.august['id'],
+                                                       device={'id': 'laptop', 'name': 'Laptop'})
+        saved[0]['mask'][0, 0] = 255
+        saved = self.save(saved)
+        self.assertEqual(saved[0]['provenance']['last_modified_device']['id'], 'laptop')
+        self.manager.contributor_session = self.alex
+        saved[0]['mask'][0, 1] = 255
+        self.assertNotIn('last_modified_device', self.save(saved)[0]['provenance'])
+
     def test_only_changed_instance_is_credited_to_new_contributor(self):
         saved = self.save([annotation(1), annotation(2)])
         before = saved[1]['provenance'].copy()
@@ -279,6 +293,11 @@ class FolderSyncTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(data)
         self.configuration = probe_destination(self.remote)
+        # Keep legacy full-folder compatibility coverage; compact storage has its own suite.
+        self.configuration['storage_mode'] = 'full'
+        rollback = self.base / 'rollbacks'
+        rollback.mkdir()
+        self.configuration['rollback_root'] = str(rollback)
         self.contributor = new_session('August')
 
     def tearDown(self):
@@ -290,7 +309,7 @@ class FolderSyncTests(unittest.TestCase):
     def test_probe_checks_identity_and_cleans_up_only_its_files(self):
         existing = self.remote / 'keep.txt'
         existing.write_text('keep')
-        self.assertEqual(probe_destination(self.remote), self.configuration)
+        self.assertEqual(probe_destination(self.remote)['root_id'], self.configuration['root_id'])
         self.assertEqual(existing.read_text(), 'keep')
         self.assertFalse(list(self.remote.glob('.bumblebox-test-*')))
         with self.assertRaises(ValueError):
@@ -356,6 +375,7 @@ class FolderSyncTests(unittest.TestCase):
         self.configuration = probe_destination(self.source)
         with self.assertRaisesRegex(ValueError, 'non-nested'):
             self.sync()
+        (self.source / ROOT_MARKER).unlink()
         self.configuration = original
         (self.source / 'frames/link').symlink_to(self.base, target_is_directory=True)
         with self.assertRaisesRegex(ValueError, 'symbolic links'):
@@ -431,7 +451,7 @@ class FolderSyncTests(unittest.TestCase):
         project = Path(self.sync()['path'])
         home = project.parents[2]
         self.assertEqual(home.name, 'August--' + self.contributor['id'][:8])
-        self.assertEqual(home.parent.parent.name, 'Hive-Test--' + ensure_project_identity(self.source)[:8])
+        self.assertEqual(home.parent.parent.name, self.source.name + '--' + ensure_project_identity(self.source)[:8])
         marker = json.loads((home / LOCATION_MARKERS['contributor']).read_text())
         self.assertEqual(marker['id'], self.contributor['id'])
 

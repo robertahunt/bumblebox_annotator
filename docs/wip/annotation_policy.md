@@ -13,6 +13,11 @@ confirmed** meanings trigger the setup reminder every time the project is
 reopened, including after restarting the app. **Remind Me Later**, the window's
 close button, and saving partial choices do not silence that reminder. Only
 fully specified saved meanings stop it; no masks or scopes are converted.
+Completed policies now open as **Review Saved Annotation Policy**, with read-only
+choices, **Continue** to acknowledge on this installation, and **Edit Policy** to
+make an explicit project-wide change. Closing without Continue does not acknowledge
+the review. Incomplete policies open as **Finish Configuring Annotation Policy**.
+Changing a saved meaning still does not certify or rewrite existing mask pixels.
 An active-category summary appears
 above the image. Import warnings and the **Imported Frame Review...** queue are
 described in [the import workflow](../project_import.md).
@@ -108,6 +113,10 @@ All unchecked items below are pending, not available functionality.
   "Hive | This frame | Visible surfaces", with concise contextual guidance.
 - [x] Distinguish available temporal analysis from whether it is actually enabled
   in a batch. A frame-specific labeling policy must not imply it is running.
+- [x] Separate read-only review from editing a complete policy, and from completing
+  missing setup. Keep review acknowledgment local, and reject stale policy saves.
+- [ ] Support explicitly unused categories without silently hiding existing labels;
+  activating one later must require policy setup. Unconfirmed is not yet unused.
 
 ### Existing Data and Transfers
 

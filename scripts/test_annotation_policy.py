@@ -18,7 +18,8 @@ from core.import_review import (REVIEW_FILE, complete_review, read_reviews, requ
                                review_rows, review_status, validate_coco_reviews)
 from core.project_import import prepare_import
 from core.project_manager import ProjectManager
-from core.project_sync import _read_json, _write_json, test_destination as probe_destination, sync_project
+from core.project_sync import (_read_json, _write_json, test_destination as probe_destination,
+                               restore_project, sync_project)
 from scripts.test_project_import import mask_annotation
 from training.coco_video_export import export_coco_per_video, export_coco_with_tracking
 
@@ -278,7 +279,8 @@ class ImportReviewTests(PolicyFixture):
         remote = self.root / 'external'
         remote.mkdir()
         result = sync_project(self.dest, probe_destination(remote), self.contributor)
-        copied = Path(result['path'])
+        copied = self.root / 'restored'
+        restore_project(result['path'], copied)
         self.assertEqual(read_reviews(copied), read_reviews(self.dest))
         self.assertEqual(review_status(copied, 'video', 2), 'complete')
         self.assertEqual(category_policies(_read_json(copied / 'annotations/project.json')),

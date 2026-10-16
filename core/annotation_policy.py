@@ -8,7 +8,7 @@ from pathlib import Path
 from core.annotation_scope import frame_categories, read_project_info
 from core.categories import CATEGORIES, BROOD_CATEGORIES, category_label
 from core.contributors import utc_now
-from core.project_sync import _write_json
+from core.project_sync import _write_json, require_working_project
 
 
 MEANINGS = {'visible': 'Visible surfaces', 'full_extent': 'Full object extent',
@@ -81,6 +81,7 @@ def policy_needs_confirmation(info):
 
 def save_policy(project, entries, contributor=None):
     """Confirm intent only. Scope conversion is deliberately not a settings operation."""
+    require_working_project(project)
     info = read_project_info(project)
     updated = deepcopy(info)
     body = updated.get('project_info', updated)

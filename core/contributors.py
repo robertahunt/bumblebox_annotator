@@ -5,7 +5,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import numpy as np
 
@@ -14,12 +14,26 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def new_session(name, contributor_id=None):
+def contributor_profile(value):
+    """Portable, self-declared attribution identity; never an authentication token."""
+    if not isinstance(value, dict) or value.get('format') != 1 or value.get('kind') != 'bumblebox-contributor':
+        raise ValueError('Choose an exported BumbleBox contributor profile.')
+    name = value.get('name')
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
+        raise ValueError('A contributor profile needs a name of 1-80 characters.')
+    return {'format': 1, 'kind': 'bumblebox-contributor',
+            'name': name.strip(), 'id': str(UUID(value['id']))}
+
+
+def new_session(name, contributor_id=None, *, device=None):
     name = name.strip()
     if not name:
         raise ValueError('A contributor name is required.')
-    return {'id': contributor_id or str(uuid4()), 'name': name,
-            'session_id': str(uuid4()), 'started_at': utc_now()}
+    session = {'id': contributor_id or str(uuid4()), 'name': name,
+               'session_id': str(uuid4()), 'started_at': utc_now()}
+    if device:
+        session['device'] = dict(device)
+    return session
 
 
 def annotation_digest(annotation):
@@ -96,6 +110,10 @@ class AnnotationAttributor:
                         provenance.update(created_by=actor, created_at=timestamp)
                 provenance.update(last_modified_by=actor, last_modified_at=timestamp,
                                   session_id=session['session_id'])
+                if session.get('device'):
+                    provenance['last_modified_device'] = dict(session['device'])
+                else:
+                    provenance.pop('last_modified_device', None)
                 provenance.setdefault('origin', ann.get('source', 'manual_or_unspecified'))
             if provenance:
                 ann['provenance'] = provenance

@@ -58,6 +58,7 @@ class AnnotationPolicyGuiTests(PolicyFixture):
         window = self.make_window()
         dialog = window._policy_dialog
         self.assertFalse(dialog.save_button.isEnabled())
+        dialog.begin_editing()
         combo = dialog.policy.meanings['hive']
         combo.setCurrentIndex(combo.findData('visible'))
         dialog.confirm.setChecked(True)
@@ -85,6 +86,7 @@ class AnnotationPolicyGuiTests(PolicyFixture):
     def test_grouped_brood_meaning_saves_and_reopens_for_every_stage(self):
         dialog = AnnotationPolicyDialog(self.dest, self.contributor)
         self.addCleanup(dialog.close)
+        dialog.begin_editing()
         combo = dialog.policy.meanings['brood']
         combo.setCurrentIndex(combo.findData('full_extent'))
         dialog.confirm.setChecked(True)
@@ -174,6 +176,7 @@ class AnnotationPolicyGuiTests(PolicyFixture):
                           if p.is_file()}
                 dialog = AnnotationPolicyDialog(project, self.contributor)
                 self.addCleanup(dialog.close)
+                dialog.begin_editing()
                 entries = dialog.policy.entries()
                 combo = dialog.policy.scopes['hive']
                 requested = 'video' if scope == 'frame' else 'frame'
@@ -223,7 +226,7 @@ class AnnotationPolicyGuiTests(PolicyFixture):
     def test_automatic_policy_reminder_only_once_per_policy_version(self):
         window = self.make_window()
         dialog = window._policy_dialog
-        dialog.close()
+        dialog.defer_button.click()
         window.show_annotation_policy(automatic=True)
         self.assertIs(window._policy_dialog, dialog)
         self.assertFalse(dialog.isVisible())
@@ -321,7 +324,7 @@ class AnnotationPolicyGuiTests(PolicyFixture):
         _write_json(self.dest / 'annotations/project.json', info)
         window = self.make_window()
         window.load_project(self.source)
-        window._policy_dialog.close()
+        window._policy_dialog.defer_button.click()
         window.load_project(self.dest)
         reminder = window._policy_dialog
         self.assertTrue(reminder.isVisible())
@@ -404,6 +407,51 @@ class AnnotationPolicyGuiTests(PolicyFixture):
         window = self.make_window()
         self.assertFalse(window.frame_review_check.isEnabled())
         self.assertEqual(window.import_review_label.text(), '')
+
+    def test_complete_policy_review_never_saves_and_requires_explicit_edit(self):
+        window = self.make_window()
+        dialog = window._policy_dialog
+        path = self.dest / 'annotations/project.json'
+        before = path.read_bytes()
+        self.assertFalse(dialog.editing)
+        self.assertEqual(dialog.windowTitle(), 'Review Saved Annotation Policy')
+        self.assertTrue(dialog.save_button.isHidden())
+        self.assertTrue(all(not combo.isEnabled() for combo in dialog.policy.meanings.values()))
+        dialog.confirm.setChecked(True)
+        dialog.save()
+        self.assertEqual(path.read_bytes(), before)
+        dialog.defer_button.click()
+        self.assertEqual(path.read_bytes(), before)
+        window.show_annotation_policy(automatic=True)
+        self.assertIs(window._policy_dialog, dialog)
+        window.show_annotation_policy()
+        dialog = window._policy_dialog
+        dialog.edit_button.click()
+        self.assertTrue(dialog.editing)
+        self.assertTrue(dialog.policy.meanings['hive'].isEnabled())
+        dialog.policy.meanings['hive'].setCurrentIndex(dialog.policy.meanings['hive'].findData('visible'))
+        dialog.defer_button.click()
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_closing_review_without_continue_does_not_acknowledge_it(self):
+        window = self.make_window()
+        first = window._policy_dialog
+        first.close()
+        window.show_annotation_policy(automatic=True)
+        self.assertIsNot(window._policy_dialog, first)
+
+    def test_policy_changed_elsewhere_cannot_be_overwritten_by_open_dialog(self):
+        dialog = AnnotationPolicyDialog(self.dest, self.contributor)
+        self.addCleanup(dialog.close)
+        dialog.begin_editing()
+        entries = category_policies(self.dest_info)
+        entries['nectar']['meaning'] = 'full_extent'
+        save_policy(self.dest, entries)
+        dialog.confirm.setChecked(True)
+        with patch.object(QMessageBox, 'warning') as warning:
+            dialog.save()
+        self.assertIn('changed while this dialog', warning.call_args.args[2])
+        self.assertEqual(category_policies(_read_json(self.dest / 'annotations/project.json')), entries)
 
 
 if __name__ == '__main__':

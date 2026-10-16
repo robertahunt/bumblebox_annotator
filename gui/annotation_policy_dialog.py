@@ -1,12 +1,13 @@
 """Project label intent and imported-frame review controls."""
 
 from PyQt6.QtCore import Qt, pyqtSignal, QSignalBlocker
+from PyQt6.QtGui import QPalette
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                             QDialogButtonBox, QHeaderView, QLabel, QMessageBox,
-                            QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                            QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from core.annotation_policy import (MEANINGS, SCOPES, category_policies, default_policy,
-                                    guidance, policy_needs_confirmation, policy_text,
+                                    guidance, policy_needs_confirmation, policy_signature, policy_text,
                                     save_policy, temporal_support)
 from core.annotation_scope import read_project_info
 from core.categories import CATEGORIES, BROOD_CATEGORIES, category_label
@@ -141,6 +142,7 @@ class PolicyTable(QWidget):
 
 class AnnotationPolicyDialog(QDialog):
     policy_saved = pyqtSignal()
+    policy_reviewed = pyqtSignal(str)
 
     def __init__(self, project, contributor=None, parent=None):
         super().__init__(parent)
@@ -155,6 +157,9 @@ class AnnotationPolicyDialog(QDialog):
         layout.addWidget(label)
         info = read_project_info(project)
         pending = policy_needs_confirmation(info)
+        self.saved_signature = policy_signature(info)
+        self.editing = pending
+        self.setWindowTitle('Finish Configuring Annotation Policy' if pending else 'Review Saved Annotation Policy')
         self.reminder_label = QLabel(
             'Annotation policy setup is incomplete. Choose label meanings for all categories and save to finish. '
             'Until then, this reminder will return when you reopen this project, including after restarting the app.')
@@ -163,6 +168,10 @@ class AnnotationPolicyDialog(QDialog):
         layout.addWidget(self.reminder_label)
         self.policy = PolicyTable(info, self)
         layout.addWidget(self.policy)
+        self.edit_button = QPushButton('Edit Policy')
+        self.edit_button.clicked.connect(self.begin_editing)
+        self.edit_button.setVisible(not pending)
+        layout.addWidget(self.edit_button)
         note = QLabel('Saved scopes cannot be changed here. Hive scope conversion is available through Import From Project; '
                       'alternate scopes for the other categories are not implemented yet. '
                       'Temporal maps are batch outputs, not training labels. Changing label meaning does not edit masks.')
@@ -172,21 +181,50 @@ class AnnotationPolicyDialog(QDialog):
         layout.addWidget(self.confirm)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Close)
         self.defer_button = buttons.button(QDialogButtonBox.StandardButton.Close)
+        self.defer_button.setText('Remind Me Later' if pending else 'Continue')
         if pending:
-            self.defer_button.setText('Remind Me Later')
             self.defer_button.setToolTip('Close without saving these choices. Remind me when this project is reopened.')
         self.save_button = buttons.button(QDialogButtonBox.StandardButton.Save)
         self.save_button.setEnabled(False)
+        self.save_button.setVisible(pending)
+        self.confirm.setVisible(pending)
+        self._set_controls_editable(pending)
         self.confirm.toggled.connect(self.save_button.setEnabled)
         buttons.accepted.connect(self.save)
-        buttons.rejected.connect(self.reject)
+        buttons.rejected.connect(self.continue_or_defer)
         layout.addWidget(buttons)
+
+    def _set_controls_editable(self, editable):
+        for combo in (*self.policy.meanings.values(), *self.policy.scopes.values()):
+            palette = combo.palette()
+            for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
+                palette.setColor(QPalette.ColorGroup.Disabled, role,
+                                 palette.color(QPalette.ColorGroup.Active, role))
+            combo.setPalette(palette)
+            combo.setEnabled(editable)
+
+    def begin_editing(self):
+        self.editing = True
+        self.setWindowTitle('Edit Annotation Policy')
+        self._set_controls_editable(True)
+        self.edit_button.hide()
+        self.confirm.show()
+        self.save_button.show()
+        self.defer_button.setText('Cancel')
+
+    def continue_or_defer(self):
+        if not self.editing:
+            self.policy_reviewed.emit(self.saved_signature)
+        self.reject()
 
     def save(self):
         try:
-            if not self.confirm.isChecked():
+            if not self.editing or not self.confirm.isChecked():
                 return
+            if policy_signature(read_project_info(self.project)) != self.saved_signature:
+                raise ValueError('The saved policy changed while this dialog was open. Reopen it before editing.')
             save_policy(self.project, self.policy.entries(), self.contributor)
+            self.saved_signature = policy_signature(read_project_info(self.project))
             self.policy_saved.emit()
             self.accept()
         except Exception as exc:
