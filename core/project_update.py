@@ -10,7 +10,7 @@ from core.annotation_policy import category_policies, policy_text
 from core.categories import category_label
 from core.project_delta import apply_delta, bytes_record, file_record, recover_delta, rollback_root
 from core.project_sync import (
-    LOCAL_STATE, LOCATION_MARKERS, PROJECT_MARKER, SyncConflictError,
+    LOCAL_STATE, WORK_STATE, LOCATION_MARKERS, PROJECT_MARKER, SyncConflictError,
     _digest, _inventory, _read_json, _read_local_state,
     _safe_child, _uuid, check_destination,
     require_no_update, require_working_project, update_journal_path,
@@ -60,6 +60,18 @@ class PublishedProject:
         self.home = _identity_folder(self.root, self.project_id, 'project')
         self.contributors = _safe_child(self.home, 'contributors')
         self.cache = {}
+
+    @classmethod
+    def from_archive(cls, configuration, project_id):
+        view = cls.__new__(cls)
+        view.project = None
+        view.configuration = dict(configuration)
+        view.root = check_destination(configuration['root'], configuration['root_id'])
+        view.project_id = _uuid(project_id)
+        view.home = _identity_folder(view.root, view.project_id, 'project')
+        view.contributors = _safe_child(view.home, 'contributors')
+        view.cache = {}
+        return view
 
     def snapshot(self, reference, metadata_only=False):
         reference = _reference(*reference)
@@ -221,6 +233,8 @@ class PreparedUpdate:
         progress = progress or (lambda message: None)
         cancelled = cancelled or (lambda: False)
         self.project = Path(project).resolve()
+        if _safe_child(self.project, 'annotations/' + WORK_STATE).exists():
+            raise ValueError('Assigned work cannot use a full-project update. Publish it, then download a new working set.')
         require_no_update(self.project)
         self.published = PublishedProject(self.project, configuration)
         self.heads = self.published.heads()

@@ -82,6 +82,8 @@ def policy_needs_confirmation(info):
 def save_policy(project, entries, contributor=None):
     """Confirm intent only. Scope conversion is deliberately not a settings operation."""
     require_working_project(project)
+    from core.assigned_work import require_full_project
+    require_full_project(project)
     info = read_project_info(project)
     updated = deepcopy(info)
     body = updated.get('project_info', updated)

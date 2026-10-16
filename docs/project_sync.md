@@ -65,6 +65,10 @@ historical backup contents are not rewritten.
 
 ## Setup
 
+For selective downloads and a contributor-only video list, use
+[Assigned Work](assigned_work.md). The full-project backup/update workflow below
+remains available to coordinators; assigned copies use **Publish Work** instead.
+
 The first app launch offers optional sync setup. **Not Now** leaves local editing
 and saving fully available. Setup is also available at **Settings > Project Sync**.
 
@@ -356,8 +360,10 @@ disk failure; retain independent backups.
 
 ## Next Steps (Not Implemented)
 
-- A conflict-review UI for same-video edits, deletions, policy and split changes;
-  different videos are not automatically assumed independent.
+- A conflict-review UI for same-video edits, deletions, policy and split changes.
+  Ordinary full-project updates remain conservative. The separate Assigned Work
+  workflow can combine changes to different assigned videos with explicit scope
+  and ancestry checks; it does not merge edits to the same video.
 - A policy-level **Not used in this project** state, with safeguards for already
   labeled categories and required setup when an unused category is activated.
 - Remote garbage collection/retention and legacy archive compaction, preserving

@@ -473,6 +473,7 @@ class AnnotationToolbar(QWidget):
         )
         row3.addWidget(self.clear_measurement_line_btn)
 
+        self.calibration_widgets = [row3.itemAt(i).widget() for i in range(row3.count())]
         main_layout.addLayout(row3)
 
         self.set_imaging_setups([], None)

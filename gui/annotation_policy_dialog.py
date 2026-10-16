@@ -12,6 +12,7 @@ from core.annotation_policy import (MEANINGS, SCOPES, category_policies, default
 from core.annotation_scope import read_project_info
 from core.categories import CATEGORIES, BROOD_CATEGORIES, category_label
 from core.import_review import review_rows
+from core.assigned_work import workspace
 
 
 class PolicyTable(QWidget):
@@ -194,6 +195,15 @@ class AnnotationPolicyDialog(QDialog):
         buttons.rejected.connect(self.continue_or_defer)
         layout.addWidget(buttons)
 
+        self.assigned = bool(workspace(project))
+        if self.assigned:
+            self.editing = False
+            self.edit_button.hide()
+            self.confirm.hide()
+            self.save_button.hide()
+            self._set_controls_editable(False)
+            self.setWindowTitle('Review Assigned Annotation Policy')
+
     def _set_controls_editable(self, editable):
         for combo in (*self.policy.meanings.values(), *self.policy.scopes.values()):
             palette = combo.palette()
@@ -204,6 +214,8 @@ class AnnotationPolicyDialog(QDialog):
             combo.setEnabled(editable)
 
     def begin_editing(self):
+        if self.assigned:
+            return
         self.editing = True
         self.setWindowTitle('Edit Annotation Policy')
         self._set_controls_editable(True)

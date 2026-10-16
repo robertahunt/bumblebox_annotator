@@ -136,6 +136,8 @@ def review_rows(project):
 
 def require_reviewed(project, selections):
     """Fail before replacing any exports. Training selection and review are distinct."""
+    from core.assigned_work import require_full_project
+    require_full_project(project)
     records = read_reviews(project)
     info = read_project_info(project)
     pending = [f'{video}/frame_{index:06d}' for video, indices in selections.items() for index in indices
@@ -161,6 +163,8 @@ def export_review_metadata(project, video, index):
 
 def validate_coco_reviews(project, paths):
     """Cached COCO must not bypass new imports or changed review/policy decisions."""
+    from core.assigned_work import require_full_project
+    require_full_project(project)
     policies = category_policies(read_project_info(project))
     records = read_reviews(project)
     for path in paths:

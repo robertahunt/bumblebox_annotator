@@ -73,6 +73,10 @@ See [contributors and optional project sync](docs/project_sync.md) for session a
 external-folder setup, deduplicated versioned backups, previewed changed-file
 updates, local rollback history, and collaboration safeguards.
 
+For smaller contributor laptops, [Assigned Work](docs/assigned_work.md) lets a
+coordinator assign videos, download only selected frame images, and publish
+annotation changes without copying the whole project.
+
 ## Project Structure
 
 ```

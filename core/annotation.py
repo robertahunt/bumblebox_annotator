@@ -268,6 +268,8 @@ class AnnotationManager:
         
     def save_project(self, project_path):
         """Save project to directory"""
+        from core.assigned_work import require_full_project
+        require_full_project(project_path)
         project_path = Path(project_path)
         annotations_dir = project_path / 'annotations'
         annotations_dir.mkdir(parents=True, exist_ok=True)
@@ -472,6 +474,8 @@ class AnnotationManager:
             annotations: List of annotation dicts (with or without masks)
         """
         session = self.contributor_session if contributor is _ACTIVE_CONTRIBUTOR else contributor
+        from core.assigned_work import require_assigned_frame
+        require_assigned_frame(project_path, session, video_id, frame_idx)
         attribution_key = (str(Path(project_path).resolve()), video_id, int(frame_idx))
         source_annotations = annotations
         annotations = self.attributor.prepare(
@@ -1184,6 +1188,8 @@ class AnnotationManager:
         project_path = Path(project_path)
 
         session = self.contributor_session if contributor is _ACTIVE_CONTRIBUTOR else contributor
+        from core.assigned_work import require_assigned_frame
+        require_assigned_frame(project_path, session, video_id)
         attribution_key = (str(project_path.resolve()), video_id, 'video')
         source_annotations = annotations
         annotations = self.attributor.prepare(

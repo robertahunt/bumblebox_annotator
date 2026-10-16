@@ -281,6 +281,8 @@ def prepare_import(source, destination, selections, categories, *, split='preser
                    progress=None, cancelled=None):
     """Build editable copies; no source or destination annotation files are changed."""
     source, destination = Path(source).resolve(), Path(destination).resolve()
+    from core.assigned_work import require_full_project
+    require_full_project(destination)
     if source == destination or source in destination.parents or destination in source.parents:
         raise ValueError('Source and destination must be separate, non-nested projects.')
     if not (destination / 'annotations/project.json').is_file():

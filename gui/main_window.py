@@ -52,6 +52,9 @@ from core.import_review import read_reviews, frame_task, review_status, complete
 from core.project_sync import (SyncConflictError, require_working_project, require_no_update,
                                sync_project, update_journal_path, publication_estimate)
 from core.project_update import published_versions
+from core.assigned_work import (workspace, require_contributor, require_full_project,
+                               require_assigned_frame, publish_work)
+from gui.assigned_work_dialog import AssignmentManagerDialog, AssignedDownloadDialog
 from .project_update_dialog import ProjectUpdateDialog
 from .project_rollback_dialog import ProjectRollbackDialog
 from core.contributors import utc_now, provenance_records
@@ -441,7 +444,9 @@ class MainWindow(QMainWindow):
         review_button = QPushButton('Review Queue...')
         review_button.clicked.connect(self.show_import_reviews)
         review_layout.addWidget(review_button)
-        layout.addLayout(review_layout)
+        self.import_review_controls = QWidget()
+        self.import_review_controls.setLayout(review_layout)
+        layout.addWidget(self.import_review_controls)
         self.setCentralWidget(central_widget)
         
         # Hide YOLO toolbars by default
@@ -809,6 +814,9 @@ class MainWindow(QMainWindow):
 
         self.recent_projects_menu = file_menu.addMenu("Recent Projects")
         self.update_recent_projects_menu()
+        assigned_action = QAction('My Assigned Work...', self)
+        assigned_action.triggered.connect(self.open_assigned_work)
+        file_menu.addAction(assigned_action)
         
         file_menu.addSeparator()
         
@@ -1063,6 +1071,124 @@ class MainWindow(QMainWindow):
         review_action = QAction('Imported Frame Review...', self)
         review_action.triggered.connect(self.show_import_reviews)
         project_menu.addAction(review_action)
+        self.manage_assignments_action = QAction('Video Assignments...', self)
+        self.manage_assignments_action.triggered.connect(self.manage_assignments)
+        project_menu.addAction(self.manage_assignments_action)
+        self.ready_work_action = QAction('Submit Current Video for Review...', self)
+        self.ready_work_action.triggered.connect(lambda: self.publish_assigned_work(ready=True))
+        self.ready_work_action.setVisible(False)
+        project_menu.addAction(self.ready_work_action)
+        self.full_project_actions = [new_project_action, add_video_action, import_project_action, self.update_project_action,
+            rollback_action, export_coco_action, export_video_action, export_all_action, train_yolo_action,
+            train_yolo_instance_focused_action, train_yolo_bbox_action, predict_action,
+            frame_level_validation_action, batch_inference_action, batch_video_inference_action,
+            tracking_validation_action, self.manage_assignments_action, review_action]
+
+    def _set_assigned_mode(self):
+        assigned = bool(workspace(self.project_path))
+        previous = getattr(self, '_assigned_mode_active', False)
+        if assigned and not previous:
+            self._tracking_dock_was_hidden = self.tracking_sequences_dock.isHidden()
+            self.tracking_sequences_dock.hide()
+        elif previous and not assigned:
+            self.tracking_sequences_dock.setVisible(not self._tracking_dock_was_hidden)
+        self._assigned_mode_active = assigned
+        for action in self.full_project_actions:
+            action.setEnabled(not assigned)
+        self.ready_work_action.setVisible(assigned)
+        self.assigned_controls.setVisible(assigned)
+        self.video_dock.setWindowTitle('My Assigned Videos' if assigned else 'Project Videos')
+        self.sync_project_action.setText('Publish Work...' if assigned else 'Publish Project Backup...')
+        for widget in (self.video_filter_label, self.frame_filter_label, self.video_split_filter_combo,
+                       self.split_filter_combo, self.tracking_filter_checkbox, self.video_batch_help,
+                       self.import_review_controls, self.sam2_toolbar.finetune_btn,
+                       *self.toolbar.calibration_widgets):
+            widget.setVisible(not assigned)
+        for widget in (self.video_split_filter_combo, self.tracking_filter_checkbox,
+                       self.split_filter_combo, self.video_batch_help, self.tracking_sequences_panel,
+                       self.toolbar.imaging_setup_combo, self.toolbar.apply_imaging_setup_btn,
+                       self.toolbar.new_imaging_setup_btn, self.toolbar.set_measurement_scale_btn,
+                       self.toolbar.clear_measurement_scale_btn, self.toolbar.clear_aruco_btn):
+            widget.setEnabled(not assigned)
+        if assigned:
+            self.assigned_status.setText('Assigned work: ' + self.contributor_session['name'])
+            self.video_split_filter_combo.setCurrentIndex(0)
+            self.split_filter_combo.setCurrentIndex(0)
+            self.tracking_filter_checkbox.setChecked(False)
+
+    def open_assigned_work(self):
+        try:
+            configuration = setting_json('project_sync/destination', {})
+            if not configuration.get('root_id'):
+                QMessageBox.information(self, 'Choose a Shared Folder',
+                    'Configure and test the folder in Settings > Project Sync first.')
+                return
+            if not self.contributor_session:
+                return
+            dialog = AssignedDownloadDialog(configuration, self.contributor_session, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted and dialog.download_result:
+                self.load_project(dialog.download_result['path'])
+        except Exception as exc:
+            QMessageBox.warning(self, 'Assigned Work Unavailable', str(exc))
+
+    def manage_assignments(self):
+        if not self.project_path or not self.contributor_session:
+            QMessageBox.information(self, 'Open a Project', 'Open and publish the full project before assigning videos.')
+            return
+        try:
+            require_full_project(self.project_path)
+            configuration = setting_json('project_sync/destination', {})
+            if not configuration.get('root_id'):
+                raise ValueError('Configure the shared folder and publish a project backup first.')
+            self.save_worker.wait_until_idle(raise_errors=False)
+            self._save_annotation_sources()
+            self.save_worker.wait_until_idle()
+            AssignmentManagerDialog(self.project_path, configuration, self.contributor_session, self).exec()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Assignments Unavailable', str(exc))
+
+    def publish_assigned_work(self, ready=False):
+        if self._sync_in_progress or not self.project_path:
+            return
+        try:
+            state = require_contributor(self.project_path, self.contributor_session)
+            if not state:
+                return
+            video = self.current_video_id
+            if ready and not video:
+                return
+            if ready and QMessageBox.question(self, 'Submit Video for Review?',
+                    f'Submit your assigned frames of {video} for coordinator review?\n\n'
+                    'Video-wide masks also affect frames that were not downloaded. '
+                    'Other saved edits in this working copy will be published as work in progress.',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+            if self.is_playing:
+                self.toggle_play()
+            self._sync_in_progress = True
+            self.save_worker.wait_until_idle(raise_errors=False)
+            self._save_annotation_sources(refresh_next_id=True)
+            self.save_worker.wait_until_idle()
+            configuration = setting_json('project_sync/destination', {})
+            result = SyncProgressDialog('Publish Assigned Work', lambda progress, cancelled:
+                publish_work(self.project_path, configuration, self.contributor_session,
+                             ready=[video] if ready else [], progress=progress, cancelled=cancelled), self).run()
+            projects = setting_json('project_sync/projects', {})
+            projects.setdefault(str(self.project_path.resolve()), {}).update(
+                last_success=utc_now(), last_error='', last_path=result['path'])
+            save_setting('project_sync/projects', projects)
+            message = 'Submitted for review' if ready else 'Work published'
+            self.status_label.setText(message)
+            self.assigned_status.setText(message + (': ' + video if ready else ''))
+            if result.get('warning'):
+                QMessageBox.warning(self, 'Work Published', result['warning'])
+            else:
+                QMessageBox.information(self, message, f'{result["copied_files"]} changed files uploaded. Local work is saved.')
+        except Exception as exc:
+            QMessageBox.warning(self, 'Work Not Published', str(exc))
+        finally:
+            self._sync_in_progress = False
 
     def _update_annotation_policy_label(self):
         if not hasattr(self, 'policy_label') or not self.project_path:
@@ -1118,6 +1244,8 @@ class MainWindow(QMainWindow):
         check.setChecked(False)
         check.setEnabled(False)
         self.import_review_label.clear()
+        if workspace(self.project_path):
+            return
         if not self.project_path or not self.current_video_id or self.current_frame_idx < 0:
             return
         try:
@@ -1136,6 +1264,8 @@ class MainWindow(QMainWindow):
             self.import_review_label.setText('Review unavailable: ' + str(exc))
 
     def mark_import_review(self, checked):
+        if workspace(self.project_path):
+            return
         if not self.project_path or not self.current_video_id:
             return
         try:
@@ -1163,6 +1293,8 @@ class MainWindow(QMainWindow):
             self._update_import_review_controls()
 
     def show_import_reviews(self):
+        if workspace(self.project_path):
+            return
         if not self.project_path:
             return
         try:
@@ -1183,6 +1315,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, 'Review Queue Unavailable', str(exc))
 
     def set_contributor(self, session):
+        require_contributor(self.project_path, session)
         self.contributor_session = dict(session)
         self.annotation_manager.contributor_session = dict(session)
         self.contributor_label.setText('Contributor: ' + session['name'])
@@ -1209,7 +1342,11 @@ class MainWindow(QMainWindow):
             return
         session = choose_contributor(self)
         if session:
-            self.set_contributor(session)
+            try:
+                self.set_contributor(session)
+            except ValueError as exc:
+                QSettings().setValue('contributors/last_name', self.contributor_session['name'])
+                QMessageBox.warning(self, 'Contributor Not Changed', str(exc))
 
     def offer_sync_setup(self):
         settings = QSettings()
@@ -1250,6 +1387,10 @@ class MainWindow(QMainWindow):
         self.video_next_mask_id.clear()
 
     def update_current_project(self, history=False):
+        if workspace(self.project_path):
+            QMessageBox.information(self, 'Assigned Work',
+                'Keep this working copy and publish its edits. Download a new working set for updated assignments.')
+            return
         if self._sync_in_progress:
             return
         if not self.project_path:
@@ -1318,6 +1459,9 @@ class MainWindow(QMainWindow):
             self._sync_in_progress = False
 
     def sync_current_project(self):
+        if workspace(self.project_path):
+            self.publish_assigned_work()
+            return
         if self._sync_in_progress:
             return
         if not self.project_path:
@@ -2316,7 +2460,9 @@ class MainWindow(QMainWindow):
         return videos
     
     def show_video_context_menu(self, position):
-        """Show context menu for video list"""
+        """Show context menu for video list."""
+        if workspace(self.project_path):
+            return
         item = self.video_list.itemAt(position)
         if not item:
             return
@@ -2579,12 +2725,15 @@ class MainWindow(QMainWindow):
             return
 
         self._load_imaging_setup_config()
+        assigned = workspace(self.project_path)
 
         def setup_sort_key(video_id):
             setup_name = self.video_imaging_setups.get(video_id)
             return (setup_name is None, (setup_name or "").casefold(), video_id.casefold())
 
         def video_item_text(split_label, video_id):
+            if assigned:
+                return video_id
             setup_name = self.video_imaging_setups.get(video_id)
             setup_suffix = f"  •  {setup_name}" if setup_name else "  •  unassigned"
             return f"[{split_label}] {video_id}{setup_suffix}"
@@ -2599,6 +2748,12 @@ class MainWindow(QMainWindow):
         val_videos = self.project_manager.get_videos_by_split('val')
         test_videos = self.project_manager.get_videos_by_split('test')
         inference_videos = self.project_manager.get_videos_by_split('inference')
+        if assigned:
+            allowed = assigned['assignments']
+            train_videos = [v for v in train_videos if v in allowed]
+            val_videos = [v for v in val_videos if v in allowed]
+            test_videos = [v for v in test_videos if v in allowed]
+            inference_videos = [v for v in inference_videos if v in allowed]
 
         # Restrict the sidebar by split. The mask-only choice follows the
         # selected-frame metadata used by the annotation export workflow.
@@ -2740,7 +2895,8 @@ class MainWindow(QMainWindow):
         layout.setSpacing(5)
 
         split_filter_layout = QHBoxLayout()
-        split_filter_layout.addWidget(QLabel("Show:"))
+        self.video_filter_label = QLabel('Show:')
+        split_filter_layout.addWidget(self.video_filter_label)
         self.video_split_filter_combo = QComboBox()
         self.video_split_filter_combo.addItems([
             'All Videos',
@@ -2777,6 +2933,21 @@ class MainWindow(QMainWindow):
         )
         batch_help.setWordWrap(True)
         layout.addWidget(batch_help)
+        self.video_batch_help = batch_help
+        self.assigned_controls = QWidget()
+        assigned_layout = QVBoxLayout(self.assigned_controls)
+        assigned_layout.setContentsMargins(0, 0, 0, 0)
+        self.assigned_status = QLabel('Assigned work')
+        self.assigned_status.setWordWrap(True)
+        assigned_layout.addWidget(self.assigned_status)
+        publish_button = QPushButton('Publish Work')
+        publish_button.clicked.connect(lambda: self.publish_assigned_work())
+        assigned_layout.addWidget(publish_button)
+        ready_button = QPushButton('Submit Current Video for Review')
+        ready_button.clicked.connect(lambda: self.publish_assigned_work(ready=True))
+        assigned_layout.addWidget(ready_button)
+        self.assigned_controls.hide()
+        layout.addWidget(self.assigned_controls)
         
         container.setLayout(layout)
         self.video_dock.setWidget(container)
@@ -2815,7 +2986,8 @@ class MainWindow(QMainWindow):
         
         # Split filter dropdown
         filter_layout = QHBoxLayout()
-        filter_layout.addWidget(QLabel("Show:"))
+        self.frame_filter_label = QLabel('Show:')
+        filter_layout.addWidget(self.frame_filter_label)
         self.split_filter_combo = QComboBox()
         self.split_filter_combo.addItems([
             'All Frames',
@@ -2881,6 +3053,7 @@ class MainWindow(QMainWindow):
     def create_tracking_sequences_dock(self):
         """Create dock widget for tracking sequences"""
         dock = QDockWidget("Tracking Sequences", self)
+        self.tracking_sequences_dock = dock
         dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | 
                             Qt.DockWidgetArea.RightDockWidgetArea)
         
@@ -3901,6 +4074,7 @@ class MainWindow(QMainWindow):
         target_list_idx = self.current_frame_idx if list_idx is None else list_idx
         frame_key = self._frame_annotation_key(target_video_id, target_list_idx)
         frame_idx_in_video = frame_key[1] if frame_key is not None else target_list_idx
+        require_assigned_frame(self.project_path, self.contributor_session, target_video_id, frame_idx_in_video)
 
         if annotations is None:
             self._commit_canvas_edit_if_needed()
@@ -4262,6 +4436,9 @@ class MainWindow(QMainWindow):
             path = working_project_path(path, self, self.default_projects_dir)
             if path is None:
                 return
+            if any(p.name.startswith('.assigned-download-') for p in (Path(path), *Path(path).parents)):
+                raise ValueError('This download is incomplete. Open only its completed local working copy.')
+            require_contributor(path, self.contributor_session)
             changing_project = self.project_path and Path(self.project_path).resolve() != Path(path).resolve()
             if changing_project:
                 if self.is_playing:
@@ -4307,6 +4484,7 @@ class MainWindow(QMainWindow):
             self.annotation_manager.load_project(self.project_path)
             category_policies(self.annotation_manager.project_info)
             self.centralWidget().setEnabled(True)
+            self._set_assigned_mode()
             
             # Update video list
             self.update_video_list()
@@ -4592,6 +4770,9 @@ class MainWindow(QMainWindow):
         """Load frames from a specific video for annotation"""
         if not self.project_path:
             return
+        assigned = workspace(self.project_path)
+        if assigned and video_id not in assigned['assignments']:
+            return
         
         # Create progress dialog for loading feedback
         from PyQt6.QtWidgets import QProgressDialog
@@ -4647,6 +4828,8 @@ class MainWindow(QMainWindow):
             
             # Load all frame paths
             frame_files = sorted(frames_dir.glob('frame_*.jpg'))
+            if assigned:
+                frame_files = [p for p in frame_files if int(p.stem.split('_')[1]) in assigned['assignments'][video_id]['frames']]
             split = self.project_manager.get_video_split(video_id)
             
             # Load metadata to see which frames are selected
@@ -5361,6 +5544,9 @@ class MainWindow(QMainWindow):
         
     def on_sam2_finetune_requested(self):
         """Handle SAM2 fine-tuning request"""
+        if workspace(self.project_path):
+            QMessageBox.information(self, 'Assigned Work', 'Training belongs in the coordinator\'s full project.')
+            return
         # Check if SAM2 is loaded
         if not hasattr(self, 'sam2_toolbar') or not self.sam2_toolbar.is_checkpoint_loaded():
             QMessageBox.warning(
@@ -9861,6 +10047,9 @@ class MainWindow(QMainWindow):
         
         # Get all video subdirectories
         video_dirs = [d for d in frames_dir.iterdir() if d.is_dir()]
+        assigned = workspace(self.project_path)
+        if assigned:
+            video_dirs = [d for d in video_dirs if d.name in assigned['assignments']]
         
         for video_dir in sorted(video_dirs):
             video_id = video_dir.name
@@ -9868,6 +10057,8 @@ class MainWindow(QMainWindow):
             
             # Get frames for this video
             frame_files = sorted(video_dir.glob('frame_*.jpg'))
+            if assigned:
+                frame_files = [p for p in frame_files if int(p.stem.split('_')[1]) in assigned['assignments'][video_id]['frames']]
             
             # Load metadata to see which frames are selected
             import json

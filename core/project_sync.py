@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 ROOT_MARKER = '.bumblebox-sync-root.json'
 PROJECT_MARKER = 'project_sync.json'
 LOCAL_STATE = '.project-sync-state.json'
+WORK_STATE = '.assigned-work.json'
 OBJECTS_DIR = 'objects/sha256'
 LOCATION_MARKERS = {'project': '.bumblebox-project.json',
                     'contributor': '.bumblebox-contributor.json'}
@@ -517,6 +518,8 @@ def publication_estimate(project, configuration, contributor, progress=None, can
 def sync_project(project, configuration, contributor, progress=None, cancelled=None, *, separate_backup=False):
     """Publish one revision. Call only after saves finish and while edits are paused."""
     project = Path(project).resolve()
+    if _safe_child(project, 'annotations/' + WORK_STATE).exists():
+        raise ValueError('This is assigned work, not a complete project. Use Publish Work to preserve undownloaded files.')
     with _sync_location(project, configuration, contributor) as home:
         result = _sync_revision(project, configuration, contributor, home, progress, cancelled, separate_backup)
         # Only an accepted publication may rename an existing readable archive.

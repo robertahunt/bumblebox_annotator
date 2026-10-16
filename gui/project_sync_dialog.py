@@ -357,6 +357,13 @@ class ProjectSyncDialog(QDialog):
         layout.addWidget(buttons)
         self.sync_requested = False
         self.update_requested = False
+        from core.assigned_work import workspace
+        if workspace(project):
+            self.sync_button.setText('Publish Work')
+            self.update_button.setEnabled(False)
+            self.enabled.setChecked(True)
+            for control in (self.enabled, self.videos, self.storage):
+                control.setEnabled(False)
 
     def _path_changed(self):
         self.tested = None
