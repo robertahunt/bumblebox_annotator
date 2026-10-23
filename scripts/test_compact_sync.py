@@ -1,13 +1,14 @@
 """Shared-object publications, delta updates, and retained rollback controls."""
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from core.contributors import new_session
-from core.project_sync import (LOCATION_MARKERS, _digest, _inventory, _read_json, _write_json,
-    backup_location, object_path, publication_estimate, restore_project, snapshot_file,
+from core.project_sync import (LOCATION_MARKERS, SyncConflictError, _digest, _inventory, _read_json, _write_json,
+    backup_location, object_path, publication_estimate, publication_estimate_matches, restore_project, snapshot_file,
     sync_project, update_journal_path)
 from core.project_update import PreparedUpdate, published_versions, recover_update
 from core.project_delta import (delete_rollback_bundle, rollback_bundles, rollback_update,
@@ -322,6 +323,134 @@ class CompactSyncTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, 'Insufficient destination'):
                 self.sync()
         self.assertEqual(before, contents(self.remote))
+
+    def test_estimate_is_bound_to_source_identity_and_payload_options(self):
+        estimate = publication_estimate(self.source, self.configuration, self.contributor)
+        self.assertTrue(publication_estimate_matches(estimate, self.source, self.configuration, self.contributor))
+        for options in ({'include_videos': False}, {'storage_mode': 'full'},
+                        {'root_id': 'another-drive'}, {'root': str(self.base / 'elsewhere')}):
+            self.assertFalse(publication_estimate_matches(estimate, self.source,
+                dict(self.configuration, **options), self.contributor))
+        self.assertFalse(publication_estimate_matches(estimate, self.source, self.configuration, new_session('Other')))
+        self.assertFalse(publication_estimate_matches(estimate, self.base / 'other', self.configuration, self.contributor))
+        (self.source / 'frames/new-frame.png').write_bytes(b'new frame')
+        self.assertFalse(publication_estimate_matches(estimate, self.source, self.configuration, self.contributor))
+
+    def test_estimate_rejects_files_changed_while_hashing_and_cancellation(self):
+        self.sync()
+        before = contents(self.remote)
+        def change(progress):
+            (self.source / 'frames/new-frame.png').write_bytes(b'new frame')
+        with self.assertRaisesRegex(ValueError, 'changed during'):
+            publication_estimate(self.source, self.configuration, self.contributor, progress=change)
+        with self.assertRaises(InterruptedError):
+            publication_estimate(self.source, self.configuration, self.contributor, cancelled=lambda: True)
+        self.assertEqual(before, contents(self.remote))
+
+    def test_publish_reuses_estimate_hashes_but_verifies_remote_and_written_content(self):
+        self.sync()
+        name = 'annotations/json/video/frame_000000.json'
+        (self.source / name).write_text('["changed"]')
+        estimate = publication_estimate(self.source, self.configuration, self.contributor)
+        self.assertEqual(set(estimate['source_checksums']), set(estimate['source_inventory']))
+        checked = []
+
+        def digest(path):
+            self.assertNotIn(self.source, path.parents, 'Local contents must not be hashed a second time')
+            checked.append(path)
+            return _digest(path)
+
+        messages = []
+        with patch('core.project_sync._digest', side_effect=digest):
+            result = self.sync(estimate=estimate, progress=messages.append)
+        self.assertEqual(result['copied_files'], 1)
+        self.assertTrue(any(path.name.startswith('.pending-') for path in checked))
+        self.assertTrue(any('objects' in path.parts and not path.name.startswith('.') for path in checked))
+        self.assertTrue(any(message.startswith('Reusing local checksums') for message in messages))
+        self.assertTrue(any(message.startswith('Verifying stored backup') for message in messages))
+        manifest = _read_json(Path(result['path']) / 'manifest.json')
+        self.assertEqual(manifest['files'][name]['sha256'], _digest(self.source / name))
+
+    def test_noop_publication_with_estimate_never_reads_local_contents_or_copies(self):
+        previous = self.sync()
+        estimate = publication_estimate(self.source, self.configuration, self.contributor)
+        with patch('core.project_sync._digest', wraps=_digest) as digest, \
+                patch('core.project_sync.shutil.copy2', side_effect=AssertionError('No upload expected')):
+            result = self.sync(estimate=estimate)
+        self.assertTrue(result['unchanged'])
+        self.assertEqual(previous['path'], result['path'])
+        self.assertFalse(any(self.source in call.args[0].parents for call in digest.call_args_list))
+
+    def test_first_and_full_publications_hash_local_contents_only_once_overall(self):
+        for mode in ('deduplicated', 'full'):
+            with self.subTest(mode=mode):
+                configuration = dict(self.configuration, storage_mode=mode)
+                with patch('core.project_sync._digest', wraps=_digest) as digest:
+                    estimate = publication_estimate(self.source, configuration, self.contributor)
+                    if mode == 'deduplicated':
+                        digest.assert_not_called()  # No baseline yet: all files are additions.
+                    else:
+                        self.assertTrue(estimate['source_checksums'])
+                    result = sync_project(self.source, configuration, self.contributor, estimate=estimate)
+                names = [call.args[0].relative_to(self.source).as_posix() for call in digest.call_args_list
+                         if self.source in call.args[0].parents]
+                self.assertCountEqual(names, _inventory(self.source, True))
+                restored = self.base / ('restored-' + mode)
+                restore_project(result['path'], restored)
+                self.assertEqual(contents(restored / 'frames'), contents(self.source / 'frames'))
+
+    def test_cached_estimate_rejects_same_size_edit_even_if_mtime_is_restored(self):
+        self.sync()
+        estimate = publication_estimate(self.source, self.configuration, self.contributor)
+        path = self.source / 'frames/video/frame_000000.jpg'
+        before = path.stat()
+        path.write_bytes(b'x' * before.st_size)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertFalse(publication_estimate_matches(estimate, self.source, self.configuration, self.contributor))
+        remote_before = contents(self.remote)
+        with self.assertRaisesRegex(ValueError, 'Estimate transfer size again'):
+            self.sync(estimate=estimate)
+        self.assertEqual(contents(self.remote), remote_before)
+
+    def test_cached_estimate_rejects_source_changes_during_publication(self):
+        self.sync()
+        estimate = publication_estimate(self.source, self.configuration, self.contributor)
+        remote_before = contents(self.remote)
+        def change(message):
+            if message.startswith('Verifying stored backup'):
+                (self.source / 'annotations/new.json').write_text('{}')
+        with self.assertRaisesRegex(ValueError, 'changed during sync'):
+            self.sync(estimate=estimate, progress=change)
+        self.assertEqual(contents(self.remote), remote_before)
+
+    def test_cached_estimate_still_rejects_remote_corruption(self):
+        version = Path(self.sync()['path'])
+        estimate = publication_estimate(self.source, self.configuration, self.contributor)
+        manifest = _read_json(version / 'manifest.json')
+        path = snapshot_file(version / 'manifest.json', manifest, 'frames/video/frame_000000.jpg')
+        stat = path.stat()
+        path.write_bytes(b'x' * stat.st_size)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        remote_before = contents(self.remote)
+        with self.assertRaisesRegex(ValueError, 'damaged'):
+            self.sync(estimate=estimate)
+        self.assertEqual(contents(self.remote), remote_before)
+
+    def test_cached_estimate_keeps_conflict_cancellation_and_option_guards(self):
+        first = self.sync()
+        local = self.base / 'other-computer'
+        restore_project(first['path'], local)
+        estimate = publication_estimate(local, self.configuration, self.contributor)
+        self.publish_change()
+        remote_before = contents(self.remote)
+        with self.assertRaises(SyncConflictError):
+            sync_project(local, self.configuration, self.contributor, estimate=estimate)
+        with self.assertRaisesRegex(ValueError, 'does not match'):
+            sync_project(local, dict(self.configuration, include_videos=False), self.contributor, estimate=estimate)
+        with self.assertRaises(InterruptedError):
+            sync_project(local, self.configuration, self.contributor, estimate=estimate,
+                         separate_backup=True, cancelled=lambda: True)
+        self.assertEqual(contents(self.remote), remote_before)
 
     def test_rollback_folder_must_not_be_project_or_archive(self):
         for path in (self.source, self.source / 'backup', self.remote):

@@ -13,7 +13,7 @@ from core.annotation import AnnotationManager
 from core.annotation_policy import default_policy, save_policy
 from core.assigned_work import (accept_submission, assignment_status, download_plan, download_work,
     latest_snapshot, my_projects, parse_frames, publish_work, read_assignments, save_assignments,
-    workspace)
+    workspace, establish_director)
 from core.contributors import new_session
 from core.import_review import require_reviewed, validate_coco_reviews
 from core.project_sync import (_read_json, _write_json, WORK_STATE, SyncConflictError,
@@ -54,7 +54,8 @@ class AssignedWorkTests(unittest.TestCase):
         self.project_id = _read_json(self.source / 'annotations/project_sync.json')['project_id']
         self.choices = {'alpha': {'contributor': self.alex, 'frames': [0]},
                         'beta': {'contributor': self.sam, 'frames': [1, 2]}}
-        save_assignments(self.source, self.configuration, self.coordinator, self.choices, None)
+        setup = establish_director(self.source, self.configuration, self.coordinator, None)
+        save_assignments(self.source, self.configuration, self.coordinator, self.choices, setup['revision'])
 
     def view(self):
         return PublishedProject(self.source, self.configuration)
@@ -158,7 +159,7 @@ class AssignedWorkTests(unittest.TestCase):
         local = self.download()
         with self.assertRaisesRegex(ValueError, 'belongs to Alex'):
             publish_work(local, self.configuration, new_session('Alex'))
-        with self.assertRaisesRegex(ValueError, 'Publish Work'):
+        with self.assertRaisesRegex(ValueError, 'Upload Assigned Annotations'):
             sync_project(local, self.configuration, self.alex)
         with self.assertRaisesRegex(ValueError, 'Assigned work'):
             PreparedUpdate(local, self.configuration, latest_snapshot(self.view())[0]['reference'])
@@ -209,7 +210,7 @@ class AssignedWorkTests(unittest.TestCase):
         publish_work(local, self.configuration, self.alex, ready=['alpha'])
         status, revision = self.status()
         self.assertEqual(status, 'Ready for Review')
-        with self.assertRaisesRegex(ValueError, 'Update Local Copy'):
+        with self.assertRaisesRegex(ValueError, 'Review Shared Updates'):
             accept_submission(self.source, self.configuration, self.coordinator, 'alpha', revision)
         PreparedUpdate(self.source, self.configuration, (self.alex['id'], revision)).apply()
         accept_submission(self.source, self.configuration, self.coordinator, 'alpha', revision)

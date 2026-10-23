@@ -1,20 +1,25 @@
 """Local contributor preferences and optional mounted-folder publishing UI."""
 
+import hashlib
 import json
 from pathlib import Path
 import platform
 from uuid import uuid4
 
-from PyQt6.QtCore import QSettings, QThread, Qt, pyqtSignal
-from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-                            QFileDialog, QFormLayout, QHBoxLayout, QLabel,
-                            QLineEdit, QMessageBox, QProgressBar, QPushButton,
-                            QStyle, QVBoxLayout)
+from PyQt6.QtCore import QSettings, QSize, QThread, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap, QTextOption
+from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
+                            QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
+                            QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                            QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar,
+                            QPushButton, QScrollArea, QStyle, QVBoxLayout, QWidget)
 
 from core.contributors import contributor_profile, new_session
 from core.project_delta import default_rollback_root
 from core.project_sync import (SyncConflictError, backup_location, restore_project,
-                               test_destination, update_journal_path, _read_json, _write_json)
+                               test_destination, update_journal_path, _read_json, _write_json,
+                               publication_estimate_matches)
+from gui.workflow_help import ASSIGNED_LABEL, BACKUP_LABEL, UPDATE_LABEL, add_help_row
 
 
 def setting_json(key, default):
@@ -33,26 +38,230 @@ def save_setting(key, value):
     settings.sync()
 
 
+def load_contributor_profiles():
+    """Migrate name-keyed preferences without losing duplicate display names."""
+    profiles = {}
+    stored = setting_json('contributors/identities', {})
+    legacy = setting_json('contributors/profiles', {})
+    candidates = list(stored.values()) if isinstance(stored, dict) else []
+    if isinstance(legacy, dict):
+        candidates += [{'id': identity, 'name': name} for name, identity in legacy.items()]
+    for value in candidates:
+        try:
+            profile = contributor_profile(dict(value, format=1, kind='bumblebox-contributor'))
+            profiles.setdefault(profile['id'], profile)
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+    return profiles
+
+
+def save_contributor_profiles(profiles):
+    save_setting('contributors/identities', profiles)
+    # Retain the old preference for older app versions; the ID-keyed store is authoritative.
+    legacy = {}
+    for profile in profiles.values():
+        legacy.setdefault(profile['name'], profile['id'])
+    save_setting('contributors/profiles', legacy)
+
+
+def remember_contributor_profile(profile, *, newly_created=False):
+    profile = contributor_profile(dict(profile, format=1, kind='bumblebox-contributor'))
+    profiles = load_contributor_profiles()
+    if profile['id'] in profiles and profiles[profile['id']] != profile:
+        raise ValueError('This contributor ID already has a different local name. '
+                         'The existing identity was not overwritten.')
+    profiles.setdefault(profile['id'], profile)
+    save_contributor_profiles(profiles)
+    sharing = setting_json('contributors/shared', {})
+    if newly_created and sharing.get('enabled') and sharing.get('share_new', True):
+        sharing['publish_ids'] = sorted(set(sharing.get('publish_ids', [])) | {profile['id']})
+        save_setting('contributors/shared', sharing)
+
+
+def export_contributor_profile(profile, parent=None):
+    """Export identity only; session/device details and credentials are never included."""
+    filename, _ = QFileDialog.getSaveFileName(parent, 'Export My Contributor Profile',
+                                             'contributor-profile.json', 'JSON (*.json)')
+    if not filename:
+        return
+    try:
+        _write_json(filename, contributor_profile(dict(profile, format=1, kind='bumblebox-contributor')))
+        QMessageBox.information(parent, 'Profile Exported',
+            'This file contains only your contributor name and ID, plus its format information. '
+            'Send it to your project director so they can assign work to this profile. '
+            'Nothing was sent automatically.')
+    except Exception as exc:
+        QMessageBox.warning(parent, 'Profile Not Exported', str(exc))
+
+
+def _contributor_avatar(name, identity):
+    colors = ('#26776d', '#a44b51', '#426eaa', '#716099', '#94702e', '#386f43')
+    color = colors[hashlib.sha256(identity.encode()).digest()[0] % len(colors)]
+    parts = name.split()
+    initials = (parts[0][0] + parts[-1][0] if len(parts) > 1 else parts[0][:2]).upper()[:2]
+    pixmap = QPixmap(128, 128)
+    pixmap.setDevicePixelRatio(2)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawEllipse(2, 2, 60, 60)
+    font = painter.font()
+    font.setPixelSize(22)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.setPen(Qt.GlobalColor.white)
+    painter.drawText(2, 2, 60, 60, Qt.AlignmentFlag.AlignCenter, initials)
+    painter.end()
+    icon = QIcon(pixmap)
+    icon.addPixmap(pixmap, QIcon.Mode.Selected)
+    return icon
+
+
 def choose_contributor(parent=None):
-    profiles = setting_json('contributors/profiles', {})
+    """Confirm a saved or new identity before starting an attribution session."""
+    profiles = load_contributor_profiles()
     dialog = QDialog(parent)
-    dialog.setWindowTitle('Session Contributor')
+    dialog.setWindowTitle('Choose Contributor Profile')
+    dialog.resize(560, 500)
+    dialog.setMinimumSize(460, 400)
     layout = QVBoxLayout(dialog)
-    form = QFormLayout()
-    name = QComboBox()
-    name.setEditable(True)
-    name.lineEdit().setMaxLength(80)
-    name.addItems(sorted(profiles))
-    name.setCurrentText(QSettings().value('contributors/last_name', '', type=str))
-    name.setMinimumWidth(280)
-    form.addRow('Contributor name:', name)
-    layout.addLayout(form)
+    layout.setContentsMargins(20, 20, 20, 16)
+    layout.setSpacing(12)
+    heading = QLabel("Who's annotating?")
+    heading_font = heading.font()
+    heading_font.setPointSize(16)
+    heading_font.setBold(True)
+    heading.setFont(heading_font)
+    layout.addWidget(heading)
+    empty = QLabel('No saved profiles')
+    layout.addWidget(empty)
+    tiles = QListWidget()
+    tiles.setObjectName('contributorProfiles')
+    tiles.setAccessibleName('Contributor profiles')
+    tiles.setCursor(Qt.CursorShape.PointingHandCursor)
+    tiles.setViewMode(QListWidget.ViewMode.IconMode)
+    tiles.setResizeMode(QListWidget.ResizeMode.Adjust)
+    tiles.setMovement(QListWidget.Movement.Static)
+    tiles.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    tiles.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    tiles.setDragEnabled(False)
+    tiles.setIconSize(QSize(64, 64))
+    tiles.setGridSize(QSize(144, 144))
+    tiles.setWordWrap(True)
+    tiles.setTextElideMode(Qt.TextElideMode.ElideRight)
+    tiles.setFrameShape(QFrame.Shape.NoFrame)
+    tiles.setStyleSheet('''
+        QListWidget#contributorProfiles { background: transparent; }
+        QListWidget#contributorProfiles::item {
+            border: 1px solid palette(mid); border-radius: 6px;
+            padding: 8px; margin: 4px;
+        }
+        QListWidget#contributorProfiles::item:hover { background: palette(alternate-base); }
+        QListWidget#contributorProfiles::item:selected {
+            background: palette(highlight); color: palette(highlighted-text);
+        }
+    ''')
+    layout.addWidget(tiles, 1)
     transfer = QHBoxLayout()
+    new_button = QPushButton('New Profile...')
     import_button = QPushButton('Import Profile...')
     export_button = QPushButton('Export Profile...')
-    transfer.addWidget(import_button)
-    transfer.addWidget(export_button)
+    for button, icon in ((new_button, QStyle.StandardPixmap.SP_FileIcon),
+                         (import_button, QStyle.StandardPixmap.SP_DialogOpenButton),
+                         (export_button, QStyle.StandardPixmap.SP_DialogSaveButton)):
+        button.setIcon(dialog.style().standardIcon(icon))
+        button.setAutoDefault(False)
+        transfer.addWidget(button)
+    export_button.setToolTip('Export the selected contributor profile')
     layout.addLayout(transfer)
+
+    from gui.shared_profiles import profile_sync_service, SharedProfileSettingsDialog
+    service = profile_sync_service()
+    sharing_row = QHBoxLayout()
+    sharing_button = QPushButton('Profile Sharing...')
+    sharing_button.setAutoDefault(False)
+    sharing_button.setIcon(dialog.style().standardIcon(QStyle.StandardPixmap.SP_DriveNetIcon))
+    refresh_button = QPushButton()
+    refresh_button.setIcon(dialog.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+    refresh_button.setToolTip('Refresh shared profiles')
+    refresh_button.setAutoDefault(False)
+    hide_button = QPushButton('Hide Profile')
+    hide_button.setAutoDefault(False)
+    hide_button.setToolTip('Hide only on this computer. Shared profiles and annotation attribution are unchanged.')
+    for control in (sharing_button, refresh_button, hide_button):
+        sharing_row.addWidget(control)
+    layout.addLayout(sharing_row)
+    show_hidden = QCheckBox('Show hidden profiles')
+    layout.addWidget(show_hidden)
+    sharing_status = QLabel()
+    sharing_status.setWordWrap(True)
+    sharing_status.setTextFormat(Qt.TextFormat.PlainText)
+    layout.addWidget(sharing_status)
+
+    def selected_name():
+        item = tiles.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def refresh_profiles(selected=None):
+        tiles.clear()
+        hidden = setting_json('contributors/hidden', [])
+        names = [profile['name'].casefold() for profile in profiles.values()]
+        for identity, profile in sorted(profiles.items(), key=lambda entry: (entry[1]['name'].casefold(), entry[0])):
+            if identity in hidden and not show_hidden.isChecked():
+                continue
+            display_name = profile['name']
+            label = (f'{display_name}\n{identity[:8]}' if names.count(display_name.casefold()) > 1
+                     else display_name)
+            if identity in hidden:
+                label += '\nHidden locally'
+            item = QListWidgetItem(_contributor_avatar(display_name, identity), label)
+            item.setData(Qt.ItemDataRole.UserRole, identity)
+            item.setToolTip(label)
+            item.setSizeHint(QSize(136, 136))
+            tiles.addItem(item)
+            if identity == selected:
+                tiles.setCurrentItem(item)
+        empty.setVisible(not tiles.count())
+        if tiles.currentItem():
+            tiles.scrollToItem(tiles.currentItem())
+
+    def create_profile():
+        editor = QDialog(dialog)
+        editor.setWindowTitle('New Contributor Profile')
+        form = QFormLayout(editor)
+        name = QLineEdit()
+        name.setMaxLength(80)
+        name.setMinimumWidth(280)
+        form.addRow('Contributor name:', name)
+        actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        create = actions.button(QDialogButtonBox.StandardButton.Ok)
+        create.setText('Create and Continue')
+        create.setEnabled(False)
+        name.textChanged.connect(lambda text: create.setEnabled(bool(text.strip())))
+        actions.accepted.connect(editor.accept)
+        actions.rejected.connect(editor.reject)
+        form.addRow(actions)
+        if editor.exec() != QDialog.DialogCode.Accepted:
+            return
+        display_name = name.text().strip()
+        existing = [profile for profile in profiles.values() if profile['name'].casefold() == display_name.casefold()]
+        if existing:
+            if QMessageBox.question(editor, 'Create a Separate Identity?',
+                    f'A profile named {display_name} already exists. Select its tile if it is yours.\n\n'
+                    'Create a different person with the same name? Their attribution will remain separate.',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                refresh_profiles(existing[0]['id'])
+                return
+        identity = str(uuid4())
+        profile = {'id': identity, 'name': display_name}
+        remember_contributor_profile(profile, newly_created=True)
+        profiles.update(load_contributor_profiles())
+        refresh_profiles(identity)
+        service.refresh()
+        dialog.accept()
 
     def import_profile():
         filename, _ = QFileDialog.getOpenFileName(dialog, 'Import Your Contributor Profile', '', 'JSON (*.json)')
@@ -60,9 +269,7 @@ def choose_contributor(parent=None):
             return
         try:
             profile = contributor_profile(_read_json(filename))
-            existing = next((key for key in profiles if key.casefold() == profile['name'].casefold()), None)
-            detail = ('\nThis replaces a different locally saved ID for that name; existing annotations '
-                      'will not be reattributed.' if existing and profiles[existing] != profile['id'] else '')
+            detail = '\nOther profiles with this name are kept separate; no existing annotations are reattributed.'
             if QMessageBox.question(
                     dialog, 'Use This Contributor Identity?',
                     f"Use {profile['name']} ({profile['id']}) as your identity?\n"
@@ -70,56 +277,94 @@ def choose_contributor(parent=None):
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
                 return
-            if existing:
-                del profiles[existing]
-            profiles[profile['name']] = profile['id']
-            name.clear()
-            name.addItems(sorted(profiles))
-            name.setCurrentText(profile['name'])
+            remember_contributor_profile(profile)
+            profiles.update(load_contributor_profiles())
+            refresh_profiles(profile['id'])
         except Exception as exc:
             QMessageBox.warning(dialog, 'Profile Not Imported', str(exc))
 
     def export_profile():
-        existing = next((key for key in profiles if key.casefold() == name.currentText().strip().casefold()), None)
+        existing = selected_name()
         if existing is None:
-            QMessageBox.information(dialog, 'Start a Session First',
-                                    'Start a session with this name first, then export it via Settings > Change Contributor.')
             return
-        filename, _ = QFileDialog.getSaveFileName(dialog, 'Export Your Contributor Profile',
-                                                 'contributor-profile.json', 'JSON (*.json)')
-        if filename:
-            try:
-                _write_json(filename, contributor_profile({'format': 1, 'kind': 'bumblebox-contributor',
-                                                          'name': existing, 'id': profiles[existing]}))
-            except Exception as exc:
-                QMessageBox.warning(dialog, 'Profile Not Exported', str(exc))
+        export_contributor_profile(profiles[existing], dialog)
 
+    def update_shared():
+        selected = selected_name()
+        profiles.update(load_contributor_profiles())
+        refresh_profiles(selected)
+        sharing_status.setText(service.status)
+        refresh_button.setEnabled(service.worker is None)
+
+    def configure_sharing():
+        SharedProfileSettingsDialog(dialog).exec()
+        update_shared()
+
+    def toggle_hidden():
+        identity = selected_name()
+        if not identity:
+            return
+        hidden = set(setting_json('contributors/hidden', []))
+        if identity in hidden:
+            hidden.remove(identity)
+        else:
+            hidden.add(identity)
+        save_setting('contributors/hidden', sorted(hidden))
+        refresh_profiles(identity)
+
+    sharing_button.clicked.connect(configure_sharing)
+    refresh_button.clicked.connect(service.refresh)
+    hide_button.clicked.connect(toggle_hidden)
+    show_hidden.toggled.connect(lambda: refresh_profiles(selected_name()))
+    service.changed.connect(update_shared)
+
+    new_button.clicked.connect(create_profile)
     import_button.clicked.connect(import_profile)
     export_button.clicked.connect(export_profile)
     buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                               QDialogButtonBox.StandardButton.Cancel)
-    buttons.button(QDialogButtonBox.StandardButton.Ok).setText('Start Session')
-    buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(bool(name.currentText().strip()))
-    name.currentTextChanged.connect(lambda text: buttons.button(
-        QDialogButtonBox.StandardButton.Ok).setEnabled(bool(text.strip())))
+    proceed = buttons.button(QDialogButtonBox.StandardButton.Ok)
+    proceed.setText('Continue')
+    proceed.setEnabled(False)
+    export_button.setEnabled(False)
+    tiles.currentItemChanged.connect(lambda current, previous: proceed.setEnabled(current is not None))
+    tiles.currentItemChanged.connect(lambda current, previous: export_button.setEnabled(current is not None))
+    def update_hide(current, previous):
+        hide_button.setEnabled(current is not None)
+        hide_button.setText('Show Profile' if current and current.data(Qt.ItemDataRole.UserRole) in
+                            setting_json('contributors/hidden', []) else 'Hide Profile')
+    tiles.currentItemChanged.connect(update_hide)
+    tiles.itemClicked.connect(lambda item: dialog.accept())
+    tiles.itemActivated.connect(lambda item: dialog.accept())
     buttons.accepted.connect(dialog.accept)
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)
-    if dialog.exec() != QDialog.DialogCode.Accepted:
+    last_id = QSettings().value('contributors/last_id', '', type=str)
+    if not last_id:
+        last_name = QSettings().value('contributors/last_name', '', type=str)
+        matches = [p['id'] for p in profiles.values() if p['name'] == last_name]
+        last_id = matches[0] if len(matches) == 1 else None
+    refresh_profiles(last_id)
+    sharing_status.setText(service.status)
+    QTimer.singleShot(0, service.refresh)
+    tiles.setFocus()
+    result = dialog.exec()
+    service.changed.disconnect(update_shared)
+    if result != QDialog.DialogCode.Accepted:
         return None
-    display_name = name.currentText().strip()
-    existing = next((key for key in profiles if key.casefold() == display_name.casefold()), None)
+    identity = selected_name()
+    if identity is None:
+        return None
+    profile = profiles[identity]
     device_id = QSettings().value('contributors/device_id', '', type=str)
     if not device_id:
         device_id = str(uuid4())
         QSettings().setValue('contributors/device_id', device_id)
-    session = new_session(display_name, profiles.get(existing),
+    session = new_session(profile['name'], identity,
                           device={'id': device_id, 'name': platform.node()})
-    if existing and existing != display_name:
-        del profiles[existing]
-    profiles[display_name] = session['id']
-    save_setting('contributors/profiles', profiles)
-    QSettings().setValue('contributors/last_name', display_name)
+    remember_contributor_profile(profile)
+    QSettings().setValue('contributors/last_name', profile['name'])
+    QSettings().setValue('contributors/last_id', identity)
     return session
 
 
@@ -139,30 +384,76 @@ class OperationWorker(QThread):
             self.error = exc
 
 
+def _size_transfer_dialog(dialog, width, height, minimum_height=260):
+    available = dialog.screen().availableGeometry()
+    width = min(width, max(1, available.width() - 64))
+    height = min(height, max(1, available.height() - 64))
+    dialog.setMinimumSize(min(640, width), min(minimum_height, height))
+    dialog.resize(width, height)
+    dialog.setSizeGripEnabled(True)
+
+
+def _transfer_text(text):
+    message = QPlainTextEdit()
+    message.setReadOnly(True)
+    message.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+    message.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+    message.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    font = message.font()
+    font.setPointSizeF(max(11.0, font.pointSizeF()))
+    message.setFont(font)
+    message.setPlainText(text)
+    return message
+
+
+class TransferConfirmationDialog(QDialog):
+    def __init__(self, title, text, accept_text, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        self.message = _transfer_text(text)
+        self.message.setAccessibleName('Transfer details')
+        layout.addWidget(self.message, 1)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                        QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(accept_text)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setAutoDefault(False)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setFocus()
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        _size_transfer_dialog(self, 860, 440)
+
+
 class SyncProgressDialog(QDialog):
     def __init__(self, title, operation, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.setMinimumWidth(500)
         layout = QVBoxLayout(self)
-        self.label = QLabel('Preparing...')
-        self.label.setWordWrap(True)
-        layout.addWidget(self.label)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        self.message = _transfer_text('Preparing...')
+        self.message.setAccessibleName('Transfer status')
+        layout.addWidget(self.message, 1)
         progress = QProgressBar()
         progress.setRange(0, 0)
         layout.addWidget(progress)
         self.cancel = QPushButton('Cancel')
         self.cancel.clicked.connect(self.reject)
-        layout.addWidget(self.cancel)
+        layout.addWidget(self.cancel, 0, Qt.AlignmentFlag.AlignRight)
         self.worker = OperationWorker(operation, self)
-        self.worker.progress.connect(self.label.setText)
+        self.worker.progress.connect(self.message.setPlainText)
         self.worker.finished.connect(self.accept)
+        _size_transfer_dialog(self, 860, 340)
 
     def reject(self):
         if self.worker.isRunning():
             self.worker.requestInterruption()
             self.cancel.setEnabled(False)
-            self.label.setText('Cancelling after the current file operation...')
+            self.message.setPlainText('Cancelling after the current file operation...')
         else:
             super().reject()
 
@@ -214,7 +505,9 @@ def working_project_path(path, parent=None, default_dir=None):
         f"Project: {manifest.get('project_name', location['project'].name)}\n"
         f"Contributor: {manifest['contributor']['name']}\n"
         f"Published: {manifest.get('created_at', 'Unknown')}\n\n"
-        'Create a verified local copy to work on.' +
+        'Create a verified copy in a new local folder. This restores only the selected version; '
+        'it does not merge contributors\' work or upload local changes. Confirm this is the '
+        'version your project director intends you to use.' +
         ('\nOriginal videos were excluded; some workflows will need those videos restored separately.'
          if not manifest.get('include_videos', True) else ''))
     create = question.addButton('Create Local Working Copy', QMessageBox.ButtonRole.AcceptRole)
@@ -235,53 +528,66 @@ def working_project_path(path, parent=None, default_dir=None):
 
 
 def confirm_separate_backup(parent, error):
-    question = QMessageBox(parent)
-    question.setIcon(QMessageBox.Icon.Warning)
-    question.setWindowTitle('Published Work Has Changed')
-    question.setText(str(error))
-    save = question.addButton('Save Separate Backup', QMessageBox.ButtonRole.ActionRole)
-    cancel = question.addButton(QMessageBox.StandardButton.Cancel)
-    question.setDefaultButton(cancel)
-    question.exec()
-    return question.clickedButton() is save
+    question = TransferConfirmationDialog('Published Work Has Changed', str(error),
+                                          'Save Separate Backup', parent)
+    return question.exec() == QDialog.DialogCode.Accepted
+
+
+def publication_summary(estimate):
+    return (f"Project inventory: {estimate['files']:,} files | "
+            f"{estimate['logical_bytes'] / 1024**3:.2f} GiB total (not upload size)\n"
+            f"Estimated additional storage: {estimate['new_bytes'] / 1024**2:.1f} MiB\n"
+            f"Destination free space: {estimate['free_bytes'] / 1024**3:.2f} GiB")
+
+
+def show_publication_review(estimate, parent=None):
+    from gui.publication_review_dialog import PublicationReviewDialog
+    PublicationReviewDialog(estimate, parent).exec()
 
 
 def confirm_publication(parent, estimate, configuration):
-    box = QMessageBox(parent)
-    box.setWindowTitle('Publish Backup: Storage Estimate')
-    box.setTextFormat(Qt.TextFormat.PlainText)
-    box.setText(f"{estimate['files']:,} files | {estimate['logical_bytes'] / 1024**3:.2f} GiB logical project size\n"
-                f"Estimated additional storage: {estimate['new_bytes'] / 1024**2:.1f} MiB\n"
-                f"Destination free space: {estimate['free_bytes'] / 1024**3:.2f} GiB")
     rename_notice = (
         f"\n\nAfter a successful normal publish, the existing archive '{estimate['rename_from']}' will be renamed to match "
         f"the local folder '{estimate['project_name']}', keeping its ID and history. "
         'Saved links to the old path will need updating. Use the same project folder name on other computers.'
         if estimate.get('rename_from') else '')
-    box.setInformativeText(
+    details = (
         ('Identical files are stored once across this project\'s contributors and versions. '
          'Compact backups require this updated app to restore; keep the shared objects folder.'
          if configuration.get('storage_mode', 'deduplicated') == 'deduplicated' else
          'Each changed publication stores a complete project folder.') +
         '\nServer quotas may be lower than the reported free space. Existing archives will not be deleted.' +
         rename_notice)
-    publish = box.addButton('Publish', QMessageBox.ButtonRole.AcceptRole)
-    cancel = box.addButton(QMessageBox.StandardButton.Cancel)
-    box.setDefaultButton(cancel)
-    box.exec()
-    return box.clickedButton() is publish
+    box = TransferConfirmationDialog('Back Up Local Project: Storage Estimate',
+                                      publication_summary(estimate) + '\n\n' + details,
+                                      BACKUP_LABEL, parent)
+    review = box.buttons.addButton('Review Changes...', QDialogButtonBox.ButtonRole.ActionRole)
+    review.setIcon(box.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+    review.setAutoDefault(False)
+    review.setEnabled('review' in estimate)
+    review.clicked.connect(lambda: show_publication_review(estimate, box))
+    return box.exec() == QDialog.DialogCode.Accepted
 
 
 class ProjectSyncDialog(QDialog):
     def __init__(self, project=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Project Sync')
-        self.setMinimumWidth(580)
         self.project = str(Path(project).resolve()) if project else None
         self.configuration = setting_json('project_sync/destination', {})
         self.projects = setting_json('project_sync/projects', {})
         self.tested = None
-        layout = QVBoxLayout(self)
+        self.transfer_estimate = None
+        self.estimator = getattr(parent, 'estimate_project_backup', None)
+        self.contributor = getattr(parent, 'contributor_session', None)
+        outer = QVBoxLayout(self)
+        contents = QWidget()
+        layout = QVBoxLayout(contents)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(contents)
+        outer.addWidget(scroll, 1)
         form = QFormLayout()
         self.enabled = QCheckBox('Enable sync for this project')
         self.enabled.setEnabled(self.project is not None)
@@ -330,43 +636,140 @@ class ProjectSyncDialog(QDialog):
         self.test.clicked.connect(self.test_connection)
         layout.addWidget(self.test)
         self.status = QLabel('Not tested')
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+        profiles_button = QPushButton('Profile Sharing...')
+        profiles_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveNetIcon))
+        profiles_button.setToolTip('Share contributor identities separately from project backups')
+        def configure_profiles():
+            from gui.shared_profiles import SharedProfileSettingsDialog
+            SharedProfileSettingsDialog(self, suggested=self.pending_configuration()).exec()
+        profiles_button.clicked.connect(configure_profiles)
+        layout.addWidget(profiles_button)
         last = self.projects.get(self.project, {})
         self.last = QLabel('Last successful sync: ' + last.get('last_success', 'Never'))
         self.last.setWordWrap(True)
         layout.addWidget(self.last)
         if last.get('last_error'):
             error = QLabel('Last error: ' + last['last_error'])
+            error.setTextFormat(Qt.TextFormat.PlainText)
+            error.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             error.setWordWrap(True)
             layout.addWidget(error)
-        self.sync_button = QPushButton('Publish Project Backup')
-        self.sync_button.setEnabled(self.project is not None)
+        self.estimate_button = QPushButton('Estimate Transfer Size')
+        self.estimate_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.estimate_button.setEnabled(self.project is not None and callable(self.estimator))
+        self.estimate_button.clicked.connect(self.estimate_transfer)
+        self.estimate_help = add_help_row(layout, self.estimate_button, 'estimate')
+        self.estimate_status = QLabel('Transfer size not estimated')
+        self.estimate_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.estimate_status.setWordWrap(True)
+        layout.addWidget(self.estimate_status)
+        self.review_button = QPushButton('Review Changes...')
+        self.review_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.review_button.setEnabled(False)
+        self.review_button.setToolTip('Estimate transfer size before reviewing outgoing changes')
+        self.review_button.clicked.connect(self.review_transfer)
+        self.review_help = add_help_row(layout, self.review_button, 'review')
+        self.sync_button = QPushButton(BACKUP_LABEL)
+        self.sync_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
+        self.sync_button.setEnabled(False)
+        self.sync_button.setToolTip('Estimate transfer size before publishing')
         self.sync_button.clicked.connect(self.sync_now)
-        layout.addWidget(self.sync_button)
-        self.update_button = QPushButton('Update Local Copy...')
+        from core.assigned_work import workspace
+        self.assigned = bool(workspace(project))
+        add_help_row(layout, self.sync_button, lambda: 'assigned' if self.assigned else 'backup')
+        self.update_button = QPushButton(UPDATE_LABEL)
         self.update_button.setEnabled(self.project is not None)
         self.update_button.clicked.connect(self.update_now)
-        layout.addWidget(self.update_button)
+        add_help_row(layout, self.update_button, 'update')
         if last.get('last_update'):
             layout.addWidget(QLabel('Last local update: ' + last['last_update']))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save |
                                   QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        layout.addStretch()
+        outer.addWidget(buttons)
         self.sync_requested = False
         self.update_requested = False
-        from core.assigned_work import workspace
-        if workspace(project):
-            self.sync_button.setText('Publish Work')
+        if self.assigned:
+            self.sync_button.setText(ASSIGNED_LABEL)
+            self.sync_button.setEnabled(True)
+            self.sync_button.setToolTip('Publish assigned annotation work')
+            self.estimate_button.hide()
+            self.estimate_help.hide()
+            self.estimate_status.hide()
+            self.review_button.hide()
+            self.review_help.hide()
             self.update_button.setEnabled(False)
             self.enabled.setChecked(True)
             for control in (self.enabled, self.videos, self.storage):
                 control.setEnabled(False)
+        self.videos.toggled.connect(self.invalidate_estimate)
+        self.storage.currentIndexChanged.connect(self.invalidate_estimate)
+        self.enabled.toggled.connect(self.invalidate_estimate)
+        _size_transfer_dialog(self, 860, 660, minimum_height=420)
+
+    def invalidate_estimate(self):
+        self.transfer_estimate = None
+        if hasattr(self, 'estimate_status'):
+            self.estimate_status.setText('Transfer size not estimated')
+            self.review_button.setEnabled(False)
+            self.sync_button.setEnabled(getattr(self, 'assigned', False))
+            if not getattr(self, 'assigned', False):
+                self.sync_button.setToolTip('Estimate transfer size before publishing')
+        parent = self.parent()
+        if parent and hasattr(parent, 'invalidate_backup_estimate'):
+            parent.invalidate_backup_estimate()
+
+    def pending_configuration(self):
+        configuration = dict(self.tested or self.configuration)
+        if self.tested is None:
+            configuration['root'] = self.folder.text().strip()
+        configuration.update(include_videos=self.videos.isChecked(),
+                             storage_mode=self.storage.currentData(), rollback_root=self.rollback.text().strip())
+        return configuration
+
+    def estimate_transfer(self):
+        self.invalidate_estimate()
+        if not self.project or not callable(self.estimator):
+            return
+        self.enabled.setChecked(True)
+        if not self.test_connection():
+            return
+        self.transfer_estimate = self.estimator(self.pending_configuration(), parent=self)
+        if self.transfer_estimate:
+            self.estimate_status.setText(publication_summary(self.transfer_estimate))
+            self.review_button.setEnabled('review' in self.transfer_estimate)
+            self.sync_button.setEnabled(True)
+            self.sync_button.setToolTip('Publish the estimated backup')
+
+    def review_transfer(self):
+        if not self.transfer_estimate or 'review' not in self.transfer_estimate:
+            return
+        if self._estimate_is_current():
+            show_publication_review(self.transfer_estimate, self)
+
+    def _estimate_is_current(self):
+        try:
+            current = SyncProgressDialog('Check Transfer Estimate',
+                lambda progress, cancelled: publication_estimate_matches(
+                    self.transfer_estimate, self.project, self.pending_configuration(), self.contributor), self).run()
+            if not current:
+                self.invalidate_estimate()
+                self.estimate_status.setText('Project files changed. Estimate transfer size again.')
+            return current
+        except Exception as exc:
+            self.invalidate_estimate()
+            self.estimate_status.setText(str(exc))
+            return False
 
     def _path_changed(self):
         self.tested = None
+        self.invalidate_estimate()
         if hasattr(self, 'status'):
             self.status.setText('Not tested')
 
@@ -387,10 +790,14 @@ class ProjectSyncDialog(QDialog):
             return True
         except Exception as exc:
             self.tested = None
+            self.invalidate_estimate()
             self.status.setText(str(exc))
             return False
 
     def sync_now(self):
+        if not self.assigned:
+            if not self.transfer_estimate or not self._estimate_is_current():
+                return
         self.enabled.setChecked(True)
         self.sync_requested = True
         self.accept()

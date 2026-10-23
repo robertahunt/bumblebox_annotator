@@ -7,13 +7,16 @@ os.environ.setdefault('NO_ALBUMENTATIONS_UPDATE', '1')
 from contextlib import ExitStack
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QSettings, QTimer
-from PyQt6.QtWidgets import QApplication, QComboBox, QDialogButtonBox, QMessageBox, QPushButton
+from PyQt6.QtCore import QSettings, QTimer, Qt
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import (QApplication, QComboBox, QDialogButtonBox, QLineEdit,
+                            QListWidget, QMessageBox, QPushButton)
 
 from core.annotation import AnnotationManager
 from core.contributors import new_session
@@ -48,6 +51,7 @@ class ContributorSyncGuiTests(unittest.TestCase):
         self.remote.mkdir()
         self.settings = QSettings(str(self.base / 'settings.ini'), QSettings.Format.IniFormat)
         self.stack = ExitStack()
+        self.stack.enter_context(patch('gui.workspaces.WorkspaceController.confirm_upload_on_close', return_value=True))
         self.stack.enter_context(patch('gui.project_sync_dialog.QSettings', lambda: self.settings))
         self.stack.enter_context(patch('gui.main_window.QSettings', lambda: self.settings))
         self.stack.enter_context(patch('gui.main_window.confirm_publication', return_value=True))
@@ -65,11 +69,21 @@ class ContributorSyncGuiTests(unittest.TestCase):
     def choose(self, name, screenshot=None):
         def respond():
             dialog = self.app.activeModalWidget()
-            combo = dialog.findChild(QComboBox)
-            combo.setCurrentText(name)
+            tiles = dialog.findChild(QListWidget)
             if screenshot:
                 dialog.grab().save(screenshot)
-            dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
+            existing = next((tiles.item(i) for i in range(tiles.count())
+                             if tiles.item(i).text().casefold() == name.casefold()), None)
+            if existing:
+                QTest.mouseClick(tiles.viewport(), Qt.MouseButton.LeftButton,
+                                 pos=tiles.visualItemRect(existing).center())
+            else:
+                def enter_name():
+                    editor = self.app.activeModalWidget()
+                    editor.findChild(QLineEdit).setText(name)
+                    editor.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
+                QTimer.singleShot(0, enter_name)
+                next(b for b in dialog.findChildren(QPushButton) if b.text() == 'New Profile...').click()
         QTimer.singleShot(0, respond)
         return choose_contributor()
 
@@ -102,6 +116,204 @@ class ContributorSyncGuiTests(unittest.TestCase):
     def test_cancel_contributor_does_not_create_identity(self):
         QTimer.singleShot(0, lambda: self.app.activeModalWidget().reject())
         self.assertIsNone(choose_contributor())
+        self.assertEqual(setting_json('contributors/profiles', {}), {})
+
+    def test_startup_confirms_profile_before_home_resume_or_command_line_load(self):
+        import main as startup
+
+        profiles = {name: new_session(name)['id'] for name in ('August', 'Alex')}
+        save_setting('contributors/profiles', profiles)
+        for destination in ('home', 'resume', 'project', 'video'):
+            with self.subTest(destination=destination):
+                self.settings.setValue('contributors/last_name', 'Alex')
+                self.settings.setValue('contributors/last_id', profiles['Alex'])
+                args = SimpleNamespace(
+                    project=str(self.source) if destination == 'project' else None,
+                    video='video.mp4' if destination == 'video' else None,
+                    sam2_checkpoint=None, coarse_yolo_checkpoint=None,
+                    bbox_checkpoint=None, instance_focused_checkpoint=None)
+                observed = {}
+                with patch.object(startup, 'QApplication') as application, \
+                        patch.object(startup, 'parse_args', return_value=args), \
+                        patch.object(startup, 'MainWindow') as create_window:
+                    application.return_value.exec.return_value = 0
+                    window = create_window.return_value
+                    window.workflow.home.auto_resume.isChecked.return_value = destination != 'home'
+
+                    def respond():
+                        dialog = self.app.activeModalWidget()
+                        tiles = dialog.findChild(QListWidget)
+                        observed.update(
+                            preselected=tiles.currentItem().text(),
+                            profiles=[tiles.item(i).text() for i in range(tiles.count())],
+                            window_created=create_window.called)
+                        QTest.mouseClick(tiles.viewport(), Qt.MouseButton.LeftButton,
+                                         pos=tiles.visualItemRect(tiles.item(1)).center())
+
+                    QTimer.singleShot(0, respond)
+                    with self.assertRaises(SystemExit) as exit_result:
+                        startup.main()
+                    self.assertEqual(exit_result.exception.code, 0)
+                    self.assertEqual(observed, {
+                        'preselected': 'Alex', 'profiles': ['Alex', 'August'], 'window_created': False})
+                    window.set_contributor.assert_called_once()
+                    self.assertEqual(window.set_contributor.call_args.args[0]['id'], profiles['August'])
+                    self.assertEqual(self.settings.value('contributors/last_name'), 'August')
+                    self.assertEqual(setting_json('contributors/profiles', {}), profiles)
+                    if destination == 'resume':
+                        window.workflow.resume.assert_called_once_with()
+                    else:
+                        window.workflow.resume.assert_not_called()
+                    if args.project:
+                        window.load_project.assert_called_once_with(args.project)
+                    else:
+                        window.load_project.assert_not_called()
+                    if args.video:
+                        window.load_video.assert_called_once_with(args.video)
+                    else:
+                        window.load_video.assert_not_called()
+                    window.show.assert_called_once_with()
+
+    def test_cancelling_startup_keeps_previous_profile_and_never_opens_window(self):
+        import main as startup
+
+        profiles = {name: new_session(name)['id'] for name in ('August', 'Alex')}
+        save_setting('contributors/profiles', profiles)
+        self.settings.setValue('contributors/last_name', 'Alex')
+
+        def cancel():
+            dialog = self.app.activeModalWidget()
+            dialog.findChild(QListWidget).setCurrentRow(1)
+            dialog.reject()
+
+        with patch.object(startup, 'QApplication') as application, \
+                patch.object(startup, 'parse_args'), \
+                patch.object(startup, 'MainWindow') as create_window:
+            QTimer.singleShot(0, cancel)
+            startup.main()
+            create_window.assert_not_called()
+            application.return_value.exec.assert_not_called()
+        self.assertEqual(self.settings.value('contributors/last_name'), 'Alex')
+        self.assertEqual(setting_json('contributors/profiles', {}), profiles)
+
+    def test_profile_tiles_are_side_by_side_and_wrap_with_many_profiles(self):
+        names = ['Alex', 'August', 'Sam', 'A Very Long Contributor Name ' * 2, 'Z' * 80]
+        profiles = {name: new_session(name)['id'] for name in names}
+        profiles.update({f'Contributor {i}': new_session(str(i))['id'] for i in range(20)})
+        save_setting('contributors/profiles', profiles)
+        self.settings.setValue('contributors/last_name', 'August')
+        observed = {}
+
+        def inspect():
+            dialog = self.app.activeModalWidget()
+            tiles = dialog.findChild(QListWidget)
+            observed['dropdowns'] = len(dialog.findChildren(QComboBox))
+            observed['count'] = tiles.count()
+            observed['icons'] = all(not tiles.item(i).icon().isNull() for i in range(tiles.count()))
+            observed['tooltips'] = all(tiles.item(i).toolTip() == tiles.item(i).text()
+                                       for i in range(tiles.count()))
+            rects = [tiles.visualItemRect(tiles.item(i)) for i in range(tiles.count())]
+            observed['side_by_side'] = rects[0].top() == rects[1].top() and rects[0].right() < rects[1].left()
+            observed['wraps'] = rects[3].top() > rects[0].top()
+            observed['scrolls'] = tiles.verticalScrollBar().maximum() > 0
+            observed['horizontal_scroll'] = tiles.horizontalScrollBar().maximum()
+            dialog.grab().save('/tmp/bumblebox-profile-tiles-many.png')
+            dialog.resize(460, 310)
+            self.app.processEvents()
+            observed['narrow_horizontal_scroll'] = tiles.horizontalScrollBar().maximum()
+            tiles.scrollToBottom()
+            self.app.processEvents()
+            dialog.grab().save('/tmp/bumblebox-profile-tiles-narrow.png')
+            dialog.reject()
+
+        QTimer.singleShot(0, inspect)
+        self.assertIsNone(choose_contributor())
+        self.assertEqual(observed, {'dropdowns': 0, 'count': 25, 'icons': True, 'tooltips': True,
+                                   'side_by_side': True, 'wraps': True, 'scrolls': True,
+                                   'horizontal_scroll': 0, 'narrow_horizontal_scroll': 0})
+
+    def test_profile_tiles_support_keyboard_selection(self):
+        profiles = {name: new_session(name)['id'] for name in ('Alex', 'August', 'Sam')}
+        save_setting('contributors/profiles', profiles)
+        self.settings.setValue('contributors/last_name', 'Alex')
+
+        def select():
+            dialog = self.app.activeModalWidget()
+            tiles = dialog.findChild(QListWidget)
+            QTest.keyClick(tiles, Qt.Key.Key_Right)
+            dialog.grab().save('/tmp/bumblebox-profile-tiles-preview.png')
+            QTest.keyClick(tiles, Qt.Key.Key_Return)
+
+        QTimer.singleShot(0, select)
+        session = choose_contributor()
+        self.assertEqual(session['id'], profiles['August'])
+
+    def test_duplicate_name_requires_explicit_separate_identity_confirmation(self):
+        original = self.choose('August')
+
+        def respond():
+            dialog = self.app.activeModalWidget()
+
+            def enter_name():
+                editor = self.app.activeModalWidget()
+                editor.findChild(QLineEdit).setText('  august  ')
+                editor.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
+
+            QTimer.singleShot(0, enter_name)
+            next(b for b in dialog.findChildren(QPushButton) if b.text() == 'New Profile...').click()
+            dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
+
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.No):
+            QTimer.singleShot(0, respond)
+            selected = choose_contributor()
+        self.assertEqual(selected['id'], original['id'])
+        self.assertNotEqual(selected['session_id'], original['session_id'])
+        self.assertEqual(setting_json('contributors/profiles', {}), {'August': original['id']})
+
+    def test_right_click_does_not_start_session(self):
+        original = self.choose('August')
+        observed = {}
+
+        def respond():
+            dialog = self.app.activeModalWidget()
+            tiles = dialog.findChild(QListWidget)
+            QTest.mouseClick(tiles.viewport(), Qt.MouseButton.RightButton,
+                             pos=tiles.visualItemRect(tiles.item(0)).center())
+            observed['still_open'] = dialog.isVisible()
+            dialog.reject()
+
+        QTimer.singleShot(0, respond)
+        self.assertIsNone(choose_contributor())
+        self.assertTrue(observed['still_open'])
+        self.assertEqual(setting_json('contributors/profiles', {}), {'August': original['id']})
+
+    def test_new_profile_form_disallows_blank_names_and_can_be_cancelled(self):
+        observed = {}
+
+        def respond():
+            dialog = self.app.activeModalWidget()
+            observed['continue_enabled'] = dialog.findChild(QDialogButtonBox).button(
+                QDialogButtonBox.StandardButton.Ok).isEnabled()
+
+            def cancel_creation():
+                editor = self.app.activeModalWidget()
+                name = editor.findChild(QLineEdit)
+                name.setText('   ')
+                observed['blank_enabled'] = editor.findChild(QDialogButtonBox).button(
+                    QDialogButtonBox.StandardButton.Ok).isEnabled()
+                observed['max_length'] = name.maxLength()
+                name.setText('August')
+                editor.reject()
+
+            QTimer.singleShot(0, cancel_creation)
+            next(b for b in dialog.findChildren(QPushButton) if b.text() == 'New Profile...').click()
+            observed['count'] = dialog.findChild(QListWidget).count()
+            dialog.reject()
+
+        QTimer.singleShot(0, respond)
+        self.assertIsNone(choose_contributor())
+        self.assertEqual(observed, {'continue_enabled': False, 'blank_enabled': False,
+                                   'max_length': 80, 'count': 0})
         self.assertEqual(setting_json('contributors/profiles', {}), {})
 
     def test_destination_setup_checks_connection_and_is_locally_persisted(self):
@@ -207,6 +419,7 @@ class ContributorSyncGuiTests(unittest.TestCase):
         save_setting('project_sync/destination', probe_destination(self.remote))
         save_setting('project_sync/projects', {str(self.source): {'enabled': True}})
         with patch.object(QMessageBox, 'information'), patch.object(QMessageBox, 'warning') as warning:
+            self.assertIsNotNone(window.estimate_project_backup())
             window.sync_current_project()
             warning.assert_not_called()
         state = setting_json('project_sync/projects', {})[str(self.source)]
@@ -300,6 +513,7 @@ class ContributorSyncGuiTests(unittest.TestCase):
         save_setting('project_sync/destination', configuration)
         save_setting('project_sync/projects', {str(self.source): {'enabled': True}})
         with patch.object(QMessageBox, 'information'):
+            self.assertIsNotNone(window.estimate_project_backup())
             window.sync_current_project()
         output = setting_json('project_sync/projects', {})[str(self.source)]['last_path']
         other = self.base / 'other'
@@ -309,11 +523,13 @@ class ContributorSyncGuiTests(unittest.TestCase):
         latest = next(self.remote.rglob('latest.json'))
         before = latest.read_bytes()
         with patch('gui.main_window.confirm_separate_backup', return_value=False) as confirm:
+            self.assertIsNotNone(window.estimate_project_backup())
             window.sync_current_project()
             confirm.assert_called_once()
         self.assertEqual(latest.read_bytes(), before)
         with patch('gui.main_window.confirm_separate_backup', return_value=True), \
                 patch.object(QMessageBox, 'information') as notice, patch.object(QMessageBox, 'warning') as warning:
+            self.assertIsNotNone(window.estimate_project_backup())
             window.sync_current_project()
             warning.assert_not_called()
         self.assertEqual(notice.call_args.args[1], 'Separate Backup Saved')
@@ -329,9 +545,11 @@ class ContributorSyncGuiTests(unittest.TestCase):
             next(b for b in dialog.findChildren(QPushButton) if b.text() == 'Export Profile...').click()
             dialog.reject()
 
-        with patch('gui.project_sync_dialog.QFileDialog.getSaveFileName', return_value=(str(profile_file), '')):
+        with patch('gui.project_sync_dialog.QFileDialog.getSaveFileName', return_value=(str(profile_file), '')), \
+                patch.object(QMessageBox, 'information') as exported:
             QTimer.singleShot(0, export)
             self.assertIsNone(choose_contributor())
+            self.assertEqual(exported.call_args.args[1], 'Profile Exported')
         profile = _read_json(profile_file)
         self.assertEqual(profile['id'], first['id'])
         self.assertNotIn('device', profile)
@@ -355,6 +573,7 @@ class ContributorSyncGuiTests(unittest.TestCase):
         configuration = probe_destination(self.remote)
         save_setting('project_sync/destination', configuration)
         save_setting('project_sync/projects', {str(self.source): {'enabled': True}})
+        self.assertIsNotNone(window.estimate_project_backup())
         self.remote.rename(self.base / 'offline')
         with patch.object(QMessageBox, 'warning') as warning:
             window.sync_current_project()

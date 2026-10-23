@@ -188,41 +188,43 @@ class AnnotationToolbar(QWidget):
         row1.addWidget(self.create_separator())
         
         # Category visibility toggles
-        row1.addWidget(QLabel("Show:"))
+        self.visibility_panel = QWidget()
+        visibility_layout = FlowLayout(self.visibility_panel, hspacing=5, vspacing=6)
+        visibility_layout.addWidget(QLabel("Show:"))
         
         self.show_bees_checkbox = QCheckBox("Bees")
         self.show_bees_checkbox.setChecked(True)
         self.show_bees_checkbox.setToolTip("Show/hide bee annotations")
         self.show_bees_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('bee', state))
-        row1.addWidget(self.show_bees_checkbox)
+        visibility_layout.addWidget(self.show_bees_checkbox)
         
         self.show_hives_checkbox = QCheckBox("Hives")
         self.show_hives_checkbox.setChecked(False)
         self.show_hives_checkbox.setToolTip("Show/hide hive annotations (video-level)")
         self.show_hives_checkbox.setStyleSheet("QCheckBox { background-color: rgba(255, 255, 0, 50); padding: 2px; }")
         self.show_hives_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('hive', state))
-        row1.addWidget(self.show_hives_checkbox)
+        visibility_layout.addWidget(self.show_hives_checkbox)
         
         self.show_chambers_checkbox = QCheckBox("Chambers")
         self.show_chambers_checkbox.setChecked(False)
         self.show_chambers_checkbox.setToolTip("Show/hide chamber annotations (video-level)")
         self.show_chambers_checkbox.setStyleSheet("QCheckBox { background-color: rgba(255, 0, 0, 50); padding: 2px; }")
         self.show_chambers_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('chamber', state))
-        row1.addWidget(self.show_chambers_checkbox)
+        visibility_layout.addWidget(self.show_chambers_checkbox)
         
         self.show_pollen_checkbox = QCheckBox("Pollen")
         self.show_pollen_checkbox.setChecked(False)
         self.show_pollen_checkbox.setToolTip("Show/hide pollen annotations (video-level)")
         self.show_pollen_checkbox.setStyleSheet("QCheckBox { background-color: rgba(255, 165, 0, 50); padding: 2px; }")
         self.show_pollen_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('pollen', state))
-        row1.addWidget(self.show_pollen_checkbox)
+        visibility_layout.addWidget(self.show_pollen_checkbox)
 
         self.show_nectar_checkbox = QCheckBox("Nectar")
         self.show_nectar_checkbox.setChecked(False)
         self.show_nectar_checkbox.setToolTip("Show/hide nectar source annotations (frame-specific)")
         self.show_nectar_checkbox.setStyleSheet("QCheckBox { background-color: rgba(0, 180, 160, 50); padding: 2px; }")
         self.show_nectar_checkbox.stateChanged.connect(lambda state: self.on_annotation_type_visibility_changed('nectar', state))
-        row1.addWidget(self.show_nectar_checkbox)
+        visibility_layout.addWidget(self.show_nectar_checkbox)
         
         self.brood_visibility_actions = {}
         self.brood_visibility_groups = {}
@@ -266,22 +268,23 @@ class AnnotationToolbar(QWidget):
             button.setMenu(brood_menu)
             setattr(self, f'{name}_visibility_button', button)
             group_layout.addWidget(button)
-            row1.addWidget(group)
+            visibility_layout.addWidget(group)
 
         # Keep old checkboxes for backward compatibility with segmentation/bbox view modes
         self.segmentation_checkbox = QCheckBox("Segmentations")
         self.segmentation_checkbox.setChecked(True)
         self.segmentation_checkbox.setToolTip("Show/hide all segmentation masks (Ctrl+Shift+S)")
         self.segmentation_checkbox.stateChanged.connect(self.on_show_segmentations_changed)
-        row1.addWidget(self.segmentation_checkbox)
+        visibility_layout.addWidget(self.segmentation_checkbox)
         
         self.bbox_checkbox = QCheckBox("BBoxes")
         self.bbox_checkbox.setChecked(True)
         self.bbox_checkbox.setToolTip("Show/hide bounding boxes (Ctrl+Shift+B)")
         self.bbox_checkbox.stateChanged.connect(self.on_show_bboxes_changed)
-        row1.addWidget(self.bbox_checkbox)
+        visibility_layout.addWidget(self.bbox_checkbox)
         
         main_layout.addLayout(row1)
+        main_layout.addWidget(self.visibility_panel)
         
         # Second row: Controls and action buttons
         row2 = FlowLayout(hspacing=5, vspacing=4)

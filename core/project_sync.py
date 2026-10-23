@@ -35,12 +35,14 @@ def _read_json(path):
         return json.load(handle)
 
 
-def _write_json(path, value):
+def _write_json(path, value, *, mode=None):
     path = Path(path)
     with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix='.tmp-',
                                      delete=False) as handle:
         temporary = Path(handle.name)
         try:
+            if mode is not None:
+                os.fchmod(handle.fileno(), mode)
             json.dump(value, handle, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
@@ -231,7 +233,7 @@ def _require_current_heads(heads, base_heads):
         raise SyncConflictError(
             'Published versions differ from this working copy\'s recorded starting point. '
             'It may be outdated or independently edited; no merge was attempted.\n\n' + details +
-            '\n\nUse Update Local Copy to preview a newer publication. If both copies have edits, '
+            '\n\nUse Review Shared Updates to preview a newer publication. If both copies have edits, '
             'create a local copy of the desired published version and review/import your work, '
             'or save a separate backup without replacing any latest pointer.')
 
@@ -398,14 +400,18 @@ def prepare_sync_location(project, configuration, contributor):
         return home
 
 
-def _inventory(project, include_videos):
+def _inventory(project, include_videos, *, with_identity=False):
+    def signature(stat):
+        stamp = (stat.st_size, stat.st_mtime_ns)
+        return stamp + (stat.st_ctime_ns, stat.st_dev, stat.st_ino) if with_identity else stamp
+
     files = {}
     sequences = project / 'tracking_sequences.json'
     if sequences.is_symlink():
         raise ValueError(f'Sync does not follow symbolic links: {sequences}')
     if sequences.exists():
         stat = sequences.stat()
-        files[sequences.name] = (stat.st_size, stat.st_mtime_ns)
+        files[sequences.name] = signature(stat)
     for name in ('annotations', 'frames', 'input_data') if include_videos else ('annotations', 'frames'):
         base = project / name
         if base.is_symlink():
@@ -427,7 +433,7 @@ def _inventory(project, include_videos):
                 if path.is_symlink() or not path.is_file():
                     raise ValueError(f'Sync requires ordinary files: {path}')
                 stat = path.stat()
-                files[path.relative_to(project).as_posix()] = (stat.st_size, stat.st_mtime_ns)
+                files[path.relative_to(project).as_posix()] = signature(stat)
     return files
 
 
@@ -475,14 +481,35 @@ def snapshot_file(manifest_path, manifest, name):
     raise ValueError('The shared file store is missing. Keep compact publications inside their sync project folder.')
 
 
+def _publication_options(configuration):
+    return {key: configuration.get(key, default) for key, default in (
+        ('root', None), ('root_id', None), ('include_videos', True), ('storage_mode', 'deduplicated'))}
+
+
+def publication_estimate_matches(estimate, project, configuration, contributor, *, check_files=True):
+    """Reject a preview for a different source, identity, payload, or destination."""
+    if not isinstance(estimate, dict) or not project or not contributor:
+        return False
+    if (estimate.get('project_path') != str(Path(project).resolve()) or
+            estimate.get('options') != _publication_options(configuration) or
+            estimate.get('contributor_id') != contributor.get('id')):
+        return False
+    return not check_files or estimate.get('source_inventory') == _inventory(
+        Path(project).resolve(), configuration.get('include_videos', True), with_identity=True)
+
+
 def publication_estimate(project, configuration, contributor, progress=None, cancelled=None):
-    """Read-only payload estimate; the actual publish rechecks content and free space."""
+    """Read-only estimate retaining local checksums for this session's publication."""
+    from core.publication_review import publication_baseline, publication_changes
+
     project = Path(project).resolve()
     require_no_update(project)
     root = check_destination(configuration['root'], configuration['root_id'])
-    inventory = _inventory(project, configuration.get('include_videos', True))
+    inventory = _inventory(project, configuration.get('include_videos', True), with_identity=True)
+    if cancelled and cancelled():
+        raise InterruptedError('Publication preview cancelled.')
     logical = sum(stat[0] for stat in inventory.values())
-    home = None
+    home, project_id = None, None
     identity = project / 'annotations' / PROJECT_MARKER
     if identity.exists():
         project_id = _read_json(identity)['project_id']
@@ -494,34 +521,51 @@ def publication_estimate(project, configuration, contributor, progress=None, can
                 if home is not None:
                     raise ValueError('Duplicate published project identity.')
                 home = candidate
-    missing, seen = 0, set()
-    if configuration.get('storage_mode', 'deduplicated') == 'full' or home is None:
+    baseline = publication_baseline(home, project_id, contributor['id'])
+    compact = configuration.get('storage_mode', 'deduplicated') == 'deduplicated'
+    missing, seen, checksums = 0, set(), {}
+    if not compact or home is None:
         missing = logical
-    else:
+    if baseline is not None or (compact and home is not None):
         for index, (name, stat) in enumerate(inventory.items(), 1):
             if cancelled and cancelled():
                 raise InterruptedError('Publication preview cancelled.')
             if progress:
-                progress(f'Estimating new storage {index}/{len(inventory)}: {name}')
+                progress(f'Checking local files for changes (not uploading) {index}/{len(inventory)}: {name}')
             digest = _digest(project / name)
-            if digest not in seen and not object_path(home, digest).is_file():
+            checksums[name] = digest
+            if compact and home is not None and digest not in seen and not object_path(home, digest).is_file():
                 missing += stat[0]
             seen.add(digest)
+    if cancelled and cancelled():
+        raise InterruptedError('Publication preview cancelled.')
+    if inventory != _inventory(project, configuration.get('include_videos', True), with_identity=True):
+        raise ValueError('Project files changed during the estimate. Estimate transfer size again.')
+    review = publication_changes(inventory, checksums, baseline, configuration.get('include_videos', True))
     label = _folder_label(project.name, 'project')
     rename_from = (home.name if home and home.name not in
                    (f'{label}--{project_id[:8]}', f'{label}--{project_id}') else None)
-    return {'project_name': project.name, 'rename_from': rename_from,
+    return {'project_path': str(project), 'options': _publication_options(configuration),
+            'contributor_id': contributor['id'], 'source_inventory': inventory, 'source_checksums': checksums,
+            'project_name': project.name, 'rename_from': rename_from, 'review': review,
             'files': len(inventory), 'logical_bytes': logical, 'new_bytes': missing + 65536 + len(inventory) * 512,
             'free_bytes': shutil.disk_usage(root).free}
 
 
-def sync_project(project, configuration, contributor, progress=None, cancelled=None, *, separate_backup=False):
+def sync_project(project, configuration, contributor, progress=None, cancelled=None, *, separate_backup=False,
+                 estimate=None):
     """Publish one revision. Call only after saves finish and while edits are paused."""
+    if cancelled and cancelled():
+        raise InterruptedError('Sync cancelled. No new revision was published.')
     project = Path(project).resolve()
+    if estimate is not None and not publication_estimate_matches(
+            estimate, project, configuration, contributor, check_files=False):
+        raise ValueError('The transfer estimate does not match this publication. Estimate transfer size again.')
     if _safe_child(project, 'annotations/' + WORK_STATE).exists():
-        raise ValueError('This is assigned work, not a complete project. Use Publish Work to preserve undownloaded files.')
+        raise ValueError('This is assigned work, not a complete project. Use Upload Assigned Annotations to preserve undownloaded files.')
     with _sync_location(project, configuration, contributor) as home:
-        result = _sync_revision(project, configuration, contributor, home, progress, cancelled, separate_backup)
+        result = _sync_revision(project, configuration, contributor, home, progress, cancelled, separate_backup,
+                                estimate)
         # Only an accepted publication may rename an existing readable archive.
         # Keep the project lock, but release the contributor lock before moving it.
         if not separate_backup:
@@ -537,7 +581,7 @@ def sync_project(project, configuration, contributor, progress=None, cancelled=N
         return result
 
 
-def _sync_revision(project, configuration, contributor, home, progress, cancelled, separate_backup):
+def _sync_revision(project, configuration, contributor, home, progress, cancelled, separate_backup, estimate):
     progress = progress or (lambda message: None)
     cancelled = cancelled or (lambda: False)
     project = Path(project).resolve()
@@ -564,16 +608,31 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
         state = _read_local_state(project, project_id)
         known = state['destinations'].get(configuration['root_id'])
         base_heads = dict(known['heads']) if known else {}
-        inventory = _inventory(project, include_videos)
+        progress('Checking file metadata for changes since the estimate' if estimate is not None
+                 else 'Listing project files')
+        inventory = _inventory(project, include_videos, with_identity=True)
+        checksums = {}
+        if estimate is not None:
+            expected_inventory = dict(estimate['source_inventory'])
+            # First publication creates this small identity file after the read-only estimate.
+            identity_name = 'annotations/' + PROJECT_MARKER
+            if identity_name not in expected_inventory:
+                expected_inventory[identity_name] = inventory[identity_name]
+            if inventory != expected_inventory:
+                raise ValueError('Project files changed after the preview. Estimate transfer size again.')
+            checksums = estimate.get('source_checksums', {})
         previous = {}
         previous_project = None
         previous_manifest = None
         previous_manifest_path = None
+        baseline_reference = None
         latest = _safe_child(home, 'latest.json')
         if latest.exists():
             last = _read_json(latest)
             revision = _safe_child(home, Path('revisions') / last['revision'])
-            manifest = _read_json(_safe_child(revision, 'manifest.json'))
+            manifest_bytes = _safe_child(revision, 'manifest.json').read_bytes()
+            manifest = json.loads(manifest_bytes)
+            baseline_reference = (last['revision'], hashlib.sha256(manifest_bytes).hexdigest())
             previous_manifest, previous_manifest_path = manifest, revision / 'manifest.json'
             if manifest['project_id'] != project_id or manifest['contributor']['id'] != contributor_id:
                 raise ValueError('The destination belongs to a different project or contributor.')
@@ -581,12 +640,22 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
             previous_project = revision if manifest.get('format') == 3 else _safe_child(revision, 'project')
         if not separate_backup and (known is not None or not previous):
             _require_current_heads(heads, base_heads)
+        if estimate is not None and 'review' in estimate:
+            reviewed = estimate['review']['baseline']
+            reviewed_reference = (reviewed['revision'], reviewed['manifest_sha256']) if reviewed else None
+            if baseline_reference != reviewed_reference:
+                raise ValueError('The published review baseline changed. Estimate transfer size again before publishing.')
         files = {}
+        if checksums:
+            progress(f'Reusing local checksums from the transfer estimate: {len(checksums):,} files')
         for index, relative in enumerate(sorted(inventory), 1):
             if cancelled():
                 raise InterruptedError('Sync cancelled. No new revision was published.')
-            progress(f'Checking {index}/{len(inventory)}: {relative}')
-            files[relative] = {'sha256': _digest(project / relative), 'size': inventory[relative][0]}
+            digest = checksums.get(relative)
+            if digest is None:
+                progress(f'Reading local file contents {index}/{len(inventory)}: {relative}')
+                digest = _digest(project / relative)
+            files[relative] = {'sha256': digest, 'size': inventory[relative][0]}
         # Existing installations can establish ancestry from an exact, sole latest
         # snapshot. A changed legacy copy must not silently claim a shared baseline.
         if known is None and files == previous and set(heads) == {contributor_id}:
@@ -596,20 +665,21 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
         changed = {relative for relative in files if files[relative] != previous.get(relative)}
         # Verify the last published copy, including unchanged files, before reusing it.
         verified_paths = set()
-        for relative in files.keys() & previous.keys():
+        reused = sorted((files.keys() & previous.keys()) - changed)
+        for index, relative in enumerate(reused, 1):
             if cancelled():
                 raise InterruptedError('Sync cancelled. No new revision was published.')
-            if relative not in changed:
-                existing = snapshot_file(previous_manifest_path, previous_manifest, relative)
-                if existing not in verified_paths:
-                    if (not existing.is_file() or existing.stat().st_size != files[relative]['size'] or
-                            _digest(existing) != files[relative]['sha256']):
-                        raise ValueError('The last synced copy was edited or damaged. '
-                                         'Use a separate destination to preserve both versions.')
-                    verified_paths.add(existing)
+            existing = snapshot_file(previous_manifest_path, previous_manifest, relative)
+            if existing not in verified_paths:
+                progress(f'Verifying stored backup {index}/{len(reused)}: {relative}')
+                if (not existing.is_file() or existing.stat().st_size != files[relative]['size'] or
+                        _digest(existing) != files[relative]['sha256']):
+                    raise ValueError('The last synced copy was edited or damaged. '
+                                     'Use a separate destination to preserve both versions.')
+                verified_paths.add(existing)
         if (not changed and files == previous and not separate_backup and
                 bool(previous_manifest and previous_manifest.get('format') == 3) == compact):
-            if inventory != _inventory(project, include_videos):
+            if inventory != _inventory(project, include_videos, with_identity=True):
                 raise ValueError('Project files changed during sync. Save and try again.')
             return _publication_result(project, project_id, configuration['root_id'], heads,
                                        previous_project, 0, True, False)
@@ -627,9 +697,11 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
                 verified.add(digest)
                 existing = object_path(project_home, digest)
                 if existing.exists():
-                    if existing not in verified_paths and (not existing.is_file() or
-                            existing.stat().st_size != expected['size'] or _digest(existing) != digest):
-                        raise ValueError('A shared backup file is damaged. No version was published: ' + str(existing))
+                    if existing not in verified_paths:
+                        progress(f'Verifying shared backup content: {relative}')
+                        if (not existing.is_file() or existing.stat().st_size != expected['size'] or
+                                _digest(existing) != digest):
+                            raise ValueError('A shared backup file is damaged. No version was published: ' + str(existing))
                 else:
                     missing_objects[digest] = relative
             required = sum(files[name]['size'] for name in missing_objects.values())
@@ -664,7 +736,7 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
             finally:
                 if compact:
                     temporary.unlink(missing_ok=True)
-        if inventory != _inventory(project, include_videos):
+        if inventory != _inventory(project, include_videos, with_identity=True):
             raise ValueError('Project files changed during sync. Save and try again.')
         if cancelled():
             raise InterruptedError('Sync cancelled. No new revision was published.')

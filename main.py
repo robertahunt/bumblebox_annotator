@@ -13,10 +13,11 @@ import argparse
 os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt
 
 from gui.main_window import MainWindow
 from gui.project_sync_dialog import choose_contributor
+from gui.shared_profiles import stop_profile_sync
 
 
 def parse_args():
@@ -44,29 +45,34 @@ def main():
 
     session = choose_contributor()
     if session is None:
+        stop_profile_sync()
         return
     
-    # Create main window with optional checkpoints
-    window = MainWindow(
-        sam2_checkpoint=args.sam2_checkpoint,
-        coarse_yolo_checkpoint=args.coarse_yolo_checkpoint,
-        bbox_checkpoint=args.bbox_checkpoint,
-        instance_focused_checkpoint=args.instance_focused_checkpoint
-    )
-    window.set_contributor(session)
-    
-    # Load video if specified
-    if args.video:
-        window.load_video(args.video)
-    
-    # Load project if specified
-    if args.project:
-        window.load_project(args.project)
-    
-    window.show()
-    QTimer.singleShot(0, window.offer_sync_setup)
-    
-    sys.exit(app.exec())
+    try:
+        # Create main window with optional checkpoints
+        window = MainWindow(
+            sam2_checkpoint=args.sam2_checkpoint,
+            coarse_yolo_checkpoint=args.coarse_yolo_checkpoint,
+            bbox_checkpoint=args.bbox_checkpoint,
+            instance_focused_checkpoint=args.instance_focused_checkpoint
+        )
+        window.set_contributor(session)
+
+        # Load project if specified
+        if args.project:
+            window.load_project(args.project)
+        elif not args.video and window.workflow.home.auto_resume.isChecked():
+            window.workflow.resume()
+
+        # A command-line video still goes through the existing import workflow.
+        if args.video:
+            window.load_video(args.video)
+
+        window.show()
+        sys.exit(app.exec())
+    finally:
+        # Startup may fail before QApplication.exec(), when aboutToQuit cannot run.
+        stop_profile_sync()
 
 
 if __name__ == '__main__':

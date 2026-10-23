@@ -201,16 +201,73 @@ def assignment_status(view, entry):
     return ('In Progress' if entry.get('started_at') else 'Assigned'), None
 
 
+def establish_director(project, configuration, contributor, expected_revision):
+    """Explicit first-time setup; existing directors must use the transfer workflow."""
+    require_full_project(project)
+    actor = contributor_profile(dict(contributor, format=1, kind='bumblebox-contributor'))
+    with _sync_location(Path(project).resolve(), configuration, contributor):
+        view = PublishedProject(project, configuration)
+        current = read_assignments(view)
+        if current['coordinator']:
+            raise ValueError('A project director is already set. Use Transfer Director Role instead.')
+        if current['revision'] != expected_revision:
+            raise ValueError('Assignments changed. Refresh before setting the project director.')
+        latest_snapshot(view)
+        data = dict(current, revision=str(uuid4()),
+                    coordinator={key: actor[key] for key in ('id', 'name')})
+        _write_json(view.home / ASSIGNMENTS, data)
+        return data
+
+
+def assignment_requirements(snapshot):
+    """Requirements describe the published data, not unsaved local settings."""
+    from core.annotation_policy import policy_needs_confirmation
+    requirements = []
+    if snapshot['manifest'].get('format') != 3:
+        requirements.append('compact_backup')
+    if policy_needs_confirmation(_verified_json(snapshot, 'annotations/project.json')):
+        requirements.append('policy')
+    if not catalog(snapshot):
+        requirements.append('frames')
+    return requirements
+
+
+def assignment_management(project, configuration, contributor):
+    """Read-only workspace state, including actionable first-time setup requirements."""
+    require_full_project(project)
+    if not configuration.get('root_id'):
+        return {'needs': ['connection'], 'director': None}
+    from core.project_sync import check_destination
+    check_destination(configuration['root'], configuration['root_id'])
+    if not (Path(project) / 'annotations' / PROJECT_MARKER).exists():
+        return {'needs': ['backup'], 'director': None}
+    view = PublishedProject(project, configuration)
+    data = read_assignments(view)
+    director = data['coordinator']
+    if director and director['id'] != contributor['id']:
+        return {'needs': [], 'director': director, 'restricted': True}
+    snapshot, _ = latest_snapshot(view)
+    needs = assignment_requirements(snapshot)
+    if not director:
+        needs.insert(0, 'director')
+    return {'needs': needs, 'director': director, 'data': data, 'available': catalog(snapshot),
+            'statuses': {v: assignment_status(view, e) for v, e in data['videos'].items()}}
+
+
 def save_assignments(project, configuration, contributor, videos, expected_revision):
     require_full_project(project)
     with _sync_location(Path(project).resolve(), configuration, contributor):
         view = PublishedProject(project, configuration)
         current = read_assignments(view)
-        if current['coordinator'] and current['coordinator']['id'] != contributor['id']:
+        if not current['coordinator']:
+            raise ValueError('Set the project director explicitly before assigning work.')
+        if current['coordinator']['id'] != contributor['id']:
             raise ValueError('Only the coordinator profile can change assignments.')
         if current['revision'] != expected_revision:
             raise ValueError('Assignments changed. Refresh before saving.')
         snapshot, _ = latest_snapshot(view)
+        if assignment_requirements(snapshot):
+            raise ValueError('Complete and publish the annotation policy and frame images in a deduplicated backup before assigning work.')
         available = catalog(snapshot)
         updated = {}
         for video, choice in videos.items():
@@ -235,6 +292,25 @@ def save_assignments(project, configuration, contributor, videos, expected_revis
         return data
 
 
+def transfer_director(project, configuration, contributor, successor, expected_revision):
+    """Transfer the single coordinator identity without changing video ownership."""
+    require_full_project(project)
+    profile = contributor_profile(dict(successor, format=1, kind='bumblebox-contributor'))
+    with _sync_location(Path(project).resolve(), configuration, contributor):
+        view = PublishedProject(project, configuration)
+        current = read_assignments(view)
+        if not current['coordinator'] or current['coordinator']['id'] != contributor['id']:
+            raise ValueError('Only the current project director can transfer this role.')
+        if current['revision'] != expected_revision:
+            raise ValueError('Assignments changed. Refresh before transferring the director role.')
+        if profile['id'] == contributor['id']:
+            raise ValueError('Choose a different contributor profile.')
+        updated = dict(current, revision=str(uuid4()),
+                       coordinator={key: profile[key] for key in ('id', 'name')})
+        _write_json(view.home / ASSIGNMENTS, updated)
+        return updated
+
+
 def accept_submission(project, configuration, contributor, video, expected_revision):
     require_full_project(project)
     with _sync_location(Path(project).resolve(), configuration, contributor):
@@ -251,17 +327,18 @@ def accept_submission(project, configuration, contributor, video, expected_revis
         actual = {name: file_record(Path(project) / name) for name in _inventory(Path(project), False)
                   if _annotation_video(name) == video}
         if actual != expected:
-            raise ValueError('Update Local Copy and review this video before accepting its submission.')
+            raise ValueError('Use Review Shared Updates and review this video before accepting its submission.')
         entry['accepted_revision'] = revision
         data['revision'] = str(uuid4())
         _write_json(view.home / ASSIGNMENTS, data)
 
 
-def my_projects(configuration, contributor):
+def _shared_assignments(configuration, cancelled=lambda: False):
     from core.project_sync import check_destination
     root = check_destination(configuration['root'], configuration['root_id'])
-    projects = []
     for folder in sorted(root.iterdir()):
+        if cancelled():
+            raise InterruptedError('Assignment check cancelled')
         if folder.is_symlink() or not folder.is_dir():
             continue
         marker = _safe_child(folder, LOCATION_MARKERS['project'])
@@ -270,11 +347,45 @@ def my_projects(configuration, contributor):
         identity = _read_json(marker)
         view = PublishedProject.from_archive(configuration, identity['id'])
         data = read_assignments(view)
+        yield {'id': view.project_id, 'name': identity['name'], 'data': data}
+
+
+def my_projects(configuration, contributor):
+    projects = []
+    for project in _shared_assignments(configuration):
+        data = project['data']
         owned = {video: entry for video, entry in data['videos'].items()
                  if entry['contributor']['id'] == contributor['id']}
         if owned:
-            projects.append({'id': view.project_id, 'name': identity['name'], 'videos': owned})
+            projects.append({'id': project['id'], 'name': project['name'], 'videos': owned})
     return projects
+
+
+def assignment_presence(configuration, contributor, project=None, cancelled=lambda: False):
+    """Missing/unreadable storage raises; only verified empty assignments return 'empty'."""
+    if not configuration.get('root_id'):
+        return {'status': 'unconfigured', 'count': 0}
+    if project:
+        from core.project_sync import check_destination
+        check_destination(configuration['root'], configuration['root_id'])
+        state = workspace(project)
+        if state and state['root_id'] != configuration['root_id']:
+            raise ValueError('Choose the shared folder used for this assignment.')
+        if not (Path(project) / 'annotations' / PROJECT_MARKER).exists():
+            return {'status': 'unpublished', 'count': 0}
+        view = PublishedProject(project, configuration)
+        entries = [{'id': view.project_id, 'name': Path(project).name, 'data': read_assignments(view)}]
+    else:
+        entries = list(_shared_assignments(configuration, cancelled))
+    count = sum(1 for entry in entries for assignment in entry['data']['videos'].values()
+                if assignment['contributor']['id'] == contributor['id'])
+    directors = [entry for entry in entries if entry['data']['coordinator'] and
+                 entry['data']['coordinator']['id'] == contributor['id']]
+    director = entries[0]['data']['coordinator'] if project else None
+    status = ('director' if directors else 'assigned' if count else
+              'setup' if project and not director else 'empty')
+    return {'status': status, 'count': count, 'director': director,
+            'scope': entries[0]['name'] if project else 'the shared folder'}
 
 
 def _check_owned(data, selected, contributor):
@@ -550,5 +661,5 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
         try:
             _write_json(project / 'annotations' / WORK_STATE, state)
         except OSError as exc:
-            result['warning'] = 'Work was published. Its local receipt will be recovered on the next Publish Work: ' + str(exc)
+            result['warning'] = 'Work was published. Its local receipt will be recovered on the next Upload Assigned Annotations: ' + str(exc)
         return result

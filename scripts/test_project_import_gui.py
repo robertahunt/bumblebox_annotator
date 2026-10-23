@@ -48,6 +48,7 @@ class ProjectImportGuiTests(unittest.TestCase):
         self.dialog = ProjectImportDialog(self.dest, new_session('August'))
         self.window = None
         self.stack = ExitStack()
+        self.stack.enter_context(patch('gui.workspaces.WorkspaceController.confirm_upload_on_close', return_value=True))
         self.settings = QSettings(str(self.base / 'settings.ini'), QSettings.Format.IniFormat)
         self.stack.enter_context(patch('gui.main_window.QSettings', lambda: self.settings))
 

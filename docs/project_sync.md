@@ -2,8 +2,7 @@
 
 ## Contributor Sessions
 
-Starting `python main.py` asks for a contributor name, with previously used names
-available in the dropdown. Confirm the name each session, particularly on a
+Starting `python main.py` shows contributor profile tiles. Select your identity each session, particularly on a
 shared workstation. Cancel exits without starting an editing session.
 
 The active name appears in the status bar. **Settings > Change Contributor** saves
@@ -14,13 +13,19 @@ Contributor names and stable IDs are stored in local application settings, not
 inherited from an opened project. A new name gets a new ID; selecting a remembered
 name reuses its ID but creates a new session ID. Names are self-declared, not
 authenticated accounts. The same name first entered on another installation gets
-a different ID unless you explicitly import your existing profile.
+a different ID unless you select the existing shared profile or import it.
+
+Use **Profile Sharing...** to [share identities automatically](shared_profiles.md)
+through the mounted shared folder. Existing local profiles require an explicit
+selection before publication. Discovered identities are cached locally; sharing
+does not synchronize active sessions, device settings, or project roles.
 
 Use **Export Profile...** in the contributor dialog (also available through
 **Settings > Change Contributor**) on the first computer, then **Import Profile...**
 on the second. Import asks for confirmation and does not reattribute old labels.
 The profile contains only your display name and contributor UUID, not credentials.
-Cancelling the session discards an imported selection. Each installation keeps a
+Cancelling the session does not select a new active person; explicitly imported or
+created profiles remain saved. Each installation keeps a
 separate device UUID and hostname, recorded with subsequent edits and backups;
 profiles do not transfer that device identity. There is no account service or
 authentication of claimed authorship.
@@ -67,7 +72,7 @@ historical backup contents are not rewritten.
 
 For selective downloads and a contributor-only video list, use
 [Assigned Work](assigned_work.md). The full-project backup/update workflow below
-remains available to coordinators; assigned copies use **Publish Work** instead.
+remains available to coordinators; assigned copies use **Upload Assigned Annotations** instead.
 
 The first app launch offers optional sync setup. **Not Now** leaves local editing
 and saving fully available. Setup is also available at **Settings > Project Sync**.
@@ -76,9 +81,19 @@ and saving fully available. Setup is also available at **Settings > Project Sync
 2. Select **Test Connection**. The app writes, reads, and removes a uniquely named
    probe, then records a small destination identity marker.
 3. With a project open, select **Enable sync for this project**, then **Save**.
-4. Use **File > Publish Project Backup** or **Publish Project Backup** in the
-   settings dialog. Publishing does not download or merge others' changes.
-5. To receive a newer publication, use **File > Update Local Copy** (also available
+4. Choose **Estimate Transfer Size** in Manage Project, the File menu, or the
+   settings dialog. Pending annotations are saved locally, then file count,
+   logical size, estimated additional storage, and free space are displayed.
+   This does not upload project files. A connection test may write a small probe
+   and destination identity marker.
+5. **Back Up Local Project** becomes available after a successful estimate.
+   **Review Changes...**, next to Publish in Manage Project and Project Sync settings,
+   opens the outgoing comparison. It is also available in the final publish confirmation.
+   Edits or changed backup options invalidate it. Publishing reuses the local
+   checksums calculated by the estimate and checks file metadata to reject stale
+   results, without rereading those local contents. The final confirmation still allows
+   cancellation. Publishing does not download or merge others' changes.
+6. To receive a newer publication, use **File > Review Shared Updates** (also available
    in Project Sync settings). Updating is a separate, explicit action.
 
 The destination can be configured before opening a project. Enable each project
@@ -193,6 +208,62 @@ and destination free space; publishing rechecks space. Server quotas can be lowe
 than filesystem free space. Hashing and verification still read substantial data:
 deduplication reduces stored/written bytes, not all network reads or CPU work.
 
+Estimates keep their local checksums in memory until publication, project edits,
+or a settings change. Publication checks sizes, modification/change times and
+file identities before reuse, and checks the inventory again before completing.
+Destination files are still verified: this is different from the estimate's local
+file scan and is labeled **Verifying stored backup** in the progress window.
+Newly copied files are also verified before their version is published. A first
+backup estimate may not need to hash local files; those files are read once during
+publication instead. Full-folder estimates hash files when a previous publication
+exists so the outgoing review can compare contents, then reuse those checksums at
+publication. No persistent checksum cache is trusted
+across application sessions.
+
+The estimate's inventory count and logical total describe the whole project,
+not the number or size of files to upload. **Estimated additional storage** includes
+new contents and a conservative allowance for the version manifest. After publication, the version's
+`manifest.json` records every included path, size and checksum.
+**Review Shared Updates > Preview Changes** provides a file-level review for incoming changes; assigned
+work also has submission/review status.
+
+### Review Outgoing Changes
+
+After **Estimate Transfer Size**, choose **Review Changes...**. This read-only table
+uses the estimate's cached comparison, without hashing local files again or uploading.
+Files are grouped by video; shared project metadata has a separate **Project files**
+group. Search and change-type filters narrow the list. Large groups load their rows
+only when expanded. Each row shows the project-relative path, change type, annotation
+scope/file type, and previous/new sizes. Full paths and exact byte counts are available
+in tooltips; selecting a file also shows its full path below the table.
+
+The baseline is explicitly **this contributor's latest published backup**, not an
+arbitrary collaborator's version. If this contributor has never published, all
+included files are **Added**, even when their contents can be reused from another
+contributor's stored objects. The table describes changes to the snapshot's files,
+not physical upload counts or counts of edited segmentation instances.
+
+- **Added**: a new path in this contributor's version.
+- **Changed**: the file's contents differ, not merely its timestamp.
+- **Removed**: the path will not appear in the new version. Older backups remain intact.
+- **Excluded**: an original video from the previous version is omitted because
+  **Include original videos** is unchecked. It is not deleted from older backups.
+
+Unchanged files are counted but not listed. Shared-video annotation files are
+labeled **Shared across video**; frame masks/JSON/bboxes are **Frame annotation**.
+Project settings include policy and split metadata; this is a file-level review,
+not a field-by-field policy comparison or a visual before/after mask viewer.
+Generated version manifests and initial project identity metadata are separate
+from the existing local file inventory shown here.
+
+Opening or closing the review never publishes and does not add a new mandatory
+approval step. The normal publish confirmation remains required. Local edits or
+changed settings invalidate the estimate and review. If the contributor's remote
+baseline changes after estimation, publication requires a fresh estimate/review;
+the existing collaborator-history conflict checks also remain active. Assigned
+working sets still use their separate **Upload Assigned Annotations** flow; this table currently
+applies to **Back Up Local Project** for full local projects only.
+
 The legacy full-folder mode still copies complete trees, using copy-on-write
 where available. Its estimates conservatively allow full ordinary copies.
 
@@ -251,14 +322,14 @@ local update described below can advance an unedited copy. Publishing locks
 serialize transfers, not editing sessions. Older clients do not implement the
 ancestry check; use the updated version everywhere.
 
-### Update Local Copy
+### Review Shared Updates
 
 This provides controlled updates in the other direction, not continuous two-way
 folder mirroring. Continue to edit on local storage and publish completed versions
 to the shared drive. Do not run two annotators against the same local folder.
 
 1. Mount the shared drive and open your **local working copy**.
-2. Choose **File > Update Local Copy...**. Pending edits are saved locally and
+2. Choose **File > Review Shared Updates...**. Pending edits are saved locally and
    background writes/reads finish before comparison. No changes are published.
 3. Choose a contributor's latest publication. If there are multiple contributors,
    none is selected automatically. There is no universal latest project version.
@@ -320,7 +391,7 @@ updater still restore through Open Project, but are not automatically cleaned up
 
 To test on two computers, publish version A, restore it locally on the second
 computer, then edit and publish version B on the first. Leave the second copy
-unedited and use Update Local Copy to receive B. As a separate test on disposable
+unedited and use Review Shared Updates to receive B. As a separate test on disposable
 copies, edit both before publishing: the second copy's update should show the
 conflict and disable applying. Use the new app version on **both** computers.
 

@@ -30,6 +30,7 @@ class AssignedWorkGuiTests(unittest.TestCase):
         fixtures.AssignedWorkTests.setUp(self)
         self.settings = QSettings(str(self.base / 'settings.ini'), QSettings.Format.IniFormat)
         self.stack = ExitStack()
+        self.stack.enter_context(patch('gui.workspaces.WorkspaceController.confirm_upload_on_close', return_value=True))
         self.stack.enter_context(patch('gui.project_sync_dialog.QSettings', lambda: self.settings))
         self.stack.enter_context(patch('gui.main_window.QSettings', lambda: self.settings))
         self.stack.enter_context(patch.object(QMessageBox, 'critical', side_effect=AssertionError('Unexpected critical dialog')))
@@ -95,7 +96,7 @@ class AssignedWorkGuiTests(unittest.TestCase):
         self.assertEqual(len(window.frames), 1)
         self.assertEqual(window.current_video_id, 'alpha')
         self.assertTrue(all(not action.isEnabled() for action in window.full_project_actions))
-        self.assertEqual(window.sync_project_action.text(), 'Publish Work...')
+        self.assertEqual(window.sync_project_action.text(), 'Upload Assigned Annotations')
         self.assertFalse(window.toolbar.imaging_setup_combo.isEnabled())
         window.show()
         self.app.processEvents()
@@ -123,7 +124,7 @@ class AssignedWorkGuiTests(unittest.TestCase):
         self.assertTrue(dialog.save_button.isHidden())
         self.assertTrue(all(not widget.isEnabled() for widget in dialog.policy.meanings.values()))
         settings = ProjectSyncDialog(local)
-        self.assertEqual(settings.sync_button.text(), 'Publish Work')
+        self.assertEqual(settings.sync_button.text(), 'Upload Assigned Annotations')
         self.assertFalse(settings.update_button.isEnabled())
         dialog.close()
         settings.close()
@@ -157,7 +158,7 @@ class AssignedWorkGuiTests(unittest.TestCase):
         window.load_project(self.source)
         self.assertEqual(window.video_list.count(), 2)
         self.assertTrue(window.manage_assignments_action.isEnabled())
-        self.assertEqual(window.sync_project_action.text(), 'Publish Project Backup...')
+        self.assertEqual(window.sync_project_action.text(), 'Back Up Local Project')
 
 
 if __name__ == '__main__':

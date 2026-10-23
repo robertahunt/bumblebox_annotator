@@ -77,6 +77,12 @@ For smaller contributor laptops, [Assigned Work](docs/assigned_work.md) lets a
 coordinator assign videos, download only selected frame images, and publish
 annotation changes without copying the whole project.
 
+Contributor identities can be [shared between computers](docs/shared_profiles.md)
+through an optional shared-folder profile directory, without exchanging files manually.
+
+See [Project Home and workspaces](docs/workspaces.md) for the streamlined startup,
+annotation/review/training views, local autosave, and shared-project update status.
+
 ## Project Structure
 
 ```

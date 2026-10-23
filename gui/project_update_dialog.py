@@ -13,7 +13,7 @@ from gui.project_sync_dialog import SyncProgressDialog
 class ProjectUpdateDialog(QDialog):
     def __init__(self, project, configuration, versions, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Update Local Copy')
+        self.setWindowTitle('Review Shared Updates')
         self.resize(980, 650)
         self.project = project
         self.configuration = configuration
