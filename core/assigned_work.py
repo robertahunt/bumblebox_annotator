@@ -254,10 +254,12 @@ def add_project_member(project, configuration, contributor, member, expected_rev
         return updated
 
 
-def assignment_status(view, entry):
-    revision = view.heads().get(entry['contributor']['id'])
+def assignment_status(view, entry, *, heads=None, current=None, cancelled=lambda: False):
+    revision = (view.heads() if heads is None else heads).get(entry['contributor']['id'])
     visited = set()
     while revision:
+        if cancelled():
+            raise InterruptedError('Assignment check cancelled')
         if revision in visited or len(visited) >= 1000:
             raise ValueError('Assignment publication history needs coordinator review.')
         visited.add(revision)
@@ -266,7 +268,8 @@ def assignment_status(view, entry):
         video = entry['video']
         if submission.get('assignments', {}).get(video) == entry['id']:
             submitted = view.snapshot(snapshot['reference'])
-            current, _ = latest_snapshot(view)
+            if current is None:
+                current, _ = latest_snapshot(view)
             if _video_files(submitted['manifest']['files'], video) != _video_files(current['manifest']['files'], video):
                 return 'Changed Since Submission', revision
             if video in submission.get('ready', []):
@@ -274,6 +277,34 @@ def assignment_status(view, entry):
             return 'In Progress', revision
         revision = snapshot['parents'].get(entry['contributor']['id'])
     return ('In Progress' if entry.get('started_at') else 'Assigned'), None
+
+
+def assigned_review_statuses(project, configuration, contributor, assignments, cancelled=lambda: False):
+    """Check published review states, without scanning local or remote mask payloads."""
+    if cancelled():
+        raise InterruptedError('Assignment check cancelled')
+    if not configuration.get('root_id'):
+        raise ValueError('Connect the shared folder to check review status.')
+    state = require_contributor(project, contributor)
+    if state and state['root_id'] != configuration['root_id']:
+        raise ValueError('Choose the shared folder used for this assignment.')
+    view = PublishedProject(project, configuration)
+    data = read_assignments(view)
+    current, heads = latest_snapshot(view)
+    statuses = {}
+    for video, expected in assignments.items():
+        if cancelled():
+            raise InterruptedError('Assignment check cancelled')
+        entry = data['videos'].get(video)
+        if (not entry or entry['contributor']['id'] != contributor['id'] or
+                any(entry.get(key) != expected.get(key) for key in ('id', 'frames', 'task'))):
+            statuses[video] = 'Assignment changed'
+            continue
+        statuses[video], _ = assignment_status(view, entry, heads=heads, current=current, cancelled=cancelled)
+    if (view.heads(validate_snapshots=False) != heads or
+            read_assignments(view)['revision'] != data['revision']):
+        raise ValueError('Shared work changed during the check. Refresh review status.')
+    return statuses
 
 
 def establish_director(project, configuration, contributor, expected_revision):

@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (QComboBox, QFormLayout, QHBoxLayout, QLabel, QMessa
 from core.annotation_work import (TASKS, local_index, mark_finished, matches, summarize,
                                   task_label)
 from core.assigned_work import workspace
+from gui.assigned_review import AssignedReviewViews
 from gui.project_sync_dialog import OperationWorker, SyncProgressDialog
 from gui.video_browsing import SORT_ROLE
 
@@ -90,6 +91,9 @@ class AnnotationWorkBrowser(QObject):
         self.source.setTextFormat(Qt.TextFormat.PlainText)
         self.source.setWordWrap(True)
         layout.insertWidget(0, self.source)
+        self.review = AssignedReviewViews()
+        layout.insertWidget(layout.indexOf(window.video_list), self.review)
+        self.review.changed.connect(self.apply)
         self.filters = WorkFilters()
         self.filters.split.hide()  # The existing sidebar already has a split selector.
         self.filters.extra.layout().labelForField(self.filters.split).hide()
@@ -209,6 +213,10 @@ class AnnotationWorkBrowser(QObject):
         self.source.setToolTip(str(w.project_path or ''))
         task = self.filters.task.currentData()
         state = workspace(w.project_path) if w.project_path else None
+        assignments = state['assignments'] if state else (
+            w.video_browser.my_work if w.video_browser.only_mine.isChecked() else {})
+        self.review.set_context(w.project_path, getattr(w, 'contributor_session', None), assignments)
+        visible_count = 0
         for row in range(w.video_list.count()):
             item = w.video_list.item(row)
             video = item.data(Qt.ItemDataRole.UserRole)
@@ -222,17 +230,22 @@ class AnnotationWorkBrowser(QObject):
                 base = item.text()
                 item.setData(Qt.ItemDataRole.UserRole + 40, base)
             item.setText(base + '\n' + task_label(task) + ': ' + self.summary_text(summary))
+            review_text = self.review.status_text(video)
+            if review_text:
+                item.setText(item.text() + '\n' + review_text)
             item.setToolTip(base + '\nLocal saved annotations\n' + summary.get('detail', '') +
-                            '\n' + w.video_browser.tooltip(video))
-            # Mask filters retain the active item; experiment filters are exact.
+                            '\n' + w.video_browser.tooltip(video) + ('\n' + review_text if review_text else ''))
+            # Mask filters retain the active item; experiment/review filters are exact.
             # Neither changes the video currently displayed on the canvas.
-            visible = w.video_browser.accepts(video) and (
+            visible = w.video_browser.accepts(video) and self.review.accepts(video) and (
                 summary['state'] == 'loading' or video == w.current_video_id or self.filters.accepts(summary))
             item.setHidden(not visible)
+            visible_count += int(visible)
             if not visible:
                 item.setSelected(False)
             item.setData(SORT_ROLE, w.video_browser.key(video, item.data(Qt.ItemDataRole.UserRole + 42) or 0))
         w.video_list.sortItems(Qt.SortOrder.AscendingOrder)
+        self.review.update_labels(visible_count)
         video, frame, entry = self.current()
         summary = self.summary(entry, task, [frame])
         dirty = bool(getattr(w, 'current_frame_modified', False))
@@ -242,7 +255,7 @@ class AnnotationWorkBrowser(QObject):
             self.note.setText(self.note.text() + '\nChecking local saved masks...')
         elif self.error:
             self.note.setText('Mask summary unavailable: ' + self.error)
-        if video and not w.video_browser.accepts(video):
+        if video and not (w.video_browser.accepts(video) and self.review.accepts(video)):
             self.note.setText(self.note.text() + '\nCurrent video is outside the video filters')
         elif video and summary['state'] != 'loading' and not self.filters.accepts(summarize(entry, task)):
             self.note.setText(self.note.text() + '\nCurrent video kept visible outside these filters')

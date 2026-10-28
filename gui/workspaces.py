@@ -731,6 +731,7 @@ class WorkspaceController(QObject):
         self.shared_status.setText('Upload verified')
         self.update_button.hide()
         self.update_help.hide()
+        self.window.annotation_work.review.schedule()
 
     def update_save_status(self):
         window = self.window
@@ -822,6 +823,7 @@ class WorkspaceController(QObject):
         stopped = self.home.inbox.stop()
         stopped = self.assignments_page.stop() and stopped
         stopped = self.window.video_browser.stop() and stopped
+        stopped = self.window.annotation_work.review.stop() and stopped
         if self.worker and self.worker.isRunning():
             self.worker.requestInterruption()
             stopped = self.worker.wait(2000) and stopped

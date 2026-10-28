@@ -272,6 +272,31 @@ The coordinator opens the **Assignments** workspace (also reachable through
 Local unsent edits cannot be seen remotely. These statuses describe published
 work, except the initial download's In Progress indication.
 
+In the annotation sidebar, **Review** separates locally available assignments:
+
+- **Active Work** (default): Assigned, In Progress, Changed Since Submission,
+  changed assignments needing attention, and work whose review status is not yet known.
+- **Awaiting Review**: submitted videos marked Ready for Review.
+- **Accepted**: submissions accepted by the director.
+- **All Assigned**: every locally available assignment, regardless of review status.
+
+These views appear automatically in selective working copies, and in full projects
+when **Only my assigned videos** is checked. Counts refer to those local assignments;
+experiment and mask-completion filters can narrow the list further. The current
+canvas stays unchanged when a review filter hides its video from the list.
+Submitting or accepting work does not remove its assignment, lock editing, or delete files.
+
+Review status is checked in the background when opening assigned work, after an
+upload, every minute while these controls are visible, and using the refresh icon
+next to **Review**. It reads publication metadata, not every image or mask. If the
+drive cannot be checked, the status is explicitly unavailable and unchecked work
+stays accessible in Active Work and All Assigned. Unsaved or saved-but-unuploaded
+edits do not change this published status; upload and resubmit as needed.
+
+**Show > Finished** remains a separate, local, per-mask-task completion filter.
+Marking work finished does not submit it. Submission is explicit and does not
+require every mask type or frame to have been marked finished.
+
 Use **File > Review Shared Updates** in the coordinator's full project to get the
 latest combined publication, review the assigned frames and shared masks, then
 select the video and **Accept Reviewed Submission...**. Acceptance checks that

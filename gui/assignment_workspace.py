@@ -357,6 +357,7 @@ class AssignmentInbox(QWidget):
         browser.set_my_work(w.project_path, {v: assignments[v] for v in available}, enabled=True)
         # Old experiment, split, or completion filters must not hide newly opened work.
         filters = w.annotation_work.filters
+        w.annotation_work.review.view.setCurrentIndex(0)
         for combo in (browser.experiment, w.video_split_filter_combo, w.split_filter_combo,
                       filters.show, filters.presence, filters.split):
             combo.blockSignals(True)
@@ -385,6 +386,7 @@ class AssignmentInbox(QWidget):
         filters.task.setCurrentIndex(max(0, filters.task.findData(task)))
         w.update_video_list()
         w.update_frame_list()
+        w.annotation_work.review.schedule()
         w.video_list.clearSelection()
         for row in range(w.video_list.count()):
             item = w.video_list.item(row)
