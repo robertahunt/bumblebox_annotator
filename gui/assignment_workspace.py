@@ -75,7 +75,7 @@ class AssignmentInbox(QWidget):
         self.open.clicked.connect(self.open_selected)
         layout.addWidget(self.open)
         self.download_more = QPushButton('Download Assigned Work...')
-        self.download_more.setToolTip('Download assignments into a separate local working copy; existing local edits are kept.')
+        self.download_more.setToolTip('Add or refresh assignments in your existing working copy; local edits are kept.')
         self.download_more.clicked.connect(self.download_selected)
         layout.addWidget(self.download_more)
         self.download_more.hide()
@@ -253,8 +253,17 @@ class AssignmentInbox(QWidget):
         self.selection_changed()
 
     def local_path(self, project):
+        from gui.assigned_work_dialog import assigned_local_path
         actor = self.window.contributor_session['id']
-        root = setting_json('project_sync/destination', {}).get('root_id', '')
+        configuration = setting_json('project_sync/destination', {})
+        root = configuration.get('root_id', '')
+        if root:
+            try:
+                managed = assigned_local_path(configuration, project['id'], self.window.contributor_session)
+                if managed:
+                    return managed
+            except (OSError, ValueError, KeyError):
+                return ''  # Do not silently fall back to a different copy when managed work is unavailable.
         local = self.window.workflow.settings.value(
             f'workflow/shared_projects/{actor}/{root}/{project["id"]}', '', type=str)
         if not local:
@@ -340,8 +349,8 @@ class AssignmentInbox(QWidget):
         if not available:
             QMessageBox.information(w, 'Assigned Work Not Available Locally',
                 'This project does not contain usable frames for your current assignments. '
-                'Choose Download Assigned Work on Home to download a separate working copy. '
-                'Existing local work will not be replaced.')
+                'Choose Download Assigned Work on Home to add assignments to your working copy. '
+                'Existing local edits will be kept; conflicts stop for review.')
             return
 
         browser = w.video_browser

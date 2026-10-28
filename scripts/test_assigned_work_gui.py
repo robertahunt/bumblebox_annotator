@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 from pathlib import Path
+import os
 import unittest
 from unittest.mock import patch
 
@@ -10,7 +11,8 @@ from PyQt6.QtWidgets import QApplication, QMessageBox, QDialog
 
 from core.assigned_work import read_assignments, save_assignments, workspace
 from core.contributors import new_session
-from gui.assigned_work_dialog import AssignmentManagerDialog, AssignedDownloadDialog
+from gui.assigned_work_dialog import (AssignmentManagerDialog, AssignedDownloadDialog,
+                                      assigned_local_path, managed_copy_key)
 from gui.annotation_policy_dialog import AnnotationPolicyDialog
 from gui.main_window import MainWindow
 from gui.project_sync_dialog import ProjectSyncDialog, save_setting
@@ -30,6 +32,7 @@ class AssignedWorkGuiTests(unittest.TestCase):
         fixtures.AssignedWorkTests.setUp(self)
         self.settings = QSettings(str(self.base / 'settings.ini'), QSettings.Format.IniFormat)
         self.stack = ExitStack()
+        self.stack.enter_context(patch.dict(os.environ, {'XDG_DATA_HOME': str(self.base / 'appdata')}))
         self.stack.enter_context(patch('gui.workspaces.WorkspaceController.confirm_upload_on_close', return_value=True))
         self.stack.enter_context(patch('gui.project_sync_dialog.QSettings', lambda: self.settings))
         self.stack.enter_context(patch('gui.main_window.QSettings', lambda: self.settings))
@@ -76,12 +79,72 @@ class AssignedWorkGuiTests(unittest.TestCase):
         dialog.show()
         self.app.processEvents()
         dialog.grab().save('/tmp/bumblebox-my-assignments.png')
-        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes), \
-                patch('gui.assigned_work_dialog.QFileDialog.getExistingDirectory', return_value=str(self.base)):
+        with patch('gui.assigned_work_dialog.TransferConfirmationDialog.exec', return_value=QDialog.DialogCode.Accepted), \
+                patch('gui.assigned_work_dialog.QFileDialog.getExistingDirectory') as chooser:
             dialog.download_selected()
+        chooser.assert_not_called()
         self.warnings.assert_not_called()
         self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
         self.assertTrue(workspace(dialog.download_result['path']))
+
+    def test_repeat_download_uses_same_path_without_parent_chooser(self):
+        with patch('gui.assigned_work_dialog.TransferConfirmationDialog.exec', return_value=QDialog.DialogCode.Accepted), \
+                patch('gui.assigned_work_dialog.QFileDialog.getExistingDirectory') as chooser:
+            first = AssignedDownloadDialog(self.configuration, self.alex)
+            first.download_selected()
+            second = AssignedDownloadDialog(self.configuration, self.alex)
+            second.download_selected()
+        self.warnings.assert_not_called()
+        chooser.assert_not_called()
+        self.assertEqual(first.download_result['path'], second.download_result['path'])
+
+    def test_unavailable_remembered_copy_does_not_create_another(self):
+        save_setting('assigned_work/locations', {
+            managed_copy_key(self.configuration, self.project_id, self.alex): str(self.base / 'missing')})
+        with self.assertRaisesRegex(ValueError, 'No replacement copy'):
+            assigned_local_path(self.configuration, self.project_id, self.alex)
+
+    def test_existing_copy_can_be_adopted_without_copying_or_merging(self):
+        local = self.download()
+        window = self.make_window(local)
+        with patch('gui.assigned_work_dialog.QInputDialog.getItem', return_value=(str(local), True)), \
+                patch('gui.assigned_work_dialog.TransferConfirmationDialog.exec', return_value=QDialog.DialogCode.Accepted):
+            dialog = AssignedDownloadDialog(self.configuration, self.alex, window)
+            dialog.download_selected()
+        self.warnings.assert_not_called()
+        self.assertEqual(dialog.download_result['path'], str(local))
+        self.assertEqual(dialog.download_result['bytes'], 0)
+
+    def test_main_window_refresh_saves_edits_and_reloads_same_path(self):
+        local = self.download()
+        window = self.make_window(local)
+        annotations = window.canvas.get_annotations()
+        annotations[0]['mask'][0, 0] = 255
+        window.canvas.set_annotations(annotations)
+        window._mark_current_annotations_dirty()
+
+        def download(dialog):
+            dialog.download_selected()
+            return dialog.result()
+
+        with patch.object(AssignedDownloadDialog, 'exec', download), \
+                patch('gui.assigned_work_dialog.QInputDialog.getItem', return_value=(str(local), True)), \
+                patch('gui.assigned_work_dialog.TransferConfirmationDialog.exec', return_value=QDialog.DialogCode.Accepted):
+            self.assertTrue(window.open_assigned_work(project_id=self.project_id))
+        self.warnings.assert_not_called()
+        self.assertFalse(window._sync_in_progress)
+        self.assertTrue(window.preload_worker.is_alive())
+        loaded = window.annotation_manager.load_frame_annotations(local, 'alpha', 0)
+        self.assertEqual(loaded[0]['mask'][0, 0], 255)
+
+    def test_assigned_copy_can_open_local_rollback_history(self):
+        window = self.make_window(self.download())
+        self.assertTrue(window.rollback_history_action.isEnabled())
+        with patch('gui.main_window.ProjectRollbackDialog') as dialog:
+            dialog.return_value.update_result = None
+            window.update_current_project(history=True)
+            dialog.assert_called_once()
+        self.warnings.assert_not_called()
 
     def test_no_assignments_and_same_name_different_identity(self):
         dialog = AssignedDownloadDialog(self.configuration, new_session('Alex'))

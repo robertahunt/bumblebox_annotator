@@ -222,14 +222,44 @@ annotations. The director adds people explicitly in **Assignments > People**.
 
 ## Deliberate Limits
 
-- Assigned copies still require director reconciliation and a fresh working copy
-  after incompatible updates or reassignment. In-place assignment refresh is not
-  implemented; the UI does not offer a misleading generic Sync action for it.
+- **Download Assigned Work** refreshes the persistent local assigned copy and adds
+  new assignments. Unsent edits are kept; competing same-video changes, changed
+  project settings, and changed assignments with unsent edits require director
+  reconciliation. Older scattered copies are not merged automatically.
 - There is no streaming image cache, automatic eviction, cloud login, or automatic
   merging of masks. Only assigned material is downloaded; local storage cannot
   consist solely of changed labels because source frames are required to edit.
 - Pending annotation-policy setup and changed-policy review remain explicit.
   Remembering startup preferences does not bypass these checks.
+
+## Brush Performance Check
+
+Manual brush/eraser editing uses CPU-side mask arrays and Qt painting, not CUDA
+model inference. Small strokes now accumulate a bounding rectangle and update
+only that region of the RGBA overlay. Mask pixels, stroke-start guards, protected
+regions, and undo semantics are unchanged. Qt still receives a full pixmap, so
+this does not eliminate all image-size-dependent costs.
+
+The scrollable canvas is fixed to the image bounds. Cursor previews, bounding
+boxes, and labels crossing an image edge must not enlarge it or shift the view.
+Brush-cursor motion is coalesced to the latest position at 16 ms intervals;
+every drawing/erasing movement still reaches the stroke handler. Cursor geometry
+and colors are reused until the brush size or tool changes. Empty or
+horizontal-only scroll events do not change zoom.
+
+Run `python scripts/benchmark_brush_overlay.py` from the annotator environment to
+compare machines using the same synthetic 4096 x 3072 frame. It writes no project
+files and reports median/p95 CPU-side stroke + overlay times, with boxes enabled.
+It does not measure tablet input, screen presentation, autosave, or frame loading.
+Two same-machine before/after runs measured approximately 35 ms before and
+11-17 ms after this change; these are not a guarantee of tablet latency on other
+hardware. Test both a mouse and pen on the second computer with locally stored
+frames before attributing remaining stalls to its GPU.
+
+`scripts/test_canvas_view_stability.py` checks view stability with edge overlays,
+mask toggles, cursor bursts, frame changes, and empty wheel events. These tests
+use synthetic input; physical tablet/driver behavior still needs testing on the
+affected computer.
 
 ## Testing
 

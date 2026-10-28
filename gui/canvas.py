@@ -145,6 +145,11 @@ class ImageCanvas(QGraphicsView):
         self.brush_cursor_preview_enabled = True
         self.brush_cursor_items = []
         self._last_brush_cursor_pos = None
+        self._brush_cursor_style = None
+        self._brush_cursor_timer = QTimer(self)
+        self._brush_cursor_timer.setSingleShot(True)
+        self._brush_cursor_timer.setInterval(16)
+        self._brush_cursor_timer.timeout.connect(self._flush_brush_cursor_preview)
         self._switch_tap_required = 3
         self._switch_tap_max_interval_seconds = 0.8
         self._switch_tap_candidate = None
@@ -155,7 +160,7 @@ class ImageCanvas(QGraphicsView):
         
         # Throttling for brush/eraser to improve performance
         self._pending_viz_update = False  # Flag indicating viz update is pending
-        self._dirty_pixels = None  # Accumulate dirty pixels for batched update
+        self._dirty_region = None  # Union of stroke bounds, not a full-image boolean array
         self._viz_update_timer = QTimer()
         self._viz_update_timer.setSingleShot(True)
         self._viz_update_timer.setInterval(16)  # ~60fps max update rate
@@ -356,6 +361,7 @@ class ImageCanvas(QGraphicsView):
 
     def _clear_brush_cursor_preview(self):
         """Remove the brush footprint cursor from the scene."""
+        self._brush_cursor_timer.stop()
         for item in getattr(self, 'brush_cursor_items', []):
             try:
                 if item.scene() == self.scene:
@@ -363,6 +369,7 @@ class ImageCanvas(QGraphicsView):
             except (RuntimeError, AttributeError):
                 pass
         self.brush_cursor_items = []
+        self._brush_cursor_style = None
 
     def _brush_cursor_preview_should_show(self):
         return (
@@ -374,7 +381,7 @@ class ImageCanvas(QGraphicsView):
     def _set_default_cursor_for_current_tool(self):
         """Set the native cursor for the active tool."""
         if self.current_tool == 'pan':
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            shape = Qt.CursorShape.OpenHandCursor
         elif self.current_tool in {
             'sam2_prompt',
             'brush',
@@ -385,9 +392,11 @@ class ImageCanvas(QGraphicsView):
             'no_draw_zone',
             'measure'
         }:
-            self.setCursor(Qt.CursorShape.CrossCursor)
+            shape = Qt.CursorShape.CrossCursor
         else:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            shape = Qt.CursorShape.ArrowCursor
+        if self.cursor().shape() != shape:
+            self.setCursor(shape)
 
     def _ensure_brush_cursor_preview_items(self):
         """Create scene items used for the brush footprint cursor."""
@@ -410,8 +419,27 @@ class ImageCanvas(QGraphicsView):
 
         self.brush_cursor_items = [circle, h_line, v_line]
 
+    def _queue_brush_cursor_preview(self, scene_pos):
+        """Coalesce display-only motion; the stroke path still receives every point."""
+        self._last_brush_cursor_pos = QPointF(scene_pos)
+        if not self._brush_cursor_preview_should_show():
+            self._update_brush_cursor_preview()
+            return
+        h, w = self.current_image.shape[:2]
+        if not (0 <= scene_pos.x() < w and 0 <= scene_pos.y() < h):
+            self._update_brush_cursor_preview()
+            return
+        if not self.brush_cursor_items:
+            self._update_brush_cursor_preview()
+        elif not self._brush_cursor_timer.isActive():
+            self._brush_cursor_timer.start()
+
+    def _flush_brush_cursor_preview(self):
+        self._update_brush_cursor_preview()
+
     def _update_brush_cursor_preview(self, scene_pos=None):
         """Show a brush-size cursor matching the actual image-space stroke."""
+        self._brush_cursor_timer.stop()
         if scene_pos is not None:
             self._last_brush_cursor_pos = QPointF(scene_pos)
 
@@ -428,32 +456,32 @@ class ImageCanvas(QGraphicsView):
             self._set_default_cursor_for_current_tool()
             return
 
-        self.setCursor(Qt.CursorShape.BlankCursor)
+        if self.cursor().shape() != Qt.CursorShape.BlankCursor:
+            self.setCursor(Qt.CursorShape.BlankCursor)
         self._ensure_brush_cursor_preview_items()
         circle, h_line, v_line = self.brush_cursor_items
 
-        radius = max(0.5, float(self.brush_size) / 2.0)
-        diameter = radius * 2.0
-        circle.setRect(x - radius, y - radius, diameter, diameter)
-        h_line.setLine(x - radius, y, x + radius, y)
-        v_line.setLine(x, y - radius, x, y + radius)
-
-        if self.current_tool == 'eraser':
-            color = QColor(255, 80, 80, 235)
-        else:
-            color = QColor(255, 246, 80, 235)
-
-        pen = QPen(color)
-        pen.setWidthF(1.5)
-        pen.setCosmetic(True)
-        circle.setPen(pen)
-        circle.setBrush(QBrush(Qt.BrushStyle.NoBrush))
-
-        line_pen = QPen(color)
-        line_pen.setWidthF(1.0)
-        line_pen.setCosmetic(True)
-        h_line.setPen(line_pen)
-        v_line.setPen(line_pen)
+        style = (self.brush_size, self.current_tool)
+        if self._brush_cursor_style != style:
+            radius = max(0.5, float(self.brush_size) / 2.0)
+            diameter = radius * 2.0
+            circle.setRect(-radius, -radius, diameter, diameter)
+            h_line.setLine(-radius, 0, radius, 0)
+            v_line.setLine(0, -radius, 0, radius)
+            color = QColor(255, 80, 80, 235) if self.current_tool == 'eraser' else QColor(255, 246, 80, 235)
+            pen = QPen(color)
+            pen.setWidthF(1.5)
+            pen.setCosmetic(True)
+            circle.setPen(pen)
+            circle.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            line_pen = QPen(color)
+            line_pen.setWidthF(1.0)
+            line_pen.setCosmetic(True)
+            h_line.setPen(line_pen)
+            v_line.setPen(line_pen)
+            self._brush_cursor_style = style
+        for item in self.brush_cursor_items:
+            item.setPos(x, y)
 
     def set_brush_cursor_preview_enabled(self, enabled):
         """Enable or disable the brush-size cursor preview."""
@@ -994,6 +1022,8 @@ class ImageCanvas(QGraphicsView):
         self.clear_no_draw_zones()
         self._clear_temporary_dimension_graphics()
         self._clear_brush_cursor_preview()
+        self._last_brush_cursor_pos = None
+        self._set_default_cursor_for_current_tool()
         self.scene.clear()
         for _category, mask_attr in MASK_ATTRIBUTES:
             setattr(self, mask_attr, None)
@@ -1014,6 +1044,9 @@ class ImageCanvas(QGraphicsView):
         # Add image to scene
         self.image_item = QGraphicsPixmapItem(pixmap)
         self.scene.addItem(self.image_item)
+        # Labels, outward box strokes and cursor rings must not resize the
+        # scrollable canvas or shift the image when they cross an image edge.
+        self.scene.setSceneRect(QRectF(0, 0, w, h))
         
         self._view_restore_token += 1
         view_token = self._view_restore_token
@@ -1028,7 +1061,10 @@ class ImageCanvas(QGraphicsView):
         self.clear_no_draw_zones()
         self._clear_temporary_dimension_graphics()
         self._clear_brush_cursor_preview()
+        self._last_brush_cursor_pos = None
+        self._set_default_cursor_for_current_tool()
         self.scene.clear()
+        self.scene.setSceneRect(QRectF())
         self.current_image = None
         self.image_path = None
         self.image_item = None
@@ -1129,10 +1165,12 @@ class ImageCanvas(QGraphicsView):
         
     def wheelEvent(self, event):
         """Handle mouse wheel for zooming"""
-        if event.angleDelta().y() > 0:
+        delta = event.angleDelta().y() or event.pixelDelta().y()
+        if delta > 0:
             self.zoom_in()
-        else:
+        elif delta < 0:
             self.zoom_out()
+        event.accept()
             
     def set_tool(self, tool_name):
         """Set current tool"""
@@ -1839,7 +1877,7 @@ class ImageCanvas(QGraphicsView):
             return
             
         scene_pos = self.mapToScene(event.pos())
-        self._update_brush_cursor_preview(scene_pos)
+        self._queue_brush_cursor_preview(scene_pos)
 
         if self.current_tool == 'no_draw_zone':
             if self.no_draw_polygon_points:
@@ -1984,6 +2022,8 @@ class ImageCanvas(QGraphicsView):
     def leaveEvent(self, event):
         """Hide brush footprint cursor when the mouse leaves the canvas."""
         self._clear_brush_cursor_preview()
+        self._last_brush_cursor_pos = None
+        self._set_default_cursor_for_current_tool()
         super().leaveEvent(event)
             
     def mouseReleaseEvent(self, event):
@@ -2425,15 +2465,14 @@ class ImageCanvas(QGraphicsView):
         editing_crop = self.editing_mask[min_y:max_y, min_x:max_x]
         editing_crop[allowed_pixels] = 255 if self.current_tool == 'brush' else 0
         
-        # Create dirty region mask for this stroke
-        stroke_dirty = np.zeros(self.editing_mask.shape, dtype=bool)
-        stroke_dirty[min_y:max_y, min_x:max_x] = allowed_pixels
-        
-        # Accumulate dirty pixels for batched update (major performance improvement)
-        if self._dirty_pixels is None:
-            self._dirty_pixels = stroke_dirty
+        # Repaint from the actual edit mask, so unchanged/protected pixels in the
+        # bounding rectangle retain their exact values without a full-frame dirty mask.
+        if self._dirty_region is None:
+            self._dirty_region = (min_x, min_y, max_x, max_y)
         else:
-            self._dirty_pixels |= stroke_dirty
+            left, top, right, bottom = self._dirty_region
+            self._dirty_region = (min(left, min_x), min(top, min_y),
+                                  max(right, max_x), max(bottom, max_y))
         
         # Schedule throttled visualization update
         if not self._viz_update_timer.isActive():
@@ -2589,7 +2628,7 @@ class ImageCanvas(QGraphicsView):
         self.editing_instance_category = category
         self.selected_mask_idx = instance_id
         self.selected_instance_category = category
-        self._dirty_pixels = None
+        self._dirty_region = None
 
         if self._editing_overlay_cache is not None:
             del self._editing_overlay_cache
@@ -4604,7 +4643,7 @@ class ImageCanvas(QGraphicsView):
             if rebuild:
                 self._flush_pending_viz_update()
         if not rebuild:
-            self._dirty_pixels = None
+            self._dirty_region = None
         
         if self.editing_instance_id <= 0 or self.editing_mask is None:
             return
@@ -4911,17 +4950,18 @@ class ImageCanvas(QGraphicsView):
     
     def _flush_pending_viz_update(self):
         """Flush pending visualization update (called by timer)"""
-        if self._dirty_pixels is not None:
-            self._update_editing_visualization_incremental(self._dirty_pixels)
-            self._dirty_pixels = None
+        if self._dirty_region is not None:
+            self._update_editing_visualization_incremental(bounds=self._dirty_region)
+            self._dirty_region = None
     
-    def _update_editing_visualization_incremental(self, affected_pixels):
+    def _update_editing_visualization_incremental(self, affected_pixels=None, *, bounds=None):
         """Update only the affected region of the editing visualization
         
         Much faster than full rebuild - updates only changed pixels.
         
         Args:
-            affected_pixels: Boolean mask of pixels that changed
+            affected_pixels: Boolean mask for fill/subtract operations
+            bounds: Small source-image rectangle for batched brush/eraser strokes
         """
         if self.editing_mask is None or self.editing_instance_id <= 0:
             return
@@ -4935,14 +4975,17 @@ class ImageCanvas(QGraphicsView):
         color = self.mask_colors.get(self.editing_instance_id, (255, 255, 255))
         alpha = min(self.mask_opacity, 255)
         
-        # Update only affected pixels in the cached overlay
-        # For brush: set pixels to color where editing_mask is non-zero
-        # For eraser: set pixels to transparent where editing_mask is zero
-        brush_pixels = affected_pixels & (self.editing_mask > 0)
-        eraser_pixels = affected_pixels & (self.editing_mask == 0)
-        
-        self._editing_overlay_cache[brush_pixels] = [color[0], color[1], color[2], alpha]
-        self._editing_overlay_cache[eraser_pixels] = [0, 0, 0, 0]
+        if bounds is not None:
+            left, top, right, bottom = bounds
+            overlay = self._editing_overlay_cache[top:bottom, left:right]
+            brush_pixels = self.editing_mask[top:bottom, left:right] > 0
+            overlay[:] = 0
+            overlay[brush_pixels] = [color[0], color[1], color[2], alpha]
+        else:
+            brush_pixels = affected_pixels & (self.editing_mask > 0)
+            eraser_pixels = affected_pixels & (self.editing_mask == 0)
+            self._editing_overlay_cache[brush_pixels] = [color[0], color[1], color[2], alpha]
+            self._editing_overlay_cache[eraser_pixels] = [0, 0, 0, 0]
         
         # Update the pixmap from cached overlay (optimized: reuse buffer)
         h, w = self._editing_overlay_cache.shape[:2]

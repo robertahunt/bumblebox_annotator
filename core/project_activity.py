@@ -68,6 +68,11 @@ def project_activity(project, configuration, cancelled=lambda: False):
         baseline = base['manifest']['files']
     baseline = annotation_files(baseline)
     local = annotation_files(_inventory(project, False))
+    if state:
+        for video in state.get('retained_assignments', {}):
+            for name in _video_files({**baseline, **local}, video):
+                baseline.pop(name, None)
+                local.pop(name, None)
     changed = local.keys() != baseline.keys()
     if not changed:
         for name in local:

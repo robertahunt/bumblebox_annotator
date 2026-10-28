@@ -156,8 +156,9 @@ completion columns, and persistent scan caching for older backups remain future 
    or your system tools. Connect to the same archive root. The path may differ between
    computers, but it must point to the same shared folder identity.
 3. Select your project in **My Work**, or open **File > My Assigned Work...**. Choose assigned videos, then
-   **Download Assigned Work...**. Confirm the frame count and estimated download
-   size, then select a local parent folder with enough free space.
+   **Download Assigned Work...**. Review new/updated videos and the incremental
+   transfer size. The app chooses a persistent local working folder automatically.
+   Later downloads reuse it instead of making numbered copies.
 4. The verified copy opens in the **Annotate** workspace in **Assigned Work** mode.
    Edits autosave locally after a brief idle period; **File > Save** is also
    available. Work can continue while the drive is disconnected.
@@ -174,10 +175,25 @@ from an older profile/project/drive check are discarded. Directors do not get th
 empty-assignment notice for their own project. Roles are per project, not global
 properties of the exported profile.
 
-Reopen this local copy through **Recent Projects** on subsequent sessions. Do not
-download it again each day. Downloading always creates a new folder; it never
-silently replaces existing work. A different active contributor cannot edit or
-publish this copy.
+Reopen this local copy through **My Work** or **Recent Projects** on subsequent
+sessions. Use **Download Assigned Work** again to add assignments or refresh clean
+local videos. Already downloaded, unchanged files are not copied again. A
+different active contributor cannot edit or publish this copy.
+
+On Linux, new copies live under `$XDG_DATA_HOME/BeeWhere/assigned-work`, defaulting
+to `~/.local/share/BeeWhere/assigned-work`, keyed by shared-root, project, and
+contributor IDs. This is persistent data, not a disposable cache, and is outside
+the application checkout. The download preview shows the actual folder. Project
+or contributor renames do not create another copy. Each computer has its own copy.
+Images and annotations still need local storage; this is not remote streaming.
+
+If older downloaded copies are known in Recent Projects, the app asks which one
+to keep using and remembers that choice. It does **not** choose by timestamp,
+merge competing masks, move, or delete the other folders. If work is split across
+copies, retain all of them and ask the director to compare/import their changes.
+An older copy not listed in Recents can be opened first, then adopted on download.
+A remembered copy that is unavailable is an error, not permission to silently
+create another folder. Reconnect/restore that folder before continuing.
 
 Project Home offers **Open Selected Project** and **Download Assigned Work**. See
 [workspaces.md](workspaces.md) for startup preferences and save/upload indicators.
@@ -242,9 +258,20 @@ One contributor owns each video assignment, even if only some frames are assigne
 Two people should not edit the same video's shared masks concurrently.
 
 Reassigning a video or changing its assigned frame range or mask task retires the old assignment.
-Its local files remain intact, but publishing is blocked until the coordinator
-reconciles the work. Finish/publish current work before expanding an assignment;
-then download a fresh working set. There is no in-place assignment refresh yet.
+Its local files remain intact. Downloading can refresh a changed assignment if
+the local video has no unpublished changes. If that video has edits, review is
+required before refreshing its task/range. Finish/publish current work before
+expanding an assignment when possible.
+
+Incremental downloads include existing active assignments as well as the new
+selection. They preserve local edits when the published video is unchanged, and
+update clean videos when shared annotations change. If both sides changed any
+part of the same video, the whole update stops: mask PNGs and annotation JSONs
+are not merged file by file. Changed project-wide policy/settings also require
+director review. A simultaneous change after the preview requires a fresh check.
+Reassigned videos are retained on disk, removed from active work, and excluded
+from uploads when downloading other current assignments. They are never deleted
+automatically; unpublished retained work still needs director review.
 
 Publishing also stops if someone else changed any part of the assigned video, or
 changed project-wide settings after the download. This includes two computers
@@ -253,7 +280,17 @@ or merge masks automatically. Keep both working copies and ask the coordinator t
 compare/import the intended annotations into the full project, then issue fresh
 assignments. **Do not delete `.assigned-work.json` to force a full backup.**
 
-Interrupted downloads are not opened as completed projects. Upload cancellation
+New downloads are verified in staging before opening. Updates of existing copies
+stage and verify changed files, retain a rollback bundle, and use the normal local
+update journal. Cancellation before replacement leaves the old copy unchanged;
+an interrupted replacement must be recovered on reopening before editing. The
+GUI saves pending edits and pauses preloading/autosaving during the operation,
+then discards old mask caches before reopening the same path. Use **File > Local
+Rollback History** to undo an update only if no newer edits have been made.
+Updated copies use assigned-work record format 2; older apps must be upgraded
+before opening them.
+
+Upload cancellation
 leaves local edits saved. If an upload finished but its final local receipt could
 not be written, the next Upload Assigned Annotations recovers that receipt before checking new
 edits. After a process crash, the existing sync lock may still require the manual

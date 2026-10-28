@@ -883,6 +883,7 @@ class MainWindow(QMainWindow):
         self.update_project_action.triggered.connect(self.update_current_project)
         file_menu.addAction(self.update_project_action)
         rollback_action = QAction('Local Rollback History...', self)
+        self.rollback_history_action = rollback_action
         rollback_action.triggered.connect(lambda: self.update_current_project(history=True))
         file_menu.addAction(rollback_action)
         restore_action = QAction(RESTORE_LABEL, self)
@@ -1122,7 +1123,7 @@ class MainWindow(QMainWindow):
         self.ready_work_action.setVisible(False)
         project_menu.addAction(self.ready_work_action)
         self.full_project_actions = [new_project_action, add_video_action, import_project_action, self.update_project_action,
-            rollback_action, export_coco_action, export_video_action, export_all_action, train_yolo_action,
+            export_coco_action, export_video_action, export_all_action, train_yolo_action,
             train_yolo_instance_focused_action, train_yolo_bbox_action, predict_action,
             frame_level_validation_action, batch_inference_action, batch_video_inference_action,
             tracking_validation_action, self.manage_assignments_action, review_action]
@@ -1168,6 +1169,11 @@ class MainWindow(QMainWindow):
             self.tracking_filter_checkbox.setChecked(False)
 
     def open_assigned_work(self, *, project_id=None):
+        if self._sync_in_progress:
+            return
+        source = self.project_path
+        stopped_worker = None
+        paused_timers = []
         try:
             configuration = setting_json('project_sync/destination', {})
             if not configuration.get('root_id'):
@@ -1176,12 +1182,47 @@ class MainWindow(QMainWindow):
                 return
             if not self.contributor_session:
                 return
+            if not self.workflow.assignments_page.confirm_discard():
+                return
+            self._sync_in_progress = True
+            if self.is_playing:
+                self.toggle_play()
+            if source:
+                require_no_update(source)
+                self.save_worker.wait_until_idle(raise_errors=False)
+                self._save_annotation_sources()
+                self.save_worker.wait_until_idle()
+            stopped_worker = self.preload_worker
+            stopped_worker.stop()
+            stopped_worker.join()
+            for name in ('_instance_list_update_timer', 'done_counter_update_timer'):
+                timer = getattr(self, name, None)
+                if timer is not None and timer.isActive():
+                    timer.stop()
+                    paused_timers.append(timer)
             dialog = AssignedDownloadDialog(configuration, self.contributor_session, self, project_id=project_id)
-            if dialog.exec() == QDialog.DialogCode.Accepted and dialog.download_result:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            result = dialog.download_result
+            if result and (accepted or (source and Path(result['path']).resolve() == Path(source).resolve())):
+                # A reused path still has stale masks in the canvas and preload caches.
+                self._discard_annotation_view()
                 self.load_project(dialog.download_result['path'])
                 return self.project_path == Path(dialog.download_result['path'])
         except Exception as exc:
             QMessageBox.warning(self, 'Assigned Work Unavailable', str(exc))
+        finally:
+            if source and (update_journal_path(source).exists() or update_journal_path(source).is_symlink()):
+                self._discard_annotation_view()
+                self.project_path = None
+                self.centralWidget().setEnabled(False)
+                self.status_label.setText('Update requires recovery; reopen this working copy before editing')
+            if stopped_worker is not None and self.preload_worker is stopped_worker:
+                self.preload_worker = PreloadWorker(self.frame_cache, self.annotation_manager)
+                self.preload_worker.start()
+            for timer in paused_timers:
+                if self.project_path:
+                    timer.start()
+            self._sync_in_progress = False
 
     def manage_assignments(self):
         if not self.project_path or not self.contributor_session:
@@ -1536,9 +1577,9 @@ class MainWindow(QMainWindow):
         self.video_next_mask_id.clear()
 
     def update_current_project(self, history=False):
-        if workspace(self.project_path):
+        if workspace(self.project_path) and not history:
             QMessageBox.information(self, 'Assigned Work',
-                'Keep this working copy and publish its edits. Download a new working set for updated assignments.')
+                'Use Download Assigned Work on Home to update this working copy and add new assignments. Local edits are kept.')
             return
         if self._sync_in_progress:
             return
@@ -1588,7 +1629,8 @@ class MainWindow(QMainWindow):
                 save_setting('project_sync/projects', projects)
                 self.status_label.setText('Local project updated; rollback bundle retained')
                 QMessageBox.information(self, 'Local Copy Updated',
-                    'Re-export COCO before training.\n\nPrevious affected files:\n' + result['backup'] +
+                    ('Re-export COCO before training.\n\n' if not workspace(source) else '') +
+                    'Previous affected files:\n' + result['backup'] +
                     '\n\nUse File > Local Rollback History to review or undo.')
         except Exception as exc:
             QMessageBox.warning(self, 'Local Update Not Completed', str(exc))

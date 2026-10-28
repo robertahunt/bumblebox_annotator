@@ -145,6 +145,46 @@ class EditingToolTests(unittest.TestCase):
         self.assertEqual(canvas.editing_mask[50, 25], 0)
         self.assertEqual(canvas.editing_mask[50, 50], 255)
 
+    def test_batched_stroke_bounds_match_full_overlay_with_protection(self):
+        for tool, initial in (('brush', 0), ('eraser', 255)):
+            for size in (1, 9, 25):
+                with self.subTest(tool=tool, size=size):
+                    canvas = self.make_canvas(initial)
+                    self.add_square_zone(canvas)
+                    canvas.current_tool = tool
+                    canvas.brush_size = size
+                    canvas._update_editing_visualization()
+                    for start, end in (((-3, 50), (70, 50)), ((50, 20), (50, 95))):
+                        canvas.draw_on_mask(QPointF(*start), QPointF(*end))
+                    self.assertIsInstance(canvas._dirty_region, tuple)
+                    self.assertEqual(len(canvas._dirty_region), 4)
+                    canvas._viz_update_timer.stop()
+                    canvas._flush_pending_viz_update()
+                    self.assertIsNone(canvas._dirty_region)
+                    actual = canvas._editing_overlay_cache.copy()
+                    pixmap = canvas.editing_mask_item.pixmap().toImage()
+                    canvas._update_editing_visualization()
+                    np.testing.assert_array_equal(actual, canvas._editing_overlay_cache)
+                    self.assertEqual(pixmap, canvas.editing_mask_item.pixmap().toImage())
+                    self.assertEqual(canvas.editing_mask[50, 50], initial)
+                    canvas.close()
+
+    def test_tiny_stroke_keeps_only_small_dirty_rectangle_and_undo_clears_it(self):
+        canvas = self.make_canvas()
+        canvas.current_tool = 'brush'
+        canvas.brush_size = 1
+        canvas._begin_brush_history_step()
+        canvas.draw_on_mask(QPointF(10, 10), QPointF(11, 11))
+        left, top, right, bottom = canvas._dirty_region
+        self.assertLess((right - left) * (bottom - top), 30)
+        canvas._finish_brush_history_step()
+        canvas.undo()
+        self.assertIsNone(canvas._dirty_region)
+        self.assertFalse(canvas.editing_mask.any())
+        canvas.redo()
+        self.assertEqual(canvas.editing_mask[10, 10], 255)
+        canvas.close()
+
     def test_fill_respects_protection_and_supports_undo_redo(self):
         canvas = self.make_canvas()
         canvas.editing_mask[20:80, 20:80] = 255

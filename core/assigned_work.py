@@ -40,15 +40,17 @@ def workspace(project):
     if not path.exists():
         return None
     state = _read_json(path)
-    if state.get('format') != 1 or state.get('kind') != 'assigned-work':
+    if state.get('format') not in (1, 2) or state.get('kind') != 'assigned-work':
         raise ValueError('Unsupported assigned-work record. Keep this copy and update the app.')
     _uuid(state['project_id'])
     _uuid(state['contributor']['id'])
     _uuid(state['workspace_id'])
     identity = _read_json(_safe_child(Path(project), 'annotations/' + PROJECT_MARKER))
-    if identity.get('project_id') != state['project_id'] or not state['assignments']:
+    retained = state.get('retained_assignments', {})
+    if (identity.get('project_id') != state['project_id'] or
+            not (state['assignments'] or retained) or state['assignments'].keys() & retained.keys()):
         raise ValueError('Assigned-work identity does not match this project.')
-    for video, assignment in state['assignments'].items():
+    for video, assignment in {**retained, **state['assignments']}.items():
         from core.annotation_work import task_categories
         task_categories(assignment.get('task'))
         _video(video)
@@ -72,6 +74,8 @@ def require_full_project(project):
 
 
 def require_assigned_frame(project, contributor, video, frame=None):
+    if project:
+        require_no_update(project)
     state = require_contributor(project, contributor)
     if state and (video not in state['assignments'] or
                   (frame is not None and frame not in state['assignments'][video]['frames'])):
@@ -535,9 +539,10 @@ def download_plan(configuration, project_id, contributor, videos):
             'bytes': sum(files[name]['size'] for name in names)}
 
 
-def download_work(configuration, project_id, contributor, videos, destination, progress=None, cancelled=None):
+def download_work(configuration, project_id, contributor, videos, destination, progress=None, cancelled=None,
+                  *, plan=None):
     progress, cancelled = progress or (lambda text: None), cancelled or (lambda: False)
-    plan = download_plan(configuration, project_id, contributor, videos)
+    plan = plan or download_plan(configuration, project_id, contributor, videos)
     destination = Path(destination).expanduser().absolute()
     if destination.exists() or destination.is_symlink() or not destination.parent.is_dir():
         raise ValueError('Choose a new local folder with an existing parent.')
@@ -666,6 +671,9 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
         for name in state['local_files'].keys() | local.keys():
             if local.get(name) == state['local_files'].get(name):
                 continue
+            if any(name in _video_files({name: None}, video)
+                   for video in state.get('retained_assignments', {})):
+                continue  # Revoked work stays locally; it is never uploaded as an active assignment.
             if _editable(name, assignments):
                 changes.add(_annotation_video(name))
                 if name in local:

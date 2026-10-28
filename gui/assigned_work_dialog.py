@@ -10,9 +10,10 @@ from PyQt6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButto
 from core.contributors import contributor_profile
 from core.project_sync import _read_json
 from core.project_update import PublishedProject
-from core.assigned_work import (accept_submission, assignment_status, catalog, download_plan,
-    download_work, latest_snapshot, my_projects, parse_frames, read_assignments, save_assignments,
+from core.assigned_work import (accept_submission, assignment_status, catalog,
+    latest_snapshot, my_projects, parse_frames, read_assignments, save_assignments,
     transfer_director, project_members, add_project_member)
+from core.assigned_workspace import (PreparedAssignedDownload, managed_directory, matching_copy, existing_copies)
 from gui.project_sync_dialog import (SyncProgressDialog, TransferConfirmationDialog,
                                      setting_json, save_setting, load_contributor_profiles,
                                      remember_contributor_profile)
@@ -575,6 +576,22 @@ class BulkAssignmentDialog(QDialog):
             QMessageBox.warning(self, 'Check Assignment', str(exc))
 
 
+def managed_copy_key(configuration, project_id, contributor):
+    return '/'.join((configuration['root_id'], project_id, contributor['id']))
+
+
+def assigned_local_path(configuration, project_id, contributor):
+    saved = setting_json('assigned_work/locations', {}).get(managed_copy_key(configuration, project_id, contributor))
+    path = Path(saved) if saved else managed_directory(configuration, project_id, contributor)
+    if saved and not path.is_dir():
+        raise ValueError('Your saved working copy is unavailable:\n' + str(path) +
+                         '\n\nReconnect or restore this folder. No replacement copy has been created.')
+    if saved or path.exists():
+        matching_copy(path, configuration, project_id, contributor)
+        return str(path)
+    return ''
+
+
 class AssignedDownloadDialog(QDialog):
     def __init__(self, configuration, contributor, parent=None, *, project_id=None):
         super().__init__(parent)
@@ -630,28 +647,57 @@ class AssignedDownloadDialog(QDialog):
             return
         try:
             project_id = self.projects.currentData()
+            destination = self.choose_working_copy(project_id)
+            if destination is None:
+                return
             plan = SyncProgressDialog('Estimate Assigned Download', lambda progress, cancelled:
-                download_plan(self.configuration, project_id, self.contributor, selected), self).run()
-            count = sum(len(e['frames']) for e in plan['assignments'].values())
-            if QMessageBox.question(self, 'Download Assigned Work?',
-                    f'{len(selected)} videos | {count} frame images | {plan["bytes"] / 1024**2:.1f} MiB\n\n'
-                    'Original videos are excluded. Video-wide masks affect all frames of their video, '
-                    'including frames not downloaded.', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                PreparedAssignedDownload(self.configuration, project_id, self.contributor, selected,
+                                         destination, progress, cancelled), self).run()
+            details = (f'{len(plan.new_videos)} new videos | {len(plan.updated_videos)} updated videos\n'
+                       f'{plan.file_count} files to add/update/remove | {plan.bytes / 1024**2:.1f} MiB to write\n\n'
+                       f'Local working copy:\n{destination}\n\n'
+                       'Existing local edits are kept. Original videos are excluded. '
+                       'This same folder will be used for future assignment downloads.')
+            rollback_bytes = sum(record['size'] for record in plan.before.values() if record)
+            if rollback_bytes:
+                details += f'\n\nRollback copies of affected files: {rollback_bytes / 1024**2:.1f} MiB.'
+            if plan.kept_edits:
+                details += '\n\nLocal edits kept: ' + ', '.join(plan.kept_edits)
+            if plan.retained:
+                details += ('\n\nNo longer assigned (files kept locally, hidden from active work and not uploaded): '
+                            + ', '.join(plan.retained))
+            if TransferConfirmationDialog('Update My Assigned Work', details,
+                    'Download and Open' if plan.file_count else 'Open Working Copy', self).exec() != QDialog.DialogCode.Accepted:
                 return
-            parent = QFileDialog.getExistingDirectory(self, 'Choose a Local Parent Folder', str(Path.home()))
-            if not parent:
-                return
-            from core.project_sync import _folder_label
-            name = _folder_label(self.projects.currentText(), 'project') + '-assigned'
-            destination = Path(parent) / name
-            suffix = 2
-            while destination.exists():
-                destination = Path(parent) / f'{name}-{suffix}'
-                suffix += 1
             self.download_result = SyncProgressDialog('Download Assigned Work', lambda progress, cancelled:
-                download_work(self.configuration, project_id, self.contributor, selected, destination,
-                              progress, cancelled), self).run()
+                plan.apply(progress, cancelled), self).run()
+            locations = setting_json('assigned_work/locations', {})
+            locations[managed_copy_key(self.configuration, project_id, self.contributor)] = str(destination)
+            save_setting('assigned_work/locations', locations)
+            if self.download_result.get('warning'):
+                QMessageBox.warning(self, 'Working Copy Updated', self.download_result['warning'])
             self.accept()
         except Exception as exc:
             QMessageBox.warning(self, 'Work Not Downloaded', str(exc))
+
+    def choose_working_copy(self, project_id):
+        registered = assigned_local_path(self.configuration, project_id, self.contributor)
+        if registered:
+            return Path(registered)
+        parent = self.parent()
+        paths = list(getattr(parent, 'recent_projects', []))
+        paths.append(getattr(parent, 'project_path', None))
+        workflow = getattr(parent, 'workflow', None)
+        if workflow:
+            settings = workflow.settings
+            actor, root = self.contributor['id'], self.configuration['root_id']
+            paths += settings.value('workflow/recent_projects/' + actor, [], type=list)
+            paths.append(settings.value(f'workflow/shared_projects/{actor}/{root}/{project_id}', '', type=str))
+        copies = existing_copies(paths, self.configuration, project_id, self.contributor)
+        if copies:
+            choice, accepted = QInputDialog.getItem(self, 'Continue an Existing Working Copy',
+                'Choose the copy to keep using on this computer. Other copies are left untouched.\n'
+                'If edits are spread across copies, ask the director to reconcile them before continuing.',
+                [str(path) for path in copies], 0, False)
+            return Path(choice) if accepted else None
+        return managed_directory(self.configuration, project_id, self.contributor)

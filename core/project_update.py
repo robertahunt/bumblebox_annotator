@@ -237,7 +237,7 @@ class PreparedUpdate:
         cancelled = cancelled or (lambda: False)
         self.project = Path(project).resolve()
         if _safe_child(self.project, 'annotations/' + WORK_STATE).exists():
-            raise ValueError('Assigned work cannot use a full-project update. Publish it, then download a new working set.')
+            raise ValueError('Assigned work cannot use a full-project update. Use Download Assigned Work to refresh its working copy.')
         require_no_update(self.project)
         self.published = PublishedProject(self.project, configuration)
         self.heads = self.published.heads()

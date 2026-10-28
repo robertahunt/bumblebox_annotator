@@ -26,10 +26,12 @@ HELP = {
         'Conflicting changes are blocked for review. Uploading saves progress; '
         'Submit Current Video for Review separately marks a video ready for review.'),
     'download': ('Download Assigned Work',
-        'Download the videos and frames assigned to your contributor profile into a new local '
-        'working folder. Original videos are not downloaded.\n\n'
-        'Your project director must assign work first. To continue an assignment already on '
-        'this computer, open that local project instead. Upload Assigned Annotations sends your progress back.'),
+        'Keep one local working copy per project and contributor. Downloads add new assignments '
+        'and update unchanged local work in that same folder. Local edits are kept; conflicts stop '
+        'for director review. Original videos are not downloaded.\n\n'
+        'Working copies live in persistent application data, outside the app installation. '
+        'An existing downloaded copy can be reused instead. Work no longer assigned stays locally '
+        'but is not uploaded. Upload Assigned Annotations sends progress back.'),
     'update': ('Review Shared Updates',
         'Compare published work with your existing local project before applying an update. '
         'Conflicts require review; this does not silently replace local edits or upload them. '

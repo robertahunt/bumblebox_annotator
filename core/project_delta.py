@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 from uuid import uuid4
 
-from core.project_sync import (LOCAL_STATE, PROJECT_MARKER, _clone_or_copy, _digest,
+from core.project_sync import (LOCAL_STATE, WORK_STATE, PROJECT_MARKER, _clone_or_copy, _digest,
     _inventory, _read_json, _safe_child, _write_json, require_no_update,
     require_working_project, update_journal_path)
 
@@ -261,7 +261,7 @@ def rollback_update(project, bundle, configuration, progress=None, cancelled=Non
     before, after = manifest['after'], manifest['before']
     post = dict(manifest['post_files'])
     for name, entry in after.items():
-        if name == 'annotations/' + LOCAL_STATE or name.startswith('annotations/coco/') or name == 'dataset_info.json':
+        if name in ('annotations/' + LOCAL_STATE, 'annotations/' + WORK_STATE) or name.startswith('annotations/coco/') or name == 'dataset_info.json':
             continue
         if entry is None:
             post.pop(name, None)
