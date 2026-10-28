@@ -116,7 +116,7 @@ class ProjectHome(QWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
-        title = label('Choose a project', heading=True)
+        title = label('My Work', heading=True)
         title.setObjectName('homeTitle')
         layout.addWidget(title)
         self.identity = label('')
@@ -125,7 +125,7 @@ class ProjectHome(QWidget):
         self.inbox = AssignmentInbox(controller.window)
         layout.addWidget(self.inbox)
         layout.addSpacing(12)
-        self.recent_heading = label('Recent projects')
+        self.recent_heading = label('Recent local projects')
         font = self.recent_heading.font()
         font.setBold(True)
         self.recent_heading.setFont(font)
@@ -153,7 +153,9 @@ class ProjectHome(QWidget):
         download = QPushButton('Download Assigned Work...')
         download.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveNetIcon))
         download.clicked.connect(controller.join_shared)
-        add_help_row(layout, download, 'download')
+        download_help = add_help_row(layout, download, 'download')
+        self.inbox.projects_visible.connect(lambda visible: (
+            download.setVisible(not visible), download_help.setVisible(not visible)))
         command(layout, 'Create New Project...', controller.window.new_project,
                 QStyle.StandardPixmap.SP_FileIcon)
         layout.addSpacing(10)
@@ -216,7 +218,9 @@ class ProjectHome(QWidget):
         self.identity.setText('Working as ' + session['name'] if session else 'Contributor not selected')
         self.recent.clear()
         target = window.project_path or self.controller.last_project()
-        paths = list(dict.fromkeys(str(path) for path in [target, *window.recent_projects] if path))
+        identity = (session or {}).get('id', '')
+        recent = self.controller.settings.value('workflow/recent_projects/' + identity, [], type=list)
+        paths = list(dict.fromkeys(str(path) for path in [target, *recent] if path))
         for path in paths:
             item = QListWidgetItem(Path(path).name)
             item.setData(Qt.ItemDataRole.UserRole, str(path))
@@ -510,6 +514,22 @@ class WorkspaceController(QObject):
         self.project_label.setToolTip(str(project))
         identity = (self.window.contributor_session or {}).get('id', '')
         self.settings.setValue('workflow/last_project/' + identity, str(project))
+        recent_key = 'workflow/recent_projects/' + identity
+        recent = self.settings.value(recent_key, [], type=list)
+        self.settings.setValue(recent_key, list(dict.fromkeys([str(project), *recent]))[:10])
+        from core.project_sync import PROJECT_MARKER, _read_json
+        marker = project / 'annotations' / PROJECT_MARKER
+        try:
+            if marker.is_file():
+                metadata = _read_json(marker)
+                root = setting_json('project_sync/destination', {}).get('root_id', '')
+                state = workspace(project)
+                if root and (not state or state['root_id'] == root):
+                    self.settings.setValue(f'workflow/shared_projects/{identity}/{root}/{metadata["project_id"]}', str(project))
+        except (OSError, ValueError, KeyError):
+            # This shortcut is optional; loading the local project does not require a shared identity.
+            pass
+        self.home.refresh()
         for i, name in enumerate(self.names):
             self.tabs.setTabEnabled(i, not self.assigned() or name == 'Annotate')
             self.tabs.setTabVisible(i, not self.assigned() or name == 'Annotate')
@@ -592,7 +612,7 @@ class WorkspaceController(QObject):
 
     def join_shared(self):
         if not setting_json('project_sync/destination', {}).get('root_id'):
-            self.window.configure_project_sync()
+            self.home.inbox.connect_folder()
         if setting_json('project_sync/destination', {}).get('root_id'):
             self.window.open_assigned_work()
 
@@ -671,6 +691,10 @@ class WorkspaceController(QObject):
         self.settings.setValue(self.key('unpublished'), True)
         self.settings.sync()
         self.update_save_status()
+        if hasattr(self.window, 'annotation_work'):
+            self.window.annotation_work.schedule()
+        if hasattr(self.window, 'video_browser'):
+            self.window.video_browser.schedule()
 
     def uploaded(self):
         self.generation += 1
@@ -769,6 +793,8 @@ class WorkspaceController(QObject):
     def stop_check(self):
         self.save_timer.stop()
         stopped = self.home.inbox.stop()
+        stopped = self.assignments_page.stop() and stopped
+        stopped = self.window.video_browser.stop() and stopped
         if self.worker and self.worker.isRunning():
             self.worker.requestInterruption()
             stopped = self.worker.wait(2000) and stopped

@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButto
                             QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout)
 
 from gui.project_sync_dialog import _size_transfer_dialog
+from gui.shared_version import display_time
 
 
 def _size(value):
@@ -22,8 +23,10 @@ def _size(value):
 class PublicationReviewDialog(QDialog):
     def __init__(self, estimate, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Review Changes Before Publishing')
         self.review = estimate['review']
+        self.comparison = self.review.get('comparison') == 'local_vs_shared'
+        self.action_names = ('Only local', 'Different', 'Only shared') if self.comparison else ('Added', 'Changed', 'Removed', 'Excluded')
+        self.setWindowTitle('Review Local vs Shared Changes' if self.comparison else 'Review Changes Before Publishing')
         self.rows = self.review['rows']
         self.groups = {}
         layout = QVBoxLayout(self)
@@ -33,6 +36,11 @@ class PublicationReviewDialog(QDialog):
         baseline_text = (f"Compared with {baseline['contributor_name']}'s published backup: "
                          f"{baseline['created_at']} | {baseline['revision']}" if baseline else
                          'First backup for this contributor. All included files are additions.')
+        if self.comparison:
+            baseline_text = ('Local saved annotations: ' + self.review['local_project'] +
+                             '\nCompared with the shared version displayed in Assignments: ' +
+                             baseline['contributor_name'] + ' | Published ' + display_time(baseline['created_at']) +
+                             '\nVersion: ' + baseline['revision'])
         self.baseline = QLabel(baseline_text)
         self.baseline.setTextFormat(Qt.TextFormat.PlainText)
         self.baseline.setWordWrap(True)
@@ -45,12 +53,12 @@ class PublicationReviewDialog(QDialog):
         filters = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText('Search videos or files')
-        self.search.setAccessibleName('Search outgoing changes')
+        self.search.setAccessibleName('Search annotation differences' if self.comparison else 'Search outgoing changes')
         self.search.setClearButtonEnabled(True)
         self.actions = QComboBox()
         self.actions.setAccessibleName('Filter by change type')
         self.actions.addItem('All changes', None)
-        for action in ('Added', 'Changed', 'Removed', 'Excluded'):
+        for action in self.action_names:
             self.actions.addItem(action, action)
         filters.addWidget(self.search, 1)
         filters.addWidget(self.actions)
@@ -65,7 +73,8 @@ class PublicationReviewDialog(QDialog):
         layout.addLayout(filters)
 
         self.table = QTreeWidget()
-        self.table.setHeaderLabels(['Video / file', 'Change', 'Scope', 'Before', 'After'])
+        self.table.setHeaderLabels(['Video / file', 'Difference', 'Scope', 'Shared', 'Local'] if self.comparison else
+                                   ['Video / file', 'Change', 'Scope', 'Before', 'After'])
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -91,6 +100,10 @@ class PublicationReviewDialog(QDialog):
         layout.addWidget(self.details)
         note = QLabel('Removed and excluded files remain in older backups. '
                       'File changes are not counts of edited masks. Shared-video annotations affect the whole video.')
+        if self.comparison:
+            note.setText('Saved annotation files and settings only; unsaved edits, frame images, and original videos are excluded. '
+                         'Different does not mean newer. Only shared may mean not downloaded, not deleted. '
+                         'This comparison does not upload, replace, or merge files.')
         note.setWordWrap(True)
         layout.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -130,11 +143,14 @@ class PublicationReviewDialog(QDialog):
             self.table.addTopLevelItem(item)
         counts = self.review['counts']
         self.summary.setText(' | '.join(f"{counts.get(kind, 0):,} {kind.lower()}"
-                                       for kind in ('Added', 'Changed', 'Removed', 'Excluded')) +
+                                       for kind in self.action_names) +
                              f" | {self.review['unchanged']:,} unchanged\n"
-                             f'Showing {visible:,} of {len(self.rows):,} changed/excluded files')
+                             f'Showing {visible:,} of {len(self.rows):,} ' +
+                             ('file differences' if self.comparison else 'changed/excluded files'))
         self.empty.setVisible(not visible)
-        self.empty.setText('No changes match these filters.' if self.rows else 'No file changes since this backup.')
+        self.empty.setText('No changes match these filters.' if self.rows else
+                           'No saved annotation file differences from this shared version.' if self.comparison else
+                           'No file changes since this backup.')
         self.details.clear()
         # Populate only expanded groups; a first backup can contain tens of thousands of files.
         if visible <= 100:
@@ -161,6 +177,9 @@ class PublicationReviewDialog(QDialog):
                 'Changed': 'File contents differ; timestamp-only changes are not included.',
                 'Removed': 'Absent from the new version. Older backups are retained.',
                 'Excluded': 'Omitted because Include original videos is unchecked. Older backups are retained.',
+                'Only local': 'Saved locally but not present in the displayed shared version.',
+                'Different': 'File contents differ. This does not establish which version should be kept.',
+                'Only shared': 'Present in the shared version but absent locally; it may not have been downloaded.',
             }[row['action']])
             for column, key in ((3, 'before_bytes'), (4, 'after_bytes')):
                 child.setTextAlignment(column, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)

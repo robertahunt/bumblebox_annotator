@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import time
+from threading import Event
 import unittest
 from unittest.mock import Mock, patch
 
@@ -9,7 +10,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton
 
-from core.assigned_work import (assignment_management, assignment_presence, establish_director,
+from core.assigned_work import (assignment_management, assignment_presence, establish_director, latest_snapshot,
                                read_assignments, save_assignments)
 from core.contributors import new_session
 from core.project_sync import _read_json, _write_json, sync_project
@@ -80,6 +81,24 @@ class AssignmentDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'policy'):
             save_assignments(self.source, self.configuration, self.coordinator, self.choices, state['data']['revision'])
 
+    def test_setup_checks_old_backups_without_reading_masks(self):
+        snapshot, heads = latest_snapshot(self.view())
+        snapshot['manifest'].pop('annotation_work')
+        messages = []
+        with patch('core.assigned_work.latest_snapshot', return_value=(snapshot, heads)), \
+             patch('core.annotation_work._unit', side_effect=AssertionError('Setup must not scan masks')):
+            state = assignment_management(self.source, self.configuration, self.coordinator,
+                                          progress=messages.append)
+        self.assertFalse(state['needs'])
+        self.assertEqual(set(state['available']), {'alpha', 'beta'})
+        self.assertTrue(messages)
+        with patch('core.annotation_work.published_index', side_effect=AssertionError('Saving assignments must not scan masks')):
+            save_assignments(self.source, self.configuration, self.coordinator, self.choices, state['data']['revision'])
+
+    def test_setup_honors_cancellation(self):
+        with self.assertRaises(InterruptedError):
+            assignment_management(self.source, self.configuration, self.coordinator, cancelled=lambda: True)
+
 
 class AssignmentOnboardingGuiTests(unittest.TestCase):
     @classmethod
@@ -101,6 +120,14 @@ class AssignmentOnboardingGuiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertIsNone(inbox.worker)
         return inbox
+
+    def settle_assignments(self):
+        page = self.window.workflow.assignments_page
+        deadline = time.monotonic() + 5
+        while page.worker and time.monotonic() < deadline:
+            QTest.qWait(10)
+        self.assertIsNone(page.worker)
+        return page
 
     def test_empty_notice_once_per_session_and_persistent_home_status(self):
         self.window.set_contributor(new_session('New Student'))
@@ -150,6 +177,7 @@ class AssignmentOnboardingGuiTests(unittest.TestCase):
         flow = self.load()
         self.settle()
         flow.activate('Assignments')
+        self.settle_assignments()
         page = flow.assignments_page
         panel = page.panel
         self.assertIsNotNone(panel)
@@ -197,6 +225,7 @@ class AssignmentOnboardingGuiTests(unittest.TestCase):
         flow = self.load()
         self.settle()
         flow.activate('Assignments')
+        self.settle_assignments()
         page = flow.assignments_page
         self.assertIsNone(page.panel)
         self.assertTrue(any(b.text() == 'Set Project Director...' for b in page.findChildren(QPushButton)))
@@ -205,6 +234,7 @@ class AssignmentOnboardingGuiTests(unittest.TestCase):
         self.assertIsNone(read_assignments(self.view())['coordinator'])
         with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
             page.set_director()
+        self.settle_assignments()
         self.assertEqual(read_assignments(self.view())['coordinator']['id'], self.coordinator['id'])
         self.assertIsNotNone(page.panel)
 
@@ -224,12 +254,14 @@ class AssignmentOnboardingGuiTests(unittest.TestCase):
         self.assertEqual(inbox.result['status'], 'unconfigured')
         self.assertIsNone(inbox.notice)
         flow.activate('Assignments')
+        self.settle_assignments()
         self.assertTrue(any(b.text() == 'Connect Shared Folder...' for b in flow.assignments_page.findChildren(QPushButton)))
 
     def test_unsaved_table_choices_block_switch_close_and_reload(self):
         flow = self.load()
         self.settle()
         flow.activate('Assignments')
+        self.settle_assignments()
         page = flow.assignments_page
         frames = page.panel.controls['alpha'][1]
         before = frames.text()
@@ -249,10 +281,11 @@ class AssignmentOnboardingGuiTests(unittest.TestCase):
         finally:
             frames.setText(before)
 
-    def test_shared_profile_discovery_preserves_unsaved_assignment_choices(self):
+    def test_discovery_requires_enrollment_and_preserves_unsaved_assignment_choices(self):
         flow = self.load()
         self.settle()
         flow.activate('Assignments')
+        self.settle_assignments()
         panel = flow.assignments_page.panel
         actor, frames = panel.controls['alpha']
         original, identity = frames.text(), actor.currentData()
@@ -262,6 +295,8 @@ class AssignmentOnboardingGuiTests(unittest.TestCase):
             remember_contributor_profile(newcomer)
             from gui.shared_profiles import profile_sync_service
             profile_sync_service().changed.emit()
+            self.assertEqual(actor.findData(newcomer['id']), -1)
+            panel.enroll(newcomer)
             self.assertGreaterEqual(actor.findData(newcomer['id']), 0)
             self.assertEqual(actor.currentData(), identity)
             self.assertEqual(frames.text(), '0-1')
@@ -269,6 +304,55 @@ class AssignmentOnboardingGuiTests(unittest.TestCase):
             self.assertEqual(self.window.contributor_session['id'], self.coordinator['id'])
         finally:
             frames.setText(original)
+
+    def test_slow_setup_is_nonmodal_and_cancelled_result_cannot_open_table(self):
+        flow = self.load()
+        self.settle()
+        release = Event()
+        started = Event()
+        def slow_check(*args, progress, cancelled):
+            started.set()
+            progress('Reading the published project version...')
+            release.wait(5)
+            return {'needs': ['director'], 'director': None}
+        with patch('gui.assignment_workspace.assignment_management', side_effect=slow_check), \
+             patch('gui.assignment_workspace.SyncProgressDialog.run', side_effect=AssertionError('Startup must not open a modal')):
+            try:
+                flow.activate('Assignments')
+                self.assertTrue(started.wait(2))
+                QTest.qWait(30)
+                page = flow.assignments_page
+                self.assertIsNotNone(page.worker)
+                self.assertIn('published project', page.status.text())
+                self.assertIsNone(QApplication.activeModalWidget())
+                page.cancel()
+                flow.activate('Annotate')
+                self.assertEqual(flow.current, 'Annotate')
+            finally:
+                release.set()
+                self.settle_assignments()
+        self.assertIsNone(page.panel)
+        self.assertIn('cancelled', page.status.text())
+
+    def test_project_change_discards_outdated_setup_result(self):
+        flow = self.load()
+        self.settle()
+        release = Event()
+        def slow_check(*args, **kwargs):
+            release.wait(5)
+            return {'needs': ['director'], 'director': None}
+        with patch('gui.assignment_workspace.assignment_management', side_effect=slow_check):
+            try:
+                flow.activate('Assignments')
+                page = flow.assignments_page
+                page.clear()
+                flow.activate('Annotate')
+            finally:
+                release.set()
+                self.settle_assignments()
+        self.assertIsNone(page.context_key)
+        self.assertIsNone(page.panel)
+        self.assertFalse(any(b.text() == 'Set Project Director...' for b in page.findChildren(QPushButton)))
 
 
 if __name__ == '__main__':

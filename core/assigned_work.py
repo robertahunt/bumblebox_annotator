@@ -24,7 +24,7 @@ from core.project_sync import (
 from core.project_update import PublishedProject, _base_snapshot
 
 ASSIGNMENTS = 'assignments.json'
-ANNOTATION_KINDS = ('json', 'png', 'bbox')
+ANNOTATION_KINDS = ('json', 'png', 'bbox', 'work')
 
 
 def _video(value):
@@ -49,6 +49,8 @@ def workspace(project):
     if identity.get('project_id') != state['project_id'] or not state['assignments']:
         raise ValueError('Assigned-work identity does not match this project.')
     for video, assignment in state['assignments'].items():
+        from core.annotation_work import task_categories
+        task_categories(assignment.get('task'))
         _video(video)
         _uuid(assignment['id'])
         if not assignment['frames'] or any(type(i) is not int or i < 0 for i in assignment['frames']):
@@ -94,6 +96,7 @@ def _editable(name, assignments):
         return False
     filename = Path(name).name
     return (filename == 'video_annotations.json' or
+            (Path(name).parts[1] == 'work' and filename == 'video_work.json') or
             bool(re.fullmatch(r'video_annotations(?:_[A-Za-z0-9_]+)?\.png', filename)) or
             _frame(name) in assignments[video]['frames'])
 
@@ -121,28 +124,50 @@ def latest_snapshot(view):
     return _base_snapshot(view, {'heads': heads}), heads
 
 
-def catalog(snapshot):
+def catalog(snapshot, *, include_work=False, progress=lambda message: None, cancelled=lambda: False):
+    """List published videos without scanning annotation payloads.
+
+    Optional mask status uses only fingerprint-validated, already published summaries.
+    Missing or stale summaries require an explicit annotation scan.
+    """
+    from core.annotation_work import published_index
+    from core.video_browsing import experiment_assignments
     files = snapshot['manifest']['files']
     if any(name.startswith(('annotations/pkl/', 'annotations/frames/')) for name in files):
         raise ValueError('Assigned work requires current PNG/JSON annotations, not legacy pickle files.')
     result = {}
+    input_splits = {}
+    setups_file = 'annotations/imaging_setups.json'
+    experiments = experiment_assignments(_verified_json(snapshot, setups_file)) if setups_file in files else {}
     for name, record in files.items():
         parts = Path(name).parts
+        if len(parts) >= 3 and parts[0] == 'input_data':
+            input_splits.setdefault(Path(name).stem, set()).add(parts[1])
         if len(parts) == 3 and parts[0] == 'frames' and re.fullmatch(r'frame_\d+\.jpg', parts[2]):
             video = _video(parts[1])
             entry = result.setdefault(video, {'frames': [], 'bytes': 0})
             entry['frames'].append(_frame(name))
             entry['bytes'] += record['size']
-    for video, entry in result.items():
+    for position, (video, entry) in enumerate(result.items(), 1):
+        if cancelled():
+            raise InterruptedError('Assignment check cancelled')
+        if position == 1 or position % 25 == 0:
+            progress(f'Reading published video metadata: {position}/{len(result)}')
         entry['frames'].sort()
         meta_name = f'frames/{video}/video_metadata.json'
         meta = _verified_json(snapshot, meta_name) if meta_name in files else {}
-        splits = {Path(name).parts[1] for name in files if name.startswith('input_data/') and Path(name).stem == video}
+        splits = input_splits.get(video, set())
         split = next(iter(splits)) if len(splits) == 1 else meta.get('split')
         if len(splits) > 1 or split not in ('train', 'val', 'test', 'inference'):
             raise ValueError('Publish valid split metadata for video ' + video + ' before assigning it.')
         entry['split'] = split
         entry['metadata'] = meta
+        entry['experiment'] = experiments.get(video)
+    if include_work:
+        progress('Checking saved mask-status summaries...')
+        index = published_index(snapshot, cached_only=True, cancelled=cancelled)
+        for video, entry in result.items():
+            entry['annotation_work'] = index['videos'].get(video)
     return result
 
 
@@ -171,12 +196,58 @@ def read_assignments(view):
     if data.get('format') != 1 or data.get('project_id') != view.project_id:
         raise ValueError('Assignment metadata does not match the project.')
     for video, entry in data['videos'].items():
+        from core.annotation_work import task_categories
+        task_categories(entry.get('task'))
         _video(video)
         _uuid(entry['id'])
         _uuid(entry['contributor']['id'])
         if not entry['frames'] or any(type(i) is not int or i < 0 for i in entry['frames']):
             raise ValueError('Invalid assignment frame list.')
+    project_members(data)
     return data
+
+
+def project_members(data):
+    """Read an additive roster, including directors/assignees from older versions."""
+    members = {}
+    stored = data.get('members', {})
+    if not isinstance(stored, dict):
+        raise ValueError('Invalid project contributor roster.')
+    candidates = list(stored.values()) + [entry['contributor'] for entry in data['videos'].values()]
+    if data.get('coordinator'):
+        candidates.append(data['coordinator'])
+    for value in candidates:
+        profile = contributor_profile(dict(value, format=1, kind='bumblebox-contributor'))
+        person = {key: profile[key] for key in ('id', 'name')}
+        if person['id'] in members and members[person['id']] != person:
+            raise ValueError('A contributor ID has conflicting names in the project roster.')
+        members[person['id']] = person
+    if any(identity != value['id'] for identity, value in stored.items()):
+        raise ValueError('Project roster keys must match contributor IDs.')
+    return members
+
+
+def add_project_member(project, configuration, contributor, member, expected_revision):
+    """Only the director may enroll a person; this does not assign videos or switch identity."""
+    require_full_project(project)
+    profile = contributor_profile(dict(member, format=1, kind='bumblebox-contributor'))
+    with _sync_location(Path(project).resolve(), configuration, contributor):
+        view = PublishedProject(project, configuration)
+        current = read_assignments(view)
+        if not current['coordinator'] or current['coordinator']['id'] != contributor['id']:
+            raise ValueError('Only the project director can add contributors.')
+        if current['revision'] != expected_revision:
+            raise ValueError('Project people or assignments changed. Refresh before adding a contributor.')
+        members = project_members(current)
+        person = {key: profile[key] for key in ('id', 'name')}
+        if person['id'] in members:
+            if members[person['id']] != person:
+                raise ValueError('This contributor ID already has a different name in this project.')
+            return current
+        members[person['id']] = person
+        updated = dict(current, revision=str(uuid4()), members=members)
+        _write_json(view.home / ASSIGNMENTS, updated)
+        return updated
 
 
 def assignment_status(view, entry):
@@ -219,7 +290,7 @@ def establish_director(project, configuration, contributor, expected_revision):
         return data
 
 
-def assignment_requirements(snapshot):
+def assignment_requirements(snapshot, *, available=None):
     """Requirements describe the published data, not unsaved local settings."""
     from core.annotation_policy import policy_needs_confirmation
     requirements = []
@@ -227,17 +298,21 @@ def assignment_requirements(snapshot):
         requirements.append('compact_backup')
     if policy_needs_confirmation(_verified_json(snapshot, 'annotations/project.json')):
         requirements.append('policy')
-    if not catalog(snapshot):
+    if not (catalog(snapshot) if available is None else available):
         requirements.append('frames')
     return requirements
 
 
-def assignment_management(project, configuration, contributor):
+def assignment_management(project, configuration, contributor, *, progress=lambda message: None,
+                          cancelled=lambda: False):
     """Read-only workspace state, including actionable first-time setup requirements."""
     require_full_project(project)
+    if cancelled():
+        raise InterruptedError('Assignment check cancelled')
     if not configuration.get('root_id'):
         return {'needs': ['connection'], 'director': None}
     from core.project_sync import check_destination
+    progress('Connecting to the shared project...')
     check_destination(configuration['root'], configuration['root_id'])
     if not (Path(project) / 'annotations' / PROJECT_MARKER).exists():
         return {'needs': ['backup'], 'director': None}
@@ -246,12 +321,20 @@ def assignment_management(project, configuration, contributor):
     director = data['coordinator']
     if director and director['id'] != contributor['id']:
         return {'needs': [], 'director': director, 'restricted': True}
+    progress('Reading the published project version...')
     snapshot, _ = latest_snapshot(view)
-    needs = assignment_requirements(snapshot)
+    available = catalog(snapshot, include_work=True, progress=progress, cancelled=cancelled)
+    needs = assignment_requirements(snapshot, available=available)
     if not director:
         needs.insert(0, 'director')
-    return {'needs': needs, 'director': director, 'data': data, 'available': catalog(snapshot),
-            'statuses': {v: assignment_status(view, e) for v, e in data['videos'].items()}}
+    statuses = {}
+    for position, (video, entry) in enumerate(data['videos'].items(), 1):
+        if cancelled():
+            raise InterruptedError('Assignment check cancelled')
+        progress(f'Checking submissions: {position}/{len(data["videos"])}')
+        statuses[video] = assignment_status(view, entry)
+    return {'needs': needs, 'director': director, 'data': data, 'available': available,
+            'statuses': statuses, 'snapshot': snapshot}
 
 
 def save_assignments(project, configuration, contributor, videos, expected_revision):
@@ -266,9 +349,9 @@ def save_assignments(project, configuration, contributor, videos, expected_revis
         if current['revision'] != expected_revision:
             raise ValueError('Assignments changed. Refresh before saving.')
         snapshot, _ = latest_snapshot(view)
-        if assignment_requirements(snapshot):
-            raise ValueError('Complete and publish the annotation policy and frame images in a deduplicated backup before assigning work.')
         available = catalog(snapshot)
+        if assignment_requirements(snapshot, available=available):
+            raise ValueError('Complete and publish the annotation policy and frame images in a deduplicated backup before assigning work.')
         updated = {}
         for video, choice in videos.items():
             if video not in available:
@@ -281,13 +364,24 @@ def save_assignments(project, configuration, contributor, videos, expected_revis
             if not frames or not set(frames) <= set(available[video]['frames']):
                 raise ValueError('Invalid assigned frames for ' + video)
             old = current['videos'].get(video)
-            if old and old['contributor']['id'] == actor['id'] and old['frames'] == frames:
+            from core.annotation_work import task_categories
+            task = choice.get('task', (old or {}).get('task'))
+            task_categories(task)
+            if old and old['contributor']['id'] == actor['id'] and old['frames'] == frames and old.get('task') == task:
                 updated[video] = dict(old, contributor=actor)
             else:
                 updated[video] = {'id': str(uuid4()), 'video': video, 'contributor': actor,
                                   'frames': frames, 'assigned_at': utc_now()}
+                if task is not None:
+                    updated[video]['task'] = task
         data = dict(current, revision=str(uuid4()), videos=updated,
                     coordinator={key: contributor[key] for key in ('id', 'name')})
+        # An explicit assignment by a director is also enrollment, including
+        # assignments saved by older clients that did not have a People panel.
+        members = project_members(current)
+        members.update({entry['contributor']['id']: entry['contributor'] for entry in updated.values()})
+        members[contributor['id']] = data['coordinator']
+        data['members'] = project_members(dict(data, members=members))
         _write_json(view.home / ASSIGNMENTS, data)
         return data
 
@@ -307,6 +401,7 @@ def transfer_director(project, configuration, contributor, successor, expected_r
             raise ValueError('Choose a different contributor profile.')
         updated = dict(current, revision=str(uuid4()),
                        coordinator={key: profile[key] for key in ('id', 'name')})
+        updated['members'] = project_members(dict(updated, members=project_members(current)))
         _write_json(view.home / ASSIGNMENTS, updated)
         return updated
 
@@ -385,7 +480,12 @@ def assignment_presence(configuration, contributor, project=None, cancelled=lamb
     status = ('director' if directors else 'assigned' if count else
               'setup' if project and not director else 'empty')
     return {'status': status, 'count': count, 'director': director,
-            'scope': entries[0]['name'] if project else 'the shared folder'}
+            'scope': entries[0]['name'] if project else 'the shared folder',
+            'projects': [{'id': entry['id'], 'name': entry['name'],
+                          'role': 'director' if entry in directors else 'contributor',
+                          'count': sum(e['contributor']['id'] == contributor['id']
+                                       for e in entry['data']['videos'].values())}
+                         for entry in entries if contributor['id'] in project_members(entry['data'])]}
 
 
 def _check_owned(data, selected, contributor):
@@ -590,6 +690,17 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
             if status in ('Ready for Review', 'Accepted') and video not in changes:
                 previous_ready.add(video)
         ready = sorted(previous_ready | set(ready))
+        from core.backup_integrity import check_stored_file, require_healthy_references
+        require_healthy_references(view.home, configuration, view.project_id, files)
+        inspected = set()
+        for index, (name, record) in enumerate(files.items(), 1):
+            if cancelled():
+                raise InterruptedError('Publishing cancelled; local work remains saved.')
+            if name in sources or record['sha256'] in inspected:
+                continue
+            progress(f'Checking stored file information {index}/{len(files)}: {name}')
+            check_stored_file(snapshot_file(current['manifest_path'], current['manifest'], name), record)
+            inspected.add(record['sha256'])
         if files == incoming and set(ready) == previous_ready:
             statuses = [assignment_status(view, entry)[1] for entry in assignments.values()]
             if all(statuses):
@@ -639,7 +750,13 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
         revisions = _safe_child(home, 'revisions', mkdir=True)
         stage = _safe_child(revisions, '.pending-' + revision, mkdir=True)
         try:
+            from core.annotation_work import build_index
+            annotation_work = build_index(files, lambda name: object_path(view.home, files[name]['sha256']),
+                previous=current['manifest'].get('annotation_work'), cancelled=cancelled)
+            if inventory != _inventory(project, True) or view.heads() != heads or cancelled():
+                raise ValueError('Local or shared files changed during the annotation summary. Save and retry.')
             manifest = dict(current['manifest'], files=files, base_heads=heads,
+                            annotation_work=annotation_work,
                             contributor={key: contributor[key] for key in ('id', 'name')},
                             created_at=utc_now(), device=contributor.get('device'), publication='latest',
                             assigned_work={'workspace_id': state['workspace_id'],

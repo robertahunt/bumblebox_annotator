@@ -16,16 +16,18 @@ or a security role. Use the same updated app version on every computer.
    are preserved. The app no longer assigns the role implicitly when saving work.
    Missing connection, published policy, deduplicated backup, or frame prerequisites
    appear here with actions to resolve them. Check Setup Again after making changes.
-4. Enable [Profile Sharing](shared_profiles.md) on the director's and contributors'
-   computers using the same shared folder. Select existing identities to share;
-   new identities can be published automatically. Discovered profiles appear in
-   Assignments without changing your active contributor or any existing roles.
-   **Add Contributor: Import Profile...** remains an offline fallback.
+   This check runs in the Assignments page, not a blocking startup dialog. You can
+   switch to Annotate or cancel the check while the shared drive responds.
+4. Use [Connect to Lab](shared_profiles.md) once on each computer using the same
+   shared folder. In **Assignments > People > Add Contributor...**, select an
+   existing lab identity or create a new one. This adds project membership without
+   changing your active person; new profiles appear automatically on connected
+   computers. **Import Profile...** inside People remains a fallback.
 5. Search/filter the video table and check several videos, or **Select Visible**.
    Choose **Assign Selected Videos...**, choose a contributor, and choose **All
    extracted frames** or **Specific frames**, such as `0,5-10`. Review the list and
    confirm **Assign Work**. Frame ranges must exist in every selected video.
-   Assignments are saved immediately; no downloads are started on another computer.
+Assignments are saved immediately; no downloads are started on another computer.
    Changing filters clears hidden checkbox selections. Table edits remain available
    separately through **Save Table Edits**; save or discard them before bulk assigning.
    Unsaved table choices require confirmation before reload, project/profile changes,
@@ -36,7 +38,7 @@ profile; entering the same name does not recover its ID. One video has one assig
 not change train/validation splits or training-frame selections.
 
 The director can use **Transfer Director Role...** to hand over to another
-imported profile. This preserves existing assignments and requires confirmation;
+project member. This preserves existing assignments and requires confirmation;
 it does not grant a second director or change annotation attribution.
 
 Publish newly imported videos before assigning them. A completed annotation
@@ -44,15 +46,116 @@ policy is required before assigning or downloading work. Legacy projects need cu
 PNG/JSON annotation storage and valid video split metadata. Legacy full-folder
 backups must first be published using deduplicated storage.
 
+## Select Work by Mask Type
+
+The source header identifies the **Shared version**, who published it, and its
+publication time. The folder icon opens that exact version's directory; the
+information icon shows its version ID, manifest location, and the local project
+path. **Last checked** is the time of a freshness check, not the publication time.
+
+While this page is visible, a background check reads small publication pointers
+once per minute, without opening masks. The refresh icon in the header checks
+immediately. Changed publications show **Refresh Assignments**; the displayed
+version and unsaved assignment choices are not replaced automatically. Refresh
+retains the existing discard-confirmation step. A failed check is shown as a
+failure, never as "up to date". Divergent shared histories still require resolution
+through the existing guarded workflow; the check never chooses a winning branch.
+
+In Assignments, choose **Work on: Hive**, then **Show: Not Started** for untouched
+work or **Show: Not Checked** for started/unverified work, and **Unassigned**.
+Use **Select Visible > Assign Selected Videos...** to assign the
+matching videos. **More filters** includes Has masks, No masks, Some frames lack
+masks, Unknown availability, and the train/validation/test/inference split.
+Bee annotations have no effect when filtering hive work. Brood groups select all
+their stages; individual stages are also available.
+
+The Show filter offers **All Work**, **Not Started**, **Not Checked**, and
+**Finished** in both Assignments and the annotation sidebar. Not Started means no
+saved masks or completion records for the selected task. Not Checked includes
+partially finished work, changed masks, pending import reviews, and unknown/unscanned status;
+the specific status is still shown on each row. Finished includes work explicitly
+checked as having no objects present. Alternating row backgrounds separate videos.
+
+**Experiment / setup** filters by the project's existing named imaging setups,
+such as `2021 bumblebox` or `2024 rig build`. Choose All experiments to remove this
+filter, or No experiment assigned to find ungrouped videos. This is only a view
+filter: it does not reassign videos or change calibration. It combines with the
+mask, split, search and contributor filters; hidden checkbox selections are cleared.
+The assignment table uses the published setup assignments.
+
+**Sort > Recently modified** orders videos newest-first using annotation-file and
+annotation-folder modification times in your local working project. The
+**Modified (local)** column shows those dates; unavailable dates sort last. It
+includes shared masks, frame masks, bounding boxes, completion records and folder
+changes from deletions. It excludes original-video dates, extracted-frame dates,
+COCO exports and calibration settings. Imports/downloads can change file dates,
+so this is not a cross-computer edit audit trail. Dates are read in the background
+only when requested, without loading images or masks. Table edits and selections
+stay attached to their videos when sorting.
+
+The Masks and Annotation work columns describe the **published annotations**,
+over all published frame images. Publish local changes before expecting them in
+this table. The assignment confirmation carries the selected mask type as its
+task, alongside the contributor and frame range. Opening an assigned video
+selects that task in the annotation sidebar. It is guidance, not a restriction
+on editing other categories. One contributor still owns the video; this does not
+enable concurrent category-specific assignments to the same video.
+
+Mask availability is automatic; completion is not inferred from the existence of
+an annotation. Empty instances and bounding-box-only annotations do not count as
+masks. Missing/corrupt or unsupported legacy data appear as Unknown, not No masks.
+Existing masks initially appear as Not checked. Shared masks count once per video;
+frame-specific progress counts the available or assigned frames, not missing
+frames from a selective download.
+
+New backups include a sparse summary in the publication manifest. Unchanged video
+summaries are reused by source fingerprint. Opening Assignments checks these saved
+summaries but does not scan annotation payloads. Missing or stale summaries appear
+as **Not scanned**, not Unknown or No masks; this is not a background scan in
+progress. Choose **Scan Mask Status** to inspect older backups
+from annotation metadata (and legacy mask rasters where needed), without downloading
+frame images. Unresolved rows show **Scanning...** during that operation and remain
+visible under work filters until results arrive; experiment, split, search, and
+assignment filters still apply. **Unknown** after scanning means data could not be
+read or interpreted; row tooltips show the reason, and scanning can be retried.
+Cancellation or failure restores the previous summaries, never leaves Scanning
+displayed, and does not claim the masks are absent.
+The explicit scan reports video/frame progress and can be cancelled
+after the current file operation; assignment table edits are preserved. Subsequent
+filter changes use the in-memory index. Publishing a backup with this app includes
+the summary for later sessions; merely inspecting a backup does not modify it.
+
+## Compare Local and Shared Work
+
+**Review Local vs Shared Changes...** compares saved annotation files and project
+annotation settings against the **exact shared version displayed in Assignments**.
+It does not switch to a newer publication halfway through the comparison. Results
+are grouped by video, with project-level files in their own group; filters search
+by video/file and distinguish **Different**, **Only local**, and **Only shared**.
+An undownloaded file is Only shared, never automatically considered deleted.
+
+This is a read-only, file-level comparison, not an upload plan or a mask-pixel
+viewer. It does not say which copy is newer, infer conflicts, merge, upload, or
+approve annotations. Unsaved canvas edits, extracted image files, original videos,
+models, and regenerated COCO exports are excluded. Save local annotation edits
+before comparing them. If annotation files change while checking, the comparison
+asks for a retry rather than presenting an inconsistent result. The operation is
+cancellable after the current file read.
+
+The upload workflow's existing Review Changes still compares with that contributor's
+previous publication. Its baseline remains explicitly labeled; it is separate from
+the Assignments comparison. Per-mask visual comparisons, per-class local/shared
+completion columns, and persistent scan caching for older backups remain future work.
+
 ## Contributor Workflow
 
-1. Select your contributor profile. On another computer, enable Profile Sharing
+1. Select your contributor profile. On another computer, use Connect to Lab
    and select the existing shared identity, or import the same exported profile.
    Do not create a second identity with the same name.
-2. Mount/authenticate the shared drive outside the app. Configure and test the
-   same archive root in **Settings > Project Sync**. The path may differ between
+2. Authenticate the drive if needed using **Sign In to Drive...** (Linux Kerberos)
+   or your system tools. Connect to the same archive root. The path may differ between
    computers, but it must point to the same shared folder identity.
-3. Open **File > My Assigned Work...**, choose assigned videos, and choose
+3. Select your project in **My Work**, or open **File > My Assigned Work...**. Choose assigned videos, then
    **Download Assigned Work...**. Confirm the frame count and estimated download
    size, then select a local parent folder with enough free space.
 4. The verified copy opens in the **Annotate** workspace in **Assigned Work** mode.
@@ -64,7 +167,7 @@ backups must first be published using deduplicated storage.
 Assignment status is checked in the background after choosing a profile or opening
 a project, and on returning Home. A verified empty result opens a non-modal **No
 Work Assigned Yet** notice once per contributor session/shared root, offering
-Profile Sharing, Check Again, and Continue Locally. The status remains on Home.
+Connect to Lab, Check Again, and Continue Locally. The status remains on Home.
 Disconnected/unreadable drives say **Unable to check assignments**, never "no work".
 An unconfigured connection or unpublished project has its own setup state. Results
 from an older profile/project/drive check are discarded. Directors do not get the
@@ -138,7 +241,7 @@ apply in the full project.
 One contributor owns each video assignment, even if only some frames are assigned.
 Two people should not edit the same video's shared masks concurrently.
 
-Reassigning a video or changing its assigned frame range retires the old assignment.
+Reassigning a video or changing its assigned frame range or mask task retires the old assignment.
 Its local files remain intact, but publishing is blocked until the coordinator
 reconciles the work. Finish/publish current work before expanding an assignment;
 then download a fresh working set. There is no in-place assignment refresh yet.
@@ -161,6 +264,11 @@ or filesystem permissions. Anyone with write access to the shared folder could
 alter its files. Keep independent backups and appropriate shared-drive permissions.
 
 ## Testing
+
+`scripts/test_annotation_work.py` and `scripts/test_annotation_work_gui.py` cover
+category filters, exact mask completion signatures, reviewed absence, shared masks,
+import-review independence, sparse-frame navigation, and completion publication
+without removing undownloaded files.
 
 `scripts/test_assigned_work.py` and `scripts/test_assigned_work_gui.py` exercise
 selective download, normal GUI saves, identity and scope guards, independent-video

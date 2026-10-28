@@ -1,7 +1,8 @@
 """Optional one-way publishing of complete, versioned annotation projects.
 
 No authentication or mounting is performed here. The destination must already be
-accessible. A completed revision is published only after all files are verified.
+accessible. New contents are verified before publication; unchanged contents get
+structural checks. A separate integrity check reads all stored contents.
 """
 
 from contextlib import contextmanager
@@ -59,10 +60,20 @@ def _uuid(value):
     return str(UUID(value))
 
 
+def _require_archive_root(root):
+    """A saved marker inside a project must not turn that project into a lab root."""
+    for parent in reversed((root, *root.parents)):
+        marker = parent / LOCATION_MARKERS['project']
+        if marker.exists() or marker.is_symlink():
+            raise ValueError('This folder is inside a published project, not the shared lab root. '
+                             'Choose the folder containing all published projects instead:\n' + str(parent.parent))
+
+
 def check_destination(folder, expected_id):
     root = Path(folder).expanduser()
     if not root.is_dir():
         raise ValueError('Sync folder is unavailable. Connect or mount the drive, then try again.')
+    _require_archive_root(root.resolve())
     marker = root / ROOT_MARKER
     if marker.is_symlink() or not marker.is_file():
         raise ValueError('Sync destination marker is missing. Reconnect the configured drive; '
@@ -80,6 +91,7 @@ def test_destination(folder, expected_id=None):
     if not root.is_dir():
         raise ValueError('Choose an existing, accessible folder. Network drives must be mounted first.')
     root = root.resolve()
+    _require_archive_root(root)
     if expected_id:
         check_destination(root, expected_id)
     payload = os.urandom(64)
@@ -364,6 +376,28 @@ def _identity_directory(parent, name, identity, kind, *, rename_existing=False):
 
 
 @contextmanager
+def project_storage_lock(configuration, project_id, owner):
+    """Serialize publication, integrity checks, and readable-folder migration."""
+    root = check_destination(configuration['root'], configuration['root_id'])
+    lock = _safe_child(root, f'.project-{_uuid(project_id)}.sync-lock')
+    try:
+        handle = lock.open('x')
+    except FileExistsError:
+        raise ValueError('This project is locked by another or interrupted sync or integrity check. '
+                         'Confirm no operation is running before removing its project lock.')
+    try:
+        with handle:
+            json.dump({'pid': os.getpid(), 'contributor': owner}, handle)
+        yield root
+    finally:
+        try:
+            check_destination(root, configuration['root_id'])
+            lock.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
+
+
+@contextmanager
 def _sync_location(project, configuration, contributor):
     root = check_destination(configuration['root'], configuration['root_id'])
     if project == root or project in root.parents or root in project.parents:
@@ -372,26 +406,10 @@ def _sync_location(project, configuration, contributor):
     require_no_update(project)
     project_id = ensure_project_identity(project)
     contributor_id = _uuid(contributor['id'])
-    # The lock's path is independent of display names and folder migration.
-    lock = _safe_child(root, f'.project-{project_id}.sync-lock')
-    try:
-        handle = lock.open('x')
-    except FileExistsError:
-        raise ValueError('This project is locked by another or interrupted sync. '
-                         'Confirm no sync is running before removing its project lock.')
-    try:
-        with handle:
-            json.dump({'pid': os.getpid(), 'contributor': contributor['name']}, handle)
+    with project_storage_lock(configuration, project_id, contributor['name']):
         location = _identity_directory(root, project.name, project_id, 'project')
         contributors = _safe_child(location, 'contributors', mkdir=True)
-        home = _identity_directory(contributors, contributor['name'], contributor_id, 'contributor')
-        yield home
-    finally:
-        try:
-            check_destination(root, configuration['root_id'])
-            lock.unlink(missing_ok=True)
-        except (OSError, ValueError):
-            pass
+        yield _identity_directory(contributors, contributor['name'], contributor_id, 'contributor')
 
 
 def prepare_sync_location(project, configuration, contributor):
@@ -574,7 +592,7 @@ def sync_project(project, configuration, contributor, progress=None, cancelled=N
                 renamed = _identity_directory(previous.parent, project.name, ensure_project_identity(project),
                                               'project', rename_existing=True)
             except (OSError, ValueError) as exc:
-                warning = 'Backup verified, but its archive folder could not be renamed: ' + str(exc)
+                warning = 'Backup published, but its archive folder could not be renamed: ' + str(exc)
                 result['warning'] = '\n'.join(filter(None, (result.get('warning'), warning)))
             else:
                 result['path'] = str(renamed / Path(result['path']).relative_to(previous))
@@ -663,21 +681,22 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
         if not separate_backup:
             _require_current_heads(heads, base_heads)
         changed = {relative for relative in files if files[relative] != previous.get(relative)}
-        # Verify the last published copy, including unchanged files, before reusing it.
-        verified_paths = set()
+        from core.backup_integrity import check_stored_file, require_healthy_references
+        project_home = home.parent.parent
+        require_healthy_references(project_home, configuration, project_id, files, previous_manifest_path)
+        # Unchanged contents are checked structurally, not rehashed over the network.
+        metadata_checked_paths = set()
         reused = sorted((files.keys() & previous.keys()) - changed)
         for index, relative in enumerate(reused, 1):
             if cancelled():
                 raise InterruptedError('Sync cancelled. No new revision was published.')
             existing = snapshot_file(previous_manifest_path, previous_manifest, relative)
-            if existing not in verified_paths:
-                progress(f'Verifying stored backup {index}/{len(reused)}: {relative}')
-                if (not existing.is_file() or existing.stat().st_size != files[relative]['size'] or
-                        _digest(existing) != files[relative]['sha256']):
-                    raise ValueError('The last synced copy was edited or damaged. '
-                                     'Use a separate destination to preserve both versions.')
-                verified_paths.add(existing)
+            if existing not in metadata_checked_paths:
+                progress(f'Checking stored file information {index}/{len(reused)}: {relative}')
+                check_stored_file(existing, files[relative])
+                metadata_checked_paths.add(existing)
         if (not changed and files == previous and not separate_backup and
+                (previous_manifest or {}).get('annotation_work', {}).get('version') == 1 and
                 bool(previous_manifest and previous_manifest.get('format') == 3) == compact):
             if inventory != _inventory(project, include_videos, with_identity=True):
                 raise ValueError('Project files changed during sync. Save and try again.')
@@ -685,8 +704,8 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
                                        previous_project, 0, True, False)
 
         revision_name = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '-' + uuid4().hex[:8]
-        project_home = home.parent.parent
         missing_objects, verified = {}, set()
+        newly_referenced = {files[name]['sha256'] for name in changed}
         if compact:
             for relative, expected in files.items():
                 if cancelled():
@@ -697,10 +716,10 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
                 verified.add(digest)
                 existing = object_path(project_home, digest)
                 if existing.exists():
-                    if existing not in verified_paths:
-                        progress(f'Verifying shared backup content: {relative}')
-                        if (not existing.is_file() or existing.stat().st_size != expected['size'] or
-                                _digest(existing) != digest):
+                    if existing not in metadata_checked_paths or digest in newly_referenced:
+                        progress(f'Verifying newly reused content: {relative}')
+                        check_stored_file(existing, expected)
+                        if _digest(existing) != digest:
                             raise ValueError('A shared backup file is damaged. No version was published: ' + str(existing))
                 else:
                     missing_objects[digest] = relative
@@ -729,6 +748,7 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
                     shutil.copy2(project / relative, temporary)
                 else:
                     _clone_or_copy(snapshot_file(previous_manifest_path, previous_manifest, relative), temporary)
+                progress(f'Verifying uploaded content {index}/{len(to_copy)}: {relative}')
                 if _digest(temporary) != files[relative]['sha256']:
                     raise OSError(f'File verification failed: {relative}')
                 if compact:
@@ -736,6 +756,10 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
             finally:
                 if compact:
                     temporary.unlink(missing_ok=True)
+        from core.annotation_work import build_index
+        progress('Summarizing annotation work by mask type')
+        annotation_work = build_index(files, lambda name: project / name,
+            previous=(previous_manifest or {}).get('annotation_work'), cancelled=cancelled)
         if inventory != _inventory(project, include_videos, with_identity=True):
             raise ValueError('Project files changed during sync. Save and try again.')
         if cancelled():
@@ -748,6 +772,7 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
             'device': contributor.get('device'),
             'created_at': datetime.now(timezone.utc).isoformat(),
             'include_videos': include_videos, 'files': files,
+            'annotation_work': annotation_work,
             'root_id': configuration['root_id'], 'base_heads': base_heads,
             'publication': 'separate' if separate_backup else 'latest',
         })
@@ -776,7 +801,8 @@ def _sync_revision(project, configuration, contributor, home, progress, cancelle
 
 
 def _publication_result(project, project_id, root_id, heads, path, copied, unchanged, separate):
-    result = {'path': str(path), 'copied_files': copied, 'unchanged': unchanged, 'separate_backup': separate}
+    result = {'path': str(path), 'copied_files': copied, 'unchanged': unchanged, 'separate_backup': separate,
+              'verification': 'uploaded-content-and-existing-file-metadata'}
     if not separate:
         try:
             _save_local_heads(project, project_id, root_id, heads)

@@ -66,6 +66,8 @@ def file_context(name):
     parts = path.parts
     if len(parts) >= 3 and parts[0] == 'frames':
         return parts[1], 'Video metadata' if path.name == 'video_metadata.json' else 'Frame image'
+    if len(parts) >= 4 and parts[0] == 'annotations' and parts[1] == 'work':
+        return parts[2], 'Annotation work completion'
     if len(parts) >= 4 and parts[0] == 'annotations' and parts[1] in ('json', 'png', 'bbox', 'pkl', 'frames'):
         return parts[2], 'Shared across video' if path.name.startswith('video_annotations') else 'Frame annotation'
     if len(parts) >= 3 and parts[0] == 'input_data':

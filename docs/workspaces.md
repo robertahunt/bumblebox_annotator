@@ -12,14 +12,17 @@ automatic project reopening. The name remains visible in the header; select it
 to switch contributors or import/export your own profile. Profiles are attribution
 identities, not authenticated accounts.
 
-**Profile Sharing...** enables optional [shared identities](shared_profiles.md).
+**Connect to Lab...** configures optional [shared identities and project discovery](shared_profiles.md).
 Connected computers discover the same profiles automatically; selecting the active
 person stays explicit. Same-name identities show distinct IDs. Hiding a profile is
 local to the computer and does not delete it from the shared folder.
 
 ## Everyday Flow
 
-- **Choose a project** shows recent projects with one primary action directly below
+- **My Work** shows shared projects where the selected person is a member, their
+  role, and assigned-video count. A local working copy can be reopened; assigned
+  downloads remain explicit. Merely creating a lab identity does not enroll it in projects.
+- **Recent local projects** shows recent projects with one primary action directly below
   the list: **Open Selected Project**, or **Return to Project** for the project
   already open. The current contributor's last project is preselected. Paths appear
   below the action and in tooltips, not as competing project names.
@@ -76,7 +79,78 @@ The Home icon or File > Project Home returns to project selection. Existing
 menus and shortcuts remain available. Model assistance and workspace selection
 do not silently change masks, classes, or the selected editing tool.
 
+## Video Browsing
+
+Annotate labels its video list **Local working copy**, with the project name and
+folder path in the tooltip. Assignments labels its source **Shared version**, with
+publisher and publication time. These are deliberately different data sources.
+Its separate last-checked time and newer-publication notice never imply local and
+shared annotations match. The source header can show the exact archive location
+and open a read-only, video-grouped comparison of local saved annotations against
+the displayed shared version. See
+[assigned_work.md](assigned_work.md#compare-local-and-shared-work).
+
+The Annotate video sidebar and the Assignments table have an **Experiment / setup**
+filter and a **Sort** menu. Experiments use the existing imaging setup names, not
+new project folders. Filtering does not change assignments, calibration, annotations,
+or the current canvas. The experiment filter is exact: the active video's list item
+can be hidden while its image remains open, with a notice below the list. Hidden
+videos are removed from batch selections. All experiments restores the full list.
+
+**Recently modified** sorts newest-first across splits using local annotation-file
+and annotation-folder dates, including shared masks and completion records. Dates
+are checked in the background without opening masks, and refreshed after saves;
+the sidebar refresh button also rechecks them. Unknown dates sort last, with name
+as the tie-breaker. **Default order** restores the original split/setup grouping
+in Annotate, or alphabetical order in Assignments. Copying/importing/downloading
+files can affect dates; this is not a shared contributor edit history. See
+[assigned_work.md](assigned_work.md#select-work-by-mask-type) for details.
+
 ## Local Saving and Shared Work
+
+### Mask Work in the Annotation Sidebar
+
+The video list has **Work on**, **Show**, and **More filters** controls, matching
+the assignment table. Each video shows mask availability and completion for the
+selected type; each frame shows its work status. These are **local saved** results,
+not the published backup. Unsaved edits are identified separately. The summary
+refreshes in the background after saves; the refresh icon also checks external
+changes. Before the initial scan finishes, videos and frames show **Loading...**
+rather than Unknown. Pending videos stay visible under work filters until their
+status is available; experiment filtering still applies. **Unknown** after the
+scan means the saved status could not be determined, not that masks are absent.
+Assignments instead uses published summaries: **Not scanned** there means an
+explicit **Scan Mask Status** is needed, and **Scanning...** appears while it runs.
+The current video remains visible even if it no longer matches a work
+filter (the experiment filter remains exact). Alternating backgrounds separate
+the visible video rows, including after filtering or sorting.
+Filtering never changes mask visibility, the drawing category, zoom, or training
+selection.
+
+**Show** offers All Work, Not Started, Not Checked, and Finished. Not Started is
+untouched work for the selected mask type. Not Checked includes existing masks
+without full completion, changed work, pending import reviews, and unknown status;
+each row still shows its specific status. Finished also includes checked absence.
+
+Choose a mask type and use **Mark Finished** after checking the current frame.
+For a shared-video category, the confirmation explicitly applies to the shared
+mask once for the whole video. With no mask, confirmation records **Checked: none
+present**, rather than treating a checked negative example as permanently unfinished.
+**Reopen Work** removes that completion. The arrow button advances to the next
+unfinished frame in the existing frame list, wrapping within the current video;
+sampled frame numbers remain the original source indices.
+
+Completion is saved in `annotations/work/<video>/frame_<index>.json` or
+`video_work.json`, with contributor identity, timestamp, and a category-specific
+mask signature. Editing that category's geometry or changing its policy requires
+rechecking; unrelated category edits do not invalidate its completion. Existing
+labels are never automatically marked finished. Unsupported/missing pixels and
+unconfirmed annotation policies must be resolved first.
+
+This is distinct from **Submit Current Video for Review**, director acceptance,
+and imported-frame review. Marking a shared mask finished does not approve all
+imported frames. Existing import-review and training/export checks remain in force.
+Completion records are included in backups and assigned-annotation uploads.
 
 Annotation edits are saved locally after about 2.5 seconds of inactivity, after
 the stroke finishes. Autosave snapshots the active mask without ending the edit
@@ -130,8 +204,9 @@ boundary. No new role is silently assigned to an existing project during startup
 Home checks assignments automatically after profile/project changes and when
 reopened, without downloading or modifying project files. Confirmed empty work
 shows a non-blocking notice once per session/shared folder; inaccessible storage
-and missing setup are distinct states. **Profile Sharing** connects the profile
-directory; it does not approve membership, assign work, or upload annotations.
+and missing setup are distinct states. **Connect to Lab** connects the profile
+directory and project discovery; it does not add membership, assign work, or upload
+annotations. The director adds people explicitly in **Assignments > People**.
 
 ## Deliberate Limits
 

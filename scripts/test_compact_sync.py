@@ -165,13 +165,13 @@ class CompactSyncTests(unittest.TestCase):
         self.assertEqual(before, self.objects())
         self.assertEqual(len(list(self.remote.rglob('latest.json'))), 2)
 
-    def test_unchanged_shared_media_is_verified_once_per_publication(self):
+    def test_unchanged_shared_media_is_not_rehashed_during_publication(self):
         version = Path(self.sync()['path'])
         manifest = _read_json(version / 'manifest.json')
         frame = snapshot_file(version / 'manifest.json', manifest, 'frames/video/frame_000000.jpg')
         with patch('core.project_sync._digest', wraps=_digest) as digest:
             self.publish_change()
-        self.assertEqual(sum(call.args[0] == frame for call in digest.call_args_list), 1)
+        self.assertEqual(sum(call.args[0] == frame for call in digest.call_args_list), 0)
 
     def test_legacy_then_compact_then_full_remain_restorable(self):
         self.configuration['storage_mode'] = 'full'
@@ -347,7 +347,7 @@ class CompactSyncTests(unittest.TestCase):
             publication_estimate(self.source, self.configuration, self.contributor, cancelled=lambda: True)
         self.assertEqual(before, contents(self.remote))
 
-    def test_publish_reuses_estimate_hashes_but_verifies_remote_and_written_content(self):
+    def test_publish_reuses_estimate_hashes_and_verifies_only_written_content(self):
         self.sync()
         name = 'annotations/json/video/frame_000000.json'
         (self.source / name).write_text('["changed"]')
@@ -365,9 +365,9 @@ class CompactSyncTests(unittest.TestCase):
             result = self.sync(estimate=estimate, progress=messages.append)
         self.assertEqual(result['copied_files'], 1)
         self.assertTrue(any(path.name.startswith('.pending-') for path in checked))
-        self.assertTrue(any('objects' in path.parts and not path.name.startswith('.') for path in checked))
+        self.assertFalse(any('objects' in path.parts and not path.name.startswith('.') for path in checked))
         self.assertTrue(any(message.startswith('Reusing local checksums') for message in messages))
-        self.assertTrue(any(message.startswith('Verifying stored backup') for message in messages))
+        self.assertTrue(any(message.startswith('Checking stored file information') for message in messages))
         manifest = _read_json(Path(result['path']) / 'manifest.json')
         self.assertEqual(manifest['files'][name]['sha256'], _digest(self.source / name))
 
@@ -417,13 +417,13 @@ class CompactSyncTests(unittest.TestCase):
         estimate = publication_estimate(self.source, self.configuration, self.contributor)
         remote_before = contents(self.remote)
         def change(message):
-            if message.startswith('Verifying stored backup'):
+            if message.startswith('Checking stored file information'):
                 (self.source / 'annotations/new.json').write_text('{}')
         with self.assertRaisesRegex(ValueError, 'changed during sync'):
             self.sync(estimate=estimate, progress=change)
         self.assertEqual(contents(self.remote), remote_before)
 
-    def test_cached_estimate_still_rejects_remote_corruption(self):
+    def test_same_size_corruption_requires_full_check_or_restore(self):
         version = Path(self.sync()['path'])
         estimate = publication_estimate(self.source, self.configuration, self.contributor)
         manifest = _read_json(version / 'manifest.json')
@@ -431,10 +431,9 @@ class CompactSyncTests(unittest.TestCase):
         stat = path.stat()
         path.write_bytes(b'x' * stat.st_size)
         os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-        remote_before = contents(self.remote)
+        self.assertTrue(self.sync(estimate=estimate)['unchanged'])
         with self.assertRaisesRegex(ValueError, 'damaged'):
-            self.sync(estimate=estimate)
-        self.assertEqual(contents(self.remote), remote_before)
+            restore_project(version, self.base / 'corrupt-restore')
 
     def test_cached_estimate_keeps_conflict_cancellation_and_option_guards(self):
         first = self.sync()

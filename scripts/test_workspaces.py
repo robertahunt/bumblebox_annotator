@@ -164,6 +164,7 @@ class WorkspaceGuiTests(unittest.TestCase):
         self.assertEqual(layout.indexOf(home.open_selected), layout.indexOf(home.recent) + 1)
         local = next(button for button in home.findChildren(QPushButton) if button.text() == 'Open Local Project...')
         self.window.recent_projects = [str(self.source)]
+        self.settings.setValue('workflow/recent_projects/' + self.coordinator['id'], [str(self.source)])
         home.refresh()
         self.app.processEvents()
         self.assertGreater(local.geometry().top(), home.open_selected.geometry().bottom())
@@ -183,6 +184,7 @@ class WorkspaceGuiTests(unittest.TestCase):
         try:
             home = self.window.workflow.home
             self.window.recent_projects = [str(self.source), '/a/very/long/path/' * 8 + 'second-project']
+            self.settings.setValue('workflow/recent_projects/' + self.coordinator['id'], self.window.recent_projects)
             home.refresh()
             self.window.resize(1000, 800)
             self.window.show()

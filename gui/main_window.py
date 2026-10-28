@@ -65,6 +65,7 @@ from core.contributors import utc_now, provenance_records
 from .tracking_validation_dialog import TrackingValidationConfigDialog, TrackingValidationProgressDialog
 from .tracking_validation_worker import TrackingValidationWorker
 from .project_overview_dialog import ProjectOverviewDialog
+from .video_browsing import VideoBrowserControls, VideoListItem, VideoRowColors
 from .workspaces import WorkspaceController
 from core.video_processor import VideoProcessor
 from core.annotation import AnnotationManager
@@ -271,6 +272,10 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"✓ Frame {frame_idx} saved")
         self.status_label.setStyleSheet("color: green; font-weight: bold;")
         self._schedule_done_counter_update(saved_counts_dirty=True)
+        if hasattr(self, 'annotation_work'):
+            self.annotation_work.schedule()
+        if hasattr(self, 'video_browser'):
+            self.video_browser.schedule()
         if hasattr(self, 'workflow'):
             self.workflow.update_save_status()
         # Auto-clear after 2 seconds
@@ -869,6 +874,10 @@ class MainWindow(QMainWindow):
         self.sync_project_action.triggered.connect(self.sync_current_project)
         file_menu.addAction(self.sync_project_action)
 
+        integrity_action = QAction('Check Backup Integrity...', self)
+        integrity_action.triggered.connect(self.check_backup_integrity)
+        file_menu.addAction(integrity_action)
+
         self.update_project_action = QAction(UPDATE_LABEL, self)
         self.update_project_action.setToolTip(HELP['update'][1])
         self.update_project_action.triggered.connect(self.update_current_project)
@@ -1158,7 +1167,7 @@ class MainWindow(QMainWindow):
             self.split_filter_combo.setCurrentIndex(0)
             self.tracking_filter_checkbox.setChecked(False)
 
-    def open_assigned_work(self):
+    def open_assigned_work(self, *, project_id=None):
         try:
             configuration = setting_json('project_sync/destination', {})
             if not configuration.get('root_id'):
@@ -1167,7 +1176,7 @@ class MainWindow(QMainWindow):
                 return
             if not self.contributor_session:
                 return
-            dialog = AssignedDownloadDialog(configuration, self.contributor_session, self)
+            dialog = AssignedDownloadDialog(configuration, self.contributor_session, self, project_id=project_id)
             if dialog.exec() == QDialog.DialogCode.Accepted and dialog.download_result:
                 self.load_project(dialog.download_result['path'])
         except Exception as exc:
@@ -1597,6 +1606,12 @@ class MainWindow(QMainWindow):
                     timer.start()
             self._sync_in_progress = False
 
+    def check_backup_integrity(self):
+        if self._sync_in_progress:
+            return
+        from gui.backup_integrity_dialog import open_integrity_dialog
+        open_integrity_dialog(self.project_path, setting_json('project_sync/destination', {}), self)
+
     def sync_current_project(self):
         if workspace(self.project_path):
             return self.publish_assigned_work()
@@ -1660,7 +1675,9 @@ class MainWindow(QMainWindow):
             if result.get('warning'):
                 QMessageBox.warning(self, title, result['warning'] + '\n\n' + result['path'])
             else:
-                QMessageBox.information(self, title, 'Verified backup:\n' + result['path'] + detail)
+                QMessageBox.information(self, title, 'Published backup:\n' + result['path'] + detail +
+                    '\n\nUploaded content was verified. Unchanged files were checked for presence and size, '
+                    'not reread. Use File > Check Backup Integrity for a full content check.')
             if not result['separate_backup']:
                 self.workflow.uploaded()
                 return True
@@ -2538,14 +2555,17 @@ class MainWindow(QMainWindow):
         selected_ids = {
             item.data(Qt.ItemDataRole.UserRole)
             for item in self.video_list.selectedItems()
-            if item.data(Qt.ItemDataRole.UserRole)
+            if item.data(Qt.ItemDataRole.UserRole) and not item.isHidden()
         }
         ordered_ids = []
         for row in range(self.video_list.count()):
             video_id = self.video_list.item(row).data(Qt.ItemDataRole.UserRole)
             if video_id in selected_ids:
                 ordered_ids.append(video_id)
-        if not ordered_ids and self.current_video_id:
+        current_visible = any(self.video_list.item(row).data(Qt.ItemDataRole.UserRole) == self.current_video_id
+                              and not self.video_list.item(row).isHidden()
+                              for row in range(self.video_list.count()))
+        if not ordered_ids and self.current_video_id and current_visible:
             ordered_ids.append(self.current_video_id)
         return ordered_ids
 
@@ -2869,6 +2889,7 @@ class MainWindow(QMainWindow):
         self.video_list.clear()
         
         if not self.project_path:
+            self.video_browser.set_context(None, [], {})
             return
 
         self._load_imaging_setup_config()
@@ -2901,6 +2922,9 @@ class MainWindow(QMainWindow):
             val_videos = [v for v in val_videos if v in allowed]
             test_videos = [v for v in test_videos if v in allowed]
             inference_videos = [v for v in inference_videos if v in allowed]
+
+        self.video_browser.set_context(self.project_path,
+            train_videos + val_videos + test_videos + inference_videos, self.video_imaging_setups)
 
         # Restrict the sidebar by split. The mask-only choice follows the
         # selected-frame metadata used by the annotation export workflow.
@@ -2939,8 +2963,7 @@ class MainWindow(QMainWindow):
         # Add train videos
         for video_id in sorted(train_videos, key=setup_sort_key):
             item_text = video_item_text("TRAIN", video_id)
-            from PyQt6.QtWidgets import QListWidgetItem
-            item = QListWidgetItem(item_text)
+            item = VideoListItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
             item.setToolTip(item_text)
             
@@ -2956,8 +2979,7 @@ class MainWindow(QMainWindow):
         # Add val videos
         for video_id in sorted(val_videos, key=setup_sort_key):
             item_text = video_item_text("VAL", video_id)
-            from PyQt6.QtWidgets import QListWidgetItem
-            item = QListWidgetItem(item_text)
+            item = VideoListItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
             item.setToolTip(item_text)
             
@@ -2973,8 +2995,7 @@ class MainWindow(QMainWindow):
         # Add test videos
         for video_id in sorted(test_videos, key=setup_sort_key):
             item_text = video_item_text("TEST", video_id)
-            from PyQt6.QtWidgets import QListWidgetItem
-            item = QListWidgetItem(item_text)
+            item = VideoListItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
             item.setToolTip(item_text)
             
@@ -2990,8 +3011,7 @@ class MainWindow(QMainWindow):
         # Add inference videos
         for video_id in sorted(inference_videos, key=setup_sort_key):
             item_text = video_item_text("INFERENCE", video_id)
-            from PyQt6.QtWidgets import QListWidgetItem
-            item = QListWidgetItem(item_text)
+            item = VideoListItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
             item.setToolTip(item_text)
             
@@ -3013,6 +3033,7 @@ class MainWindow(QMainWindow):
             current_item_to_restore = None
             for index in range(self.video_list.count()):
                 item = self.video_list.item(index)
+                item.setData(Qt.ItemDataRole.UserRole + 42, index)
                 video_id = item.data(Qt.ItemDataRole.UserRole)
                 if video_id == restore_current_id:
                     current_item_to_restore = item
@@ -3028,6 +3049,10 @@ class MainWindow(QMainWindow):
         finally:
             self.video_list.blockSignals(False)
 
+        if hasattr(self, 'annotation_work'):
+            self.annotation_work.context_changed()
+            self.annotation_work.schedule()
+
     def create_video_list_dock(self):
         """Create dock widget for video list sidebar"""
         self.video_dock = QDockWidget("Project Videos", self)
@@ -3041,15 +3066,18 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
 
+        self.video_browser = VideoBrowserControls()
+        layout.addWidget(self.video_browser)
+
         split_filter_layout = QHBoxLayout()
-        self.video_filter_label = QLabel('Show:')
+        self.video_filter_label = QLabel('Split:')
         split_filter_layout.addWidget(self.video_filter_label)
         self.video_split_filter_combo = QComboBox()
         self.video_split_filter_combo.addItems([
             'All Videos',
             'Training Videos',
             'Validation Videos',
-            'Validation Videos with Masks',
+            'Validation Videos with Bee Masks',
             'Test Videos',
             'Inference Videos',
         ])
@@ -3066,12 +3094,17 @@ class MainWindow(QMainWindow):
         
         # Create video list widget
         self.video_list = QListWidget()
+        VideoRowColors(self.video_list)
         self.video_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.video_list.itemClicked.connect(self.on_video_item_clicked)
         self.video_list.itemActivated.connect(self.on_video_item_activated)
         self.video_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.video_list.customContextMenuRequested.connect(self.show_video_context_menu)
         layout.addWidget(self.video_list)
+
+        from gui.annotation_work import AnnotationWorkBrowser
+        self.annotation_work = AnnotationWorkBrowser(self, layout)
+        self.video_browser.changed.connect(self.annotation_work.apply)
 
         batch_help = QLabel(
             "Ctrl-click selects individual videos; Shift-click selects a range. "
@@ -3108,13 +3141,14 @@ class MainWindow(QMainWindow):
             'Training Videos': 'train',
             'Validation Videos': 'val',
             'Validation Videos with Masks': 'val_masks',
+            'Validation Videos with Bee Masks': 'val_masks',
             'Test Videos': 'test',
             'Inference Videos': 'inference',
         }
         self.video_split_filter = filter_map.get(text, 'all')
 
         if self.video_split_filter == 'val_masks' and hasattr(self, 'split_filter_combo'):
-            self.split_filter_combo.setCurrentText('Validation Masks Only')
+            self.split_filter_combo.setCurrentText('Validation Bee Masks Only')
 
         self.update_video_list()
     
@@ -3141,7 +3175,7 @@ class MainWindow(QMainWindow):
             'All Frames',
             'Training Only',
             'Validation Only',
-            'Validation Masks Only',
+            'Validation Bee Masks Only',
             'Test Only',
             'Inference Only',
         ])
@@ -4193,6 +4227,9 @@ class MainWindow(QMainWindow):
             self.dirty_video_annotation_ids.add(self.current_video_id)
         if hasattr(self, 'workflow'):
             self.workflow.edited()
+        if hasattr(self, 'annotation_work'):
+            self.annotation_work.note.setText('Unsaved edits; showing saved status')
+            self.annotation_work.finish.setText('Mark Finished')
 
     def _commit_canvas_edit_if_needed(self):
         """Commit an active canvas edit and mark it dirty if it contains pixels."""
@@ -4443,7 +4480,7 @@ class MainWindow(QMainWindow):
             self.split_filter = 'train'
         elif text == 'Validation Only':
             self.split_filter = 'val'
-        elif text == 'Validation Masks Only':
+        elif text in ('Validation Masks Only', 'Validation Bee Masks Only'):
             self.split_filter = 'val_masks'
         elif text == 'Test Only':
             self.split_filter = 'test'
@@ -5161,6 +5198,9 @@ class MainWindow(QMainWindow):
             self.frame_slider.setEnabled(False)
         self._update_frame_navigation_buttons()
 
+        if hasattr(self, 'annotation_work'):
+            self.annotation_work.context_changed()
+
     def _update_frame_navigation_buttons(self):
         """Enable frame navigation buttons based on the current filtered view."""
         if not hasattr(self, 'prev_frame_button') or not hasattr(self, 'next_frame_button'):
@@ -5403,6 +5443,8 @@ class MainWindow(QMainWindow):
                 self._save_project_state()
                 self._update_frame_navigation_buttons()
                 self._update_import_review_controls()
+                if hasattr(self, 'annotation_work'):
+                    self.annotation_work.context_changed()
                 
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to load frame: {str(e)}")
@@ -12959,6 +13001,9 @@ class MainWindow(QMainWindow):
         if not self.workflow.prepare_close():
             event.ignore()
             return
+
+        if hasattr(self, 'annotation_work'):
+            self.annotation_work.stop()
         
         # Stop and wait for save worker to finish
         if hasattr(self, 'save_worker'):

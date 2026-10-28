@@ -108,12 +108,13 @@ class PublishedProject:
         parents = dict(_reference(k, v) for k, v in manifest.get('base_heads', {}).items())
         if metadata_only:
             del manifest['files']
+            manifest.pop('annotation_work', None)
         result = {'reference': reference, 'path': path / 'project', 'manifest_path': manifest_path,
                   'manifest_hash': fingerprint, 'manifest': manifest, 'parents': parents}
         self.cache[cache_key] = result
         return result
 
-    def heads(self):
+    def heads(self, *, validate_snapshots=True):
         check_destination(self.root, self.configuration['root_id'])
         heads = {}
         for home in self.contributors.iterdir():
@@ -129,7 +130,9 @@ class PublishedProject:
             identity = _uuid(_read_json(marker)['id'] if marker.exists() else home.name)
             if identity in heads:
                 raise ValueError('Duplicate published contributor identity.')
-            self.snapshot((identity, revision), metadata_only=True)
+            _reference(identity, revision)
+            if validate_snapshots:
+                self.snapshot((identity, revision), metadata_only=True)
             heads[identity] = revision
         return heads
 

@@ -16,7 +16,9 @@ HELP = {
         'Files not present locally are NOT added from an older backup. Older backups remain available. '
         'This is not a way to combine contributors\' work.\n\n'
         'Estimate Transfer Size, then Review Changes before backing up. '
-        'For a downloaded assignment, use Upload Assigned Annotations instead.'),
+        'For a downloaded assignment, use Upload Assigned Annotations instead.\n\n'
+        'Uploaded content is verified. Unchanged stored content gets presence and size checks only. '
+        'Use Check Backup Integrity separately to read and verify every file in a selected backup.'),
     'assigned': (ASSIGNED_LABEL,
         'The routine upload for a downloaded assignment. Send permitted annotation changes '
         'while preserving shared files you did not download. Deleting a downloaded annotation '

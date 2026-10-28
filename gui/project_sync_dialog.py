@@ -46,6 +46,9 @@ def load_contributor_profiles():
     candidates = list(stored.values()) if isinstance(stored, dict) else []
     if isinstance(legacy, dict):
         candidates += [{'id': identity, 'name': name} for name, identity in legacy.items()]
+    imported = setting_json('assignments/profiles', {})
+    if isinstance(imported, dict):
+        candidates += list(imported.values())
     for value in candidates:
         try:
             profile = contributor_profile(dict(value, format=1, kind='bumblebox-contributor'))
@@ -177,10 +180,10 @@ def choose_contributor(parent=None):
     export_button.setToolTip('Export the selected contributor profile')
     layout.addLayout(transfer)
 
-    from gui.shared_profiles import profile_sync_service, SharedProfileSettingsDialog
+    from gui.shared_profiles import profile_sync_service, LabConnectionDialog
     service = profile_sync_service()
     sharing_row = QHBoxLayout()
-    sharing_button = QPushButton('Profile Sharing...')
+    sharing_button = QPushButton('Connect to Lab...')
     sharing_button.setAutoDefault(False)
     sharing_button.setIcon(dialog.style().standardIcon(QStyle.StandardPixmap.SP_DriveNetIcon))
     refresh_button = QPushButton()
@@ -297,7 +300,7 @@ def choose_contributor(parent=None):
         refresh_button.setEnabled(service.worker is None)
 
     def configure_sharing():
-        SharedProfileSettingsDialog(dialog).exec()
+        LabConnectionDialog(dialog).exec()
         update_shared()
 
     def toggle_hidden():
@@ -468,6 +471,26 @@ class SyncProgressDialog(QDialog):
         return self.worker.result
 
 
+def connection_test_result(parent, status, folder, *, error=None, report=False):
+    """Explicit tests retain a result; implicit setup checks only update the form."""
+    title = 'Connection Test Failed' if error is not None else 'Connection Test Passed'
+    if error is not None:
+        details = str(error)
+    else:
+        details = 'Connection verified: write, read, and cleanup succeeded. No project files were transferred.'
+    message = f'{details}\n\nFolder: {folder or "(not selected)"}'
+    status.setText(message)
+    status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    if report:
+        box = QMessageBox(parent)
+        box.setWindowTitle(title)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setIcon(QMessageBox.Icon.Warning if error is not None else QMessageBox.Icon.Information)
+        box.setText(message)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+
+
 def working_project_path(path, parent=None, default_dir=None):
     """Gate every GUI entry path before loading managers or writing debug files."""
     journal = update_journal_path(path)
@@ -557,6 +580,8 @@ def confirm_publication(parent, estimate, configuration):
          if configuration.get('storage_mode', 'deduplicated') == 'deduplicated' else
          'Each changed publication stores a complete project folder.') +
         '\nServer quotas may be lower than the reported free space. Existing archives will not be deleted.' +
+        '\nNew contents are verified after upload. Unchanged stored files get presence and size checks, '
+        'not a full content check. Use Check Backup Integrity for a full check.' +
         rename_notice)
     box = TransferConfirmationDialog('Back Up Local Project: Storage Estimate',
                                       publication_summary(estimate) + '\n\n' + details,
@@ -595,7 +620,7 @@ class ProjectSyncDialog(QDialog):
         form.addRow('Project:', QLabel(Path(self.project).name if self.project else 'No project open'))
         form.addRow('', self.enabled)
         self.folder = QLineEdit(self.configuration.get('root', ''))
-        self.folder.setToolTip('An existing mounted or local folder. Authentication is handled outside the app.')
+        self.folder.setToolTip('An existing mounted or local folder. Kerberos sign-in opens a separate terminal.')
         self.folder.textChanged.connect(self._path_changed)
         browse = QPushButton()
         browse.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
@@ -633,25 +658,47 @@ class ProjectSyncDialog(QDialog):
         form.addRow('Local rollbacks:', rollback_row)
         layout.addLayout(form)
         self.test = QPushButton('Test Connection')
-        self.test.clicked.connect(self.test_connection)
+        self.test.clicked.connect(lambda: self.test_connection(report=True))
         layout.addWidget(self.test)
+        from gui.drive_login import DriveLoginButton
+        self.login = DriveLoginButton(self)
+        self.login.completed.connect(lambda: self.test_connection(report=True))
+        layout.addWidget(self.login)
         self.status = QLabel('Not tested')
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        profiles_button = QPushButton('Profile Sharing...')
+        profiles_button = QPushButton('Connect Profiles and Projects to Lab...')
         profiles_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveNetIcon))
-        profiles_button.setToolTip('Share contributor identities separately from project backups')
+        profiles_button.setToolTip('Use one shared folder for contributor profiles and project discovery')
         def configure_profiles():
-            from gui.shared_profiles import SharedProfileSettingsDialog
-            SharedProfileSettingsDialog(self, suggested=self.pending_configuration()).exec()
+            from gui.shared_profiles import LabConnectionDialog
+            dialog = LabConnectionDialog(self, suggested=self.pending_configuration())
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.configuration = setting_json('project_sync/destination', {})
+                self.folder.setText(self.configuration.get('root', ''))
+                self.tested = None
+                self.invalidate_estimate()
         profiles_button.clicked.connect(configure_profiles)
         layout.addWidget(profiles_button)
         last = self.projects.get(self.project, {})
-        self.last = QLabel('Last successful sync: ' + last.get('last_success', 'Never'))
+        self.last = QLabel('Last successful publication: ' + last.get('last_success', 'Never'))
         self.last.setWordWrap(True)
         layout.addWidget(self.last)
+        integrity_button = QPushButton('Check Backup Integrity...')
+        integrity_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
+        integrity_button.setEnabled(self.project is not None)
+        integrity_button.setToolTip('View version-specific integrity results and run a full content check')
+        def integrity():
+            from gui.backup_integrity_dialog import open_integrity_dialog
+            open_integrity_dialog(self.project, self.pending_configuration(), self)
+        integrity_button.clicked.connect(integrity)
+        layout.addWidget(integrity_button)
+        integrity_note = QLabel('Publication verifies uploaded content, not all unchanged backup content. '
+                               'Review full-check status separately in Check Backup Integrity.')
+        integrity_note.setWordWrap(True)
+        layout.addWidget(integrity_note)
         if last.get('last_error'):
             error = QLabel('Last error: ' + last['last_error'])
             error.setTextFormat(Qt.TextFormat.PlainText)
@@ -778,7 +825,7 @@ class ProjectSyncDialog(QDialog):
         if folder:
             self.folder.setText(folder)
 
-    def test_connection(self):
+    def test_connection(self, *, report=False):
         folder = self.folder.text().strip()
         expected = (self.configuration.get('root_id')
                     if folder == self.configuration.get('root') else None)
@@ -786,12 +833,12 @@ class ProjectSyncDialog(QDialog):
             self.tested = SyncProgressDialog(
                 'Test Sync Destination',
                 lambda progress, cancelled: test_destination(folder, expected), self).run()
-            self.status.setText('Connection verified: write, read, and cleanup succeeded.')
+            connection_test_result(self, self.status, self.tested['root'], report=report)
             return True
         except Exception as exc:
             self.tested = None
             self.invalidate_estimate()
-            self.status.setText(str(exc))
+            connection_test_result(self, self.status, folder, error=exc, report=report)
             return False
 
     def sync_now(self):

@@ -3,7 +3,7 @@
 from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
     QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QPushButton, QStyle, QVBoxLayout)
+    QMessageBox, QPushButton, QStyle, QVBoxLayout)
 
 from core.shared_profiles import sync_profiles
 from core.project_sync import test_destination
@@ -129,8 +129,12 @@ class SharedProfileSettingsDialog(QDialog):
         row.addWidget(browse)
         layout.addLayout(row)
         test = QPushButton('Test Connection')
-        test.clicked.connect(self.test_connection)
+        test.clicked.connect(lambda: self.test_connection(report=True))
         layout.addWidget(test)
+        from gui.drive_login import DriveLoginButton
+        self.login = DriveLoginButton(self)
+        self.login.completed.connect(lambda: self.test_connection(report=True))
+        layout.addWidget(self.login)
         title = QLabel('Existing profiles to share')
         layout.addWidget(title)
         self.profiles = QListWidget()
@@ -147,7 +151,7 @@ class SharedProfileSettingsDialog(QDialog):
         self.share_new = QCheckBox('Automatically share new profiles created on this computer')
         self.share_new.setChecked(self.configuration.get('share_new', True))
         layout.addWidget(self.share_new)
-        note = QLabel('Shares names and contributor IDs only. Everyone with access to this folder can '
+        self.note = note = QLabel('Shares names and contributor IDs only. Everyone with access to this folder can '
                       'see and select these identities; this is not a secure login. Unchecking a profile '
                       'stops publishing it but does not remove its shared copy.')
         note.setWordWrap(True)
@@ -156,7 +160,7 @@ class SharedProfileSettingsDialog(QDialog):
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.status)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons = buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -166,17 +170,17 @@ class SharedProfileSettingsDialog(QDialog):
         if folder:
             self.folder.setText(folder)
 
-    def test_connection(self):
+    def test_connection(self, *, report=False):
         folder = self.folder.text().strip()
         expected = self.configuration.get('root_id') if folder == self.configuration.get('root') else None
         try:
             self.tested = preferences.SyncProgressDialog('Test Profile Sharing',
                 lambda progress, cancelled: test_destination(folder, expected), self).run()
-            self.status.setText('Connection verified')
+            preferences.connection_test_result(self, self.status, self.tested['root'], report=report)
             return True
         except Exception as exc:
             self.tested = None
-            self.status.setText(str(exc))
+            preferences.connection_test_result(self, self.status, folder, error=exc, report=report)
             return False
 
     def accept(self):
@@ -192,3 +196,95 @@ class SharedProfileSettingsDialog(QDialog):
         preferences.save_setting('contributors/shared', configuration)
         profile_sync_service().refresh()
         super().accept()
+
+
+class LabConnectionDialog(SharedProfileSettingsDialog):
+    """One explicit connection for identity discovery and project collaboration."""
+
+    def __init__(self, parent=None, *, suggested=None):
+        super().__init__(parent, suggested=suggested)
+        self.setWindowTitle('Connect to Lab')
+        self.resize(720, 600)
+        self.enabled.setChecked(True)
+        self.enabled.hide()
+        self.share_new.setChecked(True)
+        self.share_new.hide()
+        self.note.setText('Connecting shares the checked names and contributor IDs, and automatically '
+            'shares new profiles created on this computer. It also uses this folder for project discovery '
+            'and backups. Project files are not uploaded or downloaded by connecting. Everyone with '
+            'folder access can select these profiles; contributor selection is not a secure login.')
+        self.buttons.button(QDialogButtonBox.StandardButton.Save).setText('Connect to Lab')
+        destination = preferences.setting_json('project_sync/destination', {})
+        if (destination.get('root') and self.configuration.get('root') and
+                destination['root'] != self.configuration['root']):
+            self.use_project_folder = QPushButton('Use Project Sync Folder')
+            self.use_project_folder.setAutoDefault(False)
+            self.use_project_folder.setToolTip(destination['root'])
+            self.use_project_folder.clicked.connect(lambda: self.folder.setText(destination['root']))
+            self.layout().insertWidget(2, self.use_project_folder)
+            self.status.setText('Profiles and projects currently use different folders.\n'
+                                'Project sync folder: ' + destination['root'])
+        if self.configuration.get('root_id') or preferences.setting_json('project_sync/destination', {}).get('root_id'):
+            disconnect = self.buttons.addButton('Disconnect This Computer', QDialogButtonBox.ButtonRole.ActionRole)
+            disconnect.setAutoDefault(False)
+            disconnect.clicked.connect(self.disconnect_lab)
+        current = (getattr(parent, 'contributor_session', None) or {}).get('id')
+        current = current or preferences.QSettings().value('contributors/last_id', '')
+        if not self.configuration.get('enabled'):
+            for index in range(self.profiles.count()):
+                item = self.profiles.item(index)
+                if item.data(Qt.ItemDataRole.UserRole) == current:
+                    item.setCheckState(Qt.CheckState.Checked)
+
+    def test_connection(self, *, report=False):
+        # Respect either saved root identity when upgrading a previously separate setup.
+        folder = self.folder.text().strip()
+        for configuration in (self.configuration, preferences.setting_json('project_sync/destination', {})):
+            if folder == configuration.get('root') and configuration.get('root_id'):
+                expected = configuration['root_id']
+                break
+        else:
+            expected = None
+        try:
+            self.tested = preferences.SyncProgressDialog('Test Lab Connection',
+                lambda progress, cancelled: test_destination(folder, expected), self).run()
+            preferences.connection_test_result(self, self.status, self.tested['root'], report=report)
+            return True
+        except Exception as exc:
+            self.tested = None
+            preferences.connection_test_result(self, self.status, folder, error=exc, report=report)
+            return False
+
+    def accept(self):
+        if self.tested is None and not self.test_connection():
+            return
+        destination = preferences.setting_json('project_sync/destination', {})
+        different = [configuration['root'] for configuration in (self.configuration, destination)
+                     if configuration.get('root') and configuration['root'] != self.tested['root']]
+        if different and QMessageBox.question(self, 'Change Shared Folder?',
+                'This replaces the saved profile and project connection on this computer. '
+                'Existing data is not moved; assigned copies from another drive still require that drive.\n\n'
+                'Previous folders:\n' + '\n'.join(dict.fromkeys(different)),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Yes:
+            return
+        # Preserve storage preferences and per-project opt-in. Connecting is never a backup request.
+        preferences.save_setting('project_sync/destination', dict(destination, **self.tested))
+        super().accept()
+
+    def disconnect_lab(self):
+        if QMessageBox.question(self, 'Disconnect This Computer?',
+                'Stop automatic profile sharing and clear the default project connection on this '
+                'computer? Local work, cached profiles, and all shared files stay intact. '
+                'Reconnect to publish or download work.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Yes:
+            return
+        sharing = preferences.setting_json('contributors/shared', {})
+        preferences.save_setting('contributors/shared', dict(sharing, enabled=False))
+        destination = preferences.setting_json('project_sync/destination', {})
+        destination.pop('root', None)
+        destination.pop('root_id', None)
+        preferences.save_setting('project_sync/destination', destination)
+        profile_sync_service().refresh()
+        QDialog.accept(self)

@@ -5,22 +5,29 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QMessageBox,
-    QPushButton, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
+    QPushButton, QStyle, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
 
 from core.contributors import contributor_profile
 from core.project_sync import _read_json
 from core.project_update import PublishedProject
 from core.assigned_work import (accept_submission, assignment_status, catalog, download_plan,
     download_work, latest_snapshot, my_projects, parse_frames, read_assignments, save_assignments,
-    transfer_director)
+    transfer_director, project_members, add_project_member)
 from gui.project_sync_dialog import (SyncProgressDialog, TransferConfirmationDialog,
-                                     setting_json, save_setting, load_contributor_profiles)
+                                     setting_json, save_setting, load_contributor_profiles,
+                                     remember_contributor_profile)
 from gui.workflow_help import help_button
+from gui.annotation_work import WorkFilters, task_combo
+from gui.video_browsing import VideoBrowserControls, ModifiedTableItem, SORT_ROLE, VideoRowColors
+from core.annotation_work import published_index, summarize, task_label
+from core.shared_project_review import compare_saved_annotations
+from gui.shared_version import SharedVersionHeader
 
 
 def _table(headers):
     table = QTableWidget(0, len(headers))
     table.setHorizontalHeaderLabels(headers)
+    VideoRowColors(table)
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
     table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -37,15 +44,16 @@ class AssignmentManagerDialog(QDialog):
         if embedded:
             self.setWindowFlags(Qt.WindowType.Widget)
         self.project, self.configuration, self.contributor = project, configuration, contributor
-        self.profiles = {identity: {key: profile[key] for key in ('id', 'name')}
-                         for identity, profile in load_contributor_profiles().items()}
-        self.profiles[contributor['id']] = {k: contributor[k] for k in ('id', 'name')}
-        for value in setting_json('assignments/profiles', {}).values():
-            profile = contributor_profile(dict(value, format=1, kind='bumblebox-contributor'))
-            self.profiles[profile['id']] = {k: profile[k] for k in ('id', 'name')}
+        self.profiles = {}
+        self.scanning_masks = False
         self.setWindowTitle('Video Assignments')
         self.resize(1080, 580)
         layout = QVBoxLayout(self)
+        self.shared_version = SharedVersionHeader(project, configuration, self)
+        self.shared_version.refresh_requested.connect(self.confirm_refresh)
+        self.shared_version.compare_requested.connect(self.compare_with_shared)
+        self.finished.connect(self.shared_version.cancel)
+        layout.addWidget(self.shared_version)
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
@@ -57,6 +65,24 @@ class AssignmentManagerDialog(QDialog):
         filters.addWidget(self.search, 1)
         filters.addWidget(self.filter)
         layout.addLayout(filters)
+        self.video_browser = VideoBrowserControls()
+        layout.addWidget(self.video_browser)
+        self.video_browser.changed.connect(self.filter_videos)
+        self.finished.connect(self.video_browser.cancel)
+        self.work_filters = WorkFilters()
+        layout.addWidget(self.work_filters)
+        self.work_filters.changed.connect(self.filter_videos)
+        mask_status_row = QHBoxLayout()
+        self.mask_status = QLabel()
+        self.mask_status.setWordWrap(True)
+        mask_status_row.addWidget(self.mask_status, 1)
+        self.scan_masks = QPushButton('Scan Mask Status')
+        self.scan_masks.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.scan_masks.setToolTip('Read published annotations to fill in missing mask summaries. '
+                                   'No frame images are downloaded and no annotations are changed.')
+        self.scan_masks.clicked.connect(self.scan_mask_status)
+        mask_status_row.addWidget(self.scan_masks)
+        layout.addLayout(mask_status_row)
         bulk = QHBoxLayout()
         self.select_visible = QPushButton('Select Visible')
         self.select_visible.clicked.connect(self.check_visible)
@@ -70,29 +96,36 @@ class AssignmentManagerDialog(QDialog):
         bulk.addStretch()
         bulk.addWidget(self.assign_selected)
         layout.addLayout(bulk)
-        self.table = _table(['Video', 'Split', 'Published frames', 'Contributor', 'Assigned frames', 'Status'])
+        self.table = _table(['Video', 'Split', 'Published frames', 'Contributor', 'Assigned frames',
+                             'Submission', 'Masks', 'Annotation work', 'Assigned task',
+                             'Experiment / setup', 'Modified (local)'])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(0, 350)
         self.table.itemChanged.connect(self.update_selection)
         layout.addWidget(self.table)
         self.search.textChanged.connect(self.filter_videos)
         self.filter.currentIndexChanged.connect(self.filter_videos)
         self.contributors_toggle = QToolButton()
-        self.contributors_toggle.setText('Contributors')
+        self.contributors_toggle.setText('People')
         self.contributors_toggle.setCheckable(True)
         self.contributors_toggle.setArrowType(Qt.ArrowType.RightArrow)
         self.contributors_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         contributors_header = QHBoxLayout()
         contributors_header.addWidget(self.contributors_toggle)
         contributors_header.addStretch()
-        layout.insertLayout(1, contributors_header)
+        layout.insertLayout(2, contributors_header)
         self.contributors_panel = QWidget()
         contributors_layout = QVBoxLayout(self.contributors_panel)
         self.roster = QListWidget()
         self.roster.setMaximumHeight(110)
         contributors_layout.addWidget(self.roster)
-        import_button = QPushButton('Add Contributor: Import Profile...')
+        add_button = QPushButton('Add Contributor...')
+        add_button.clicked.connect(self.add_contributor)
+        contributors_header.addWidget(add_button)
+        import_button = QPushButton('Import Profile...')
         import_button.clicked.connect(self.import_profile)
-        contributors_header.addWidget(import_button)
-        layout.insertWidget(2, self.contributors_panel)
+        contributors_layout.addWidget(import_button)
+        layout.insertWidget(3, self.contributors_panel)
         self.contributors_panel.hide()
         self.contributors_toggle.toggled.connect(self.show_contributors)
         row = QHBoxLayout()
@@ -116,26 +149,10 @@ class AssignmentManagerDialog(QDialog):
             buttons.button(QDialogButtonBox.StandardButton.Close).hide()
         layout.addWidget(buttons)
         self.refresh(initial)
-        from gui.shared_profiles import profile_sync_service
-        profile_sync_service().changed.connect(self.add_discovered_profiles)
-
-    def add_discovered_profiles(self):
-        """Update assignee choices without discarding any in-progress table edits."""
-        added = False
-        for identity, profile in load_contributor_profiles().items():
-            if identity in self.profiles:
-                continue
-            self.profiles[identity] = {key: profile[key] for key in ('id', 'name')}
-            for actor, _ in self.controls.values():
-                actor.addItem(profile['name'] + ' (' + identity[:8] + ')', identity)
-            added = True
-        if added:
-            self.refresh_roster()
 
     def refresh(self, initial=None):
-        for identity, profile in load_contributor_profiles().items():
-            self.profiles.setdefault(identity, {key: profile[key] for key in ('id', 'name')})
         def load(progress, cancelled):
+            progress('Reading published assignments...')
             view = PublishedProject(self.project, self.configuration)
             data = read_assignments(view)
             if not data['coordinator']:
@@ -144,10 +161,15 @@ class AssignmentManagerDialog(QDialog):
                 raise ValueError('Assignment management belongs to ' + data['coordinator']['name'] +
                                  '. Use My Assigned Work for your assignments.')
             snapshot, _ = latest_snapshot(view)
-            return data, catalog(snapshot), {v: assignment_status(view, e) for v, e in data['videos'].items()}
-        self.data, self.available, self.statuses = initial or SyncProgressDialog('Read Video Assignments', load, self).run()
-        for entry in self.data['videos'].values():
-            self.profiles[entry['contributor']['id']] = entry['contributor']
+            return (data, catalog(snapshot, include_work=True, progress=progress, cancelled=cancelled),
+                    {v: assignment_status(view, e) for v, e in data['videos'].items()}, snapshot)
+        loaded = initial or SyncProgressDialog('Read Video Assignments', load, self).run()
+        self.data, self.available, self.statuses = loaded[:3]
+        self.snapshot = loaded[3] if len(loaded) > 3 else None
+        self.shared_version.set_snapshot(self.snapshot)
+        self.profiles = project_members(self.data)
+        self.video_browser.set_context(self.project, self.available,
+            {v: entry['experiment'] for v, entry in self.available.items() if entry.get('experiment')})
         for actor, frames in getattr(self, 'controls', {}).values():
             actor.blockSignals(True)
             frames.blockSignals(True)
@@ -164,7 +186,9 @@ class AssignmentManagerDialog(QDialog):
             for col, value in ((0, video), (1, info['split']), (2, str(len(info['frames']))),
                                (5, self.statuses.get(video, ('Unassigned', None))[0])):
                 self.table.setItem(row, col, QTableWidgetItem(value))
+                self.table.item(row, col).setToolTip(value)
             check = self.table.item(row, 0)
+            check.setData(Qt.ItemDataRole.UserRole, video)
             check.setFlags(check.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             check.setCheckState(Qt.CheckState.Unchecked)
             actor = QComboBox()
@@ -183,7 +207,7 @@ class AssignmentManagerDialog(QDialog):
             actor.currentIndexChanged.connect(self.update_edit_state)
             frames.textChanged.connect(self.update_edit_state)
         ready = sum(status == 'Ready for Review' for status, _ in self.statuses.values())
-        self.summary.setText(f'{len(self.available) - len(self.data["videos"])} unassigned | '
+        self.summary.setText('Published annotations | ' + f'{len(self.available) - len(self.data["videos"])} unassigned | '
                              f'{len(self.data["videos"])} assigned | {ready} ready for review | Project director: '
                              + self.data['coordinator']['name'])
         self.transfer_button.setEnabled(bool(self.data['coordinator']))
@@ -191,6 +215,75 @@ class AssignmentManagerDialog(QDialog):
         self.refresh_roster()
         self.filter_videos()
         self.update_edit_state()
+        self.update_mask_status()
+        self.video_browser.schedule()
+
+    def compare_with_shared(self):
+        if not self.snapshot:
+            return
+        try:
+            # Deliberately do not save or publish anything: the review is of files on disk.
+            snapshot = self.snapshot
+            review = SyncProgressDialog('Compare Local and Shared Annotations', lambda progress, cancelled:
+                compare_saved_annotations(self.project, snapshot, progress=progress, cancelled=cancelled), self).run()
+            from gui.publication_review_dialog import PublicationReviewDialog
+            PublicationReviewDialog({'review': review}, self).exec()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Comparison Not Completed', str(exc))
+
+    def update_mask_status(self):
+        summaries = [summarize(info.get('annotation_work') or {'scan_state': 'not_scanned'}, None)
+                     for info in self.available.values()]
+        unscanned = sum(summary['state'] == 'not_scanned' for summary in summaries)
+        unavailable = sum(summary['state'] == 'unknown' for summary in summaries)
+        missing = unscanned + unavailable
+        text = f'Mask status available for {len(self.available) - missing}/{len(self.available)} videos'
+        if self.scanning_masks:
+            text += ' | Scanning published mask status...'
+        else:
+            if unscanned:
+                text += f' | {unscanned} not scanned; use Scan Mask Status'
+            if unavailable:
+                text += f' | {unavailable} unavailable; see row details'
+        self.mask_status.setText(text)
+        self.scan_masks.setEnabled(bool(missing) and not self.scanning_masks)
+
+    def work_summary(self, video, task):
+        entry = self.available[video].get('annotation_work') or {'scan_state': 'not_scanned'}
+        summary = summarize(entry, task)
+        if self.scanning_masks and summary['state'] in ('not_scanned', 'unknown'):
+            return {'presence': 'loading', 'state': 'loading', 'mask_text': 'Scanning...',
+                    'work_text': 'Scanning...', 'detail': 'Reading published annotations; status is not yet available.'}
+        return summary
+
+    def scan_mask_status(self):
+        if self.scanning_masks:
+            return
+        self.scanning_masks = True
+        self.filter_videos()
+        self.update_mask_status()
+        error = None
+        try:
+            def scan(progress, cancelled):
+                snapshot = self.snapshot
+                if snapshot is None:
+                    progress('Reading the published project version...')
+                    snapshot, _ = latest_snapshot(PublishedProject(self.project, self.configuration))
+                return snapshot, published_index(snapshot, progress=progress, cancelled=cancelled)
+            snapshot, index = SyncProgressDialog('Scan Published Mask Status', scan, self).run()
+            self.snapshot = snapshot
+            if self.shared_version.key() != (tuple(snapshot['reference']), snapshot['manifest_hash']):
+                self.shared_version.set_snapshot(snapshot)
+            for video, entry in self.available.items():
+                entry['annotation_work'] = index['videos'].get(video)
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            self.scanning_masks = False
+            self.filter_videos()
+            self.update_mask_status()
+            if error is not None:
+                self.mask_status.setText(self.mask_status.text() + '\nMask status scan not completed: ' + error)
 
     def update_edit_state(self):
         old = {v: {k: e[k] for k in ('contributor', 'frames')} for v, e in self.data['videos'].items()}
@@ -207,19 +300,42 @@ class AssignmentManagerDialog(QDialog):
     def refresh_roster(self):
         self.roster.clear()
         for profile in sorted(self.profiles.values(), key=lambda p: p['name'].casefold()):
-            self.roster.addItem(profile['name'] + ' (' + profile['id'][:8] + ')')
-        self.contributors_toggle.setText(f'Contributors ({len(self.profiles)})')
+            role = 'Director' if profile['id'] == self.data['coordinator']['id'] else 'Contributor'
+            self.roster.addItem(profile['name'] + ' (' + profile['id'][:8] + ') | ' + role)
+        self.contributors_toggle.setText(f'People ({len(self.profiles)})')
 
     def filter_videos(self):
+        if not hasattr(self, 'videos'):
+            return
+        task = self.work_filters.task.currentData()
+        visibility = {}
         for row, video in enumerate(self.videos):
             entry = self.data['videos'].get(video)
             name = entry['contributor']['name'] if entry else ''
             status = self.statuses.get(video, ('Unassigned', None))[0]
             mode = self.filter.currentText()
-            visible = (self.search.text().casefold() in (video + ' ' + name).casefold() and
+            summary = self.work_summary(video, task)
+            for col, value in ((6, summary['mask_text']), (7, summary['work_text']),
+                               (8, task_label((entry or {}).get('task'))),
+                               (9, self.available[video].get('experiment') or 'Not assigned')):
+                item = QTableWidgetItem(value)
+                item.setToolTip('Published annotations. ' + summary.get('detail', ''))
+                self.table.setItem(row, col, item)
+            modified = ModifiedTableItem(self.video_browser.date_text(video))
+            modified.setData(SORT_ROLE, self.video_browser.key(video))
+            modified.setToolTip(self.video_browser.tooltip(video) + '\nDates refer to this local project, not the shared backup.')
+            self.table.setItem(row, 10, modified)
+            visibility[video] = (self.video_browser.accepts(video) and
+                       self.work_filters.accepts(summary, self.available[video]['split']) and
+                       self.search.text().casefold() in (video + ' ' + name).casefold() and
                        (mode == 'All videos' or mode == status or mode == 'Assigned' and bool(entry)))
-            self.table.setRowHidden(row, not visible)
-            if not visible:
+        self.table.sortItems(10 if self.video_browser.sort.currentData() == 'recent' else 0,
+                             Qt.SortOrder.AscendingOrder)
+        self.videos = [self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+                       for row in range(self.table.rowCount())]
+        for row, video in enumerate(self.videos):
+            self.table.setRowHidden(row, not visibility[video])
+            if not visibility[video]:
                 self.table.item(row, 0).setCheckState(Qt.CheckState.Unchecked)
         self.update_selection()
 
@@ -249,7 +365,8 @@ class AssignmentManagerDialog(QDialog):
             old = {v: {k: e[k] for k in ('contributor', 'frames')} for v, e in self.data['videos'].items()}
             if self.choices() != old:
                 raise ValueError('Save or refresh your table edits before making a bulk assignment.')
-            dialog = BulkAssignmentDialog(selected, self.available, self.profiles, self)
+            dialog = BulkAssignmentDialog(selected, self.available, self.profiles, self,
+                                          task=self.work_filters.task.currentData())
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             choices = dict(old, **dialog.choices)
@@ -268,7 +385,7 @@ class AssignmentManagerDialog(QDialog):
                 raise ValueError('Save or refresh your assignment choices before transferring the role.')
             profiles = [p for identity, p in self.profiles.items() if identity != self.contributor['id']]
             if not profiles:
-                raise ValueError('Import the new director\'s contributor profile first.')
+                raise ValueError('Add the new director in People first.')
             names = [p['name'] + ' (' + p['id'][:8] + ')' for p in profiles]
             name, accepted = QInputDialog.getItem(self, 'Transfer Project Director', 'New director:', names, 0, False)
             if not accepted:
@@ -304,21 +421,47 @@ class AssignmentManagerDialog(QDialog):
             return
         try:
             profile = contributor_profile(_read_json(path))
-            self.profiles[profile['id']] = {key: profile[key] for key in ('id', 'name')}
-            remembered = setting_json('assignments/profiles', {})
-            remembered[profile['id']] = self.profiles[profile['id']]
-            save_setting('assignments/profiles', remembered)
-            for actor, _ in self.controls.values():
-                index = actor.findData(profile['id'])
-                text = profile['name'] + ' (' + profile['id'][:8] + ')'
-                if index < 0:
-                    actor.addItem(text, profile['id'])
-                else:
-                    actor.setItemText(index, text)
-            self.refresh_roster()
-            self.contributors_toggle.setChecked(True)
+            if QMessageBox.question(self, 'Add Project Contributor?',
+                    f"Add {profile['name']} ({profile['id'][:8]}) to this project and the connected lab?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+                self.enroll(profile)
         except Exception as exc:
             QMessageBox.warning(self, 'Profile Not Imported', str(exc))
+
+    def add_contributor(self):
+        from gui.project_people import AddContributorDialog
+        dialog = AddContributorDialog(self.profiles, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            try:
+                self.enroll(dialog.profile)
+            except Exception as exc:
+                QMessageBox.warning(self, 'Contributor Not Added', str(exc))
+
+    def enroll(self, profile):
+        local = load_contributor_profiles().get(profile['id'])
+        portable = contributor_profile(dict(profile, format=1, kind='bumblebox-contributor'))
+        if local and local != portable:
+            raise ValueError('This identity has a different local name. No existing profile was overwritten.')
+        data = SyncProgressDialog('Add Project Contributor', lambda progress, cancelled:
+            add_project_member(self.project, self.configuration, self.contributor, profile,
+                               self.data['revision']), self).run()
+        remember_contributor_profile(portable)
+        sharing = setting_json('contributors/shared', {})
+        if sharing.get('enabled') and sharing.get('root_id') == self.configuration.get('root_id'):
+            sharing['publish_ids'] = sorted(set(sharing.get('publish_ids', [])) | {profile['id']})
+            save_setting('contributors/shared', sharing)
+            from gui.shared_profiles import profile_sync_service
+            profile_sync_service().refresh()
+        # Adding a person changes only the roster, never pending table choices.
+        self.data = data
+        self.profiles = project_members(data)
+        for actor, _ in self.controls.values():
+            if actor.findData(profile['id']) < 0:
+                actor.addItem(profile['name'] + ' (' + profile['id'][:8] + ')', profile['id'])
+        self.refresh_roster()
+        self.contributors_toggle.setChecked(True)
+        self.assignments_changed.emit()
 
     def choices(self):
         return {video: {'contributor': self.profiles[actor.currentData()],
@@ -376,7 +519,7 @@ class AssignmentManagerDialog(QDialog):
 
 
 class BulkAssignmentDialog(QDialog):
-    def __init__(self, videos, available, profiles, parent=None):
+    def __init__(self, videos, available, profiles, parent=None, *, task=None):
         super().__init__(parent)
         self.videos, self.available, self.profiles = videos, available, profiles
         self.choices = None
@@ -389,6 +532,8 @@ class BulkAssignmentDialog(QDialog):
         for identity, profile in sorted(profiles.items(), key=lambda pair: pair[1]['name'].casefold()):
             self.contributor.addItem(profile['name'] + ' (' + identity[:8] + ')', identity)
         self.contributor.setCurrentIndex(-1)
+        self.task = task_combo(self)
+        self.task.setCurrentIndex(self.task.findData(task))
         self.scope = QComboBox()
         self.scope.addItems(['All extracted frames', 'Specific frames'])
         self.frames = QLineEdit()
@@ -396,6 +541,7 @@ class BulkAssignmentDialog(QDialog):
         self.frames.setEnabled(False)
         self.scope.currentIndexChanged.connect(lambda index: self.frames.setEnabled(index == 1))
         form.addRow('Assign to', self.contributor)
+        form.addRow('Work on', self.task)
         form.addRow('Frames', self.scope)
         form.addRow('Frame numbers', self.frames)
         layout.addLayout(form)
@@ -413,10 +559,12 @@ class BulkAssignmentDialog(QDialog):
             ranges = self.frames.text() if self.scope.currentIndex() else 'All'
             choices = {v: {'contributor': actor, 'frames': parse_frames(ranges, self.available[v]['frames'])}
                        for v in self.videos}
+            for choice in choices.values():
+                choice['task'] = self.task.currentData()
             details = '\n'.join(f'{v}: {len(c["frames"])} frames' for v, c in choices.items())
             review = TransferConfirmationDialog('Review Assignment',
-                f'Assign to: {actor["name"]}\nFrames: {ranges}\n\n{details}\n\n'
-                'Changing an existing assignee or frame range retires that assignment. '
+                f'Assign to: {actor["name"]}\nWork on: {task_label(self.task.currentData())}\nFrames: {ranges}\n\n{details}\n\n'
+                'Changing an existing assignee, task, or frame range retires that assignment. '
                 'Keep any unpublished work for director review before reassigning.\n\n'
                 'This saves assignments only. The contributor downloads their selected files on their own computer.',
                 'Assign Work', self)
@@ -428,7 +576,7 @@ class BulkAssignmentDialog(QDialog):
 
 
 class AssignedDownloadDialog(QDialog):
-    def __init__(self, configuration, contributor, parent=None):
+    def __init__(self, configuration, contributor, parent=None, *, project_id=None):
         super().__init__(parent)
         self.configuration, self.contributor = configuration, contributor
         self.download_result = None
@@ -454,6 +602,8 @@ class AssignedDownloadDialog(QDialog):
             my_projects(configuration, contributor), self).run()
         for project in self.available:
             self.projects.addItem(project['name'], project['id'])
+        if project_id is not None:
+            self.projects.setCurrentIndex(self.projects.findData(project_id))
         self.projects.currentIndexChanged.connect(self.populate)
         self.populate()
 
@@ -471,7 +621,7 @@ class AssignedDownloadDialog(QDialog):
             self.table.setItem(row, 2, check)
         self.download.setEnabled(bool(videos))
         self.summary.setText(f'Contributor: {self.contributor["name"]} | {len(videos)} assigned videos' if videos else
-                             'No assignments for this contributor profile. Ask the coordinator to assign your exported profile.')
+                             'No assignments for this contributor profile. Ask the project director to add you in People and assign videos.')
 
     def download_selected(self):
         selected = [v for row, v in enumerate(self.videos)

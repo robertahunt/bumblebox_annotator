@@ -15,12 +15,13 @@ name reuses its ID but creates a new session ID. Names are self-declared, not
 authenticated accounts. The same name first entered on another installation gets
 a different ID unless you select the existing shared profile or import it.
 
-Use **Profile Sharing...** to [share identities automatically](shared_profiles.md)
-through the mounted shared folder. Existing local profiles require an explicit
-selection before publication. Discovered identities are cached locally; sharing
+Use **Connect to Lab...** to [share identities automatically](shared_profiles.md)
+and configure project discovery through one shared folder. Review the existing
+profiles selected for publication; new profiles are then shared automatically.
+Discovered identities are cached locally; sharing
 does not synchronize active sessions, device settings, or project roles.
 
-Use **Export Profile...** in the contributor dialog (also available through
+As an offline fallback, use **Export Profile...** in the contributor dialog (also available through
 **Settings > Change Contributor**) on the first computer, then **Import Profile...**
 on the second. Import asks for confirmation and does not reattribute old labels.
 The profile contains only your display name and contributor UUID, not credentials.
@@ -167,7 +168,7 @@ When publishing finds that project's existing archive under an older name, it
 shows the proposed rename in the publish preview and, after successful normal
 publication, renames the directory in place under the project lock. A blocked or
 cancelled publication, or a separate conflict backup, does not rename an existing
-readable archive. If renaming fails, the verified backup remains at the old path
+readable archive. If renaming fails, the published backup remains at the old path
 and the app reports a warning; publishing again can retry the rename. Project identity, all
 contributors' histories, stored files, and revision contents are preserved; no
 second archive is created. Existing absolute paths/bookmarks need updating. Use
@@ -191,7 +192,7 @@ do not advance it. There is no single project-wide authoritative latest version.
 Settings show the latest successful backup time or failure.
 
 Publishing is manual and one-way. Local annotations are saved and queued writes are
-drained before a modal progress dialog pauses editing. Files are checked and
+drained before a modal progress dialog pauses editing. Newly copied files are
 verified in an unpublished staging directory. Source changes during copying
 abort publishing; do not edit the local project from another process during sync.
 Only complete revisions are published, and prior revisions are not automatically
@@ -201,24 +202,78 @@ modifies another contributor's revision contents.
 
 Unchanged projects reuse their existing revision, unless the storage mode changes.
 For compact publications, only missing file contents are uploaded. Repeated media
-do not require additional data files or filesystem reflink support. A shared file
-is verified before reuse and never edited in place. A checksum failure stops the
-operation. A storage preview shows logical size, file count, estimated new bytes,
+do not require additional data files or filesystem reflink support. Unchanged
+referenced files are checked for presence, ordinary-file status, and expected size;
+their contents are not rehashed during routine publication. Newly referenced
+contents already present in the shared store are fully hashed before reuse.
+Shared contents are never edited in place. Detected damage stops publication.
+A storage preview shows logical size, file count, estimated new bytes,
 and destination free space; publishing rechecks space. Server quotas can be lower
-than filesystem free space. Hashing and verification still read substantial data:
-deduplication reduces stored/written bytes, not all network reads or CPU work.
+than filesystem free space. Estimates still read local data and publication still
+performs remote metadata operations, but unchanged remote media are not reread.
 
 Estimates keep their local checksums in memory until publication, project edits,
 or a settings change. Publication checks sizes, modification/change times and
 file identities before reuse, and checks the inventory again before completing.
-Destination files are still verified: this is different from the estimate's local
-file scan and is labeled **Verifying stored backup** in the progress window.
-Newly copied files are also verified before their version is published. A first
+Existing destination files get **Checking stored file information** checks.
+Newly copied files get **Verifying uploaded content** checks before their version
+is published. This does not certify all unchanged stored content. A first
 backup estimate may not need to hash local files; those files are read once during
 publication instead. Full-folder estimates hash files when a previous publication
 exists so the outgoing review can compare contents, then reuse those checksums at
 publication. No persistent checksum cache is trusted
 across application sessions.
+
+### Full Integrity Checks
+
+Use **File > Check Backup Integrity...**, also available in Project Sync, to select
+an exact contributor/version and run a full content check. Historical and separate
+backups are included; a newer date does not imply a version includes everyone's
+work. No full check runs automatically when the dialog opens. The dialog shows
+the latest attempt and last successful full check for the selected manifest.
+An informational reminder appears when no successful check is recorded or the
+last pass is older than the configurable interval (default 30 days). This is not
+a scheduler and does not prevent routine publication.
+
+The checker reads all content referenced by that version, including extracted
+frames and original videos if included. Identical compact objects are read once.
+Progress reports unique contents and bytes read. Only manifest-referenced data
+are checked, not other versions or unreferenced objects. Legacy full-folder
+backups are supported without conversion. A changed manifest invalidates the
+check. The checker takes the existing project-wide publication lock, so other
+computers can annotate locally but cannot publish this project until it ends.
+Use an appropriate quiet period for large checks. Cancellation is checked between
+read chunks; an operating-system network read may still take time to return.
+
+Outcomes are **Passed**, **Problems found**, **Cancelled**, or **Unable to complete**.
+Disconnected storage or unreadable files do not become a false pass or a blanket
+corruption report. Cancelled/incomplete checks preserve earlier pass records and
+never clear known damage. Reports live outside snapshots in
+`verification/reports/<id>.json`; `verification/state.json` indexes per-version
+results and known damaged content. **View Last Report** displays details and
+**Save Report...** exports a local JSON copy, including when the drive could not
+store the report. Report persistence failures are shown explicitly.
+
+Known damaged content blocks both full-project and assigned-work publications
+that would reference it. There is no automatic repair, deletion, or merge. After
+an explicit repair, rerun a check that covers the affected content to clear the
+warning. Clearing unrelated checks cannot clear the error. Reports cannot be
+treated as authenticated evidence against a malicious drive administrator.
+
+Routine size checks cannot detect same-size damage in unchanged remote files.
+Full checks and restores detect that damage by hashing contents. Every downloaded
+file is still verified during restore, assigned-work download, and incoming
+updates. A successful upload is not a full integrity check, and a successful
+check is only evidence about the selected version at the time of the check.
+Use updated clients across collaborating computers. Old clients cannot enforce
+the new shared known-damage records. No existing backup format is rewritten.
+
+This separation follows established backup patterns: [Restic structural versus
+data checks](https://restic.readthedocs.io/en/stable/045_working_with_repos.html#checking-integrity-and-consistency),
+[Borg archive/data verification](https://borgbackup.readthedocs.io/en/stable/usage/check.html),
+and [Kopia snapshot verification](https://kopia.io/docs/reference/command-line/common/snapshot-verify/).
+Resumable/subset checks, repair tooling, automatic schedules, and concurrent
+publication during checks are not implemented.
 
 The estimate's inventory count and logical total describe the whole project,
 not the number or size of files to upload. **Estimated additional storage** includes
@@ -304,7 +359,7 @@ An unchanged legacy copy matching its contributor's sole latest snapshot can
 establish its baseline automatically. A changed legacy copy cannot safely do so.
 
 Choose **Cancel**, or **Save Separate Backup** to preserve your work without
-changing any latest pointer. Separate backups remain complete, verified snapshots;
+changing any latest pointer. Separate backups use the same routine verification;
 their location is shown in the completion dialog and saved in sync settings.
 They do not acknowledge, incorporate, or merge the other work. Further publishes
 will continue to warn until you work from an appropriate verified version and
@@ -406,8 +461,8 @@ successful syncs.
 
 After an application or computer crash, an unpublished `.pending-*` folder or
 `.sync-lock` may remain, along with a destination-root
-`.project-<full-project-id>.sync-lock`. Confirm that no sync process is running
-before removing stale locks and retrying. Do not remove completed revisions or
+`.project-<full-project-id>.sync-lock`. Confirm that no sync or integrity check is
+running before removing stale locks and retrying. Do not remove completed revisions or
 an active contributor's lock. Unpublished files are not referenced by `latest.json`.
 There is no automatic history pruning or merge wizard yet.
 
@@ -443,5 +498,6 @@ disk failure; retain independent backups.
 Regression tests use disposable projects only: `scripts/test_backup_safety.py`,
 `scripts/test_project_sync.py`, `scripts/test_contributor_sync_gui.py`,
 `scripts/test_project_update.py`, `scripts/test_project_update_gui.py`,
-`scripts/test_compact_sync.py`, `scripts/test_compact_sync_gui.py`, and the
+`scripts/test_compact_sync.py`, `scripts/test_compact_sync_gui.py`,
+`scripts/test_backup_integrity.py`, `scripts/test_backup_integrity_gui.py`, and the
 annotation-policy suites. No real lab-drive content is modified by these tests.
