@@ -483,6 +483,10 @@ def assignment_presence(configuration, contributor, project=None, cancelled=lamb
             'scope': entries[0]['name'] if project else 'the shared folder',
             'projects': [{'id': entry['id'], 'name': entry['name'],
                           'role': 'director' if entry in directors else 'contributor',
+                          'videos': {video: {'id': e['id'], 'frames': list(e['frames']),
+                                             'task': e.get('task')}
+                                     for video, e in entry['data']['videos'].items()
+                                     if e['contributor']['id'] == contributor['id']},
                           'count': sum(e['contributor']['id'] == contributor['id']
                                        for e in entry['data']['videos'].values())}
                          for entry in entries if contributor['id'] in project_members(entry['data'])]}

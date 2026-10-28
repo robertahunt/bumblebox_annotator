@@ -1179,6 +1179,7 @@ class MainWindow(QMainWindow):
             dialog = AssignedDownloadDialog(configuration, self.contributor_session, self, project_id=project_id)
             if dialog.exec() == QDialog.DialogCode.Accepted and dialog.download_result:
                 self.load_project(dialog.download_result['path'])
+                return self.project_path == Path(dialog.download_result['path'])
         except Exception as exc:
             QMessageBox.warning(self, 'Assigned Work Unavailable', str(exc))
 

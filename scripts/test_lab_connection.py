@@ -136,7 +136,7 @@ class ProjectMembershipTests(unittest.TestCase):
         presence = assignment_presence(self.configuration, kevin)
         self.assertEqual(presence['status'], 'empty')
         self.assertEqual(presence['projects'], [{'id': self.project_id, 'name': self.source.name,
-                                               'role': 'contributor', 'count': 0}])
+                                               'role': 'contributor', 'count': 0, 'videos': {}}])
         self.assertEqual(assignment_presence(self.configuration, new_session('Kevin'))['projects'], [])
 
     def test_enrollment_is_director_only_revision_checked_and_idempotent(self):
@@ -392,6 +392,7 @@ class ProjectPeopleGuiTests(unittest.TestCase):
     settle_assignments = onboarding.AssignmentOnboardingGuiTests.settle_assignments
     load = onboarding.AssignmentOnboardingGuiTests.load
     view = backend.AssignedWorkTests.view
+    download = backend.AssignedWorkTests.download
 
     def tearDown(self):
         from gui.shared_profiles import stop_profile_sync
@@ -446,10 +447,10 @@ class ProjectPeopleGuiTests(unittest.TestCase):
         flow = self.load()
         inbox = self.settle()
         self.assertEqual(inbox.projects.count(), 1)
-        self.assertEqual(inbox.open.text(), 'Open Local Working Copy')
-        with patch.object(flow, 'resume') as resume:
+        self.assertEqual(inbox.open.text(), 'Open Local Project')
+        with patch.object(flow, 'activate') as activate:
             inbox.open_selected()
-            resume.assert_called_once()
+            activate.assert_called_once_with('Annotate')
         self.window.project_path = None
         self.window.set_contributor(self.alex)
         self.settle()
@@ -459,6 +460,128 @@ class ProjectPeopleGuiTests(unittest.TestCase):
         self.settle()
         flow.home.refresh()
         self.assertEqual(flow.home.recent.count(), 1)
+
+    def test_open_my_work_in_full_project_clears_filters_and_selects_assigned_frame(self):
+        choices = dict(self.choices)
+        choices['beta'] = {'contributor': self.coordinator, 'frames': [1, 2], 'task': 'hive'}
+        save_assignments(self.source, self.configuration, self.coordinator, choices,
+                         read_assignments(self.view())['revision'])
+        flow = self.load()
+        inbox = self.settle()
+        w = self.window
+        w.load_video_frames('alpha')
+        w.video_browser.experiment.addItem('Unrelated experiment', 'other')
+        w.video_browser.experiment.setCurrentIndex(2)
+        w.video_split_filter_combo.setCurrentText('Validation Videos')
+        w.split_filter_combo.setCurrentText('Validation Frames')
+        w.annotation_work.filters.show.setCurrentIndex(3)
+        w.annotation_work.filters.presence.setCurrentIndex(2)
+        w.tracking_filter_checkbox.setChecked(True)
+        w.video_dock.hide()
+        w.frame_dock.hide()
+        flow.show_home()
+        self.settle()
+        self.assertEqual(inbox.open.text(), 'Open My Assigned Work')
+        with patch.object(w, 'open_assigned_work') as download:
+            inbox.open_selected()
+            download.assert_not_called()
+        self.assertEqual(flow.current, 'Annotate')
+        self.assertEqual(w.current_video_id, 'beta')
+        self.assertEqual(w._get_frame_idx_in_video(w.current_frame_idx), 1)
+        self.assertFalse(w.video_dock.isHidden())
+        self.assertFalse(w.frame_dock.isHidden())
+        self.assertTrue(w.video_browser.only_mine.isChecked())
+        visible = lambda: {w.video_list.item(i).data(Qt.ItemDataRole.UserRole)
+                           for i in range(w.video_list.count()) if not w.video_list.item(i).isHidden()}
+        self.assertEqual(visible(), {'beta'})
+        self.assertEqual(w.annotation_work.filters.task.currentData(), 'hive')
+        self.assertEqual(w.annotation_work.filters.show.currentData(), 'all')
+        self.assertEqual(w.video_list.currentItem().data(Qt.ItemDataRole.UserRole), 'beta')
+        from core.assigned_work import workspace
+        self.assertIsNone(workspace(self.source))  # A view filter is not an assignment download.
+        w.video_browser.only_mine.setChecked(False)
+        self.assertEqual(visible(), {'alpha', 'beta'})
+        w.video_browser.only_mine.setChecked(True)
+        w.show()
+        self.app.processEvents()
+        w.grab().save('/tmp/bumblebox-my-assigned-work.png')
+        flow.show_home()
+        self.settle()
+        flow.home.grab().save('/tmp/bumblebox-my-work-home.png')
+
+    def test_assigned_copy_opens_annotate_even_when_last_workspace_is_home_or_train(self):
+        flow = self.load(assigned=True)
+        inbox = self.settle()
+        flow.show_home()
+        self.settle()
+        self.settings.setValue(flow.key('workspace'), 'Train')
+        inbox.open_selected()
+        self.assertEqual(flow.current, 'Annotate')
+        self.assertEqual(self.window.current_video_id, 'alpha')
+        self.assertTrue(self.window.video_browser.only_mine.isChecked())
+
+    def test_missing_or_wrong_person_cached_copy_offers_download(self):
+        local = self.download()
+        self.window.set_contributor(self.sam)
+        inbox = self.settle()
+        key = f'workflow/shared_projects/{self.sam["id"]}/{self.configuration["root_id"]}/{self.project_id}'
+        for path in (str(self.base / 'missing'), str(local)):
+            self.settings.setValue(key, path)
+            inbox.selection_changed()
+            self.assertEqual(inbox.open.text(), 'Download Assigned Work...')
+            with patch.object(self.window, 'open_assigned_work') as download:
+                inbox.open_selected()
+                download.assert_called_once_with(project_id=self.project_id)
+
+    def test_new_assignments_not_in_selective_copy_keep_existing_work_and_offer_download(self):
+        flow = self.load(assigned=True)
+        choices = dict(self.choices)
+        choices['beta'] = {'contributor': self.alex, 'frames': [1], 'task': 'hive'}
+        save_assignments(self.source, self.configuration, self.coordinator, choices,
+                         read_assignments(self.view())['revision'])
+        flow.show_home()
+        inbox = self.settle()
+        before = {p: p.read_bytes() for p in self.window.project_path.glob('annotations/png/*/*.png')}
+        with patch.object(QMessageBox, 'information') as notice:
+            inbox.open_selected()
+        self.assertIn('Some Assigned Work', notice.call_args.args[1])
+        self.assertEqual(self.window.current_video_id, 'alpha')
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        self.assertFalse(inbox.download_more.isHidden())
+        with patch.object(self.window, 'open_assigned_work') as download:
+            inbox.download_selected()
+            download.assert_called_once_with(project_id=self.project_id)
+
+    def test_reassigned_local_copy_does_not_silently_open_stale_work(self):
+        flow = self.load(assigned=True)
+        choices = dict(self.choices)
+        choices['alpha'] = {'contributor': self.alex, 'frames': [2], 'task': 'hive'}
+        save_assignments(self.source, self.configuration, self.coordinator, choices,
+                         read_assignments(self.view())['revision'])
+        flow.show_home()
+        inbox = self.settle()
+        with patch.object(QMessageBox, 'information') as notice:
+            inbox.open_selected()
+        self.assertEqual(flow.current, 'Home')
+        self.assertEqual(notice.call_args.args[1], 'Assigned Work Not Available Locally')
+
+    def test_switching_profile_clears_my_work_view(self):
+        self.load()
+        browser = self.window.video_browser
+        browser.set_my_work(self.source, {'alpha': {}}, enabled=True)
+        self.window.set_contributor(self.sam)
+        self.settle()
+        self.assertFalse(browser.only_mine.isChecked())
+        self.assertEqual(browser.my_work, {})
+
+    def test_local_read_error_is_reported_without_crashing_the_menu(self):
+        self.load(assigned=True)
+        inbox = self.settle()
+        project = inbox.projects.currentItem().data(Qt.ItemDataRole.UserRole)
+        with patch('gui.assignment_workspace.require_contributor', side_effect=OSError('Disk unavailable')), \
+                patch.object(QMessageBox, 'warning') as warning:
+            inbox.show_assigned_work(project)
+        self.assertEqual(warning.call_args.args[1:], ('Assigned Work Unavailable', 'Disk unavailable'))
 
     def test_unreadable_other_projects_dont_hide_current_project_director(self):
         self.load()

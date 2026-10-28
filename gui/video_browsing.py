@@ -4,7 +4,7 @@ from datetime import datetime
 
 from PyQt6.QtCore import QEvent, QObject, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QPalette
-from PyQt6.QtWidgets import (QApplication, QComboBox, QFormLayout, QLabel,
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFormLayout, QLabel,
                             QListWidgetItem, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from core.video_browsing import local_modification_times
@@ -68,6 +68,8 @@ class VideoBrowserControls(QWidget):
         self.project = ''
         self.videos = ()
         self.assignments = {}
+        self.my_work_project = ''
+        self.my_work = {}
         self.modified = {}
         self.errors = {}
         self.checked_times = False
@@ -76,6 +78,11 @@ class VideoBrowserControls(QWidget):
         self.stopping = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        self.only_mine = QCheckBox('Only my assigned videos')
+        self.only_mine.setToolTip('Assignments from the last My Work check. Uncheck to show other local videos.')
+        self.only_mine.hide()
+        self.only_mine.toggled.connect(self.changed)
+        layout.addWidget(self.only_mine)
         form = QFormLayout()
         self.experiment = QComboBox()
         self.experiment.addItem('All experiments', None)
@@ -106,6 +113,8 @@ class VideoBrowserControls(QWidget):
 
     def set_context(self, project, videos, assignments):
         project, videos = str(project or ''), tuple(sorted(videos))
+        if project != self.my_work_project:
+            self.set_my_work(None, {})
         reset = project != self.project
         changed = reset or videos != self.videos
         selected = None if reset else self.experiment.currentData()
@@ -127,7 +136,16 @@ class VideoBrowserControls(QWidget):
 
     def accepts(self, video):
         selected = self.experiment.currentData()
-        return selected is None or self.assignments.get(video, '') == selected
+        return ((not self.only_mine.isChecked() or video in self.my_work) and
+                (selected is None or self.assignments.get(video, '') == selected))
+
+    def set_my_work(self, project, assignments, *, enabled=False):
+        self.my_work_project = str(project or '')
+        self.my_work = dict(assignments)
+        self.only_mine.blockSignals(True)
+        self.only_mine.setChecked(enabled)
+        self.only_mine.setVisible(bool(project))
+        self.only_mine.blockSignals(False)
 
     def key(self, video, default_order=0):
         mode = self.sort.currentData()

@@ -176,6 +176,7 @@ class ProjectHome(QWidget):
         self.recovery.hide()
         self.recovery_toggle.toggled.connect(self.show_recovery)
         self.auto_resume = QCheckBox('Reopen my last project on startup')
+        self.auto_resume.setToolTip('Skip Home / My Work and return to your last project. Uncheck to start on Home.')
         self.auto_resume.setChecked(controller.settings.value('workflow/auto_resume', False, type=bool))
         self.auto_resume.toggled.connect(lambda value: controller.settings.setValue('workflow/auto_resume', value))
         layout.addWidget(self.auto_resume)
@@ -260,8 +261,8 @@ class WorkspaceController(QObject):
         header.setContentsMargins(8, 6, 8, 6)
         home = QToolButton()
         home.setIcon(window.style().standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon))
-        home.setToolTip('Project Home')
-        home.setAccessibleName('Project Home')
+        home.setToolTip('Home / My Work')
+        home.setAccessibleName('Home / My Work')
         home.setMinimumSize(32, 32)
         home.clicked.connect(self.show_home)
         header.addWidget(home)
@@ -495,6 +496,8 @@ class WorkspaceController(QObject):
 
     def identity_changed(self):
         self.window.invalidate_backup_estimate()
+        self.window.video_browser.set_my_work(None, {})
+        self.window.annotation_work.apply()
         session = self.window.contributor_session
         name = session['name'] if session else 'Choose Contributor'
         self.person.setText(self.person.fontMetrics().elidedText(name, Qt.TextElideMode.ElideRight, 180))

@@ -20,8 +20,18 @@ local to the computer and does not delete it from the shared folder.
 ## Everyday Flow
 
 - **My Work** shows shared projects where the selected person is a member, their
-  role, and assigned-video count. A local working copy can be reopened; assigned
-  downloads remain explicit. Merely creating a lab identity does not enroll it in projects.
+  role, and assigned-video count. **Open My Assigned Work** opens available assigned
+  videos in Annotate, shows the video/frame sidebars, clears conflicting filters,
+  and selects an assigned frame. This also works in a full local project: the
+  **Only my assigned videos** checkbox limits the view without converting or
+  deleting project data. Uncheck it to browse the other local videos. Assignments
+  reflect the last Home check, not a live access-control rule.
+  **Download Assigned Work...** remains separate and explicit, including when a
+  local copy exists but new assignments or frames are missing. It creates a separate
+  working copy rather than overwriting existing edits. Stale, missing, wrong-project,
+  or wrong-contributor shortcuts do not silently open unrelated work.
+  Directors with no personal assignments see **Open Local Project** instead.
+  Merely creating a lab identity does not enroll it in projects.
 - **Recent local projects** shows recent projects with one primary action directly below
   the list: **Open Selected Project**, or **Return to Project** for the project
   already open. The current contributor's last project is preselected. Paths appear
@@ -30,7 +40,9 @@ local to the computer and does not delete it from the shared folder.
   are separate choices below the recent-project section. With no recent projects,
   that empty section is omitted. The page uses a light palette without changing
   the annotation editor's theme and scrolls on smaller screens.
-- **Reopen my last project on startup** is an optional device preference. Project
+- **Reopen my last project on startup** is an optional device preference. When
+  checked, startup skips Home; uncheck it on **Home / My Work** to start there.
+  Explicit `--project` or `--video` launch arguments also bypass Home. Project
   workspace, model-panel selection, video/frame position, and saved zoom/position
   are remembered separately for each contributor/project on that device.
 - **Annotate** keeps editing and frame navigation visible. Class/global visibility

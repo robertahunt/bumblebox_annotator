@@ -181,6 +181,9 @@ class AnnotationWorkBrowser(QObject):
             self.video = (str(self.window.project_path), video)
             state = workspace(self.window.project_path)
             task = (state or {}).get('assignments', {}).get(video, {}).get('task')
+            browser = self.window.video_browser
+            if not state and browser.only_mine.isChecked():
+                task = browser.my_work.get(video, {}).get('task')
             if task:
                 self.filters.task.setCurrentIndex(self.filters.task.findData(task))
         self.apply()
@@ -240,7 +243,7 @@ class AnnotationWorkBrowser(QObject):
         elif self.error:
             self.note.setText('Mask summary unavailable: ' + self.error)
         if video and not w.video_browser.accepts(video):
-            self.note.setText(self.note.text() + '\nCurrent video is outside the experiment filter')
+            self.note.setText(self.note.text() + '\nCurrent video is outside the video filters')
         elif video and summary['state'] != 'loading' and not self.filters.accepts(summarize(entry, task)):
             self.note.setText(self.note.text() + '\nCurrent video kept visible outside these filters')
         self.finish.setEnabled(bool(video and entry and task and summary['state'] not in ('unknown', 'loading')))

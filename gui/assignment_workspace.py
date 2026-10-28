@@ -1,10 +1,14 @@
 """Assignment discovery and explicit project-director setup."""
 
+from pathlib import Path
+
 from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal
 from PyQt6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
                             QScrollArea, QStyle, QToolButton, QVBoxLayout, QWidget)
 
-from core.assigned_work import assignment_management, assignment_presence, establish_director
+from core.assigned_work import (assignment_management, assignment_presence, establish_director,
+                                require_contributor)
+from core.project_sync import PROJECT_MARKER, _read_json
 from gui.assigned_work_dialog import AssignmentManagerDialog
 from gui.project_sync_dialog import (OperationWorker, SyncProgressDialog,
                                      setting_json)
@@ -70,6 +74,11 @@ class AssignmentInbox(QWidget):
         self.open = QPushButton('Download Assigned Work...')
         self.open.clicked.connect(self.open_selected)
         layout.addWidget(self.open)
+        self.download_more = QPushButton('Download Assigned Work...')
+        self.download_more.setToolTip('Download assignments into a separate local working copy; existing local edits are kept.')
+        self.download_more.clicked.connect(self.download_selected)
+        layout.addWidget(self.download_more)
+        self.download_more.hide()
         self.projects.hide()
         self.open.hide()
         self.timer = QTimer(self)
@@ -89,6 +98,7 @@ class AssignmentInbox(QWidget):
         self.projects.hide()
         self.open.hide()
         self.projects_visible.emit(False)
+        self.download_more.hide()
         if self.notice:
             self.notice.close()
             self.notice = None
@@ -110,6 +120,7 @@ class AssignmentInbox(QWidget):
         self.summary.setText('Checking assignments...')
         self.check.setEnabled(False)
         self.open.setEnabled(False)
+        self.download_more.setEnabled(False)
         context = self.context()
         project = self.window.project_path
         configuration = dict(setting_json('project_sync/destination', {}))
@@ -145,6 +156,7 @@ class AssignmentInbox(QWidget):
             self.login.show()
             self.projects.hide()
             self.open.hide()
+            self.download_more.hide()
             self.projects_visible.emit(False)
             return
         self.login.hide()
@@ -243,17 +255,43 @@ class AssignmentInbox(QWidget):
     def local_path(self, project):
         actor = self.window.contributor_session['id']
         root = setting_json('project_sync/destination', {}).get('root_id', '')
-        return self.window.workflow.settings.value(
+        local = self.window.workflow.settings.value(
             f'workflow/shared_projects/{actor}/{root}/{project["id"]}', '', type=str)
+        if not local:
+            return ''
+        try:
+            path = Path(local)
+            marker = _read_json(path / 'annotations' / PROJECT_MARKER)
+            state = require_contributor(path, self.window.contributor_session)
+            if marker.get('project_id') != project['id'] or (state and state['root_id'] != root):
+                return ''
+            if not (path / 'annotations' / 'project.json').is_file():
+                return ''
+        except (OSError, ValueError, KeyError):
+            return ''
+        return local
 
     def selection_changed(self):
         item = self.projects.currentItem()
         project = item.data(Qt.ItemDataRole.UserRole) if item else None
         local = self.local_path(project) if project else ''
-        self.open.setText('Open Local Working Copy' if local else 'Download Assigned Work...')
+        self.open.setText(('Open My Assigned Work' if project['count'] else 'Open Local Project')
+                          if local else 'Download Assigned Work...')
         self.open.setEnabled(bool(project and (local or project['count'])))
         self.open.setToolTip('' if project and (local or project['count']) else
             'No videos assigned. Directors can open their local project below to assign work.')
+        self.download_more.setVisible(bool(local and project['count']))
+        self.download_more.setEnabled(bool(project and project['count']))
+
+    def download_selected(self):
+        item = self.projects.currentItem()
+        if item:
+            project = item.data(Qt.ItemDataRole.UserRole)
+            if not self.window.open_assigned_work(project_id=project['id']):
+                return
+            if self.local_path(project) and self.window.project_path and project.get('videos'):
+                if Path(self.local_path(project)) == self.window.project_path:
+                    self.show_assigned_work(project)
 
     def open_selected(self):
         item = self.projects.currentItem()
@@ -262,12 +300,95 @@ class AssignmentInbox(QWidget):
         project = item.data(Qt.ItemDataRole.UserRole)
         local = self.local_path(project)
         if local:
-            if str(self.window.project_path) == local:
-                self.window.workflow.resume()
-            else:
+            if str(self.window.project_path) != local:
                 self.window.open_recent_project(local)
+            if str(self.window.project_path) != local:
+                return  # Opening can be cancelled or rejected; do not navigate the old project.
+            if project.get('videos'):
+                self.show_assigned_work(project)
+            else:
+                self.window.workflow.activate('Annotate')
+                self.window.video_dock.show()
         elif project['count']:
-            self.window.open_assigned_work(project_id=project['id'])
+            self.download_selected()
+
+    def show_assigned_work(self, project):
+        try:
+            self._show_assigned_work(project)
+        except (OSError, ValueError, KeyError) as exc:
+            QMessageBox.warning(self.window, 'Assigned Work Unavailable', str(exc))
+
+    def _show_assigned_work(self, project):
+        """Navigate a full project or a selective copy without changing its storage mode."""
+        w = self.window
+        assignments = project['videos']
+        state = require_contributor(w.project_path, w.contributor_session)
+        available, missing = {}, []
+        for video, assignment in assignments.items():
+            if state:
+                stored = state['assignments'].get(video, {})
+                if any(stored.get(key) != assignment.get(key) for key in ('id', 'frames', 'task')):
+                    missing.append(video)
+                    continue
+            folder = w.project_manager.get_frames_dir(video)
+            frames = [frame for frame in assignment['frames']
+                      if (folder / f'frame_{frame:06d}.jpg').is_file()]
+            if frames:
+                available[video] = frames
+            if len(frames) != len(assignment['frames']):
+                missing.append(video)
+        if not available:
+            QMessageBox.information(w, 'Assigned Work Not Available Locally',
+                'This project does not contain usable frames for your current assignments. '
+                'Choose Download Assigned Work on Home to download a separate working copy. '
+                'Existing local work will not be replaced.')
+            return
+
+        browser = w.video_browser
+        browser.set_my_work(w.project_path, {v: assignments[v] for v in available}, enabled=True)
+        # Old experiment, split, or completion filters must not hide newly opened work.
+        filters = w.annotation_work.filters
+        for combo in (browser.experiment, w.video_split_filter_combo, w.split_filter_combo,
+                      filters.show, filters.presence, filters.split):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        w.video_split_filter = 'all'
+        w.split_filter = 'all'
+        w.tracking_filter_checkbox.blockSignals(True)
+        w.tracking_filter_checkbox.setChecked(False)
+        w.tracking_filter_checkbox.blockSignals(False)
+        filters.update_filter_label()
+        w.workflow.activate('Annotate')
+        w.video_dock.show()
+        w.frame_dock.show()
+        video = w.current_video_id if w.current_video_id in available else sorted(available)[0]
+        if w.current_video_id != video or not w.frames:
+            w.load_video_frames(video)
+        if w.current_video_id == video and w.frames:
+            current = w._get_frame_idx_in_video(w.current_frame_idx)
+            if current not in available[video]:
+                target = available[video][0]
+                index = next((i for i in range(len(w.frames)) if w._get_frame_idx_in_video(i) == target), None)
+                if index is not None:
+                    w.load_frame(index)
+        task = assignments[video].get('task')
+        filters.task.setCurrentIndex(max(0, filters.task.findData(task)))
+        w.update_video_list()
+        w.update_frame_list()
+        w.video_list.clearSelection()
+        for row in range(w.video_list.count()):
+            item = w.video_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == video:
+                w.video_list.setCurrentItem(item)
+                w.video_list.scrollToItem(item)
+                break
+        w.status_label.setText(f'My assigned work: {len(available)} of {len(assignments)} videos available locally')
+        if missing:
+            QMessageBox.information(w, 'Some Assigned Work Needs Downloading',
+                f'{len(missing)} assigned videos have missing frames or changed assignments. '
+                'Use Download Assigned Work on Home for the current assignments. '
+                'Existing local edits have not been replaced.')
 
     def stop(self):
         self.stopping = True

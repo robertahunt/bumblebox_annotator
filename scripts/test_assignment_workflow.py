@@ -31,6 +31,8 @@ class AssignmentDiscoveryTests(unittest.TestCase):
         self.assertEqual(assignment_presence(self.configuration, self.coordinator)['status'], 'director')
         mine = assignment_presence(self.configuration, self.alex)
         self.assertEqual((mine['status'], mine['count']), ('assigned', 1))
+        self.assertEqual(set(mine['projects'][0]['videos']), {'alpha'})
+        self.assertEqual(mine['projects'][0]['videos']['alpha']['frames'], [0])
         other = assignment_presence(self.configuration, new_session('Alex'), self.source)
         self.assertEqual(other['status'], 'empty')
         self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths})
