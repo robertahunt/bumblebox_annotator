@@ -8,7 +8,9 @@ from unittest.mock import Mock, patch
 import numpy as np
 from PyQt6.QtCore import QSettings, QTimer, Qt
 from PyQt6.QtGui import QCloseEvent, QColor, QPalette
-from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton, QToolButton
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import (QApplication, QDialog, QMessageBox, QPushButton, QStyle,
+                            QStyleOptionButton, QToolButton)
 
 from core.assigned_work import publish_work, read_assignments, save_assignments, transfer_director
 from core.project_activity import project_activity
@@ -156,6 +158,41 @@ class WorkspaceGuiTests(unittest.TestCase):
         self.assertEqual(flow.current, 'Annotate')
         self.assertFalse(self.window.canvas.isHidden())
 
+    def test_home_button_has_visible_label_large_house_icon_and_returns_home(self):
+        flow = self.load()
+        self.window.show()
+        self.app.processEvents()
+        button = flow.home_button
+        self.assertEqual(button.text(), 'Home')
+        self.assertEqual(button.toolButtonStyle(), Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.assertEqual(button.accessibleName(), 'Home / My Work')
+        self.assertGreaterEqual(button.height(), 44)
+        self.assertGreaterEqual(button.width(), 108)
+        self.assertEqual(button.iconSize().width(), 28)
+        icon = button.icon().pixmap(button.iconSize()).toImage()
+        self.assertFalse(icon.isNull())
+        white_pixels = sum(icon.pixelColor(x, y).alpha() > 128 and icon.pixelColor(x, y).lightness() > 220
+                           for x in range(icon.width()) for y in range(icon.height()))
+        self.assertGreater(white_pixels, 50)
+        before = self.app.palette()
+        try:
+            for theme in ('light', 'dark'):
+                palette = QPalette(before)
+                if theme == 'dark':
+                    palette.setColor(QPalette.ColorRole.Window, QColor('#202124'))
+                    palette.setColor(QPalette.ColorRole.WindowText, QColor('#eeeeee'))
+                    palette.setColor(QPalette.ColorRole.Button, QColor('#202124'))
+                    palette.setColor(QPalette.ColorRole.ButtonText, QColor('#eeeeee'))
+                self.app.setPalette(palette)
+                self.app.processEvents()
+                flow.navigation.grab().save(f'/tmp/bumblebox-home-navigation-{theme}.png')
+                flow.activate('Annotate')
+                QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+                self.assertEqual(flow.current, 'Home')
+                self.assertTrue(all(dock.isHidden() for dock in flow.docks))
+        finally:
+            self.app.setPalette(before)
+
     def test_recent_project_open_button_precedes_other_open_commands(self):
         home = self.window.workflow.home
         self.window.show()
@@ -210,6 +247,47 @@ class WorkspaceGuiTests(unittest.TestCase):
             self.assertGreater(rendered.toImage().pixelColor(10, 10).lightness(), 220)
             self.assertLessEqual(compact.minimumSizeHint().width(), 640)
             compact.close()
+        finally:
+            self.app.setPalette(before)
+
+    def test_startup_checkbox_is_legible_and_clickable_in_both_themes(self):
+        before = self.app.palette()
+        home = self.window.workflow.home
+        checkbox = home.auto_resume
+        self.window.show()
+        try:
+            for theme in ('light', 'dark'):
+                with self.subTest(theme=theme):
+                    palette = QPalette(before)
+                    if theme == 'dark':
+                        for role in (QPalette.ColorRole.Window, QPalette.ColorRole.Base,
+                                     QPalette.ColorRole.Button, QPalette.ColorRole.Dark):
+                            palette.setColor(role, QColor('#202124'))
+                        for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
+                                     QPalette.ColorRole.ButtonText, QPalette.ColorRole.Light):
+                            palette.setColor(role, QColor('#eeeeee'))
+                    self.app.setPalette(palette)
+                    checkbox.setChecked(False)
+                    self.app.processEvents()
+                    option = QStyleOptionButton()
+                    checkbox.initStyleOption(option)
+                    rect = checkbox.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, option, checkbox)
+                    self.assertGreaterEqual(rect.width(), 20)
+                    self.assertGreaterEqual(rect.height(), 20)
+                    unchecked = checkbox.grab(rect).toImage()
+                    QTest.mouseClick(checkbox, Qt.MouseButton.LeftButton, pos=rect.center())
+                    self.app.processEvents()
+                    checked = checkbox.grab(rect).toImage()
+                    dark_tick_pixels = sum(
+                        unchecked.pixelColor(x, y).lightness() - checked.pixelColor(x, y).lightness() > 80
+                        and checked.pixelColor(x, y).lightness() < 100
+                        for x in range(checked.width()) for y in range(checked.height()))
+                    self.assertGreater(dark_tick_pixels, 15)
+                    self.assertTrue(self.settings.value('workflow/auto_resume', False, type=bool))
+                    checkbox.grab().save(f'/tmp/bumblebox-startup-checkbox-{theme}.png')
+                    QTest.mouseClick(checkbox, Qt.MouseButton.LeftButton, pos=rect.center())
+                    self.assertFalse(checkbox.isChecked())
+                    self.assertFalse(self.settings.value('workflow/auto_resume', True, type=bool))
         finally:
             self.app.setPalette(before)
 

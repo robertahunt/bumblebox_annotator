@@ -5,12 +5,12 @@ import math
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QPointF, QSize, Qt, QTimer
-from PyQt6.QtGui import QAction, QColor, QPalette, QTransform
+from PyQt6.QtGui import QAction, QColor, QIcon, QPalette, QTransform
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDockWidget, QHBoxLayout,
                             QLabel, QListWidget, QListWidgetItem, QMessageBox,
                             QPushButton, QScrollArea, QStackedWidget, QStyle,
                             QTabBar, QToolBar, QToolButton, QVBoxLayout, QWidget,
-                            QSizePolicy)
+                            QSizePolicy, QStyleFactory)
 
 from core.assigned_work import workspace
 from core.project_activity import project_activity
@@ -176,6 +176,17 @@ class ProjectHome(QWidget):
         self.recovery.hide()
         self.recovery_toggle.toggled.connect(self.show_recovery)
         self.auto_resume = QCheckBox('Reopen my last project on startup')
+        # Native dark-theme indicators can remain pale on this light Home page.
+        checkbox_style = QStyleFactory.create('Fusion')
+        checkbox_style.setParent(self.auto_resume)
+        self.auto_resume.setStyle(checkbox_style)
+        checkbox_palette = checkbox_style.standardPalette()
+        checkbox_palette.setColor(QPalette.ColorRole.Window, palette.color(QPalette.ColorRole.Window))
+        checkbox_palette.setColor(QPalette.ColorRole.Text, QColor('#202b32'))
+        checkbox_palette.setColor(QPalette.ColorRole.Highlight, QColor('#246f60'))
+        checkbox_palette.setColor(QPalette.ColorRole.HighlightedText, QColor('#ffffff'))
+        self.auto_resume.setPalette(checkbox_palette)
+        self.auto_resume.setStyleSheet('QCheckBox::indicator { width: 20px; height: 20px; }')
         self.auto_resume.setToolTip('Skip Home / My Work and return to your last project. Uncheck to start on Home.')
         self.auto_resume.setChecked(controller.settings.value('workflow/auto_resume', False, type=bool))
         self.auto_resume.toggled.connect(lambda value: controller.settings.setValue('workflow/auto_resume', value))
@@ -259,11 +270,24 @@ class WorkspaceController(QObject):
         header_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         header = QHBoxLayout(header_widget)
         header.setContentsMargins(8, 6, 8, 6)
-        home = QToolButton()
-        home.setIcon(window.style().standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon))
+        home = self.home_button = QToolButton()
+        home.setIcon(QIcon(str(Path(__file__).with_name('icons') / 'house.svg')))
+        home.setIconSize(QSize(28, 28))
+        home.setText('Home')
+        home.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         home.setToolTip('Home / My Work')
         home.setAccessibleName('Home / My Work')
-        home.setMinimumSize(32, 32)
+        home.setMinimumWidth(108)
+        home.setFixedHeight(44)
+        home.setStyleSheet('''
+            QToolButton {
+                background: #246f60; color: #ffffff; border: 2px solid #1c5148;
+                border-radius: 4px; padding: 4px 10px; font-size: 11pt; font-weight: 600;
+            }
+            QToolButton:hover { background: #195b4e; }
+            QToolButton:pressed { background: #124b40; }
+            QToolButton:focus { border-color: #ffffff; }
+        ''')
         home.clicked.connect(self.show_home)
         header.addWidget(home)
         self.project_label = label('No project')
