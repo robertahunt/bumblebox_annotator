@@ -635,7 +635,43 @@ def _recover_receipt(project, state, view):
     return state
 
 
-def publish_work(project, configuration, contributor, ready=(), progress=None, cancelled=None):
+class AssignedUploadCache:
+    """Session-only checksums for one working copy, never a saved sync baseline."""
+
+    def __init__(self):
+        self.scope = None
+        self.inventory = {}
+        self.records = {}
+
+    def read(self, project, state, inventory, progress, cancelled):
+        scope = (str(project), state['workspace_id'], state['contributor']['id'])
+        same_copy = scope == self.scope
+        local = {name: dict(self.records[name]) for name, signature in inventory.items()
+                 if same_copy and self.inventory.get(name) == signature and name in self.records}
+        pending = sorted(inventory.keys() - local.keys())
+        progress(f'Local check: {len(pending):,} files to read; '
+                 f'{len(local):,} unchanged checksums reused')
+        for index, name in enumerate(pending, 1):
+            if cancelled():
+                raise InterruptedError('Publishing cancelled; local work remains saved.')
+            progress(f'Reading local file contents {index}/{len(pending)}: {name}')
+            record = file_record(_safe_child(project, name))
+            if record is None:
+                raise ValueError('Local files changed while checking. Save and retry.')
+            local[name] = record
+        if cancelled():
+            raise InterruptedError('Publishing cancelled; local work remains saved.')
+        if inventory != _inventory(project, True, with_identity=True):
+            raise ValueError('Local files changed while checking. Save and retry.')
+        # Only remember a stable read. Size/mtime alone miss same-size replacements
+        # or edits whose mtime was restored; inventory also contains ctime/dev/inode.
+        self.scope, self.inventory = scope, dict(inventory)
+        self.records = {name: dict(record) for name, record in local.items()}
+        return local
+
+
+def publish_work(project, configuration, contributor, ready=(), progress=None, cancelled=None,
+                 *, checksum_cache=None):
     project = Path(project).resolve()
     state = require_contributor(project, contributor)
     if not state or state['root_id'] != configuration['root_id']:
@@ -658,13 +694,10 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
             if _video_files(before, video) != _video_files(incoming, video):
                 raise SyncConflictError('Published work changed in video ' + video +
                                         '. No annotations were overwritten; ask the coordinator to reconcile both copies.')
-        inventory = _inventory(project, True)
-        local = {}
-        for index, name in enumerate(sorted(inventory), 1):
-            if cancelled():
-                raise InterruptedError('Publishing cancelled; local work remains saved.')
-            progress(f'Checking assigned work {index}/{len(inventory)}: {name}')
-            local[name] = file_record(_safe_child(project, name))
+        progress('Checking local file metadata for changes...')
+        inventory = _inventory(project, True, with_identity=True)
+        cache = checksum_cache if checksum_cache is not None else AssignedUploadCache()
+        local = cache.read(project, state, inventory, progress, cancelled)
         files = dict(incoming)
         sources = {}
         changes = set()
@@ -702,22 +735,21 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
             if status in ('Ready for Review', 'Accepted') and video not in changes:
                 previous_ready.add(video)
         ready = sorted(previous_ready | set(ready))
-        from core.backup_integrity import check_stored_file, require_healthy_references
+        from core.backup_integrity import require_healthy_references
         require_healthy_references(view.home, configuration, view.project_id, files)
-        inspected = set()
-        for index, (name, record) in enumerate(files.items(), 1):
-            if cancelled():
-                raise InterruptedError('Publishing cancelled; local work remains saved.')
-            if name in sources or record['sha256'] in inspected:
-                continue
-            progress(f'Checking stored file information {index}/{len(files)}: {name}')
-            check_stored_file(snapshot_file(current['manifest_path'], current['manifest'], name), record)
-            inspected.add(record['sha256'])
+        # Compact versions inherit immutable object references. Checking every
+        # unchanged remote object belongs to the explicit backup-integrity check.
+        progress(f'Keeping {len(files) - len(sources):,} unchanged published file references '
+                 '(stored contents not rechecked)')
+        if cancelled():
+            raise InterruptedError('Publishing cancelled; local work remains saved.')
         if files == incoming and set(ready) == previous_ready:
             statuses = [assignment_status(view, entry)[1] for entry in assignments.values()]
             if all(statuses):
+                if inventory != _inventory(project, True, with_identity=True):
+                    raise ValueError('Local files changed while publishing. Save and retry.')
                 return {'path': str(current['manifest_path'].parent), 'copied_files': 0, 'ready': ready,
-                        'unchanged': True}
+                        'unchanged': True, 'uploaded_videos': [], 'changed_videos': []}
         missing = {}
         for name, source in sources.items():
             digest = files[name]['sha256']
@@ -750,7 +782,7 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
                 temporary.replace(target)
             finally:
                 temporary.unlink(missing_ok=True)
-        if inventory != _inventory(project, True):
+        if inventory != _inventory(project, True, with_identity=True):
             raise ValueError('Local files changed while publishing. Save and retry.')
         _check_owned(read_assignments(view), assignments, contributor)
         if (_digest(current['manifest_path']) != current['manifest_hash'] or
@@ -765,7 +797,7 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
             from core.annotation_work import build_index
             annotation_work = build_index(files, lambda name: object_path(view.home, files[name]['sha256']),
                 previous=current['manifest'].get('annotation_work'), cancelled=cancelled)
-            if inventory != _inventory(project, True) or view.heads() != heads or cancelled():
+            if inventory != _inventory(project, True, with_identity=True) or view.heads() != heads or cancelled():
                 raise ValueError('Local or shared files changed during the annotation summary. Save and retry.')
             manifest = dict(current['manifest'], files=files, base_heads=heads,
                             annotation_work=annotation_work,
@@ -786,7 +818,15 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
             if stage.exists():
                 shutil.rmtree(stage)
         state.update({key: receipt[key] for key in ('base_reference', 'local_files', 'metadata')})
-        result = {'path': str(revisions / revision), 'copied_files': len(missing), 'ready': ready}
+        # One stored object may serve files in multiple videos. Count all its
+        # outgoing references, not just the representative name in `missing`.
+        uploaded_videos = {_annotation_video(name) or Path(name).parts[1]
+                           for name in sources if files[name]['sha256'] in missing}
+        changed_videos = {_annotation_video(name) or Path(name).parts[1]
+                          for name in incoming.keys() | files.keys()
+                          if incoming.get(name) != files.get(name)}
+        result = {'path': str(revisions / revision), 'copied_files': len(missing), 'ready': ready,
+                  'uploaded_videos': sorted(uploaded_videos), 'changed_videos': sorted(changed_videos)}
         try:
             _write_json(project / 'annotations' / WORK_STATE, state)
         except OSError as exc:

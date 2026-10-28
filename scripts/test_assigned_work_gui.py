@@ -146,6 +146,37 @@ class AssignedWorkGuiTests(unittest.TestCase):
             dialog.assert_called_once()
         self.warnings.assert_not_called()
 
+    def test_upload_reuses_session_cache_and_does_not_persist_it(self):
+        window = self.make_window(self.download())
+        result = {'path': 'test-publication', 'copied_files': 0}
+        with patch('gui.main_window.publish_work', return_value=result) as publish:
+            self.assertTrue(window.publish_assigned_work())
+            self.assertTrue(window.publish_assigned_work())
+        self.warnings.assert_not_called()
+        self.assertEqual(publish.call_count, 2)
+        for call in publish.call_args_list:
+            self.assertIs(call.kwargs['checksum_cache'], window._assigned_upload_cache)
+        self.assertFalse(any('checksum' in key for key in self.settings.allKeys()))
+
+    def test_upload_confirmation_counts_files_and_associated_videos(self):
+        window = self.make_window(self.download())
+        for count, uploaded, changed, expected in (
+            (5, ['alpha'], ['alpha'], '5 changed files (associated with 1 video) uploaded.'),
+            (1, ['alpha'], ['alpha'], '1 changed file (associated with 1 video) uploaded.'),
+            (1, ['alpha', 'beta'], ['alpha', 'beta'],
+             '1 changed file (associated with 2 videos) uploaded.'),
+            (0, [], [], 'No new file uploads were needed.'),
+            (0, [], ['alpha'], 'Changes for 1 video published. No new file uploads were needed.'),
+        ):
+            with self.subTest(count=count, uploaded=uploaded, changed=changed):
+                result = {'path': 'test-publication', 'copied_files': count,
+                          'uploaded_videos': uploaded, 'changed_videos': changed}
+                with patch('gui.main_window.publish_work', return_value=result), \
+                        patch.object(QMessageBox, 'information') as notice:
+                    self.assertTrue(window.publish_assigned_work())
+                self.assertEqual(notice.call_args.args[2], expected + '\n\nLocal work is saved.')
+        self.warnings.assert_not_called()
+
     def test_no_assignments_and_same_name_different_identity(self):
         dialog = AssignedDownloadDialog(self.configuration, new_session('Alex'))
         self.assertEqual(dialog.videos, [])

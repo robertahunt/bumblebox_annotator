@@ -224,6 +224,13 @@ exists so the outgoing review can compare contents, then reuse those checksums a
 publication. No persistent checksum cache is trusted
 across application sessions.
 
+Assigned-work uploads use a narrower routine check: they inherit unchanged
+published references without per-object presence/size checks, while verifying
+uploaded content and refusing known damage. They also reuse stable local
+checksums within the current app session. See
+[Incremental Upload Checks](assigned_work.md#incremental-upload-checks) for the
+scope and limitations; the full-project backup checks above are unchanged.
+
 ### Full Integrity Checks
 
 Use **File > Check Backup Integrity...**, also available in Project Sync, to select

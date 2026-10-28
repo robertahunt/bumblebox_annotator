@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 
 from core.annotation_policy import category_policies, policy_text
@@ -88,6 +89,7 @@ class PublishedProject:
             raise ValueError('A published manifest changed while reading it. Preview again.')
         if (manifest.get('format') not in (1, 2, 3) or manifest['project_id'] != self.project_id
                 or manifest['contributor']['id'] != contributor
+                or (manifest.get('format') == 3 and manifest.get('storage') != 'objects-v1')
                 or manifest.get('root_id', self.configuration['root_id']) != self.configuration['root_id']):
             raise ValueError('Published version identity or format is incompatible with this project.')
         files = manifest['files']
@@ -95,14 +97,20 @@ class PublishedProject:
             raise ValueError('Published version is missing required project metadata.')
         for name, record in files.items():
             relative = Path(name)
-            _safe_child(path / 'project', relative)
-            if (relative.as_posix() != name or not relative.parts or
+            if (relative.is_absolute() or '..' in relative.parts or '\x00' in name
+                    or relative.as_posix() != name or not relative.parts or
                     (relative.parts[0] not in ('annotations', 'frames', 'input_data') and name != 'tracking_sequences.json')
                     or any(part.startswith('.') for part in relative.parts)
                     or relative.parts[:2] == ('annotations', 'coco')
+                    or not isinstance(record, dict)
                     or not isinstance(record.get('size'), int) or record['size'] < 0
-                    or not isinstance(record.get('sha256'), str) or len(record['sha256']) != 64):
+                    or not isinstance(record.get('sha256'), str)
+                    or not re.fullmatch('[0-9a-f]{64}', record['sha256'])):
                 raise ValueError(f'Unsupported file in published manifest: {name}')
+            # Compact manifests have logical names, not a materialized project
+            # tree. Object access checks symlinks when actually reading a payload.
+            if manifest['format'] != 3:
+                _safe_child(path / 'project', relative)
             if relative.parts[0] == 'input_data' and not manifest.get('include_videos', True):
                 raise ValueError('Partial backup unexpectedly includes original videos.')
         parents = dict(_reference(k, v) for k, v in manifest.get('base_heads', {}).items())

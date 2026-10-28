@@ -57,7 +57,7 @@ from core.project_sync import (SyncConflictError, require_working_project, requi
                                publication_estimate_matches, backup_location)
 from core.project_update import published_versions
 from core.assigned_work import (workspace, require_contributor, require_full_project,
-                               require_assigned_frame, publish_work)
+                               require_assigned_frame, publish_work, AssignedUploadCache)
 from gui.assigned_work_dialog import AssignedDownloadDialog
 from .project_update_dialog import ProjectUpdateDialog
 from .project_rollback_dialog import ProjectRollbackDialog
@@ -248,6 +248,7 @@ class MainWindow(QMainWindow):
         self.contributor_session = None
         self._sync_in_progress = False
         self._backup_estimate = None
+        self._assigned_upload_cache = AssignedUploadCache()
         self.workflow = WorkspaceController(self, QSettings())
     
     def on_save_error(self, error_msg):
@@ -1263,7 +1264,8 @@ class MainWindow(QMainWindow):
             configuration = setting_json('project_sync/destination', {})
             result = SyncProgressDialog('Publish Assigned Work', lambda progress, cancelled:
                 publish_work(self.project_path, configuration, self.contributor_session,
-                             ready=[video] if ready else [], progress=progress, cancelled=cancelled), self).run()
+                             ready=[video] if ready else [], progress=progress, cancelled=cancelled,
+                             checksum_cache=self._assigned_upload_cache), self).run()
             projects = setting_json('project_sync/projects', {})
             projects.setdefault(str(self.project_path.resolve()), {}).update(
                 last_success=utc_now(), last_error='', last_path=result['path'])
@@ -1274,7 +1276,18 @@ class MainWindow(QMainWindow):
             if result.get('warning'):
                 QMessageBox.warning(self, 'Work Published', result['warning'])
             else:
-                QMessageBox.information(self, message, f'{result["copied_files"]} changed files uploaded. Local work is saved.')
+                count = result['copied_files']
+                if count:
+                    videos = len(result['uploaded_videos'])
+                    summary = (f'{count} changed {"file" if count == 1 else "files"} '
+                               f'(associated with {videos} {"video" if videos == 1 else "videos"}) uploaded.')
+                elif result.get('changed_videos'):
+                    videos = len(result['changed_videos'])
+                    summary = (f'Changes for {videos} {"video" if videos == 1 else "videos"} published. '
+                               'No new file uploads were needed.')
+                else:
+                    summary = 'No new file uploads were needed.'
+                QMessageBox.information(self, message, summary + '\n\nLocal work is saved.')
             self.workflow.uploaded()
             return True
         except Exception as exc:

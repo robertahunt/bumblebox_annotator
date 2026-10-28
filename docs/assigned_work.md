@@ -222,6 +222,40 @@ Project Home offers **Open Selected Project** and **Download Assigned Work**. Se
   garbage collection. Downloaded media remain on the local disk. Publish and
   verify work with the coordinator before manually retiring an old working copy.
 
+### Incremental Upload Checks
+
+**Upload Assigned Annotations** carries unchanged remote file references forward
+from the published manifest without scanning every stored object. It still checks
+project/assignment conflicts and known backup damage, and verifies every newly
+uploaded content object (or existing object being reused for changed content).
+Missing local annotations remain explicit deletions; undownloaded remote files
+remain in the new version.
+
+The completion message counts uploaded file contents and their associated videos,
+not all assigned or downloaded videos. Identical contents used by multiple videos
+are transferred once. Deletions or reuse of already-stored content are reported
+as published changes when no new file uploads are needed.
+
+The first upload for a working copy in an app session reads its local files to
+compute checksums. Later uploads reuse checksums only when size, modification
+time, change time, device, and inode match. Local inventories are still checked
+for additions, deletions and concurrent edits before publishing. The cache holds
+only the last working copy's metadata/checksums in memory, not image/mask pixels;
+it is never saved to the project or trusted across application restarts.
+
+Progress distinguishes **Checking local file metadata**, **Reading local file
+contents**, and **Keeping unchanged published file references**. A repeated
+one-mask upload no longer visits every unrelated stored file. Manifest processing
+still scales with project size, and older backups without current mask summaries
+may need annotation-summary reads.
+
+This routine upload is **not a backup integrity check**. Unknown missing,
+truncated, linked, or same-size damaged unchanged objects may be discovered only
+on download/restore or through **File > Check Backup Integrity...**. Known damage
+still blocks publication until repaired and rechecked. Full-project backup
+publication retains its separate presence/size checks; this change applies to
+assigned-work uploads.
+
 ## Review
 
 The coordinator opens the **Assignments** workspace (also reachable through
@@ -312,3 +346,9 @@ selective download, normal GUI saves, identity and scope guards, independent-vid
 publications, stale/same-video conflicts, review acceptance, cancellation, storage
 failure, damaged downloads, and interrupted publication receipts using temporary
 projects. No real research-drive projects are modified by these tests.
+
+`scripts/test_assigned_upload.py` covers session checksum reuse, same-size edits,
+atomic replacement, deletions, concurrent edits, upload verification, and the
+separation between routine publishing and integrity checks. Its 28,000-reference
+fixture rejects per-file probes of unchanged remote media or virtual compact
+project paths.

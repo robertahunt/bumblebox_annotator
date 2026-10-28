@@ -24,7 +24,9 @@ HELP = {
         'while preserving shared files you did not download. Deleting a downloaded annotation '
         'can also be an outgoing change; shared-video masks affect undownloaded frames too.\n\n'
         'Conflicting changes are blocked for review. Uploading saves progress; '
-        'Submit Current Video for Review separately marks a video ready for review.'),
+        'Submit Current Video for Review separately marks a video ready for review.\n\n'
+        'Uploaded content is verified. Unchanged published files are referenced without '
+        'rechecking them; use Check Backup Integrity for a full stored-content check.'),
     'download': ('Download Assigned Work',
         'Keep one local working copy per project and contributor. Downloads add new assignments '
         'and update unchanged local work in that same folder. Local edits are kept; conflicts stop '
