@@ -93,6 +93,7 @@ class AssignedWorkGuiTests(unittest.TestCase):
             first = AssignedDownloadDialog(self.configuration, self.alex)
             first.download_selected()
             second = AssignedDownloadDialog(self.configuration, self.alex)
+            second.set_checked(True)  # Explicitly refresh an already downloaded video.
             second.download_selected()
         self.warnings.assert_not_called()
         chooser.assert_not_called()
@@ -110,6 +111,7 @@ class AssignedWorkGuiTests(unittest.TestCase):
         with patch('gui.assigned_work_dialog.QInputDialog.getItem', return_value=(str(local), True)), \
                 patch('gui.assigned_work_dialog.TransferConfirmationDialog.exec', return_value=QDialog.DialogCode.Accepted):
             dialog = AssignedDownloadDialog(self.configuration, self.alex, window)
+            dialog.set_checked(True)
             dialog.download_selected()
         self.warnings.assert_not_called()
         self.assertEqual(dialog.download_result['path'], str(local))
@@ -124,6 +126,7 @@ class AssignedWorkGuiTests(unittest.TestCase):
         window._mark_current_annotations_dirty()
 
         def download(dialog):
+            dialog.set_checked(True)
             dialog.download_selected()
             return dialog.result()
 
@@ -180,7 +183,9 @@ class AssignedWorkGuiTests(unittest.TestCase):
     def test_no_assignments_and_same_name_different_identity(self):
         dialog = AssignedDownloadDialog(self.configuration, new_session('Alex'))
         self.assertEqual(dialog.videos, [])
+        self.assertEqual(dialog.review_view.itemText(0), 'Active Work (0)')
         self.assertFalse(dialog.download.isEnabled())
+        self.assertFalse(dialog.open_copy.isEnabled())
         dialog.close()
 
     def test_actual_gui_edit_save_publish_is_annotation_only(self):

@@ -165,6 +165,29 @@ completion columns, and persistent scan caching for older backups remain future 
 5. Reconnect and choose **Upload Assigned Annotations** to upload progress. When the current
    video's assigned frames are finished, choose **Submit Current Video for Review**.
 
+The download popup also has **Review > Active Work**, **Awaiting Review**,
+**Accepted**, and **All Assigned**, with counts. It defaults to Active Work.
+**On this computer** filters separately for videos needing download/refresh,
+already downloaded videos, or unchecked local status. Each row shows its published
+review status and its local availability. Mark Finished alone does not submit a
+video or move it to Accepted.
+
+Active videos that are not downloaded, have missing assigned frame images, have
+changed assignments, or have newer published video data are preselected. Already
+downloaded videos are unchecked. Hidden checkbox selections are cleared and never
+requested as new downloads. Use **Open Working Copy** to resume the existing copy
+without transferring files, or explicitly select downloaded videos to check for
+updates. The refresh icon rechecks review and local-copy status.
+
+This overview reads publication/assignment metadata and checks frame-file presence,
+not mask contents or all local checksums. Downloaded does not mean finished, approved,
+or free of local edits. Missing/unreadable saved copies and multiple older copies
+show an explicit status problem rather than being guessed as not downloaded.
+The transfer preview still checks local changes and conflicts. It may include
+updates to previously downloaded videos outside the current filter to keep the
+working copy consistent; unchanged files are not copied again. No local annotations
+are overwritten just because a video is shown as needing a refresh.
+
 Assignment status is checked in the background after choosing a profile or opening
 a project, and on returning Home. A verified empty result opens a non-modal **No
 Work Assigned Yet** notice once per contributor session/shared root, offering

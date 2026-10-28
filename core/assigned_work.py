@@ -289,6 +289,13 @@ def assigned_review_statuses(project, configuration, contributor, assignments, c
     if state and state['root_id'] != configuration['root_id']:
         raise ValueError('Choose the shared folder used for this assignment.')
     view = PublishedProject(project, configuration)
+    return assignment_review_snapshot(view, contributor, assignments, cancelled)['statuses']
+
+
+def assignment_review_snapshot(view, contributor, assignments, cancelled=lambda: False):
+    """Read a coherent publication and review states for the expected assignments."""
+    if cancelled():
+        raise InterruptedError('Assignment check cancelled')
     data = read_assignments(view)
     current, heads = latest_snapshot(view)
     statuses = {}
@@ -304,7 +311,7 @@ def assigned_review_statuses(project, configuration, contributor, assignments, c
     if (view.heads(validate_snapshots=False) != heads or
             read_assignments(view)['revision'] != data['revision']):
         raise ValueError('Shared work changed during the check. Refresh review status.')
-    return statuses
+    return {'statuses': statuses, 'snapshot': current}
 
 
 def establish_director(project, configuration, contributor, expected_revision):

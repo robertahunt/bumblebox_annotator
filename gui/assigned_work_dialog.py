@@ -13,12 +13,14 @@ from core.project_update import PublishedProject
 from core.assigned_work import (accept_submission, assignment_status, catalog,
     latest_snapshot, my_projects, parse_frames, read_assignments, save_assignments,
     transfer_director, project_members, add_project_member)
-from core.assigned_workspace import (PreparedAssignedDownload, managed_directory, matching_copy, existing_copies)
+from core.assigned_workspace import (PreparedAssignedDownload, managed_directory, matching_copy, existing_copies,
+                                     assigned_download_overview, DOWNLOAD_NEEDED, DOWNLOAD_LABELS)
 from gui.project_sync_dialog import (SyncProgressDialog, TransferConfirmationDialog,
                                      setting_json, save_setting, load_contributor_profiles,
                                      remember_contributor_profile)
 from gui.workflow_help import help_button
 from gui.annotation_work import WorkFilters, task_combo
+from gui.assigned_review import AssignedReviewViews
 from gui.video_browsing import VideoBrowserControls, ModifiedTableItem, SORT_ROLE, VideoRowColors
 from core.annotation_work import published_index, summarize, task_label
 from core.shared_project_review import compare_saved_annotations
@@ -593,21 +595,58 @@ def assigned_local_path(configuration, project_id, contributor):
 
 
 class AssignedDownloadDialog(QDialog):
+    DOWNLOAD_COLUMN = 4
+
     def __init__(self, configuration, contributor, parent=None, *, project_id=None):
         super().__init__(parent)
         self.configuration, self.contributor = configuration, contributor
         self.download_result = None
         self.setWindowTitle('My Assigned Work')
-        self.resize(820, 460)
+        self.resize(1100, 560)
         layout = QVBoxLayout(self)
         self.projects = QComboBox()
         layout.addWidget(self.projects)
-        self.table = _table(['Video', 'Assigned frames', 'Download'])
+        filters = QFormLayout()
+        review_row = QHBoxLayout()
+        self.review_view = QComboBox()
+        for label, value in AssignedReviewViews.VIEWS:
+            self.review_view.addItem(label, value)
+        self.review_view.setToolTip('Published review status, separate from local mask completion.')
+        review_row.addWidget(self.review_view, 1)
+        self.refresh_button = QToolButton()
+        self.refresh_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.refresh_button.setToolTip('Refresh review and download status')
+        self.refresh_button.setAccessibleName('Refresh review and download status')
+        self.refresh_button.clicked.connect(self.refresh_status)
+        review_row.addWidget(self.refresh_button)
+        filters.addRow('Review:', review_row)
+        self.local_filter = QComboBox()
+        for label, value in (('All videos', 'all'), ('Needs download / refresh', 'needed'),
+                             ('Already downloaded', 'downloaded'), ('Not checked', 'unknown')):
+            self.local_filter.addItem(label, value)
+        filters.addRow('On this computer:', self.local_filter)
+        layout.addLayout(filters)
+        self.table = _table(['Video', 'Review status', 'On this computer', 'Assigned frames', 'Download'])
         layout.addWidget(self.table)
+        selection = QHBoxLayout()
+        select_visible = QPushButton('Select Visible')
+        select_visible.clicked.connect(lambda: self.set_checked(True))
+        clear = QPushButton('Clear Selection')
+        clear.clicked.connect(lambda: self.set_checked(False))
+        selection.addWidget(select_visible)
+        selection.addWidget(clear)
+        selection.addStretch()
+        layout.addLayout(selection)
+        self.status_note = QLabel()
+        self.status_note.setWordWrap(True)
+        self.status_note.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.status_note)
         self.summary = QLabel('')
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.open_copy = buttons.addButton('Open Working Copy', QDialogButtonBox.ButtonRole.ActionRole)
+        self.open_copy.clicked.connect(self.open_working_copy)
         self.download = buttons.addButton('Download Assigned Work...', QDialogButtonBox.ButtonRole.ActionRole)
         self.download.clicked.connect(self.download_selected)
         buttons.rejected.connect(self.reject)
@@ -622,28 +661,148 @@ class AssignedDownloadDialog(QDialog):
         if project_id is not None:
             self.projects.setCurrentIndex(self.projects.findData(project_id))
         self.projects.currentIndexChanged.connect(self.populate)
+        self.review_view.currentIndexChanged.connect(self.filter_videos)
+        self.local_filter.currentIndexChanged.connect(self.filter_videos)
+        self.table.itemChanged.connect(self.update_selection)
         self.populate()
 
     def populate(self):
         index = self.projects.currentIndex()
         videos = self.available[index]['videos'] if index >= 0 else {}
+        self.overview = None
+        self.overview_error = ''
+        for combo in (self.review_view, self.local_filter):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
         self.videos = sorted(videos)
+        self.table.blockSignals(True)
         self.table.setRowCount(len(self.videos))
         for row, video in enumerate(self.videos):
-            self.table.setItem(row, 0, QTableWidgetItem(video))
-            self.table.setItem(row, 1, QTableWidgetItem(str(len(videos[video]['frames']))))
+            item = QTableWidgetItem(video)
+            item.setToolTip(video)
+            self.table.setItem(row, 0, item)
+            self.table.setItem(row, 1, QTableWidgetItem('Not checked'))
+            self.table.setItem(row, 2, QTableWidgetItem('Not checked'))
+            self.table.setItem(row, 3, QTableWidgetItem(str(len(videos[video]['frames']))))
             check = QTableWidgetItem()
             check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
-            check.setCheckState(Qt.CheckState.Checked)
-            self.table.setItem(row, 2, check)
-        self.download.setEnabled(bool(videos))
-        self.summary.setText(f'Contributor: {self.contributor["name"]} | {len(videos)} assigned videos' if videos else
+            check.setCheckState(Qt.CheckState.Unchecked)
+            self.table.setItem(row, self.DOWNLOAD_COLUMN, check)
+        self.table.blockSignals(False)
+        self.refresh_status(initial=True)
+
+    def known_copy_paths(self, project_id):
+        parent = self.parent()
+        paths = list(getattr(parent, 'recent_projects', []))
+        paths.append(getattr(parent, 'project_path', None))
+        workflow = getattr(parent, 'workflow', None)
+        if workflow:
+            settings = workflow.settings
+            actor, root = self.contributor['id'], self.configuration['root_id']
+            paths += settings.value('workflow/recent_projects/' + actor, [], type=list)
+            paths.append(settings.value(f'workflow/shared_projects/{actor}/{root}/{project_id}', '', type=str))
+        return paths
+
+    def refresh_status(self, _checked=False, *, initial=False):
+        project_id = self.projects.currentData()
+        self.overview, self.overview_error = None, ''
+        self.download.setEnabled(False)
+        self.open_copy.setEnabled(False)
+        if self.videos:
+            saved = setting_json('assigned_work/locations', {}).get(
+                managed_copy_key(self.configuration, project_id, self.contributor))
+            known = self.known_copy_paths(project_id)
+            assignments = self.available[self.projects.currentIndex()]['videos']
+            try:
+                self.overview = SyncProgressDialog('Check Assigned Work', lambda progress, cancelled:
+                    assigned_download_overview(self.configuration, project_id, self.contributor, assignments,
+                        saved_path=saved, known_paths=known, progress=progress, cancelled=cancelled), self).run()
+            except Exception as exc:
+                self.overview_error = str(exc)
+        data = self.overview or {}
+        self.table.blockSignals(True)
+        for row, video in enumerate(self.videos):
+            self.table.item(row, 1).setText(data.get('statuses', {}).get(video, 'Not checked'))
+            local = data.get('local', {}).get(video, 'unknown')
+            self.table.item(row, 2).setText(DOWNLOAD_LABELS[local])
+            self.table.item(row, 2).setToolTip(data.get('local_error') or
+                'Frame availability and published-version metadata only. '
+                'The transfer preview checks saved local edits and conflicts before updating files.')
+            if initial:
+                self.table.item(row, self.DOWNLOAD_COLUMN).setCheckState(
+                    Qt.CheckState.Checked if local in DOWNLOAD_NEEDED else Qt.CheckState.Unchecked)
+        for i, (label, value) in enumerate(AssignedReviewViews.VIEWS):
+            count = sum(AssignedReviewViews.group(data.get('statuses', {}).get(v)) == value for v in self.videos)
+            if value == 'all':
+                count = len(self.videos)
+            elif self.videos and not self.overview:
+                count = '?'
+            self.review_view.setItemText(i, f'{label} ({count})')
+        self.table.blockSignals(False)
+        self.open_copy.setEnabled(bool(data.get('local_path')))
+        self.open_copy.setToolTip(data.get('local_path', ''))
+        self.filter_videos()
+
+    def selected_videos(self):
+        return [v for row, v in enumerate(self.videos) if not self.table.isRowHidden(row)
+                and self.table.item(row, self.DOWNLOAD_COLUMN).checkState() == Qt.CheckState.Checked]
+
+    def set_checked(self, checked):
+        self.table.blockSignals(True)
+        for row in range(self.table.rowCount()):
+            if not checked or not self.table.isRowHidden(row):
+                self.table.item(row, self.DOWNLOAD_COLUMN).setCheckState(
+                    Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self.table.blockSignals(False)
+        self.update_selection()
+
+    def filter_videos(self):
+        data = self.overview or {}
+        selected_review, selected_local = self.review_view.currentData(), self.local_filter.currentData()
+        self.table.blockSignals(True)
+        for row, video in enumerate(self.videos):
+            local = data.get('local', {}).get(video, 'unknown')
+            visible = (selected_review == 'all' or
+                       AssignedReviewViews.group(data.get('statuses', {}).get(video)) == selected_review) and (
+                selected_local == 'all' or selected_local == local or
+                (selected_local == 'needed' and local in DOWNLOAD_NEEDED))
+            self.table.setRowHidden(row, not visible)
+            if not visible:
+                self.table.item(row, self.DOWNLOAD_COLUMN).setCheckState(Qt.CheckState.Unchecked)
+        self.table.blockSignals(False)
+        self.update_selection()
+
+    def update_selection(self):
+        count = len(self.selected_videos())
+        shown = sum(not self.table.isRowHidden(row) for row in range(len(self.videos)))
+        self.download.setEnabled(bool(count and self.overview))
+        self.download.setText(f'Download Selected ({count})...' if count else 'Download Selected...')
+        self.summary.setText(f'Contributor: {self.contributor["name"]} | {len(self.videos)} assigned videos | '
+                             f'{shown} shown | {count} selected' if self.videos else
                              'No assignments for this contributor profile. Ask the project director to add you in People and assign videos.')
+        error = self.overview_error or (self.overview or {}).get('local_error')
+        self.status_note.setText(('Status check incomplete: ' + error) if error else
+                                 'No videos match these filters.' if self.videos and not shown else '')
+        self.status_note.setVisible(bool(self.status_note.text()))
+
+    def open_working_copy(self):
+        path = (self.overview or {}).get('local_path')
+        if not path:
+            return
+        try:
+            matching_copy(path, self.configuration, self.projects.currentData(), self.contributor)
+            locations = setting_json('assigned_work/locations', {})
+            locations[managed_copy_key(self.configuration, self.projects.currentData(), self.contributor)] = path
+            save_setting('assigned_work/locations', locations)
+            self.download_result = {'path': path, 'updated': False, 'bytes': 0}
+            self.accept()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Working Copy Unavailable', str(exc))
 
     def download_selected(self):
-        selected = [v for row, v in enumerate(self.videos)
-                    if self.table.item(row, 2).checkState() == Qt.CheckState.Checked]
-        if not selected:
+        selected = self.selected_videos()
+        if not selected or not self.overview:
             return
         try:
             project_id = self.projects.currentData()
@@ -684,16 +843,7 @@ class AssignedDownloadDialog(QDialog):
         registered = assigned_local_path(self.configuration, project_id, self.contributor)
         if registered:
             return Path(registered)
-        parent = self.parent()
-        paths = list(getattr(parent, 'recent_projects', []))
-        paths.append(getattr(parent, 'project_path', None))
-        workflow = getattr(parent, 'workflow', None)
-        if workflow:
-            settings = workflow.settings
-            actor, root = self.contributor['id'], self.configuration['root_id']
-            paths += settings.value('workflow/recent_projects/' + actor, [], type=list)
-            paths.append(settings.value(f'workflow/shared_projects/{actor}/{root}/{project_id}', '', type=str))
-        copies = existing_copies(paths, self.configuration, project_id, self.contributor)
+        copies = existing_copies(self.known_copy_paths(project_id), self.configuration, project_id, self.contributor)
         if copies:
             choice, accepted = QInputDialog.getItem(self, 'Continue an Existing Working Copy',
                 'Choose the copy to keep using on this computer. Other copies are left untouched.\n'

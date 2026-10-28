@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from core.assigned_work import (ASSIGNMENTS, _check_owned, _global_files, _video_files,
-    download_plan, download_work, read_assignments, require_contributor)
+    assignment_review_snapshot, download_plan, download_work, read_assignments, require_contributor)
 from core.contributors import utc_now
 from core.project_delta import apply_delta, bytes_record, file_record
 from core.project_sync import (WORK_STATE, SyncConflictError, _digest, _inventory,
@@ -47,6 +47,72 @@ def existing_copies(paths, configuration, project_id, contributor):
             continue
         found.append(path)
     return found
+
+
+DOWNLOAD_NEEDED = frozenset(('not_downloaded', 'missing_frames', 'assignment_changed', 'shared_updates'))
+DOWNLOAD_LABELS = {
+    'not_downloaded': 'Not downloaded',
+    'downloaded': 'Downloaded',
+    'missing_frames': 'Missing frames',
+    'assignment_changed': 'Assignment changed',
+    'shared_updates': 'Shared updates available',
+    'unknown': 'Not checked',
+}
+
+
+def assigned_download_overview(configuration, project_id, contributor, assignments, *,
+                               saved_path=None, known_paths=(), progress=lambda message: None,
+                               cancelled=lambda: False):
+    """Read review states and local frame availability, not mask contents or checksums."""
+    if cancelled():
+        raise InterruptedError('Assignment check cancelled')
+    progress('Checking published review status...')
+    view = PublishedProject.from_archive(configuration, project_id)
+    review = assignment_review_snapshot(view, contributor, assignments, cancelled)
+    result = {'statuses': review['statuses'], 'local': {}, 'local_path': '', 'local_error': ''}
+    try:
+        progress('Locating your working copy on this computer...')
+        destination = Path(saved_path) if saved_path else managed_directory(configuration, project_id, contributor)
+        if saved_path or destination.exists():
+            matching_copy(destination, configuration, project_id, contributor)
+            copies = [destination]
+        else:
+            copies = existing_copies(known_paths, configuration, project_id, contributor)
+        if len(copies) > 1:
+            raise ValueError('Several older working copies exist. Select videos to download, then choose which '
+                             'copy to continue using. The copies will not be merged automatically.')
+        if not copies:
+            result['local'] = {v: 'not_downloaded' for v in assignments}
+            return result
+        destination = copies[0]
+        state = matching_copy(destination, configuration, project_id, contributor)
+        result['local_path'] = str(destination)
+        baseline = view.snapshot(tuple(state['base_reference']))['manifest']['files']
+        current = review['snapshot']['manifest']['files']
+        for position, (video, expected) in enumerate(assignments.items(), 1):
+            if cancelled():
+                raise InterruptedError('Assignment check cancelled')
+            progress(f'Checking local frame availability: {position}/{len(assignments)}')
+            old = state['assignments'].get(video)
+            if not old:
+                result['local'][video] = 'not_downloaded'
+            elif any(old.get(key) != expected.get(key) for key in ('id', 'frames', 'task')):
+                result['local'][video] = 'assignment_changed'
+            else:
+                present = True
+                for frame in expected['frames']:
+                    if cancelled():
+                        raise InterruptedError('Assignment check cancelled')
+                    if not _safe_child(destination, f'frames/{video}/frame_{frame:06d}.jpg').is_file():
+                        present = False
+                        break
+                result['local'][video] = ('missing_frames' if not present else
+                    'shared_updates' if _video_files(baseline, video) != _video_files(current, video) else 'downloaded')
+    except InterruptedError:
+        raise
+    except (OSError, ValueError, KeyError) as exc:
+        result.update(local={v: 'unknown' for v in assignments}, local_path='', local_error=str(exc))
+    return result
 
 
 def _payload(value):
