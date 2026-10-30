@@ -39,6 +39,20 @@ class MaskGeometryCache:
         else:
             self._categories.pop(category, None)
 
+    def invalidate_instances(self, category, instance_ids):
+        """Discard measurements only for instances affected by an in-place edit.
+
+        IDs are rediscovered because edits may add an instance or erase the last
+        pixel of an overlapped neighbor. Other scalar measurements remain valid.
+        Whole-array replacements still use invalidate(category).
+        """
+        entry = self._categories.get(category)
+        if entry is None:
+            return
+        for instance_id in instance_ids:
+            entry['geometry'].pop(int(instance_id), None)
+        entry['ids'] = None
+
     def _entry(self, category, mask):
         entry = self._categories.get(category)
         if entry is None or entry['source']() is not mask:

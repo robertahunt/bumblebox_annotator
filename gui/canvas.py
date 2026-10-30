@@ -58,6 +58,7 @@ class ImageCanvas(QGraphicsView):
     masks_visibility_changed = pyqtSignal(bool)  # Signal when mask visibility changes
     bboxes_visibility_changed = pyqtSignal(bool)  # Signal when bbox visibility changes
     instance_visibility_changed = pyqtSignal(int, str, bool)  # instance_id, category, visible
+    bee_visibility_changed = pyqtSignal(int)  # focal bee ID, or 0 for all bees
     instance_visibility_toggle_blocked = pyqtSignal(int, str)  # instance_id, category
     instance_selected = pyqtSignal(int, str)  # instance_id, category
     brush_size_step_requested = pyqtSignal(int)  # +1 larger, -1 smaller
@@ -1606,6 +1607,8 @@ class ImageCanvas(QGraphicsView):
 
         menu = QMenu(self)
 
+        self.add_bee_visibility_actions(menu, instance_id, current_category)
+
         if instance_id > 0:
             self._add_change_category_menu(menu, instance_id, current_category)
         else:
@@ -1780,7 +1783,7 @@ class ImageCanvas(QGraphicsView):
         self._combined_mask_dirty = True
         self._cached_instance_ids = None
         self._cached_overlay = None
-        self._geometry_cache.invalidate(category)
+        self._geometry_cache.invalidate_instances(category, (old_id, new_id))
         self._clear_brush_history()
 
         self.selected_mask_idx = new_id
@@ -1824,6 +1827,11 @@ class ImageCanvas(QGraphicsView):
             scene_pos,
             allow_active_fallback=True
         )
+
+        # While drawing, the focal mask is the active edit, even if the
+        # right-click lands on another bee or empty pixels.
+        focal_id, focal_category = self._active_brush_instance()
+        self.add_bee_visibility_actions(menu, focal_id, focal_category)
 
         fill_action = QAction("Fill Enclosed Area", self)
         fill_action.setEnabled(
@@ -2749,9 +2757,10 @@ class ImageCanvas(QGraphicsView):
 
         self.set_instance_visible(mask_id, category, True, rebuild=False)
         
-        # Add to the appropriate mask array
+        # Include neighbors whose pixels are replaced by this mask.
+        affected_ids = set(np.unique(mask_array[binary_mask])) | {mask_id}
         mask_array[binary_mask] = mask_id
-        self._geometry_cache.invalidate(category)
+        self._geometry_cache.invalidate_instances(category, affected_ids)
         
         # Mark combined mask cache as dirty
         self._combined_mask_dirty = True
@@ -2963,7 +2972,7 @@ class ImageCanvas(QGraphicsView):
             if mask_array is not None:
                 mask_array[mask_array == instance_id] = 0
                 if _category in found_categories or _category == new_category:
-                    self._geometry_cache.invalidate(_category)
+                    self._geometry_cache.invalidate_instances(_category, (instance_id,))
 
         # Active edits are exported through their category's mask array too.
         # Ensure a newly used category exists before changing the edit's category.
@@ -2984,7 +2993,9 @@ class ImageCanvas(QGraphicsView):
         elif has_pixels:
             # Add instance to the new mask array with the same ID.
             new_mask_array = self._get_mask_array_by_category(new_category)
+            affected_ids = set(np.unique(new_mask_array[source_pixels])) | {instance_id}
             new_mask_array[source_pixels] = instance_id
+            self._geometry_cache.invalidate_instances(new_category, affected_ids)
 
         self.annotation_metadata[instance_id] = old_metadata
         self.annotation_metadata[instance_id]['category'] = new_category
@@ -3065,7 +3076,7 @@ class ImageCanvas(QGraphicsView):
             if mask_array is not None and np.any(mask_array == instance_id):
                 mask_array[mask_array == instance_id] = 0
                 removed_categories.append(category)
-                self._geometry_cache.invalidate(category)
+                self._geometry_cache.invalidate_instances(category, (instance_id,))
 
         if removed_categories:
             self._combined_mask_dirty = True
@@ -3106,7 +3117,7 @@ class ImageCanvas(QGraphicsView):
                 if mask_array is not None and np.any(mask_array == instance_id):
                     mask_array[mask_array == instance_id] = 0
                     removed_categories.append(category)
-                    self._geometry_cache.invalidate(category)
+                    self._geometry_cache.invalidate_instances(category, (instance_id,))
 
             if removed_categories:
                 removed_messages.append(
@@ -3909,6 +3920,51 @@ class ImageCanvas(QGraphicsView):
         if rebuild:
             self.rebuild_visualizations()
 
+    def add_bee_visibility_actions(self, menu, instance_id=None, category=None):
+        """Share focal-bee display controls across canvas and instance menus."""
+        if not instance_id or instance_id <= 0:
+            instance_id = self.selected_mask_idx
+            category = self.selected_instance_category
+        if category is None:
+            category = self.annotation_metadata.get(instance_id, {}).get('category', 'bee')
+        layers_visible = (self._segmentation_overlays_visible() and
+                          self.annotation_type_visibility.get('bee', True))
+        focal = menu.addAction('Show Only This Bee Mask')
+        focal.setEnabled(bool(instance_id and instance_id > 0 and category == 'bee' and layers_visible))
+        focal.setToolTip('Hide other bees while keeping the focal bee visible. Turn on bee masks first.')
+        focal.triggered.connect(lambda checked=False, iid=instance_id: self.show_only_bee_mask(iid))
+        restore = menu.addAction('Show All Bee Masks')
+        restore.setEnabled(layers_visible and any(cat == 'bee' for cat, _ in self.hidden_instance_keys))
+        restore.setToolTip('Show all bees in this frame; other annotation categories keep their visibility.')
+        restore.triggered.connect(lambda checked=False: self.show_all_bee_masks())
+        menu.addSeparator()
+
+    def show_only_bee_mask(self, instance_id):
+        """Hide other bees in one redraw, preserving masks and pending edits."""
+        bee_ids = {entry['id'] for entry in self.get_instance_entries() if entry['category'] == 'bee'}
+        if instance_id not in bee_ids:
+            return False
+        hidden = {key for key in self.hidden_instance_keys if key[0] != 'bee'}
+        hidden.update(('bee', iid) for iid in bee_ids if iid != instance_id)
+        self._set_bee_mask_visibility(hidden, instance_id)
+        return True
+
+    def show_all_bee_masks(self):
+        """Restore all bee instance switches without changing other classes."""
+        hidden = {key for key in self.hidden_instance_keys if key[0] != 'bee'}
+        self._set_bee_mask_visibility(hidden, 0)
+
+    def _set_bee_mask_visibility(self, hidden, focal_id):
+        if hidden == self.hidden_instance_keys:
+            return
+        self.hidden_instance_keys = hidden
+        if self.selected_bbox_id is not None and not self.is_instance_enabled(self.selected_bbox_id):
+            self._deselect_bbox()
+        # Do not toggle checkboxes one by one: each used to rebuild the whole
+        # overlay. Visibility is display-only and must not commit brush edits.
+        self.rebuild_visualizations()
+        self.bee_visibility_changed.emit(focal_id)
+
     def toggle_selected_instance_visibility(self):
         """Toggle visibility for the currently selected instance."""
         if self.selected_mask_idx <= 0:
@@ -4286,9 +4342,9 @@ class ImageCanvas(QGraphicsView):
             if new_id >= self.next_mask_id:
                 self.next_mask_id = new_id + 1
         
-        # Clear caches
+        # Clear measurements for the renamed/merged instances only.
         self._cached_instance_ids = None
-        self._geometry_cache.invalidate()
+        self._geometry_cache.invalidate_instances(category, (old_id, new_id))
         self._combined_mask_dirty = True
         if self._cached_overlay is not None:
             del self._cached_overlay
@@ -4590,7 +4646,7 @@ class ImageCanvas(QGraphicsView):
             instance_pixels = mask_array == instance_id
             self.editing_mask[instance_pixels] = 255
             mask_array[instance_pixels] = 0
-            self._geometry_cache.invalidate(category)
+            self._geometry_cache.invalidate_instances(category, (instance_id,))
             # Mark combined mask cache as dirty
             self._combined_mask_dirty = True
         else:
@@ -4712,8 +4768,9 @@ class ImageCanvas(QGraphicsView):
 
         # Merge editing mask back into appropriate mask array
         editing_pixels = self.editing_mask > 0
+        affected_ids = set(np.unique(mask_array[editing_pixels])) | {self.editing_instance_id}
         mask_array[editing_pixels] = self.editing_instance_id
-        self._geometry_cache.invalidate(category)
+        self._geometry_cache.invalidate_instances(category, affected_ids)
         
         # Mark combined mask cache as dirty
         self._combined_mask_dirty = True
@@ -4814,7 +4871,7 @@ class ImageCanvas(QGraphicsView):
             mask_array = getattr(self, mask_attr, None)
             if mask_array is not None and np.any(mask_array == instance_id):
                 mask_array[mask_array == instance_id] = 0
-                self._geometry_cache.invalidate(_mask_category)
+                self._geometry_cache.invalidate_instances(_mask_category, (instance_id,))
                 changed = True
 
         if instance_id in self.annotation_metadata:
@@ -4912,15 +4969,7 @@ class ImageCanvas(QGraphicsView):
         alpha = min(self.mask_opacity, 255)
         self._editing_overlay_cache[mask_pixels] = [color[0], color[1], color[2], alpha]
         
-        # Convert to QPixmap (use QImage.copy() to prevent memory leak)
-        q_image = QImage(self._editing_overlay_cache.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
-        pixmap = QPixmap.fromImage(q_image.copy())
-        
-        # Add to scene on top of everything
-        self.editing_mask_item = QGraphicsPixmapItem(pixmap)
-        self.editing_mask_item.setZValue(125)  # Above regular masks and non-active boxes
-        self.editing_mask_item.setVisible(self._is_editing_mask_visible())
-        self.scene.addItem(self.editing_mask_item)
+        self._refresh_editing_pixmap()
         self._draw_or_update_editing_bbox()
         
         # Update selection border for editing mask (skip if actively drawing)
@@ -4940,6 +4989,28 @@ class ImageCanvas(QGraphicsView):
             self._segmentation_overlays_visible() and
             self.is_annotation_instance_visible(self.editing_instance_id, category)
         )
+
+    def _refresh_editing_pixmap(self):
+        """Upload only the active mask's extent, retaining source-image coordinates.
+
+        The full RGBA cache supports exact incremental edits, but uploading its
+        transparent margins on every stroke copied ~49 MB for a 2021 frame.
+        Recompute the extent after erasing too, so old edges never remain visible.
+        """
+        x, y, width, height = cv2.boundingRect(self.editing_mask)
+        if width == 0 or height == 0:
+            x, y, width, height = 0, 0, 1, 1
+        region = np.ascontiguousarray(self._editing_overlay_cache[y:y + height, x:x + width])
+        q_image = QImage(region.data, width, height, region.strides[0], QImage.Format.Format_RGBA8888)
+        # Give Qt owned pixels before this temporary cropped array is released.
+        pixmap = QPixmap.fromImage(q_image.copy())
+        if self.editing_mask_item is None:
+            self.editing_mask_item = QGraphicsPixmapItem()
+            self.scene.addItem(self.editing_mask_item)
+        self.editing_mask_item.setPixmap(pixmap)
+        self.editing_mask_item.setOffset(x, y)
+        self.editing_mask_item.setZValue(125)
+        self.editing_mask_item.setVisible(self._is_editing_mask_visible())
 
     def _sync_editing_mask_visibility(self):
         """Apply current global/class/instance visibility to the editing overlay."""
@@ -4987,24 +5058,7 @@ class ImageCanvas(QGraphicsView):
             self._editing_overlay_cache[brush_pixels] = [color[0], color[1], color[2], alpha]
             self._editing_overlay_cache[eraser_pixels] = [0, 0, 0, 0]
         
-        # Update the pixmap from cached overlay (optimized: reuse buffer)
-        h, w = self._editing_overlay_cache.shape[:2]
-        # Create QImage directly from buffer without copy for better performance
-        # The buffer is kept alive by self._editing_overlay_cache
-        q_image = QImage(self._editing_overlay_cache.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
-        # Only copy when creating pixmap to avoid tearing
-        pixmap = QPixmap.fromImage(q_image)
-        
-        # Update existing item
-        if self.editing_mask_item:
-            self.editing_mask_item.setPixmap(pixmap)
-            self.editing_mask_item.setZValue(125)
-        else:
-            # Create item if it doesn't exist
-            self.editing_mask_item = QGraphicsPixmapItem(pixmap)
-            self.editing_mask_item.setZValue(125)
-            self.editing_mask_item.setVisible(self._is_editing_mask_visible())
-            self.scene.addItem(self.editing_mask_item)
+        self._refresh_editing_pixmap()
         self._draw_or_update_editing_bbox()
         self._sync_editing_mask_visibility()
     

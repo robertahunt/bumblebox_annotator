@@ -1300,6 +1300,37 @@ class AnnotationManager:
             self.attributor.baselines.pop(attribution_key, None)
         return annotations
 
+    def load_aruco_tracking(self, project_path, video_id):
+        """Read saved tag associations without decoding any annotation masks.
+
+        Keep only the most recently requested JSON mapping. File identity and
+        timestamps detect local edits, atomic replacements, and external updates.
+        Return a copy because tag-assignment callers may modify their mapping.
+        """
+        json_file = (Path(project_path) / 'annotations' / 'json' /
+                     str(video_id) / 'video_annotations.json').absolute()
+        try:
+            stat = json_file.stat()
+            signature = (str(json_file), stat.st_dev, stat.st_ino, stat.st_size,
+                         stat.st_mtime_ns, stat.st_ctime_ns)
+            cached = getattr(self, '_aruco_metadata_cache', None)
+            if cached is not None and cached[0] == signature:
+                return dict(cached[1])
+            with json_file.open('r') as stream:
+                data = json.load(stream)
+            tracking = data.get('aruco_tracking', {}) if isinstance(data, dict) else {}
+            if not isinstance(tracking, dict):
+                tracking = {}
+            self._aruco_metadata_cache = (signature, dict(tracking))
+            return dict(tracking)
+        except FileNotFoundError:
+            self._aruco_metadata_cache = None
+            return {}
+        except (OSError, ValueError) as exc:
+            self._aruco_metadata_cache = None
+            print(f"Warning: Failed to load ArUco metadata for {video_id}: {exc}")
+            return {}
+
     def load_video_annotations(self, project_path, video_id):
         """Load video-level annotations (chamber, hive, and pollen) shared across all frames.
 

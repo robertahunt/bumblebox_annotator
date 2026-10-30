@@ -301,6 +301,7 @@ class MainWindow(QMainWindow):
         self.canvas.masks_visibility_changed.connect(self.on_masks_visibility_changed)
         self.canvas.bboxes_visibility_changed.connect(self.on_bboxes_visibility_changed)
         self.canvas.instance_visibility_changed.connect(self.on_instance_visibility_shortcut_changed)
+        self.canvas.bee_visibility_changed.connect(self.on_bee_visibility_changed)
         self.canvas.instance_visibility_toggle_blocked.connect(self.on_instance_visibility_shortcut_blocked)
         self.canvas.instance_selected.connect(self.on_canvas_instance_selected)
         self.canvas.brush_size_step_requested.connect(self.on_brush_size_step_requested)
@@ -778,6 +779,10 @@ class MainWindow(QMainWindow):
             self._refresh_done_counter_labels()
 
     def _refresh_done_counter_labels(self):
+        timer = getattr(self, 'done_counter_update_timer', None)
+        if timer is not None and getattr(getattr(self, 'canvas', None), 'is_drawing', False):
+            timer.start()
+            return
         counts = self._current_annotation_counts()
         baseline_counts = getattr(
             self,
@@ -6126,6 +6131,22 @@ class MainWindow(QMainWindow):
             f"Turn on {category} visibility before showing instance {instance_id}"
         )
         self.canvas.setFocus()
+
+    def on_bee_visibility_changed(self, focal_id):
+        """Update existing checkboxes once, without re-reading mask geometry."""
+        blocked = self.instance_list.blockSignals(True)
+        try:
+            for row in range(self.instance_list.count()):
+                item = self.instance_list.item(row)
+                entry = item.data(Qt.ItemDataRole.UserRole) or {}
+                if entry.get('type') == 'bee':
+                    visible = self.canvas.is_instance_enabled(entry['id'], 'bee')
+                    item.setCheckState(Qt.CheckState.Checked if visible else Qt.CheckState.Unchecked)
+        finally:
+            self.instance_list.blockSignals(blocked)
+        message = f'Only bee {focal_id} shown; right-click → Show All Bee Masks to restore' if focal_id else 'All bee masks shown'
+        self.status_label.setText(message)
+        self.canvas.setFocus()
     
     def on_annotation_changed(self):
         """Handle annotation changes - mark frame as modified"""
@@ -6160,114 +6181,129 @@ class MainWindow(QMainWindow):
     
     def _do_update_instance_list(self):
         """Actually perform the instance list update (called by timer)"""
+        if self.canvas.is_drawing:
+            self._instance_list_update_timer.start()
+            return
         self.update_instance_list_from_canvas()
             
     def update_instance_list_from_canvas(self):
-        """Update the instance list widget from current canvas masks"""
+        """Reconcile rows in place, updating only values that actually changed."""
         from PyQt6.QtWidgets import QListWidgetItem
+        import weakref
 
-        # An immediate refresh also satisfies any queued annotation-change refresh.
         self._instance_list_update_timer.stop()
-        
-        self._instance_list_updating = True
-        self.instance_list.clear()
-        
-        # Preserve selection for the active/editing instance
-        active_instance_id = (
-            self.canvas.editing_instance_id
-            if self.canvas.editing_instance_id > 0
-            else self.canvas.selected_mask_idx
-        )
-        active_instance_category = (
-            self.canvas.editing_instance_category
-            if self.canvas.editing_instance_id > 0
-            else self.canvas.selected_instance_category
-        )
-        
-        # Get ArUco tracking from video-level annotations
+        instance_entries = self.canvas.get_instance_entries()
         instance_to_aruco = self._get_instance_to_aruco_map()
         if instance_to_aruco != self.canvas.aruco_instance_labels:
             self.canvas.set_aruco_instance_labels(instance_to_aruco)
-        
-        instance_entries = self.canvas.get_instance_entries()
-        
-        # Track which row to select
-        row_to_select = -1
-        current_row = 0
-        
-        # Add all instances (bee, chamber, hive, and pollen). Class visibility
-        # controls canvas display, not whether the row exists in this list.
-        for entry in instance_entries:
-            instance_id = entry['id']
-            category = entry['category']
-            metadata = self.canvas.annotation_metadata.get(instance_id, {})
-            
-            # Determine category prefix
-            category_prefix_map = {'bee': 'B', 'hive': 'H', 'chamber': 'C', 'pollen': 'P', 'nectar': 'N', **BROOD_SHORT_LABELS}
-            prefix = category_prefix_map.get(category, category_label(category))
-            class_visible = self.canvas.annotation_type_visibility.get(category, True)
-            
-            geometry = self.canvas.get_instance_geometry(instance_id, category)
-            editing = (instance_id == self.canvas.editing_instance_id and
-                       category == self.canvas.editing_instance_category and
-                       self.canvas.editing_mask is not None)
-            if editing or geometry.area:
-                area = geometry.area
-            else:
-                # Bbox-only: calculate area from bbox (width * height)
-                bbox = metadata.get('bbox', [0, 0, 0, 0])
-                area = bbox[2] * bbox[3]  # width * height
-            
-            # Build display text with category prefix
-            display_text = f"{prefix} {instance_id}"
-            
-            # Add ArUco info if available (only for bees)
-            if category == 'bee' and instance_id in instance_to_aruco:
-                aruco_id = instance_to_aruco[instance_id]
-                display_text += f" [ArUco: {aruco_id}]"
-            
-            display_text += f" (area: {area})"
-            if not class_visible:
-                display_text += " [class hidden]"
-            
-            item = QListWidgetItem(display_text)
-            item.setData(Qt.ItemDataRole.UserRole, {'type': category, 'id': instance_id})
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(
-                Qt.CheckState.Checked
-                if self.canvas.is_instance_enabled(instance_id, category)
-                else Qt.CheckState.Unchecked
-            )
-            item.setToolTip(
-                f"{category_label(category)} {instance_id}\nChecked: show this instance. Unchecked: hide this instance."
-                if class_visible else
-                f"Turn on {category_label(category)} visibility first; the class switch overrides this row."
-            )
-            provenance = metadata.get('provenance', {})
-            if provenance:
-                creator = (provenance.get('created_by') or {}).get('name', 'Unknown')
-                editor = (provenance.get('last_modified_by') or {}).get('name', 'Unknown')
-                item.setToolTip(item.toolTip() + f'\nCreated by: {creator}\nLast edited by: {editor}')
-            self.instance_list.addItem(item)
-            
-            if instance_id == active_instance_id and category == active_instance_category:
-                row_to_select = current_row
-            current_row += 1
-        
-        # Restore selection
-        if row_to_select >= 0:
-            self.instance_list.blockSignals(True)
-            self.instance_list.setCurrentRow(row_to_select)
-            self.instance_list.blockSignals(False)
 
-        self._instance_list_updating = False
+        active_id = (self.canvas.editing_instance_id if self.canvas.editing_instance_id > 0
+                     else self.canvas.selected_mask_idx)
+        active_category = (self.canvas.editing_instance_category if self.canvas.editing_instance_id > 0
+                           else self.canvas.selected_instance_category)
+        active_key = (active_category, active_id)
+
+        def key_for_item(item):
+            data = item.data(Qt.ItemDataRole.UserRole) or {}
+            return (data.get('type'), data.get('id'))
+
+        previous_image = getattr(self, '_instance_list_image_ref', None)
+        same_image = previous_image is not None and previous_image() is self.canvas.current_image
+        self._instance_list_image_ref = (weakref.ref(self.canvas.current_image)
+                                        if self.canvas.current_image is not None else None)
+        selected_keys = ({key_for_item(item) for item in self.instance_list.selectedItems()}
+                         if same_image else set())
+        desired_keys = {(entry['category'], entry['id']) for entry in instance_entries}
+        scroll = self.instance_list.verticalScrollBar().value() if same_image else 0
+        previous_updating = self._instance_list_updating
+        blocked = self.instance_list.blockSignals(True)
+        self._instance_list_updating = True
+        try:
+            items = {}
+            # Keep row objects (and their selection) for instances still present.
+            for row in range(self.instance_list.count() - 1, -1, -1):
+                item = self.instance_list.item(row)
+                key = key_for_item(item)
+                if key not in desired_keys or key in items:
+                    self.instance_list.takeItem(row)
+                else:
+                    items[key] = item
+
+            prefixes = {'bee': 'B', 'hive': 'H', 'chamber': 'C', 'pollen': 'P',
+                        'nectar': 'N', **BROOD_SHORT_LABELS}
+            for row, entry in enumerate(instance_entries):
+                instance_id, category = entry['id'], entry['category']
+                key = (category, instance_id)
+                metadata = self.canvas.annotation_metadata.get(instance_id, {})
+                item = items.get(key)
+                if item is None:
+                    item = QListWidgetItem()
+                    item.setData(Qt.ItemDataRole.UserRole, {'type': category, 'id': instance_id})
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    self.instance_list.insertItem(row, item)
+                    items[key] = item
+                elif self.instance_list.row(item) != row:
+                    self.instance_list.takeItem(self.instance_list.row(item))
+                    self.instance_list.insertItem(row, item)
+
+                # Stored geometry is cached per instance. Only the active edit
+                # buffer and masks whose pixels changed need new measurements.
+                geometry = self.canvas.get_instance_geometry(instance_id, category)
+                editing = (instance_id == self.canvas.editing_instance_id and
+                           category == self.canvas.editing_instance_category and
+                           self.canvas.editing_mask is not None)
+                if editing or geometry.area:
+                    area = geometry.area
+                else:
+                    bbox = metadata.get('bbox', [0, 0, 0, 0])
+                    area = bbox[2] * bbox[3]
+
+                class_visible = self.canvas.annotation_type_visibility.get(category, True)
+                text = f"{prefixes.get(category, category_label(category))} {instance_id}"
+                if category == 'bee' and instance_id in instance_to_aruco:
+                    text += f" [ArUco: {instance_to_aruco[instance_id]}]"
+                text += f" (area: {area})"
+                if not class_visible:
+                    text += " [class hidden]"
+                if item.text() != text:
+                    item.setText(text)
+
+                checked = (Qt.CheckState.Checked if self.canvas.is_instance_enabled(instance_id, category)
+                           else Qt.CheckState.Unchecked)
+                if item.checkState() != checked:
+                    item.setCheckState(checked)
+                tooltip = (f"{category_label(category)} {instance_id}\nChecked: show this instance. Unchecked: hide this instance."
+                           if class_visible else
+                           f"Turn on {category_label(category)} visibility first; the class switch overrides this row.")
+                provenance = metadata.get('provenance', {})
+                if provenance:
+                    creator = (provenance.get('created_by') or {}).get('name', 'Unknown')
+                    editor = (provenance.get('last_modified_by') or {}).get('name', 'Unknown')
+                    tooltip += f'\nCreated by: {creator}\nLast edited by: {editor}'
+                if item.toolTip() != tooltip:
+                    item.setToolTip(tooltip)
+
+            if len(selected_keys) > 1:
+                for key, item in items.items():
+                    item.setSelected(key in selected_keys)
+            elif active_key in items:
+                item = items[active_key]
+                if self.instance_list.currentItem() is not item or not item.isSelected():
+                    self.instance_list.setCurrentItem(item)
+            else:
+                self.instance_list.setCurrentRow(-1)
+                self.instance_list.clearSelection()
+            self.instance_list.verticalScrollBar().setValue(scroll)
+        finally:
+            self.instance_list.blockSignals(blocked)
+            self._instance_list_updating = previous_updating
         self._schedule_done_counter_update()
 
     def _get_instance_to_aruco_map(self):
         """Build reverse map: instance ID -> ArUco ID for the current video."""
         instance_to_aruco = {}
         if self.current_video_id and self.project_path:
-            _, aruco_tracking = self.annotation_manager.load_video_annotations(
+            aruco_tracking = self.annotation_manager.load_aruco_tracking(
                 self.project_path, self.current_video_id
             )
             for aruco_str, instance_id in aruco_tracking.items():
@@ -6394,7 +6430,7 @@ class MainWindow(QMainWindow):
             return
         
         # Load video-level ArUco tracking
-        _, aruco_tracking = self.annotation_manager.load_video_annotations(
+        aruco_tracking = self.annotation_manager.load_aruco_tracking(
             self.project_path, self.current_video_id
         )
         
@@ -6738,7 +6774,7 @@ class MainWindow(QMainWindow):
             annotations
         )
 
-        _, aruco_tracking = self.annotation_manager.load_video_annotations(
+        aruco_tracking = self.annotation_manager.load_aruco_tracking(
             self.project_path, self.current_video_id
         )
 
@@ -7252,7 +7288,7 @@ class MainWindow(QMainWindow):
             return
         
         # Get the ArUco ID for this instance from video-level tracking
-        _, aruco_tracking = self.annotation_manager.load_video_annotations(
+        aruco_tracking = self.annotation_manager.load_aruco_tracking(
             self.project_path, self.current_video_id
         )
         
@@ -7682,6 +7718,9 @@ class MainWindow(QMainWindow):
         
         from PyQt6.QtWidgets import QMenu
         menu = QMenu()
+
+        self.canvas.add_bee_visibility_actions(
+            menu, first_item_data.get('id'), first_item_data.get('type'))
         
         # For single selection, show edit option
         if len(selected_items) == 1:
@@ -7695,7 +7734,7 @@ class MainWindow(QMainWindow):
                 # Check if instance has ArUco from video-level tracking
                 has_aruco = False
                 if self.current_video_id and self.project_path:
-                    _, aruco_tracking = self.annotation_manager.load_video_annotations(
+                    aruco_tracking = self.annotation_manager.load_aruco_tracking(
                         self.project_path, self.current_video_id
                     )
                     # Check if any ArUco code points to this instance
