@@ -15,10 +15,10 @@ import torch
 from ultralytics.data.augment import RandomHSV
 from ultralytics.data.base import BaseDataset
 from ultralytics.data.dataset import YOLODataset
-from ultralytics.models.yolo.segment import SegmentationTrainer, SegmentationValidator
 from ultralytics.utils.torch_utils import unwrap_model
 
 from core.coco_masks import decode_segmentation, encode_mask
+from training.precision import PrecisionSegmentationTrainer, PrecisionSegmentationValidator
 
 
 MASK_FORMAT = 'bumblebox-coco-rle-v1'
@@ -173,12 +173,12 @@ def build_raster_dataset(args, img_path, batch, data, mode, stride=32):
     )
 
 
-class RasterSegmentationValidator(SegmentationValidator):
+class RasterSegmentationValidator(PrecisionSegmentationValidator):
     def build_dataset(self, img_path, mode='val', batch=None):
         return build_raster_dataset(self.args, img_path, batch, self.data, mode, self.stride)
 
 
-class RasterSegmentationTrainer(SegmentationTrainer):
+class RasterSegmentationTrainer(PrecisionSegmentationTrainer):
     def build_dataset(self, img_path, mode='train', batch=None):
         stride = max(int(unwrap_model(self.model).stride.max()) if self.model is not None else 0, 32)
         return build_raster_dataset(self.args, img_path, batch, self.data, mode, stride)

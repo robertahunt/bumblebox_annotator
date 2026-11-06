@@ -112,6 +112,8 @@ YOLO("/path/to/best.pt").val(
 ```
 
 The adapter is tested with Ultralytics 8.4.16 and Albumentations 1.4.24.
+Checkpoint precision safeguards, FP32 validation, and weights-only recovery are
+documented in [Precision-Safe Segmentation Training](training_recovery.md).
 Regression tests include exact storage/COCO round trips, disconnected regions,
 holes, legacy projects, paired transforms, a real loss/backward pass, and a
 one-epoch CPU smoke run with checkpoint reload and standalone validation.
