@@ -3,7 +3,7 @@ YOLO inference toolbar for running trained model predictions
 """
 
 from PyQt6.QtWidgets import (QWidget, QToolButton, QPushButton,
-                             QLabel, QFileDialog, QMessageBox)
+                             QLabel, QFileDialog, QMessageBox, QComboBox)
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
 
@@ -51,6 +51,16 @@ class YOLOToolbar(QWidget):
         # Separator
         layout.addWidget(self.create_separator())
         
+        layout.addWidget(QLabel('Current-frame input:'))
+        self.input_size_combo = QComboBox()
+        self.input_size_combo.addItem('Model default', None)
+        for size in (640, 1280, 1920, 2560, 3072):
+            self.input_size_combo.addItem(f'{size} px', size)
+        self.input_size_combo.setToolTip(
+            'Input resolution for Run on Current Frame only. Higher sizes use more GPU memory. '
+            'Does not change saved images, masks, training settings, or video tracking.')
+        layout.addWidget(self.input_size_combo)
+
         # Run inference button
         self.inference_btn = QPushButton("Run on Current Frame")
         self.inference_btn.setToolTip("Run YOLO inference on the currently displayed frame")
@@ -217,6 +227,10 @@ class YOLOToolbar(QWidget):
             
         self.process_video_requested.emit()
     
+    def prediction_size_kwargs(self):
+        size = self.input_size_combo.currentData()
+        return {} if size is None else {'imgsz': int(size)}
+
     def get_model(self):
         """Get the loaded YOLO model"""
         return self.model

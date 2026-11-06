@@ -457,6 +457,12 @@ class TrainingConfigDialog(QDialog):
         else:
             self.imgsz_combo.addItems(['320', '480', '640', '800', '1024', '1280', '1536', '1920'])
             self.imgsz_combo.setCurrentText('640')
+        if not (self.stage2 or self.sahi or self.beehavesque or self.instance_focused):
+            self.imgsz_combo.addItems(['2560', '3072'])
+        self.imgsz_combo.setToolTip(
+            'Model input size in pixels, not the display size. Aspect ratio is preserved with padding. '
+            'Higher sizes retain more detail but need more GPU memory. '
+            'For 2560 or 3072, start with batch size 1 and compare held-out masks at the same input size.')
         params_layout.addRow("Image Size:", self.imgsz_combo)
         
         # Learning rate

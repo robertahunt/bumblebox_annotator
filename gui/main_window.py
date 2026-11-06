@@ -1179,6 +1179,9 @@ class MainWindow(QMainWindow):
         review_action = QAction('Imported Frame Review...', self)
         review_action.triggered.connect(self.show_import_reviews)
         project_menu.addAction(review_action)
+        training_review_action = QAction('Review Bee Training Candidates...', self)
+        training_review_action.triggered.connect(self.show_training_review)
+        project_menu.addAction(training_review_action)
         self.manage_assignments_action = QAction('Video Assignments...', self)
         self.manage_assignments_action.triggered.connect(self.manage_assignments)
         project_menu.addAction(self.manage_assignments_action)
@@ -1190,7 +1193,7 @@ class MainWindow(QMainWindow):
             export_coco_action, export_video_action, export_all_action, train_yolo_action,
             train_yolo_instance_focused_action, train_yolo_bbox_action, predict_action,
             frame_level_validation_action, batch_inference_action, batch_video_inference_action,
-            tracking_validation_action, self.manage_assignments_action, review_action]
+            tracking_validation_action, self.manage_assignments_action, review_action, training_review_action]
         home_action = QAction('Project Home', self)
         home_action.setShortcut('Ctrl+Shift+H')
         home_action.triggered.connect(lambda: self.workflow.show_home())
@@ -1462,6 +1465,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, 'Frame Review Not Saved', str(exc))
         finally:
             self._update_import_review_controls()
+
+    def show_training_review(self):
+        if not self.project_path or workspace(self.project_path):
+            return
+        try:
+            from gui.training_review import TrainingReviewDock
+            if not hasattr(self, 'training_review_dock'):
+                self.training_review_dock = TrainingReviewDock(self)
+                self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.training_review_dock)
+                self.workflow.docks.append(self.training_review_dock)
+                self.workflow.dock_visibility[self.training_review_dock] = True
+            self.training_review_dock.start()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Training Review Unavailable', str(exc))
 
     def show_import_reviews(self):
         if workspace(self.project_path):
@@ -10613,7 +10630,8 @@ class MainWindow(QMainWindow):
                 conf=0.5,  # Confidence threshold
                 iou=0.5,   # NMS IoU threshold
                 retina_masks=True,  # Return masks at original image size
-                verbose=False
+                verbose=False,
+                **self.yolo_toolbar.prediction_size_kwargs()
             )
             
             if not results or len(results) == 0:

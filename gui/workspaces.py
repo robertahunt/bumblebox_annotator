@@ -343,6 +343,7 @@ class WorkspaceController(QObject):
         self.stack.addWidget(self.home)
         self.stack.addWidget(self.editor)
         self.train_page = self.command_page('Train and Evaluate', [
+            ('Review Bee Training Candidates', window.show_training_review),
             ('Train Segmentation Model', window.train_yolo_model),
             ('Train Instance-Focused Model', window.train_yolo_model_instance_focused),
             ('Train Bounding-Box Model', window.train_yolo_bbox_model),
