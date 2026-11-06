@@ -21,6 +21,7 @@ import cv2
 import time
 from core.mask_editing import enclosed_mask_region
 from core.mask_geometry import MaskGeometryCache, measure_mask
+from core.instance_colors import contrasting_instance_colors
 
 
 class OutwardBBoxRectItem(QGraphicsRectItem):
@@ -106,6 +107,10 @@ class ImageCanvas(QGraphicsView):
         
         self.mask_items = []  # List of QGraphicsPixmapItem for visualization
         self.mask_colors = {}  # Dict mapping instance_id -> (r,g,b) color
+        self.distinct_bee_colors_enabled = True
+        self._bee_display_colors = {}
+        self._bee_color_preferences = {}
+        self._bee_color_context = None
         self.next_mask_id = 1  # Counter for assigning unique IDs
         self.selected_mask_idx = -1
         self.selected_instance_category = None
@@ -728,6 +733,60 @@ class ImageCanvas(QGraphicsView):
         self.mask_colors[instance_id] = color
         return color
 
+    def display_color_for_instance(self, instance_id, category=None):
+        """Keep local-contrast colors separate from saved/cached identity colors."""
+        category = category or self.annotation_metadata.get(instance_id, {}).get('category', 'bee')
+        if category == 'bee' and self.distinct_bee_colors_enabled:
+            color = self._bee_display_colors.get(instance_id)
+            if color is not None:
+                return color
+        return self.ensure_instance_color(instance_id, category)
+
+    def set_bee_color_context(self, context):
+        """Carry color preferences between frames, but not unrelated projects/videos."""
+        if context != self._bee_color_context:
+            self._bee_color_context = context
+            self._bee_color_preferences.clear()
+            self._bee_display_colors.clear()
+
+    def _update_bee_display_colors(self, *, force=False):
+        if not self.distinct_bee_colors_enabled or self._is_actively_drawing:
+            return False
+        bee_ids = {i for i, metadata in self.annotation_metadata.items()
+                   if metadata.get('category', 'bee') == 'bee'}
+        self._bee_display_colors = {i: color for i, color in self._bee_display_colors.items()
+                                    if i in bee_ids}
+        if not force and bee_ids <= self._bee_display_colors.keys():
+            return False
+
+        boxes = {}
+        for instance_id in sorted(bee_ids):
+            bbox = self.get_instance_bbox_cached(instance_id, 'bee')
+            if bbox is not None and bbox[2] > 0 and bbox[3] > 0:
+                boxes[instance_id] = bbox
+        colors = contrasting_instance_colors(
+            boxes, preferred=self._bee_color_preferences,
+            fixed=None if force else self._bee_display_colors)
+        changed = colors != self._bee_display_colors
+        self._bee_display_colors = colors
+        self._bee_color_preferences.update(colors)
+        return changed
+
+    def set_distinct_bee_colors(self, enabled):
+        if self.distinct_bee_colors_enabled == bool(enabled):
+            return
+        self.distinct_bee_colors_enabled = bool(enabled)
+        self.rebuild_visualizations()
+        self._update_editing_visualization()
+
+    def refresh_bee_colors(self):
+        """Explicitly recompute contrast after geometry changes; never edit masks."""
+        if not self.distinct_bee_colors_enabled or self._is_actively_drawing:
+            return
+        self._update_bee_display_colors(force=True)
+        self.rebuild_visualizations()
+        self._update_editing_visualization()
+
     def _event_view_pos(self, event):
         if hasattr(event, 'position'):
             return QPointF(event.position())
@@ -1031,6 +1090,7 @@ class ImageCanvas(QGraphicsView):
         self._geometry_cache.invalidate()
         self.next_mask_id = 1
         self.mask_colors = {}
+        self._bee_display_colors.clear()
         self.positive_points = []
         self.negative_points = []
         self.active_sam2_mask_idx = -1
@@ -1075,6 +1135,8 @@ class ImageCanvas(QGraphicsView):
         self.next_mask_id = 1
         self.mask_items = []  # QGraphicsPixmapItems for visualization 
         self.mask_colors = {}  # Dict mapping instance_id -> (r,g,b) color
+        self._bee_display_colors.clear()
+        self._bee_color_preferences.clear()
         self.label_items = []  # Clear instance label items
         self.aruco_label_items = []
         self.aruco_instance_labels = {}
@@ -2121,6 +2183,9 @@ class ImageCanvas(QGraphicsView):
                 # Finish drawing - update border now
                 self._is_actively_drawing = False
                 self._finish_brush_history_step()
+                # A new instance has no location until its first stroke ends.
+                if self._update_bee_display_colors():
+                    self._update_editing_visualization(update_labels=False)
                 deleted_empty_instance = False
                 if (
                     self.editing_mask is not None and
@@ -3213,6 +3278,8 @@ class ImageCanvas(QGraphicsView):
             
     def rebuild_visualizations(self):
         """Rebuild all visualizations (masks and/or bboxes) based on display flags"""
+        if self._update_bee_display_colors():
+            self._update_editing_visualization(update_labels=False)
         # Clear existing visualization items
         for item in self.mask_items:
             try:
@@ -3277,7 +3344,7 @@ class ImageCanvas(QGraphicsView):
                 
                 # Get color for this instance. This intentionally rewrites
                 # stale colors for fixed-color categories.
-                color = self.ensure_instance_color(instance_id, category)
+                color = self.display_color_for_instance(instance_id, category)
                 
                 # Apply color with appropriate opacity
                 if mask_array.shape[:2] != (h, w):
@@ -3350,7 +3417,7 @@ class ImageCanvas(QGraphicsView):
                 
                 if bbox is not None:
                     x, y, w, h = bbox
-                    color = self.mask_colors.get(instance_id, (255, 255, 255))
+                    color = self.display_color_for_instance(instance_id, category)
                     
                     rect_item = OutwardBBoxRectItem(x, y, w, h)
                     pen = QPen(QColor(color[0], color[1], color[2]))
@@ -3391,7 +3458,7 @@ class ImageCanvas(QGraphicsView):
             # Only draw if it's a bbox-only annotation with a valid bbox
             if 'bbox' in metadata and metadata['bbox'] != [0, 0, 0, 0]:
                 x, y, w, h = metadata['bbox']
-                color = self.mask_colors.get(instance_id, (255, 255, 255))
+                color = self.display_color_for_instance(instance_id, category)
                 
                 rect_item = OutwardBBoxRectItem(x, y, w, h)
                 pen = QPen(QColor(color[0], color[1], color[2]))
@@ -3457,7 +3524,7 @@ class ImageCanvas(QGraphicsView):
             return
 
         x, y, w, h = bbox
-        color = self.mask_colors.get(self.editing_instance_id, (255, 255, 255))
+        color = self.display_color_for_instance(self.editing_instance_id, category)
         if self.editing_bbox_item is None:
             self.editing_bbox_item = OutwardBBoxRectItem(x, y, w, h)
             self.scene.addItem(self.editing_bbox_item)
@@ -3602,7 +3669,7 @@ class ImageCanvas(QGraphicsView):
         if instance_id is not None:
             # Drawing: set pixels to instance color
             category = self.annotation_metadata.get(instance_id, {}).get('category', 'bee')
-            color = self.ensure_instance_color(instance_id, category)
+            color = self.display_color_for_instance(instance_id, category)
             alpha = self.mask_opacity
             self._cached_overlay[affected_pixels] = [color[0], color[1], color[2], alpha]
         else:
@@ -3618,7 +3685,7 @@ class ImageCanvas(QGraphicsView):
                 for revealed_id in revealed_ids:
                     if revealed_id > 0:
                         category = self.annotation_metadata.get(int(revealed_id), {}).get('category', 'bee')
-                        color = self.ensure_instance_color(int(revealed_id), category)
+                        color = self.display_color_for_instance(int(revealed_id), category)
                         alpha = self.mask_opacity
                         reveal_pixels = reveal_mask & (self.combined_mask == revealed_id)
                         self._cached_overlay[reveal_pixels] = [color[0], color[1], color[2], alpha]
@@ -3684,7 +3751,7 @@ class ImageCanvas(QGraphicsView):
             return
 
         if color is None:
-            color = self.mask_colors.get(instance_id, (255, 255, 255))
+            color = self.display_color_for_instance(instance_id, category)
 
         label_text = str(instance_id)
         text_item = QGraphicsTextItem()
@@ -4032,6 +4099,7 @@ class ImageCanvas(QGraphicsView):
         # Clear mask references
         self.mask_items = []
         self.mask_colors = {}  # Reset to dict
+        self._bee_display_colors.clear()
         self.next_mask_id = 1
         self.annotation_metadata = {}  # Clear metadata
         
@@ -4961,7 +5029,7 @@ class ImageCanvas(QGraphicsView):
         category = self.editing_instance_category or self.annotation_metadata.get(
             self.editing_instance_id, {}
         ).get('category', self.current_annotation_type)
-        color = self.ensure_instance_color(self.editing_instance_id, category)
+        color = self.display_color_for_instance(self.editing_instance_id, category)
         
         # Create full overlay and cache it
         self._editing_overlay_cache = np.zeros((h, w, 4), dtype=np.uint8)
@@ -5043,7 +5111,7 @@ class ImageCanvas(QGraphicsView):
             return
         
         # Get color for this instance
-        color = self.mask_colors.get(self.editing_instance_id, (255, 255, 255))
+        color = self.display_color_for_instance(self.editing_instance_id, self.editing_instance_category)
         alpha = min(self.mask_opacity, 255)
         
         if bounds is not None:
@@ -5345,7 +5413,7 @@ class ImageCanvas(QGraphicsView):
         rect_item = self.bbox_items_map[mask_id]
         
         # Highlight selected bbox by increasing pen width
-        color = self.mask_colors.get(mask_id, (255, 255, 0))
+        color = self.display_color_for_instance(mask_id)
         pen = QPen(QColor(color[0], color[1], color[2]))
         pen.setWidth(6)  # Thicker for selected bbox
         rect_item.setPen(pen)
@@ -5370,7 +5438,7 @@ class ImageCanvas(QGraphicsView):
             rect_item = self.bbox_items_map[self.selected_bbox_id]
             
             # Reset pen to normal
-            color = self.mask_colors.get(self.selected_bbox_id, (255, 255, 0))
+            color = self.display_color_for_instance(self.selected_bbox_id)
             pen = QPen(QColor(color[0], color[1], color[2]))
             pen.setWidth(4)  # Normal width
             rect_item.setPen(pen)
@@ -5410,7 +5478,7 @@ class ImageCanvas(QGraphicsView):
 
         # Preserve existing category if set; otherwise use current annotation type
         existing_category = self.annotation_metadata[mask_id].get('category', self.current_annotation_type)
-        color = self.ensure_instance_color(mask_id, existing_category)
+        self.ensure_instance_color(mask_id, existing_category)
 
         # Create bbox metadata
         bbox = [int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height())]
@@ -5421,6 +5489,8 @@ class ImageCanvas(QGraphicsView):
             'bbox_only': True,  # Mark as bbox-only until segmentation is added
             'category': existing_category
         })
+        self._update_bee_display_colors()
+        color = self.display_color_for_instance(mask_id, existing_category)
         
         # Invalidate cached instance IDs since we created a new one
         self._cached_instance_ids = None

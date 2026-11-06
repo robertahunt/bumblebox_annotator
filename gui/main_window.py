@@ -327,6 +327,10 @@ class MainWindow(QMainWindow):
         self.toolbar.brush_size_changed.connect(self.canvas.set_brush_size)
         self.toolbar.brush_cursor_preview_changed.connect(self.canvas.set_brush_cursor_preview_enabled)
         self.toolbar.mask_opacity_changed.connect(self.canvas.set_mask_opacity)
+        self.toolbar.distinct_bee_colors_changed.connect(self.canvas.set_distinct_bee_colors)
+        self.toolbar.distinct_bee_colors_changed.connect(
+            lambda enabled: QSettings().setValue('display/distinct_bee_colors', enabled))
+        self.toolbar.refresh_bee_colors_requested.connect(self.canvas.refresh_bee_colors)
         self.toolbar.clear_instance_requested.connect(self.clear_selected_instance)
         self.toolbar.clear_no_draw_zones_requested.connect(self.on_clear_no_draw_zones)
         self.toolbar.set_measurement_scale_requested.connect(self.on_set_measurement_scale)
@@ -5371,6 +5375,7 @@ class MainWindow(QMainWindow):
             
             try:
                 # Pass frame to canvas (can be path or array)
+                self.canvas.set_bee_color_context((str(self.project_path), self.current_video_id))
                 self.canvas.load_image(image_to_load, preserve_view=preserve_canvas_view)
                 self._apply_video_physical_scale(self.current_video_id)
                 
@@ -10424,6 +10429,8 @@ class MainWindow(QMainWindow):
     def load_settings(self):
         """Load application settings"""
         settings = QSettings()
+        self.toolbar.distinct_bee_colors_checkbox.setChecked(
+            settings.value('display/distinct_bee_colors', True, type=bool))
         geometry = settings.value('geometry')
         if geometry:
             self.restoreGeometry(geometry)

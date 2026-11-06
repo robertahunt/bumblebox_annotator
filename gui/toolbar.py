@@ -8,7 +8,7 @@ from gui.category_menu import add_category_menu_actions
 
 import math
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QToolButton, QButtonGroup,
-                             QSlider, QLabel, QSpinBox, QCheckBox, QMenu, QComboBox, QLayout)
+                             QSlider, QLabel, QSpinBox, QCheckBox, QMenu, QComboBox, QLayout, QStyle)
 from PyQt6.QtCore import Qt, pyqtSignal, QSignalBlocker, QPoint, QRect, QSize
 from PyQt6.QtGui import QIcon
 
@@ -115,6 +115,8 @@ class AnnotationToolbar(QWidget):
     brush_size_changed = pyqtSignal(int)
     brush_cursor_preview_changed = pyqtSignal(bool)
     mask_opacity_changed = pyqtSignal(int)
+    distinct_bee_colors_changed = pyqtSignal(bool)
+    refresh_bee_colors_requested = pyqtSignal()
     clear_instance_requested = pyqtSignal()
     new_instance_requested = pyqtSignal(str)
     delete_all_requested = pyqtSignal()
@@ -346,6 +348,27 @@ class AnnotationToolbar(QWidget):
         self.opacity_label.setMinimumWidth(35)
         opacity_layout.addWidget(self.opacity_label)
         row2.addWidget(opacity_group)
+
+        bee_colors_group = QWidget()
+        bee_colors_layout = QHBoxLayout(bee_colors_group)
+        bee_colors_layout.setContentsMargins(0, 0, 0, 0)
+        bee_colors_layout.setSpacing(5)
+        self.distinct_bee_colors_checkbox = QCheckBox("Distinct neighboring bees")
+        self.distinct_bee_colors_checkbox.setChecked(True)
+        self.distinct_bee_colors_checkbox.setToolTip(
+            "Use contrasting colors for nearby bees. Display only; masks and IDs are unchanged."
+        )
+        self.refresh_bee_colors_btn = QToolButton()
+        self.refresh_bee_colors_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.refresh_bee_colors_btn.setFixedSize(28, 28)
+        self.refresh_bee_colors_btn.setAccessibleName("Refresh bee colors")
+        self.refresh_bee_colors_btn.setToolTip("Refresh bee colors for the current mask positions")
+        self.distinct_bee_colors_checkbox.toggled.connect(self.distinct_bee_colors_changed.emit)
+        self.distinct_bee_colors_checkbox.toggled.connect(self.refresh_bee_colors_btn.setEnabled)
+        self.refresh_bee_colors_btn.clicked.connect(self.refresh_bee_colors_requested.emit)
+        bee_colors_layout.addWidget(self.distinct_bee_colors_checkbox)
+        bee_colors_layout.addWidget(self.refresh_bee_colors_btn)
+        row2.addWidget(bee_colors_group)
         
         row2.addWidget(self.create_separator())
         

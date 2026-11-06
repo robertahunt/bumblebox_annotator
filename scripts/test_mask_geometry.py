@@ -237,7 +237,8 @@ class CanvasGeometryTests(unittest.TestCase):
                     continue
                 for instance_id in np.unique(mask):
                     if instance_id > 0 and canvas.is_instance_enabled(int(instance_id), category):
-                        expected[mask == instance_id] = (*canvas.mask_colors[int(instance_id)], canvas.mask_opacity)
+                        expected[mask == instance_id] = (
+                            *canvas.display_color_for_instance(int(instance_id), category), canvas.mask_opacity)
             np.testing.assert_array_equal(canvas._cached_overlay, expected)
         canvas.set_annotation_type_visibility('hive', False)
         canvas.set_instance_visible(1, 'nectar', True)

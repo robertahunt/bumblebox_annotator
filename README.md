@@ -41,6 +41,14 @@ New projects show each category's annotation scope and label meaning. **Project 
 
 See [video import and frame selection](docs/video_import.md) for full-video or sampled extraction and how unfinished annotations affect training.
 
+**Distinct neighboring bees**, beside **Opacity**, gives nearby bee masks and
+boxes contrasting display colors. It is on by default; uncheck it to restore the
+original instance colors. The checkbox preference is remembered on this computer.
+Colors stay fixed while drawing or hiding instances; the adjacent refresh icon
+recalculates contrast after large edits. New frames favor previous colors within
+the same video where contrast allows. This affects the annotation canvas only,
+not annotation pixels, IDs, training data, or exported video colors.
+
 See [importing between projects](docs/project_import.md) to copy selected frames and annotations, including converting frame-specific hive masks into an editable video-wide mask.
 Import previews disclose scope/meaning conflicts. **Project > Imported Frame Review...** opens the review queue; correct each affected frame and check **Imported labels reviewed for this frame** before training/export.
 
