@@ -112,6 +112,7 @@ class VisibleNestTests(unittest.TestCase):
             save_worker=Mock(), status_label=Mock(),
             dirty_frame_annotation_keys=set(), canvas=Mock(),
             update_instance_list_from_canvas=Mock(),
+            _refresh_saved_annotation_files=Mock(),
             _refresh_video_next_mask_id=lambda video: 2,
         )
         window._split_source_annotations = lambda anns: MainWindow._split_source_annotations(window, anns)
@@ -151,6 +152,7 @@ class VisibleNestTests(unittest.TestCase):
         window.canvas.get_annotations.return_value = anns
         with patch('gui.main_window.QMessageBox.question', return_value=QMessageBox.StandardButton.Yes):
             MainWindow.delete_all_instances(window)
+        window._refresh_saved_annotation_files.assert_called_once_with(str(self.root), 'video', 0)
         loaded = self.manager.load_frame_annotations(self.root, 'video', 0)
         self.assertEqual(len(loaded), 1)
         self.assertEqual(loaded[0]['category'], 'hive')

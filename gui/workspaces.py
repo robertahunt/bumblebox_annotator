@@ -712,15 +712,15 @@ class WorkspaceController(QObject):
         self.update_save_status()
         self.save_timer.start()
 
-    def saved(self):
+    def saved(self, refresh=True):
         self.window.invalidate_backup_estimate()
         self.generation += 1
         self.settings.setValue(self.key('unpublished'), True)
         self.settings.sync()
         self.update_save_status()
-        if hasattr(self.window, 'annotation_work'):
+        if refresh and hasattr(self.window, 'annotation_work'):
             self.window.annotation_work.schedule()
-        if hasattr(self.window, 'video_browser'):
+        if refresh and hasattr(self.window, 'video_browser'):
             self.window.video_browser.schedule()
 
     def uploaded(self):
@@ -756,7 +756,7 @@ class WorkspaceController(QObject):
             return
         try:
             # Snapshot the active mask without committing it or clearing brush undo.
-            window._save_annotation_sources(annotations=window.canvas.get_annotations(), use_background=True)
+            window._save_annotation_sources(use_background=True)
             self.update_save_status()
         except Exception as exc:
             self.local_status.setText('Local save failed')

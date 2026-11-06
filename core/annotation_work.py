@@ -303,7 +303,9 @@ def published_index(snapshot, *, cached_only=False, progress=lambda message: Non
 def unit_for(entry, category, frame):
     data = entry['categories'][category]
     key = 'video' if data['scope'] == 'video' else str(frame)
-    return data['units'].get(key, {'count': 0, 'signature': _hash([data['policy'], []]), 'status': 'not_started'})
+    if key in data['units']:
+        return data['units'][key]
+    return {'count': 0, 'signature': _hash([data['policy'], []]), 'status': 'not_started'}
 
 
 def summarize(entry, task, frames=None):
@@ -319,7 +321,13 @@ def summarize(entry, task, frames=None):
     if not frames or not set(frames) <= set(entry['frames']):
         return summarize(None, task)
     shared = all(entry['categories'][c]['scope'] == 'video' for c in categories)
-    units = [[unit_for(entry, c, frame) for c in categories] for frame in ([frames[0]] if shared else frames)]
+    # Display summaries never use completion signatures. In particular, do not
+    # hash the same empty policy for every unannotated frame/category.
+    def display_unit(category, frame):
+        data = entry['categories'][category]
+        key = 'video' if data['scope'] == 'video' else str(frame)
+        return data['units'].get(key, {'count': 0, 'status': 'not_started'})
+    units = [[display_unit(c, frame) for c in categories] for frame in ([frames[0]] if shared else frames)]
     unknown = any(u['count'] is None for row in units for u in row)
     present = sum(any(u['count'] for u in row) for row in units)
     finished = sum(all(u['status'] == 'finished' for u in row) for row in units)

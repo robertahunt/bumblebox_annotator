@@ -69,6 +69,7 @@ from .video_browsing import VideoBrowserControls, VideoListItem, VideoRowColors
 from .workspaces import WorkspaceController
 from core.video_processor import VideoProcessor
 from core.annotation import AnnotationManager
+from core.annotation_snapshot import AnnotationSnapshot, SnapshotSave
 from core.categories import CATEGORIES, BROOD_CATEGORIES, BROOD_SHORT_LABELS, BROOD_MODEL_LABEL, category_label, training_categories
 from gui.category_menu import add_category_menu_actions
 from core.annotation_scope import split_annotations, merge_annotations, frame_categories
@@ -96,6 +97,8 @@ class SaveWorker(QThread):
     save_started = pyqtSignal(int)  # Emits frame_idx when save starts
     save_completed = pyqtSignal(int)  # Emits frame_idx when save completes
     attribution_saved = pyqtSignal(str, str, int, object)
+    snapshot_saved = pyqtSignal(object)
+    files_saved = pyqtSignal(str, str, int)
     
     def __init__(self, annotation_manager):
         super().__init__()
@@ -103,6 +106,7 @@ class SaveWorker(QThread):
         self.save_queue = queue.Queue()
         self.running = True
         self.failed_tasks = {}
+        self.pending_snapshots = set()
         
     def add_save_task(self, project_path, video_id, frame_idx, annotations):
         """Queue a save task"""
@@ -110,36 +114,59 @@ class SaveWorker(QThread):
         self.save_queue.put((project_path, video_id, frame_idx, annotations,
                              dict(session) if session else None))
         
+    def add_snapshot_task(self, project_path, video_id, frame_idx, task):
+        key = (str(project_path), video_id, frame_idx, task.revision)
+        self.pending_snapshots.add(key)
+        self.add_save_task(project_path, video_id, frame_idx, task)
+
     def run(self):
-        """Process save tasks in background"""
+        """Expand detached snapshots and write both sources on the serial worker."""
         while self.running:
             try:
-                # Wait for save task with timeout
-                try:
-                    project_path, video_id, frame_idx, annotations, session = self.save_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                    
-                # Perform the save
-                try:
-                    self.save_started.emit(frame_idx)
+                project, video, frame, annotations, session = self.save_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            snapshot_task = annotations if isinstance(annotations, SnapshotSave) else None
+            try:
+                self.save_started.emit(frame)
+                if snapshot_task:
+                    expanded = snapshot_task.snapshot.annotations()
+                    frame_annotations = [a for a in expanded if a.get('category', 'bee') in snapshot_task.frame_categories]
+                    video_annotations = [a for a in expanded if a.get('category', 'bee') not in snapshot_task.frame_categories]
+                    records = {}
+                    if snapshot_task.save_frame:
+                        saved = self.annotation_manager.save_frame_annotations(
+                            project, video, frame, frame_annotations, contributor=session)
+                        records[frame] = provenance_records(saved) if session else []
+                    if snapshot_task.save_video:
+                        saved = self.annotation_manager.save_video_annotations(
+                            project, video, video_annotations, contributor=session)
+                        records[-1] = provenance_records(saved) if session else []
+                    self.snapshot_saved.emit(dict(project=str(project), video=video, frame=frame,
+                                                  revision=snapshot_task.revision, records=records))
+                else:
                     saved = self.annotation_manager.save_frame_annotations(
-                        project_path, video_id, frame_idx, annotations, contributor=session
-                    )
+                        project, video, frame, annotations, contributor=session)
                     if session:
-                        self.attribution_saved.emit(str(project_path), video_id, frame_idx,
-                                                    provenance_records(saved))
-                    self.failed_tasks.pop((str(project_path), video_id, frame_idx), None)
-                    self.save_completed.emit(frame_idx)
-                except Exception as e:
-                    self.failed_tasks[(str(project_path), video_id, frame_idx)] = str(e)
-                    self.error_occurred.emit(f"Save failed for frame {frame_idx}: {str(e)}")
-                finally:
-                    self.save_queue.task_done()
-                    
-            except Exception as e:
-                self.error_occurred.emit(f"Worker error: {str(e)}")
-                
+                        self.attribution_saved.emit(str(project), video, frame, provenance_records(saved))
+                self.failed_tasks.pop((str(project), video, frame), None)
+                self.files_saved.emit(str(project), video, frame)
+                self.save_completed.emit(frame)
+            except Exception as exc:
+                self.failed_tasks[(str(project), video, frame)] = str(exc)
+                self.error_occurred.emit(f"Save failed for frame {frame}: {exc}")
+            finally:
+                if snapshot_task:
+                    self.pending_snapshots.discard((str(project), video, frame, snapshot_task.revision))
+                # Release large masks before waiting for another task.
+                annotations = None
+                snapshot_task = None
+                if 'expanded' in locals():
+                    expanded = frame_annotations = video_annotations = None
+                if 'saved' in locals():
+                    saved = None
+                self.save_queue.task_done()
+
     def wait_until_idle(self, raise_errors=True):
         """Finish queued and in-flight writes before synchronous annotation copies."""
         if self.save_queue.unfinished_tasks and (not self.running or not self.isRunning()):
@@ -179,6 +206,8 @@ class MainWindow(QMainWindow):
         self.save_worker.save_started.connect(self.on_save_started)
         self.save_worker.save_completed.connect(self.on_save_completed)
         self.save_worker.attribution_saved.connect(self._receive_saved_attribution)
+        self.save_worker.snapshot_saved.connect(self._receive_snapshot_saved)
+        self.save_worker.files_saved.connect(self._refresh_saved_annotation_files)
         self.save_worker.start()
         
         # Initialize frame cache with background preloading
@@ -217,6 +246,7 @@ class MainWindow(QMainWindow):
         
         # Track unsaved changes to avoid unnecessary saves
         self.current_frame_modified = False
+        self._annotation_revision = 0
         self.dirty_frame_annotation_keys = set()
         self.dirty_video_annotation_ids = set()
         self.coco_export_dirty = False
@@ -272,7 +302,7 @@ class MainWindow(QMainWindow):
         # Show saved message briefly, then clear
         self.status_label.setText(f"✓ Frame {frame_idx} saved")
         self.status_label.setStyleSheet("color: green; font-weight: bold;")
-        self._schedule_done_counter_update(saved_counts_dirty=True)
+        self._schedule_done_counter_update()
         if hasattr(self, 'annotation_work'):
             self.annotation_work.schedule()
         if hasattr(self, 'video_browser'):
@@ -637,71 +667,95 @@ class MainWindow(QMainWindow):
 
         return counts
 
+    def _annotation_count_cache(self):
+        project = str(self.project_path or '')
+        if getattr(self, '_count_cache_project', None) != project:
+            self._count_cache_project = project
+            self._count_cache = {}
+        return self._count_cache
+
+    def _annotation_file_counts(self, path, bbox_only=False):
+        path = Path(path)
+        cache = self._annotation_count_cache()
+        key = (str(path), bbox_only)
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            cache.pop(key, None)
+            return self._zero_annotation_counts()
+        signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        previous = cache.get(key)
+        if previous is not None and previous[0] == signature:
+            return dict(previous[1])
+        counts = self._count_annotation_records(self._read_annotation_records(path), bbox_only=bbox_only)
+        cache[key] = (signature, dict(counts))
+        return counts
+
+    def _refresh_saved_annotation_files(self, project, video, frame):
+        """Update the total from changed source files, including deletion/empty saves."""
+        if str(self.project_path) != str(project):
+            return
+        if getattr(self, 'done_counter_saved_counts_dirty', True):
+            self._schedule_done_counter_update()
+            return
+        cache = self._annotation_count_cache()
+        root = Path(project) / 'annotations'
+        paths = [(root / 'json' / video / 'video_annotations.json', False)]
+        if frame >= 0:
+            name = f'frame_{frame:06d}.json'
+            paths += [(root / 'json' / video / name, False), (root / 'bbox' / video / name, True)]
+        for path, bbox_only in paths:
+            key = (str(path), bbox_only)
+            previous = cache.get(key)
+            old_counts = previous[1] if previous is not None else self._zero_annotation_counts()
+            new_counts = self._annotation_file_counts(path, bbox_only)
+            counts = self._add_annotation_counts(self.done_counter_saved_counts, old_counts, sign=-1)
+            self.done_counter_saved_counts = self._add_annotation_counts(counts, new_counts)
+        self._schedule_done_counter_update()
+
     def _saved_frame_annotation_counts(self, video_id, frame_idx):
         counts = self._zero_annotation_counts()
         if not self.project_path or video_id is None or frame_idx is None:
             return counts
-
-        json_dir = Path(self.project_path) / 'annotations' / 'json' / str(video_id)
-        bbox_dir = Path(self.project_path) / 'annotations' / 'bbox' / str(video_id)
-        frame_name = f'frame_{int(frame_idx):06d}.json'
-
-        counts = self._add_annotation_counts(
-            counts,
-            self._count_annotation_records(self._read_annotation_records(json_dir / frame_name))
-        )
-        counts = self._add_annotation_counts(
-            counts,
-            self._count_annotation_records(
-                self._read_annotation_records(bbox_dir / frame_name),
-                bbox_only=True
-            )
-        )
+        root = Path(self.project_path) / 'annotations'
+        name = f'frame_{int(frame_idx):06d}.json'
+        for path, bbox_only in ((root / 'json' / str(video_id) / name, False),
+                                (root / 'bbox' / str(video_id) / name, True)):
+            record = self._annotation_count_cache().get((str(path), bbox_only))
+            if record is not None:
+                counts = self._add_annotation_counts(counts, record[1])
         return counts
 
     def _saved_video_annotation_counts(self, video_id):
         if not self.project_path or not video_id:
             return self._zero_annotation_counts()
-
-        json_path = (
-            Path(self.project_path) / 'annotations' / 'json' /
-            str(video_id) / 'video_annotations.json'
-        )
-        return self._count_annotation_records(self._read_annotation_records(json_path))
+        path = Path(self.project_path) / 'annotations' / 'json' / str(video_id) / 'video_annotations.json'
+        record = self._annotation_count_cache().get((str(path), False))
+        return dict(record[1]) if record is not None else self._zero_annotation_counts()
 
     def _scan_saved_annotation_counts(self):
+        """Inventory sources; parse only files changed since the preceding scan."""
         counts = self._zero_annotation_counts()
-        if not self.project_path:
-            return counts
-
-        project_path = Path(self.project_path)
-        json_root = project_path / 'annotations' / 'json'
-        bbox_root = project_path / 'annotations' / 'bbox'
-
-        if json_root.exists():
-            for video_dir in sorted(path for path in json_root.iterdir() if path.is_dir()):
-                for frame_json in sorted(video_dir.glob('frame_*.json')):
-                    counts = self._add_annotation_counts(
-                        counts,
-                        self._count_annotation_records(self._read_annotation_records(frame_json))
-                    )
-                video_json = video_dir / 'video_annotations.json'
-                counts = self._add_annotation_counts(
-                    counts,
-                    self._count_annotation_records(self._read_annotation_records(video_json))
-                )
-
-        if bbox_root.exists():
-            for video_dir in sorted(path for path in bbox_root.iterdir() if path.is_dir()):
-                for frame_json in sorted(video_dir.glob('frame_*.json')):
-                    counts = self._add_annotation_counts(
-                        counts,
-                        self._count_annotation_records(
-                            self._read_annotation_records(frame_json),
-                            bbox_only=True
-                        )
-                    )
-
+        cache = self._annotation_count_cache()
+        found = set()
+        if self.project_path:
+            root = Path(self.project_path) / 'annotations'
+            for folder, bbox_only in (('json', False), ('bbox', True)):
+                base = root / folder
+                if not base.exists():
+                    continue
+                for video_dir in base.iterdir():
+                    if not video_dir.is_dir():
+                        continue
+                    paths = list(video_dir.glob('frame_*.json'))
+                    if not bbox_only:
+                        paths.append(video_dir / 'video_annotations.json')
+                    for path in paths:
+                        key = (str(path), bbox_only)
+                        found.add(key)
+                        counts = self._add_annotation_counts(counts, self._annotation_file_counts(path, bbox_only))
+        for key in set(cache) - found:
+            del cache[key]
         return counts
 
     def _live_canvas_annotation_counts(self):
@@ -1443,6 +1497,24 @@ class MainWindow(QMainWindow):
         self.contributor_label.setToolTip('Active contributor: ' + session['name'])
         if hasattr(self, 'workflow'):
             self.workflow.identity_changed()
+
+    def _receive_snapshot_saved(self, result):
+        """An old save must never mark newer edits (or another frame) clean."""
+        if (result['project'] != str(self.project_path)
+                or (result['video'], result['frame']) != self._frame_annotation_key()
+                or result['revision'] != self._annotation_revision):
+            return
+        for frame, records in result['records'].items():
+            self._receive_saved_attribution(result['project'], result['video'], frame, records)
+        if result['frame'] in result['records']:
+            self.dirty_frame_annotation_keys.discard((result['video'], result['frame']))
+        if -1 in result['records']:
+            self.dirty_video_annotation_ids.discard(result['video'])
+        self.current_frame_modified = bool(
+            self._frame_annotation_key() in self.dirty_frame_annotation_keys
+            or self.current_video_id in self.dirty_video_annotation_ids)
+        if hasattr(self, 'workflow'):
+            self.workflow.update_save_status()
 
     def _receive_saved_attribution(self, project, video, frame, records):
         if (str(self.project_path) != project or self.current_video_id != video or
@@ -2744,6 +2816,9 @@ class MainWindow(QMainWindow):
             return
         
         try:
+            # Finish older writes before removing their destination files.
+            self.save_worker.wait_until_idle()
+            self._schedule_done_counter_update(saved_counts_dirty=True)
             import shutil
             
             deleted_count = 0
@@ -2845,6 +2920,9 @@ class MainWindow(QMainWindow):
             return
         
         try:
+            # Finish older writes before removing their destination files.
+            self.save_worker.wait_until_idle()
+            self._schedule_done_counter_update(saved_counts_dirty=True)
             import shutil
             
             # If we're currently viewing this video, clear the view
@@ -4278,6 +4356,7 @@ class MainWindow(QMainWindow):
     def _mark_current_annotations_dirty(self, include_frame=True, include_video=True):
         """Mark the current annotation source files as needing a save."""
         self.current_frame_modified = True
+        self._annotation_revision += 1
         self.coco_export_dirty = True
         if hasattr(self, 'frame_review_check') and self.frame_review_check.isEnabled():
             self.frame_review_check.setChecked(False)
@@ -4328,6 +4407,28 @@ class MainWindow(QMainWindow):
         frame_key = self._frame_annotation_key(target_video_id, target_list_idx)
         frame_idx_in_video = frame_key[1] if frame_key is not None else target_list_idx
         require_assigned_frame(self.project_path, self.contributor_session, target_video_id, frame_idx_in_video)
+
+        if use_background and annotations is None:
+            if target_video_id != self.current_video_id or target_list_idx != self.current_frame_idx:
+                raise ValueError('Canvas snapshots can only save the displayed frame')
+            if self.save_worker.save_queue.unfinished_tasks:
+                return {'saved_any': False, 'reason': 'pending'}
+            save_frame = force or self.current_frame_modified or frame_key in self.dirty_frame_annotation_keys
+            save_video = force or self.current_frame_modified or target_video_id in self.dirty_video_annotation_ids
+            if not save_frame and not save_video:
+                return {'saved_any': False, 'reason': 'clean'}
+            task = SnapshotSave(AnnotationSnapshot.capture(self.canvas),
+                                frozenset(frame_categories(self.annotation_manager.project_info)),
+                                save_frame, save_video, self._annotation_revision)
+            # An older binary-mask cache must not hide this save on returning to the frame.
+            self.annotation_manager.frame_annotations.pop((target_video_id, target_list_idx), None)
+            self.save_worker.add_snapshot_task(self.project_path, target_video_id, frame_idx_in_video, task)
+            self.coco_export_dirty = True
+            if hasattr(self, 'workflow'):
+                self.workflow.saved(refresh=False)
+            # Keep dirty flags until the matching revision has actually reached disk.
+            return {'saved_any': True, 'pending': True, 'video_id': target_video_id,
+                    'frame_idx': frame_idx_in_video}
 
         if annotations is None:
             self._commit_canvas_edit_if_needed()
@@ -4391,7 +4492,8 @@ class MainWindow(QMainWindow):
 
         if saved_files:
             self.coco_export_dirty = True
-            self._schedule_done_counter_update(saved_counts_dirty=True)
+            self._refresh_saved_annotation_files(str(self.project_path), target_video_id,
+                                                  -1 if use_background else frame_idx_in_video)
 
         current_key = self._frame_annotation_key()
         if target_video_id == self.current_video_id and frame_key == current_key:
@@ -4444,6 +4546,7 @@ class MainWindow(QMainWindow):
         if not target_video_id:
             return
         try:
+            self.save_worker.wait_until_idle()
             all_annotations = self.canvas.get_annotations()
             _, video_anns = self._split_source_annotations(all_annotations)
             self.annotation_manager.save_video_annotations(
@@ -5278,6 +5381,14 @@ class MainWindow(QMainWindow):
     def load_frame(self, idx):
         """Load a specific frame"""
         if 0 <= idx < len(self.frames):
+            # Snapshot autosaves do not populate the large binary-mask cache.
+            # Finish them before navigation can read their frame/shared sources.
+            if self.save_worker.pending_snapshots:
+                try:
+                    self.save_worker.wait_until_idle()
+                except Exception as exc:
+                    QMessageBox.warning(self, 'Local Work Not Saved', str(exc))
+                    return
             # IMPORTANT: Capture the video ID for the current frame BEFORE any changes
             # This must be done first because self.current_video_id and self.frame_video_ids
             # may be updated when switching videos
@@ -8113,6 +8224,11 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
+            try:
+                self.save_worker.wait_until_idle()
+            except Exception as exc:
+                QMessageBox.warning(self, 'Local Work Not Saved', str(exc))
+                return
             # Keep only non-bee annotations (hive/chamber/pollen)
             self.canvas.set_annotations(other_annotations)
             self.update_instance_list_from_canvas()
@@ -8158,6 +8274,7 @@ class MainWindow(QMainWindow):
                     self.dirty_frame_annotation_keys.discard((video_id, frame_idx_in_video))
                     self.coco_export_dirty = True
                     self.current_frame_modified = False  # Mark as not modified since we explicitly deleted
+                    self._refresh_saved_annotation_files(str(project_path), video_id, frame_idx_in_video)
                     
                 except Exception as e:
                     import traceback

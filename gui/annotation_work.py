@@ -1,6 +1,7 @@
 """Shared work filters and a nonblocking annotation-sidebar inventory."""
 
 from pathlib import Path
+from collections import OrderedDict
 
 from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (QComboBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
@@ -116,6 +117,8 @@ class AnnotationWorkBrowser(QObject):
         self.refresh_button.setToolTip('Refresh saved mask summaries')
         self.refresh_button.clicked.connect(self.schedule)
         self.refresh_button.clicked.connect(window.video_browser.schedule)
+        self.refresh_button.clicked.connect(
+            lambda: window._schedule_done_counter_update(saved_counts_dirty=True))
         row.addWidget(self.refresh_button)
         layout.addLayout(row)
         self.filters.changed.connect(self.apply)
@@ -127,6 +130,11 @@ class AnnotationWorkBrowser(QObject):
         self.pending = False
         self.stopping = False
         self.video = None
+        self._summaries = OrderedDict()
+        self.apply_timer = QTimer(self)
+        self.apply_timer.setSingleShot(True)
+        self.apply_timer.setInterval(100)
+        self.apply_timer.timeout.connect(self.apply)
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.setInterval(300)
@@ -146,6 +154,7 @@ class AnnotationWorkBrowser(QObject):
             return
         previous = self.index if project == self.project else None
         if project != self.project:
+            self._summaries.clear()
             self.project, self.index = project, {'version': 1, 'videos': {}}
             self.checked = False
         self.error = None
@@ -197,7 +206,19 @@ class AnnotationWorkBrowser(QObject):
                 not self.checked or self.worker or self.timer.isActive()):
             return {'presence': 'loading', 'state': 'loading', 'mask_text': 'Loading...',
                     'work_text': 'Loading...', 'detail': 'Checking local saved masks...'}
-        result = summarize(entry, task, frames)
+        # local_index reuses immutable entries when their source files are unchanged.
+        # Retain the entry with each cache item so Python cannot recycle its id.
+        key = (id(entry), task, None if frames is None else tuple(frames))
+        cached = self._summaries.get(key) if entry is not None else None
+        if cached is not None and cached[0] is entry:
+            self._summaries.move_to_end(key)
+            result = dict(cached[1])
+        else:
+            result = summarize(entry, task, frames)
+            if entry is not None:
+                self._summaries[key] = (entry, dict(result))
+                if len(self._summaries) > 4096:
+                    self._summaries.popitem(last=False)
         if entry is None and self.error:
             result['detail'] = self.error
         return result
@@ -208,7 +229,13 @@ class AnnotationWorkBrowser(QObject):
                 summary['mask_text'] + ' | ' + summary['work_text'])
 
     def apply(self):
+        if self.stopping:
+            return
         w = self.window
+        if getattr(w.canvas, 'is_drawing', False):
+            self.apply_timer.start()
+            return
+        self.apply_timer.stop()
         self.source.setText('Local working copy\n' + Path(w.project_path).name if w.project_path else 'No local project open')
         self.source.setToolTip(str(w.project_path or ''))
         task = self.filters.task.currentData()
@@ -257,7 +284,7 @@ class AnnotationWorkBrowser(QObject):
             self.note.setText('Mask summary unavailable: ' + self.error)
         if video and not (w.video_browser.accepts(video) and self.review.accepts(video)):
             self.note.setText(self.note.text() + '\nCurrent video is outside the video filters')
-        elif video and summary['state'] != 'loading' and not self.filters.accepts(summarize(entry, task)):
+        elif video and summary['state'] != 'loading' and not self.filters.accepts(self.summary(entry, task)):
             self.note.setText(self.note.text() + '\nCurrent video kept visible outside these filters')
         self.finish.setEnabled(bool(video and entry and task and summary['state'] not in ('unknown', 'loading')))
         self.finish.setText('Reopen Work' if not dirty and summary.get('finished', 0) == summary.get('total', -1)
@@ -329,6 +356,8 @@ class AnnotationWorkBrowser(QObject):
     def stop(self):
         self.stopping = True
         self.timer.stop()
+        self.apply_timer.stop()
+        self._summaries.clear()
         if self.worker:
             self.worker.requestInterruption()
             self.worker.wait()

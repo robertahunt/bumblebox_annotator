@@ -1404,6 +1404,7 @@ class AnnotationManager:
 
         return annotations, aruco_tracking
 
+    @serialized_save
     def update_aruco_tracking(self, project_path, video_id, aruco_id, instance_id):
         """Update video-level ArUco tracking mapping.
         
@@ -1478,6 +1479,7 @@ class AnnotationManager:
                 os.unlink(tmp_path)
             raise e
     
+    @serialized_save
     def remove_aruco_tracking(self, project_path, video_id, aruco_id):
         """Remove an ArUco tracking entry from video-level tracking.
         
@@ -1543,6 +1545,7 @@ class AnnotationManager:
                     os.unlink(tmp_path)
                 raise e
     
+    @serialized_save
     def clear_all_aruco_tracking(self, project_path, video_id):
         """Clear all ArUco tracking entries for a video.
         
