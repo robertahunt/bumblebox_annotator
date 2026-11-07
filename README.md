@@ -31,6 +31,20 @@ an older CUDA setup and install unpinned SAM2.
 
 ## Usage
 
+On a configured Linux computer, install an application-menu and optional desktop
+shortcut once from the checkout you want to run:
+
+```bash
+conda activate bee_annotator
+python scripts/desktop_launcher.py install --desktop
+```
+
+Then open **Bumblebox Annotator** from the applications menu or desktop and select
+your profile. Students do not need a terminal, Conda activation, or CUDA to draw
+masks. See [desktop launcher setup and troubleshooting](docs/setup.md#desktop-launcher).
+
+For terminal use, the existing entry point remains available:
+
 ```bash
 python main.py
 ```

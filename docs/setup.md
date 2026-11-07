@@ -190,6 +190,68 @@ GPU training benchmark or validate a research model's accuracy. After passing,
 launch `python main.py` and try editing/saving a disposable project before
 opening the real project. A first model load should be tested separately.
 
+### Desktop Launcher
+
+After verifying the environment, an experienced person can run this **once per
+Linux login account** from the intended repository checkout:
+
+```bash
+conda activate bee_annotator
+python scripts/desktop_launcher.py install --desktop
+```
+
+The installed application is named **Bumblebox Annotator**. Open it from the
+applications menu and pin it to the dock. `--desktop` also creates a desktop
+shortcut; some desktops require right-clicking that icon and choosing **Allow
+Launching** the first time. Omit `--desktop` for an application-menu entry only.
+Desktop environments without desktop icons can still use the applications menu.
+
+Students then **open the app, select their profile, and open their assigned
+work**. No terminal, environment activation, or choice of repository is needed.
+The launcher does not select an identity, sign in to the lab drive, download
+projects, load models, or require CUDA. Existing profile and project startup
+preferences still apply. Several annotation profiles using the same Linux login
+share this launcher; separate Linux logins need their own installation.
+
+The installer records the absolute checkout and environment interpreter paths.
+It checks Python/Qt and the presence of core dependencies without loading models
+or initializing CUDA; it is not a replacement for the verification above. If
+you use a differently named environment, activate it instead, or supply its
+interpreter explicitly with `--python /absolute/path/to/env/bin/python`.
+Unlike the old `run.sh`, the shortcut does not rely on Conda being on the desktop's
+PATH and does not automatically load SAM2.
+
+For a Git worktree, install from that worktree. The shortcut keeps using it even
+if another terminal/editor is in a different checkout. Normal `git pull` updates
+to that checkout are picked up next launch. **Do not switch its branch or remove
+the checkout while the application or training is running.** After moving the
+checkout/environment, or updating the launcher helper itself, rerun the install
+command from the intended checkout. Reinstalling updates the same shortcut; it
+does not create another project or change annotations. It does not update Git,
+install packages, or switch branches for you.
+
+Startup and application output is saved locally under
+`~/.local/state/bee-annotator/launcher.log`, with two rotated backups capped at
+about 5 MiB each. Errors display the log path instead of silently closing. Logs
+can contain local project paths and annotation diagnostics; nothing is uploaded
+automatically. If the app fails, send the log to the person who configured the
+computer. A graphical error dialog uses `zenity` (normally available on Ubuntu),
+`kdialog`, or `xmessage`, with a desktop-notification fallback. On a minimal Linux
+desktop, have the administrator install one of those dialog tools. Without any
+of them, failures are still recorded but cannot show a dialog.
+
+Repeated shortcut clicks are blocked while an app started by this launcher is
+starting or open. This does not detect apps started manually with `python main.py`;
+close any manually launched annotator before using the shortcut. An already-open
+window is not automatically brought to the foreground.
+
+The application-menu entry is
+`~/.local/share/applications/org.beewhere.Annotator.desktop`; its small launcher
+helper and settings are in `~/.local/share/bee-annotator/launcher/`. XDG data/state
+directory overrides are respected. Remove the menu/desktop entries to remove
+the shortcuts; none of these files contain project annotations. Installation
+requires no `sudo` and does not modify the research drive or the training environment.
+
 ## 6. Optional SAM2
 
 Brush/eraser annotation and YOLO do not require SAM2 or its checkpoint. To enable
