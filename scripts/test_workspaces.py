@@ -144,19 +144,41 @@ class WorkspaceGuiTests(unittest.TestCase):
         flow = self.window.workflow
         self.assertEqual(flow.current, 'Home')
         self.assertTrue(all(dock.isHidden() for dock in flow.docks))
-        self.assertFalse(flow.home.open_selected.isEnabled())
-        self.assertTrue(flow.home.recent_heading.isHidden())
-        self.assertTrue(flow.home.recovery.isHidden())
-        self.assertTrue(flow.home.context.isHidden())
-        self.assertEqual(flow.home.context.text(), '')
+        self.assertFalse(flow.home.inbox.open.isEnabled())
+        self.assertEqual(flow.home.inbox.projects.count(), 0)
+        self.assertEqual(flow.home.inbox.project_title.text(), 'Choose a project')
         self.load()
         flow.show_home()
-        self.assertTrue(flow.home.open_selected.isEnabled())
-        self.assertEqual(flow.home.open_selected.text(), 'Return to Project')
-        self.assertFalse(flow.home.context.isHidden())
-        flow.home.open_selected.click()
+        self.assertTrue(flow.home.inbox.open.isEnabled())
+        self.assertEqual(flow.home.inbox.open.text(), 'Open Project')
+        flow.home.inbox.open.click()
         self.assertEqual(flow.current, 'Annotate')
         self.assertFalse(self.window.canvas.isHidden())
+
+    def test_local_session_opens_assigned_work_without_shared_scans(self):
+        from gui.lab_startup import set_working_locally
+        set_working_locally(True)
+        try:
+            with patch('gui.assignment_workspace.assignment_presence') as assignments, \
+                    patch('gui.assignment_workspace.assignment_management') as management, \
+                    patch('gui.workspaces.project_activity') as updates, \
+                    patch('gui.assigned_review.assigned_review_statuses') as reviews:
+                flow = self.load(assigned=True)
+                flow.home.inbox.refresh()
+                flow.check_shared()
+                flow.assignments_page.refresh()
+                self.window.annotation_work.review.refresh()
+                self.app.processEvents()
+                assignments.assert_not_called()
+                management.assert_not_called()
+                updates.assert_not_called()
+                reviews.assert_not_called()
+                self.assertIn('Working locally', flow.home.inbox.summary.text())
+                self.assertIn('Working locally', flow.shared_status.text())
+                self.assertIsNotNone(self.window.current_video_id)
+                self.assertTrue(self.window.canvas.get_annotations())
+        finally:
+            set_working_locally(False)
 
     def test_home_button_has_visible_label_large_house_icon_and_returns_home(self):
         flow = self.load()
@@ -193,22 +215,20 @@ class WorkspaceGuiTests(unittest.TestCase):
         finally:
             self.app.setPalette(before)
 
-    def test_recent_project_open_button_precedes_other_open_commands(self):
+    def test_single_project_picker_keeps_secondary_commands_in_menu(self):
         home = self.window.workflow.home
         self.window.show()
         self.app.processEvents()
-        layout = home.recent.parentWidget().layout()
-        self.assertEqual(layout.indexOf(home.open_selected), layout.indexOf(home.recent) + 1)
-        local = next(button for button in home.findChildren(QPushButton) if button.text() == 'Open Local Project...')
         self.window.recent_projects = [str(self.source)]
         self.settings.setValue('workflow/recent_projects/' + self.coordinator['id'], [str(self.source)])
         home.refresh()
         self.app.processEvents()
-        self.assertGreater(local.geometry().top(), home.open_selected.geometry().bottom())
-        self.assertEqual(home.recent.currentRow(), 0)
-        self.assertTrue(home.open_selected.isEnabled())
+        self.assertIn('Open Local Project...', [action.text() for action in home.project_options.menu().actions()])
+        self.assertFalse(any(b.text() == 'Open Local Project...' for b in home.findChildren(QPushButton)))
+        self.assertEqual(home.inbox.projects.currentRow(), 0)
+        self.assertTrue(home.inbox.open.isEnabled())
         with patch.object(self.window, 'open_recent_project') as open_project:
-            home.open_selected.click()
+            home.inbox.open.click()
             open_project.assert_called_once_with(str(self.source))
         home.grab().save('/tmp/bumblebox-project-home-layout.png')
 
@@ -227,11 +247,9 @@ class WorkspaceGuiTests(unittest.TestCase):
             self.window.show()
             self.app.processEvents()
             self.assertGreater(home.palette().color(QPalette.ColorRole.Window).lightness(), 220)
-            self.assertTrue(home.recovery.isHidden())
-            home.recovery_toggle.click()
-            self.assertFalse(home.recovery.isHidden())
-            self.assertEqual(home.recovery_toggle.arrowType(), Qt.ArrowType.DownArrow)
-            home.recent.setCurrentRow(1)
+            from gui.workflow_help import RESTORE_LABEL
+            self.assertIn(RESTORE_LABEL, [a.text() for a in home.project_options.menu().actions()])
+            home.inbox.projects.setCurrentRow(1)
             self.app.processEvents()
             self.assertLessEqual(home.minimumSizeHint().width(), 640)
             home.grab().save('/tmp/bumblebox-project-home-dark-system.png')
@@ -402,25 +420,18 @@ class WorkspaceGuiTests(unittest.TestCase):
             self.assertFalse(event.isAccepted())
         self.assertTrue(self.window.save_worker.isRunning())
 
-    def test_close_upload_cancel_failure_and_local_only(self):
+    def test_assigned_close_delegates_to_automatic_queue_without_submit_question(self):
         flow = self.load(assigned=True)
         self.window.canvas.start_editing_instance(1, 'bee')
         self.window.canvas.editing_mask[0, 0] = 255
         self.window._mark_current_annotations_dirty()
         flow.autosave()
         self.window.save_worker.wait_until_idle()
-        def choose(text):
-            def click():
-                box = self.app.activeModalWidget()
-                next(button for button in box.buttons() if text in button.text()).click()
-            QTimer.singleShot(0, click)
-        choose('Cancel')
-        self.assertFalse(flow.confirm_upload_on_close())
-        choose('Upload and Close')
-        with patch.object(self.window, 'sync_current_project', return_value=False):
+        with patch.object(flow.automatic_work, 'finish_session', return_value=False) as finish:
             self.assertFalse(flow.confirm_upload_on_close())
-        choose('Close with Work')
-        self.assertTrue(flow.confirm_upload_on_close())
+            finish.assert_called_once_with()
+        with patch.object(flow.automatic_work, 'finish_session', return_value=True):
+            self.assertTrue(flow.confirm_upload_on_close())
         self.assertTrue(flow.pending())
 
     def test_stale_background_check_cannot_clear_new_edits(self):

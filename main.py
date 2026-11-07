@@ -14,10 +14,12 @@ os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QIcon
 
 from gui.main_window import MainWindow
 from gui.project_sync_dialog import choose_contributor
 from gui.shared_profiles import stop_profile_sync
+from gui.lab_startup import ensure_computer_setup, check_session_connection
 
 
 def parse_args():
@@ -42,13 +44,16 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Bee Annotator")
     app.setOrganizationName("BeeWhere")
+    app.setDesktopFileName("org.beewhere.Annotator")
+    app.setWindowIcon(QIcon.fromTheme("applications-graphics"))
 
-    session = choose_contributor()
-    if session is None:
-        stop_profile_sync()
-        return
-    
     try:
+        if not ensure_computer_setup():
+            return
+        session = choose_contributor()
+        if session is None:
+            return
+        check_session_connection(session['name'])
         # Create main window with optional checkpoints
         window = MainWindow(
             sam2_checkpoint=args.sam2_checkpoint,

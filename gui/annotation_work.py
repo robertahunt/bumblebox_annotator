@@ -336,6 +336,7 @@ class AnnotationWorkBrowser(QObject):
                               complete=not reopen, cancelled=cancelled), w).run()
             if hasattr(w, 'workflow'):
                 w.workflow.saved()
+                w.workflow.automatic_work.saved(completed=True)
             self.schedule()
         except Exception as exc:
             QMessageBox.warning(w, 'Completion Not Saved', str(exc))

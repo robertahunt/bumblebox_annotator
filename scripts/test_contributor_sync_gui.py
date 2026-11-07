@@ -27,6 +27,7 @@ from gui.main_window import MainWindow, SaveWorker
 from gui.project_sync_dialog import (ProjectSyncDialog, SyncProgressDialog, choose_contributor,
                                      save_setting, setting_json, working_project_path)
 from scripts.test_project_sync import annotation
+from scripts.profile_test_helpers import manage_profiles
 
 
 def probe_destination(path):
@@ -82,8 +83,11 @@ class ContributorSyncGuiTests(unittest.TestCase):
                     editor = self.app.activeModalWidget()
                     editor.findChild(QLineEdit).setText(name)
                     editor.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
-                QTimer.singleShot(0, enter_name)
-                next(b for b in dialog.findChildren(QPushButton) if b.text() == 'New Profile...').click()
+                def create(manager):
+                    QTimer.singleShot(0, enter_name)
+                    manager.new.click()
+                manage_profiles(dialog, create)
+                dialog.accept()
         QTimer.singleShot(0, respond)
         return choose_contributor()
 
@@ -135,7 +139,9 @@ class ContributorSyncGuiTests(unittest.TestCase):
                 observed = {}
                 with patch.object(startup, 'QApplication') as application, \
                         patch.object(startup, 'parse_args', return_value=args), \
-                        patch.object(startup, 'MainWindow') as create_window:
+                        patch.object(startup, 'MainWindow') as create_window, \
+                        patch.object(startup, 'check_session_connection',
+                                     side_effect=lambda name: not create_window.called) as connection:
                     application.return_value.exec.return_value = 0
                     window = create_window.return_value
                     window.workflow.home.auto_resume.isChecked.return_value = destination != 'home'
@@ -157,6 +163,7 @@ class ContributorSyncGuiTests(unittest.TestCase):
                     self.assertEqual(observed, {
                         'preselected': 'Alex', 'profiles': ['Alex', 'August'], 'window_created': False})
                     window.set_contributor.assert_called_once()
+                    connection.assert_called_once_with('August')
                     self.assertEqual(window.set_contributor.call_args.args[0]['id'], profiles['August'])
                     self.assertEqual(self.settings.value('contributors/last_name'), 'August')
                     self.assertEqual(setting_json('contributors/profiles', {}), profiles)
@@ -188,10 +195,12 @@ class ContributorSyncGuiTests(unittest.TestCase):
 
         with patch.object(startup, 'QApplication') as application, \
                 patch.object(startup, 'parse_args'), \
+                patch.object(startup, 'check_session_connection') as connection, \
                 patch.object(startup, 'MainWindow') as create_window:
             QTimer.singleShot(0, cancel)
             startup.main()
             create_window.assert_not_called()
+            connection.assert_not_called()
             application.return_value.exec.assert_not_called()
         self.assertEqual(self.settings.value('contributors/last_name'), 'Alex')
         self.assertEqual(setting_json('contributors/profiles', {}), profiles)
@@ -259,9 +268,11 @@ class ContributorSyncGuiTests(unittest.TestCase):
                 editor.findChild(QLineEdit).setText('  august  ')
                 editor.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
 
-            QTimer.singleShot(0, enter_name)
-            next(b for b in dialog.findChildren(QPushButton) if b.text() == 'New Profile...').click()
-            dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
+            def create(manager):
+                QTimer.singleShot(0, enter_name)
+                manager.new.click()
+            manage_profiles(dialog, create)
+            dialog.accept()
 
         with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.No):
             QTimer.singleShot(0, respond)
@@ -292,8 +303,7 @@ class ContributorSyncGuiTests(unittest.TestCase):
 
         def respond():
             dialog = self.app.activeModalWidget()
-            observed['continue_enabled'] = dialog.findChild(QDialogButtonBox).button(
-                QDialogButtonBox.StandardButton.Ok).isEnabled()
+            observed['profile_selected'] = dialog.selected_id() is not None
 
             def cancel_creation():
                 editor = self.app.activeModalWidget()
@@ -305,14 +315,16 @@ class ContributorSyncGuiTests(unittest.TestCase):
                 name.setText('August')
                 editor.reject()
 
-            QTimer.singleShot(0, cancel_creation)
-            next(b for b in dialog.findChildren(QPushButton) if b.text() == 'New Profile...').click()
+            def create(manager):
+                QTimer.singleShot(0, cancel_creation)
+                manager.new.click()
+            manage_profiles(dialog, create)
             observed['count'] = dialog.findChild(QListWidget).count()
             dialog.reject()
 
         QTimer.singleShot(0, respond)
         self.assertIsNone(choose_contributor())
-        self.assertEqual(observed, {'continue_enabled': False, 'blank_enabled': False,
+        self.assertEqual(observed, {'profile_selected': False, 'blank_enabled': False,
                                    'max_length': 80, 'count': 0})
         self.assertEqual(setting_json('contributors/profiles', {}), {})
 
@@ -542,7 +554,7 @@ class ContributorSyncGuiTests(unittest.TestCase):
 
         def export():
             dialog = self.app.activeModalWidget()
-            next(b for b in dialog.findChildren(QPushButton) if b.text() == 'Export Profile...').click()
+            manage_profiles(dialog, lambda manager: manager.export_button.click())
             dialog.reject()
 
         with patch('gui.project_sync_dialog.QFileDialog.getSaveFileName', return_value=(str(profile_file), '')), \
@@ -557,8 +569,8 @@ class ContributorSyncGuiTests(unittest.TestCase):
 
         def import_and_start():
             dialog = self.app.activeModalWidget()
-            next(b for b in dialog.findChildren(QPushButton) if b.text() == 'Import Profile...').click()
-            dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
+            manage_profiles(dialog, lambda manager: manager.import_button.click())
+            dialog.accept()
 
         with patch('gui.project_sync_dialog.QFileDialog.getOpenFileName', return_value=(str(profile_file), '')), \
                 patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):

@@ -1231,6 +1231,8 @@ class MainWindow(QMainWindow):
             widget.setEnabled(not assigned)
         if assigned:
             self.assigned_status.setText('Assigned work: ' + self.contributor_session['name'])
+            if any(not entry.get('task') for entry in workspace(self.project_path)['assignments'].values()):
+                self.assigned_status.setText(self.assigned_status.text() + '\nSome assignments need a mask task from the director')
             self.video_split_filter_combo.setCurrentIndex(0)
             self.split_filter_combo.setCurrentIndex(0)
             self.tracking_filter_checkbox.setChecked(False)
@@ -1354,6 +1356,8 @@ class MainWindow(QMainWindow):
                 else:
                     summary = 'No new file uploads were needed.'
                 QMessageBox.information(self, message, summary + '\n\nLocal work is saved.')
+            if self.workflow.automatic_work.session:
+                self.workflow.automatic_work.session.published(result)
             self.workflow.uploaded()
             return True
         except Exception as exc:
@@ -1543,6 +1547,8 @@ class MainWindow(QMainWindow):
                 metadata['provenance'] = record['provenance']
 
     def change_contributor(self):
+        if self._sync_in_progress:
+            return
         try:
             # Finish the previous person's edits before changing the session identity.
             self.save_worker.wait_until_idle(raise_errors=False)
@@ -1555,6 +1561,9 @@ class MainWindow(QMainWindow):
         session = choose_contributor(self)
         if session:
             try:
+                require_contributor(self.project_path, session)
+                if not self.workflow.automatic_work.finish_session():
+                    return
                 self.set_contributor(session)
             except ValueError as exc:
                 QSettings().setValue('contributors/last_name', self.contributor_session['name'])
@@ -3280,12 +3289,9 @@ class MainWindow(QMainWindow):
         self.assigned_status = QLabel('Assigned work')
         self.assigned_status.setWordWrap(True)
         assigned_layout.addWidget(self.assigned_status)
-        publish_button = QPushButton(ASSIGNED_LABEL)
-        publish_button.clicked.connect(lambda: self.publish_assigned_work())
+        publish_button = QPushButton('Retry Upload')
+        publish_button.clicked.connect(lambda: self.workflow.automatic_work.retry())
         add_help_row(assigned_layout, publish_button, 'assigned')
-        ready_button = QPushButton('Submit Current Video for Review')
-        ready_button.clicked.connect(lambda: self.publish_assigned_work(ready=True))
-        add_help_row(assigned_layout, ready_button, 'submit')
         self.assigned_controls.hide()
         layout.addWidget(self.assigned_controls)
         
@@ -4835,6 +4841,8 @@ class MainWindow(QMainWindow):
                 self.save_worker.wait_until_idle(raise_errors=False)
                 self._save_annotation_sources()
                 self.save_worker.wait_until_idle()
+                if not self.workflow.automatic_work.finish_session():
+                    return
         except Exception as exc:
             QMessageBox.warning(self, 'Project Not Opened', str(exc))
             return

@@ -162,15 +162,17 @@ completion columns, and persistent scan caching for older backups remain future 
 4. The verified copy opens in the **Annotate** workspace in **Assigned Work** mode.
    Edits autosave locally after a brief idle period; **File > Save** is also
    available. Work can continue while the drive is disconnected.
-5. Reconnect and choose **Upload Assigned Annotations** to upload progress. When the current
-   video's assigned frames are finished, choose **Submit Current Video for Review**.
+5. Use **Mark Finished** for the assigned mask task. Saved progress uploads automatically
+   when connected. Once all required assigned work for a video is finished, a verified
+   upload makes it ready for director review. Offline work remains queued locally.
+   **Retry Upload** retries paused work; conflicts need director review.
 
 The download popup also has **Review > Active Work**, **Awaiting Review**,
 **Accepted**, and **All Assigned**, with counts. It defaults to Active Work.
 **On this computer** filters separately for videos needing download/refresh,
 already downloaded videos, or unchecked local status. Each row shows its published
-review status and its local availability. Mark Finished alone does not submit a
-video or move it to Accepted.
+review status and its local availability. Mark Finished is local until an upload
+is verified. Only the director can move a submitted video to Accepted.
 
 Active videos that are not downloaded, have missing assigned frame images, have
 changed assignments, or have newer published video data are preselected. Already
@@ -314,11 +316,14 @@ upload, every minute while these controls are visible, and using the refresh ico
 next to **Review**. It reads publication metadata, not every image or mask. If the
 drive cannot be checked, the status is explicitly unavailable and unchecked work
 stays accessible in Active Work and All Assigned. Unsaved or saved-but-unuploaded
-edits do not change this published status; upload and resubmit as needed.
+edits do not change this published status until the automatic upload succeeds.
 
 **Show > Finished** remains a separate, local, per-mask-task completion filter.
-Marking work finished does not submit it. Submission is explicit and does not
-require every mask type or frame to have been marked finished.
+In assigned copies, completing every required frame for the assigned task queues
+automatic submission. Other mask types are not required. Shared-video tasks need
+one shared completion. Unknown tasks or outstanding import reviews block automatic
+submission. Full-project backups and exceptional File-menu manual submissions
+remain explicit. See [automatic work and computer reports](workspaces.md#automatic-assigned-work-and-computer-reports).
 
 Use **File > Review Shared Updates** in the coordinator's full project to get the
 latest combined publication, review the assigned frames and shared masks, then
@@ -329,7 +334,8 @@ Students publishing different assigned videos do not need to download each
 other's frames.
 
 An unchanged repeat publication retains Accepted status. Further annotation edits
-return the video to In Progress unless explicitly resubmitted. Acceptance is a
+invalidate completion and return the video to In Progress until finished again
+(the exceptional manual submit command can also resubmit). Acceptance is a
 collaboration status, not a substitute for pending imported-frame reviews or a
 new automatic training-eligibility rule; the existing training/export checks still
 apply in the full project.

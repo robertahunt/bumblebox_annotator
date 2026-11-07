@@ -273,7 +273,16 @@ def assignment_status(view, entry, *, heads=None, current=None, cancelled=lambda
             if _video_files(submitted['manifest']['files'], video) != _video_files(current['manifest']['files'], video):
                 return 'Changed Since Submission', revision
             if video in submission.get('ready', []):
-                return ('Accepted' if entry.get('accepted_revision') == revision else 'Ready for Review'), revision
+                original = submission.get('ready_revisions', {}).get(video, revision)
+                if original != revision:
+                    prior = view.snapshot((entry['contributor']['id'], original))
+                    prior_work = prior['manifest'].get('assigned_work', {})
+                    if (prior_work.get('assignments', {}).get(video) != entry['id'] or
+                            video not in prior_work.get('ready', []) or
+                            _video_files(prior['manifest']['files'], video) !=
+                            _video_files(submitted['manifest']['files'], video)):
+                        raise ValueError('Review receipt no longer matches the submitted video.')
+                return ('Accepted' if entry.get('accepted_revision') == original else 'Ready for Review'), original
             return 'In Progress', revision
         revision = snapshot['parents'].get(entry['contributor']['id'])
     return ('In Progress' if entry.get('started_at') else 'Assigned'), None
@@ -311,7 +320,45 @@ def assignment_review_snapshot(view, contributor, assignments, cancelled=lambda:
     if (view.heads(validate_snapshots=False) != heads or
             read_assignments(view)['revision'] != data['revision']):
         raise ValueError('Shared work changed during the check. Refresh review status.')
-    return {'statuses': statuses, 'snapshot': current}
+    return {'statuses': statuses, 'snapshot': current, 'heads': heads,
+            'assignment_revision': data['revision']}
+
+
+def shared_assignment_progress(configuration, project_id, contributor, assignments, cancelled=lambda: False):
+    """Read published progress without a local copy or any mask/image scans."""
+    from core.annotation_work import published_index, summarize
+    if cancelled():
+        raise InterruptedError('Shared progress check cancelled')
+    if not configuration.get('root_id'):
+        raise ValueError('Connect the shared drive to check progress.')
+    view = PublishedProject.from_archive(configuration, project_id)
+    review = assignment_review_snapshot(view, contributor, assignments, cancelled)
+    index = published_index(review['snapshot'], cached_only=True, cancelled=cancelled)
+    videos = {}
+    for video, assignment in assignments.items():
+        if cancelled():
+            raise InterruptedError('Shared progress check cancelled')
+        status = review['statuses'][video]
+        # Reassigned frames/tasks must not inherit completion from the previous assignment.
+        summary = (summarize(index['videos'].get(video), assignment.get('task'), assignment['frames'])
+                   if status != 'Assignment changed' else None)
+        videos[video] = {'status': status, 'completion': summary}
+    data = read_assignments(view)
+    review_ready = []
+    if (data.get('coordinator') or {}).get('id') == contributor['id']:
+        for video, entry in data['videos'].items():
+            status, revision = assignment_status(view, entry, heads=review['heads'],
+                current=review['snapshot'], cancelled=cancelled)
+            if status == 'Ready for Review':
+                review_ready.append({'video': video, 'assignment_id': entry['id'],
+                                     'revision': revision, 'contributor': entry['contributor']})
+    from core.work_session import read_reports
+    activity = read_reports(view, None if (data.get('coordinator') or {}).get('id') == contributor['id']
+                            else contributor['id'], cancelled)
+    if (view.heads(validate_snapshots=False) != review['heads'] or
+            read_assignments(view)['revision'] != review['assignment_revision']):
+        raise ValueError('Shared work changed during the check. Refresh progress.')
+    return {'videos': videos, 'checked_at': utc_now(), 'activity': activity, 'review_ready': review_ready}
 
 
 def establish_director(project, configuration, contributor, expected_revision):
@@ -538,6 +585,7 @@ def _check_owned(data, selected, contributor):
     for video, entry in selected.items():
         current = data['videos'].get(video)
         if (not current or current['id'] != entry['id'] or current['frames'] != entry['frames'] or
+                current.get('task') != entry.get('task') or
                 current['contributor']['id'] != contributor['id']):
             raise SyncConflictError('Assignment changed for ' + video +
                                     '. Your local work is preserved; ask the coordinator to review it.')
@@ -709,7 +757,7 @@ class AssignedUploadCache:
 
 
 def publish_work(project, configuration, contributor, ready=(), progress=None, cancelled=None,
-                 *, checksum_cache=None):
+                 *, checksum_cache=None, auto_ready=False):
     project = Path(project).resolve()
     state = require_contributor(project, contributor)
     if not state or state['root_id'] != configuration['root_id']:
@@ -738,7 +786,6 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
         local = cache.read(project, state, inventory, progress, cancelled)
         files = dict(incoming)
         sources = {}
-        changes = set()
         for name in state['local_files'].keys() | local.keys():
             if local.get(name) == state['local_files'].get(name):
                 continue
@@ -746,7 +793,6 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
                    for video in state.get('retained_assignments', {})):
                 continue  # Revoked work stays locally; it is never uploaded as an active assignment.
             if _editable(name, assignments):
-                changes.add(_annotation_video(name))
                 if name in local:
                     files[name], sources[name] = local[name], project / name
                 else:
@@ -768,10 +814,13 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
                 continue
             raise ValueError('A protected file changed outside the assigned annotations: ' + name)
         previous_ready = set()
+        previous_revisions = {}
         for video, entry in assignments.items():
-            status, _ = assignment_status(view, entry)
-            if status in ('Ready for Review', 'Accepted') and video not in changes:
+            status, previous_revision = assignment_status(view, entry)
+            if (status in ('Ready for Review', 'Accepted') and
+                    _video_files(files, video) == _video_files(incoming, video)):
                 previous_ready.add(video)
+                previous_revisions[video] = previous_revision
         ready = sorted(previous_ready | set(ready))
         from core.backup_integrity import require_healthy_references
         require_healthy_references(view.home, configuration, view.project_id, files)
@@ -781,7 +830,7 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
                  '(stored contents not rechecked)')
         if cancelled():
             raise InterruptedError('Publishing cancelled; local work remains saved.')
-        if files == incoming and set(ready) == previous_ready:
+        if not auto_ready and files == incoming and set(ready) == previous_ready:
             statuses = [assignment_status(view, entry)[1] for entry in assignments.values()]
             if all(statuses):
                 if inventory != _inventory(project, True, with_identity=True):
@@ -835,14 +884,29 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
             from core.annotation_work import build_index
             annotation_work = build_index(files, lambda name: object_path(view.home, files[name]['sha256']),
                 previous=current['manifest'].get('annotation_work'), cancelled=cancelled)
+            if auto_ready:
+                from core.annotation_work import summarize
+                # Evaluate the exact outgoing, verified masks, not a checkbox or
+                # an earlier GUI scan. Unknown tasks and import reviews block submission.
+                newly_ready = {video for video, entry in assignments.items()
+                               if entry.get('task') and summarize(
+                                   annotation_work['videos'].get(video), entry['task'],
+                                   entry['frames'])['state'] == 'finished'}
+                # Keep unchanged submissions from the older manual workflow;
+                # adopting automation must not undo a director's prior acceptance.
+                ready = sorted(previous_ready | newly_ready)
             if inventory != _inventory(project, True, with_identity=True) or view.heads() != heads or cancelled():
                 raise ValueError('Local or shared files changed during the annotation summary. Save and retry.')
+            if auto_ready and files == incoming and set(ready) == previous_ready:
+                return {'path': str(current['manifest_path'].parent), 'copied_files': 0, 'ready': ready,
+                        'unchanged': True, 'uploaded_videos': [], 'changed_videos': []}
             manifest = dict(current['manifest'], files=files, base_heads=heads,
                             annotation_work=annotation_work,
                             contributor={key: contributor[key] for key in ('id', 'name')},
                             created_at=utc_now(), device=contributor.get('device'), publication='latest',
                             assigned_work={'workspace_id': state['workspace_id'],
-                                           'assignments': {v: a['id'] for v, a in assignments.items()}, 'ready': ready})
+                                           'assignments': {v: a['id'] for v, a in assignments.items()}, 'ready': ready,
+                                           'ready_revisions': {v: previous_revisions.get(v, revision) for v in ready}})
             _write_json(stage / 'manifest.json', manifest)
             # Persist a recovery receipt before advancing the shared latest pointer.
             # A disconnect after publication must not turn a safe retry into a conflict.

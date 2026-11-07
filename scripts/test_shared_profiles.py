@@ -139,6 +139,9 @@ class SharedProfilesTests(unittest.TestCase):
         self.assertFalse((self.root / '.contributor-profiles.lock').exists())
 
 
+from scripts.profile_test_helpers import manage_profiles
+
+
 class SharedProfileGuiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -293,8 +296,11 @@ class SharedProfileGuiTests(unittest.TestCase):
                 editor = self.app.activeModalWidget()
                 editor.findChild(QLineEdit).setText('Alex')
                 editor.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
-            QTimer.singleShot(0, name)
-            next(b for b in dialog.findChildren(QPushButton) if b.text() == 'New Profile...').click()
+            def create_in_manager(manager):
+                QTimer.singleShot(0, name)
+                manager.new.click()
+            manage_profiles(dialog, create_in_manager)
+            dialog.accept()
         QTimer.singleShot(0, create)
         first = preferences.choose_contributor()
         self.sync()
@@ -364,7 +370,8 @@ class SharedProfileGuiTests(unittest.TestCase):
             tiles.setCurrentRow(0)
             observed['hidden'] = tiles.currentItem().data(Qt.ItemDataRole.UserRole)
             dialog.grab().save('/tmp/bumblebox-shared-profiles.png')
-            next(b for b in dialog.findChildren(QPushButton) if b.text() == 'Hide Profile').click()
+            with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
+                manage_profiles(dialog, lambda manager: manager.remove.click())
             observed['after'] = tiles.count()
             dialog.reject()
         QTimer.singleShot(0, inspect)
@@ -409,8 +416,11 @@ class SharedProfileGuiTests(unittest.TestCase):
                 editor = self.app.activeModalWidget()
                 editor.findChild(QLineEdit).setText('Alex')
                 editor.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
-            QTimer.singleShot(0, name)
-            next(b for b in dialog.findChildren(QPushButton) if b.text() == 'New Profile...').click()
+            def create_in_manager(manager):
+                QTimer.singleShot(0, name)
+                manager.new.click()
+            manage_profiles(dialog, create_in_manager)
+            dialog.accept()
         with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
             QTimer.singleShot(0, create)
             created = preferences.choose_contributor()

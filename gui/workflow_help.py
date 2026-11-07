@@ -23,8 +23,11 @@ HELP = {
         'The routine upload for a downloaded assignment. Send permitted annotation changes '
         'while preserving shared files you did not download. Deleting a downloaded annotation '
         'can also be an outgoing change; shared-video masks affect undownloaded frames too.\n\n'
-        'Conflicting changes are blocked for review. Uploading saves progress; '
-        'Submit Current Video for Review separately marks a video ready for review.\n\n'
+        'Assigned copies now upload saved changes automatically. Mark Finished for the assigned '
+        'mask task; when every required frame is complete, the verified upload automatically '
+        'makes the video ready for director review. Retry Upload retries queued work. '
+        'Offline work stays queued locally; conflicts require director attention. '
+        'The File menu also retains manual upload and submission controls.\n\n'
         'Uploaded content is verified. Unchanged published files are referenced without '
         'rechecking them; use Check Backup Integrity for a full stored-content check.'),
     'download': ('Download Assigned Work',

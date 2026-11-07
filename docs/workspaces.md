@@ -4,42 +4,86 @@ The application opens on Project Home instead of an empty editor with model
 toolbars. Every launch first shows saved contributor profiles as side-by-side
 tiles with initials and names. Click your tile to start your session; additional
 profiles wrap into rows and scroll. The last-used profile is highlighted, not
-automatically opened. Arrow keys and Enter, or Continue, also select a profile.
-New Profile and Import Profile are separate actions; Export Profile exports the
-highlighted identity. Cancel exits without opening a project or changing the saved
+automatically opened. Arrow keys and Enter also select a profile. **Manage
+Profiles...** contains profile creation, local removal/restoration, and an Advanced
+section for import/export. There are no connection or transfer buttons in the
+chooser. Closing it exits without opening a project or changing the saved
 selection. Each confirmed profile starts a new session ID before Project Home or
 automatic project reopening. The name remains visible in the header; select it
 to switch contributors or import/export your own profile. Profiles are attribution
 identities, not authenticated accounts.
 
-**Connect to Lab...** configures optional [shared identities and project discovery](shared_profiles.md).
-Connected computers discover the same profiles automatically; selecting the active
-person stays explicit. Same-name identities show distinct IDs. Hiding a profile is
-local to the computer and does not delete it from the shared folder.
+A new computer first offers **Connect to a Lab...** or **Use Locally**, once per
+Linux login account. Existing installations keep their saved setup. Later changes
+are available in My Work or Settings, outside the profile chooser.
+
+On returning launches, the sequence is **choose profile, check saved drive access,
+open Home or the last local project**. An available drive needs no extra click.
+If it is unavailable, a separate screen offers **Sign In to Drive...**, retry,
+and **Continue Locally**. Sign-in uses the existing Kerberos terminal, not the
+contributor name or an in-app password form. Successful sign-in is followed by
+another access check; it is not assumed to prove drive availability.
+
+The read-only startup check verifies the saved lab root's identity and directory
+access. It does not upload, download, merge, or verify every project's permissions.
+It runs in a separate process with a 15-second limit. Continue Locally is available
+even while checking. This pauses background profile, assignment, shared-update,
+and review-status checks for the session; local annotation and saving remain
+available. Reconnect using Sign In to Drive or the check button on Home. The saved
+lab configuration is preserved and checked again on the next launch. Downloads
+and uploads still require working drive access and their own permissions checks.
+
+See [shared identities and project discovery](shared_profiles.md). Selecting the
+active person stays explicit. Same-name identities show distinct IDs. Removing a
+profile from the chooser is local, reversible, and does not delete it from the
+shared folder or alter annotation ownership.
 
 ## Everyday Flow
 
-- **My Work** shows shared projects where the selected person is a member, their
-  role, and assigned-video count. **Open My Assigned Work** opens available assigned
+- **My Work** starts with one **Projects** picker combining shared membership and
+  recent local projects for the selected contributor. Selecting a project previews
+  its assigned videos, mask tasks, frame counts, role, and local availability; it
+  never downloads or opens a project automatically. Shared and local entries with
+  the same project identity are combined, not projects that merely share a name.
+  If several local copies exist, a **Local working copy** selector keeps those
+  folders explicit and does not combine or move their annotations.
+  **Open My Assigned Work** opens available assigned
   videos in Annotate, shows the video/frame sidebars, clears conflicting filters,
   and selects an assigned frame. This also works in a full local project: the
   **Only my assigned videos** checkbox limits the view without converting or
   deleting project data. Uncheck it to browse the other local videos. Assignments
   reflect the last Home check, not a live access-control rule.
-  **Download Assigned Work...** remains separate and explicit, including when a
-  local copy exists but new assignments or frames are missing. It creates a separate
-  working copy rather than overwriting existing edits. Stale, missing, wrong-project,
+  **Download My Assigned Work...** is the primary action when no local copy exists;
+  **Download / Update Assigned Work...** remains separate when a copy exists but
+  new assignments or frames may be missing. The existing managed-download workflow
+  reuses the contributor's working copy and protects local edits. Stale, missing, wrong-project,
   or wrong-contributor shortcuts do not silently open unrelated work.
-  Directors with no personal assignments see **Open Local Project** instead.
+  Projects without personal assignments offer **Open Project** when a local copy exists.
+  Directors can use **Manage Assignments...** for the selected project.
   Merely creating a lab identity does not enroll it in projects.
-- **Recent local projects** shows recent projects with one primary action directly below
-  the list: **Open Selected Project**, or **Return to Project** for the project
-  already open. The current contributor's last project is preselected. Paths appear
-  below the action and in tooltips, not as competing project names.
-- **Open Local Project**, **Download Assigned Work**, and **Create New Project**
-  are separate choices below the recent-project section. With no recent projects,
-  that empty section is omitted. The page uses a light palette without changing
-  the annotation editor's theme and scrolls on smaller screens.
+- The assignment table's **Shared Status** column checks the selected project's
+  published review state automatically, using the same Home refresh and periodic
+  checks as project discovery. It also shows completed assigned-frame counts when
+  a current published summary exists. Shared-video tasks are labeled **Video task
+  finished/unfinished**, not misleading frame counts. The check time is shown;
+  failed or offline checks say **Unavailable** or **Not checked**, never zero
+  progress. Old or stale summaries remain unknown without scanning mask pixels.
+  This works before downloading a local copy and does not change any annotations.
+  **In Progress** can mean that assignments were downloaded; it is not proof of
+  drawing or completion. Edits and Mark Finished records saved only on another
+  computer are invisible until uploaded. In downloaded assigned working copies,
+  Mark Finished queues a verified upload and automatic review submission when the
+  complete assigned task is finished. Full-project backups remain manual.
+- The picker retains the selection across background refreshes. **Shared Drive
+  Settings...** changes the connection for profiles, assignments, and backups;
+  connection status and sign-in remain separate from project actions. Offline,
+  downloaded assignments remain available and are explicitly marked as not checked
+  against the shared drive, rather than being described as current remote assignments.
+- **Project Options** contains **Open Local Project...**, **Create New Project...**,
+  and full-backup recovery. They no longer compete with the selected project's
+  primary action. The page has a light palette, project/detail columns on larger
+  screens, and a vertically stacked layout on narrower screens. The editor's theme
+  and all data-transfer rules remain unchanged.
 - **Reopen my last project on startup** is an optional device preference. When
   checked, startup skips Home; uncheck it on **Home / My Work** to start there.
   Explicit `--project` or `--video` launch arguments also bypass Home. Project
@@ -71,13 +115,66 @@ additional storage, and free destination space. Edits, profile/project changes,
 or changes to destination, included videos, or storage mode require a fresh
 estimate. Files are checked again before uploading; an external change blocks
 publishing. Estimates are not remembered across app restarts. Assigned working
-copies retain their separate **Upload Assigned Annotations** workflow.
+copies upload their saved changes automatically, using a persistent local queue.
 
 Question-mark buttons beside transfer actions open keyboard-accessible help,
 including when the action is disabled. **Back Up Local Project** stores managed
 files present locally, not missing files from another published version.
 **Upload Assigned Annotations** preserves undownloaded shared files and uploads
-permitted annotation changes. It saves progress without marking a video ready.
+permitted annotation changes. This File-menu command remains as a manual fallback;
+the everyday assigned-work UI offers **Retry Upload** instead of separate upload
+and submit buttons.
+
+### Automatic Assigned Work and Computer Reports
+
+In a downloaded assigned copy, contributors only need **Mark Finished** for the
+assigned mask task. Saved edits queue an upload after 30 idle seconds (checked
+every 10 seconds); completion requests an earlier attempt. Attempts are at least
+one minute apart. Transfers briefly pause editing in a cancellable progress dialog
+to protect the saved snapshot. They never start during a stroke or while saves
+are outstanding. Only changed annotation content is transferred, with existing
+conflict checks and upload verification. No automatic merging or downloading is
+introduced. Full-project/director backups still use the explicit backup workflow.
+
+After verification, all required assigned frames must have matching completion
+records for the assigned task before the video is made ready for review. A
+shared-video task needs one video-level completion, not bee masks on every frame.
+Unknown tasks, missing evidence, changed masks, or pending import reviews cannot
+be auto-submitted. A director must set a specific task on older "All mask types"
+assignments. Editing completed geometry invalidates completion; the next upload
+withdraws the old ready state until the task is finished again. Manual submission
+remains available in File for exceptional workflows, including older clients.
+
+Offline work stays in a hidden local outbox and resumes when that working copy is
+reopened and connected. **Continue Locally** pauses attempts until reconnecting.
+Conflicts stop automatic attempts and require director attention; cancellation
+pauses attempts until Retry Upload or the next launch. Closing or switching away
+from a project attempts the remaining upload and session-end report; an unavailable
+drive never turns local completion into a verified submission. Keep the local copy
+until it reports a verified upload.
+
+The selected project's Home detail and the header show a persistent **ready for
+review** count for directors, refreshed approximately once a minute while the app
+is open and again on launch. It is derived from shared submissions, not transient
+notifications; an unchanged accepted video does not become new work just because
+another video was uploaded. Acceptance remains a director action. There is no
+email or system notification service.
+
+With a shared project open, each computer attempts a tiny activity report on open,
+every 30 minutes, after an automatic upload, and at session end. The shared project's
+`activity/` folder stores one atomically replaced JSON record per profile, device,
+and working copy, not an ever-growing file per heartbeat. These records contain
+display names, stable IDs, timestamps, the last edited video, and queued/verified
+upload state. They contain no passwords, masks, images, or local paths. Local
+outboxes are excluded from project backups.
+
+Home shows **last heard from**, last local edit activity, and session end where
+reported. After 65 minutes without a heartbeat from an open session, it says
+**connection status unknown**. An idle timestamp is not proof a machine is offline:
+the app may be closed, asleep, or disconnected. Offline session-end timestamps
+remain local until that copy reports again. Activity is advisory and never grants
+ownership, resolves conflicts, or establishes that annotations were uploaded;
+the separate Shared Status column uses verified publications.
 
 **Recovery > Restore from Backup** on Home (also in File) is for recovery or
 full-project setup, not daily submission of work. Select a completed published
@@ -173,10 +270,12 @@ and Changes to upload are distinct states.
 
 Closing saves pending local annotation edits and waits for outstanding writes.
 There is no discard-on-exit workflow: use Undo to revert an unwanted edit before
-closing. A failed local save keeps the application open. When a linked project
+closing. A failed local save keeps the application open. When a linked full project
 has unpublished annotation changes, the closing dialog offers Upload and Close,
 Close with Work Saved Locally, or Cancel. A cancelled/failed upload, or a separate
-conflict backup, does not count as a successful update of shared work.
+conflict backup, does not count as a successful update of shared work. Assigned
+copies instead finish the automatic queue, or retain it locally when offline or
+cancelled, without a separate upload/submit choice.
 
 Opening a linked project performs a background, read-only status check. The
 refresh icon checks again. Full copies use recorded publication ancestry; they
@@ -196,8 +295,10 @@ Status describes the last check, not a continuously monitored remote folder.
 Download Assigned Work configures/tests a mounted shared folder when necessary,
 then opens the existing selective assignment downloader. Assigned copies show
 only Annotate; training, project administration, and full-project updates remain
-blocked. Upload Assigned Annotations publishes drafts; Submit Current Video for Review is a
-separate action. Downloaded source frames remain on disk for offline work.
+blocked. Saved assigned changes upload automatically; completed assigned tasks
+are submitted after verification. File-menu manual upload/submission commands
+remain available for exceptional workflows. Downloaded source frames remain on
+disk for offline work.
 
 The existing single coordinator is presented as the project director. Existing
 roles remain unchanged. New directors must explicitly confirm **Set Project

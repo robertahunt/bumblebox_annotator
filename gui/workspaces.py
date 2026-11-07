@@ -7,7 +7,7 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, QPointF, QSize, Qt, QTimer
 from PyQt6.QtGui import QAction, QColor, QIcon, QPalette, QTransform
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDockWidget, QHBoxLayout,
-                            QLabel, QListWidget, QListWidgetItem, QMessageBox,
+                            QLabel, QMenu, QMessageBox,
                             QPushButton, QScrollArea, QStackedWidget, QStyle,
                             QTabBar, QToolBar, QToolButton, QVBoxLayout, QWidget,
                             QSizePolicy, QStyleFactory)
@@ -54,6 +54,7 @@ class ProjectHome(QWidget):
         for role, color in ((QPalette.ColorRole.Window, '#f4f6f8'),
                             (QPalette.ColorRole.WindowText, '#202b32'),
                             (QPalette.ColorRole.Base, '#ffffff'),
+                            (QPalette.ColorRole.AlternateBase, '#edf2f4'),
                             (QPalette.ColorRole.Text, '#202b32'),
                             (QPalette.ColorRole.Button, '#ffffff'),
                             (QPalette.ColorRole.ButtonText, '#202b32'),
@@ -66,9 +67,11 @@ class ProjectHome(QWidget):
             QWidget#projectHome, QWidget#projectHomePage { background: #f4f6f8; }
             QWidget#projectHome QLabel, QWidget#projectHome QPushButton,
             QWidget#projectHome QToolButton, QWidget#projectHome QListWidget,
+            QWidget#projectHome QTreeWidget, QWidget#projectHome QHeaderView,
             QWidget#projectHome QCheckBox { font-size: 11pt; }
             QWidget#projectHome QLabel { color: #202b32; background: transparent; }
             QWidget#projectHome QLabel#homeTitle { font-size: 18pt; font-weight: bold; }
+            QWidget#projectHome QLabel#selectedProjectTitle { font-size: 15pt; font-weight: bold; }
             QWidget#projectHome QLabel#homeIdentity { color: #53636d; }
             QWidget#projectHome QPushButton, QWidget#projectHome QToolButton {
                 color: #202b32; background: #ffffff; border: 1px solid #aebdc5;
@@ -88,11 +91,13 @@ class ProjectHome(QWidget):
                 background: #e4e9ec; color: #687780; border-color: #c8d1d7;
             }
             QWidget#projectHome QToolButton#contextHelp { padding: 0; border-radius: 14px; }
-            QWidget#projectHome QToolButton#recoveryToggle {
-                background: transparent; border: none; padding: 8px 0; text-align: left;
-            }
-            QWidget#projectHome QListWidget {
+            QWidget#projectHome QListWidget, QWidget#projectHome QTreeWidget {
                 background: #ffffff; color: #202b32; border: 1px solid #aebdc5; border-radius: 4px;
+            }
+            QWidget#projectHome QTreeWidget { alternate-background-color: #edf2f4; }
+            QWidget#projectHome QTreeWidget::item { padding: 7px 4px; }
+            QWidget#projectHome QHeaderView::section {
+                background: #e8edef; color: #394b56; padding: 7px; border: none;
             }
             QWidget#projectHome QListWidget::item { padding: 8px; }
             QWidget#projectHome QListWidget::item:selected { background: #dceee9; color: #163e35; }
@@ -111,70 +116,36 @@ class ProjectHome(QWidget):
         page_layout = QVBoxLayout(page)
         page_layout.setContentsMargins(24, 24, 24, 24)
         content = QWidget()
-        content.setMaximumWidth(840)
+        content.setMaximumWidth(1160)
         content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
+        title_row = QHBoxLayout()
         title = label('My Work', heading=True)
         title.setObjectName('homeTitle')
-        layout.addWidget(title)
+        title_row.addWidget(title, 1)
+        self.project_options = QToolButton()
+        self.project_options.setText('Project Options')
+        self.project_options.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
+        self.project_options.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.project_options.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        options = QMenu(self.project_options)
+        options.addAction('Open Local Project...', controller.window.open_project)
+        options.addAction('Create New Project...', controller.window.new_project)
+        options.addSeparator()
+        restore = options.addAction(RESTORE_LABEL, controller.window.restore_project_backup)
+        restore.setToolTip('Recover a full project backup; not needed to download assigned work')
+        options.setToolTipsVisible(True)
+        self.project_options.setMenu(options)
+        title_row.addWidget(self.project_options)
+        layout.addLayout(title_row)
         self.identity = label('')
         self.identity.setObjectName('homeIdentity')
         layout.addWidget(self.identity)
-        self.inbox = AssignmentInbox(controller.window)
+        self.inbox = AssignmentInbox(controller)
         layout.addWidget(self.inbox)
-        layout.addSpacing(12)
-        self.recent_heading = label('Recent local projects')
-        font = self.recent_heading.font()
-        font.setBold(True)
-        self.recent_heading.setFont(font)
-        layout.addWidget(self.recent_heading)
-        self.recent = QListWidget()
-        self.recent.setAccessibleName('Recent projects')
-        self.recent.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self.recent.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.recent.itemActivated.connect(lambda item: self.open_project())
-        layout.addWidget(self.recent)
-        self.open_selected = command(layout, 'Open Selected Project', self.open_project,
-                                     QStyle.StandardPixmap.SP_DirOpenIcon)
-        self.open_selected.setObjectName('openSelectedProject')
-        self.open_selected.setDefault(True)
-        self.context = label('')
-        self.context.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        layout.addWidget(self.context)
-        self.recent.itemSelectionChanged.connect(self.selection_changed)
         layout.addSpacing(18)
-        self.other_heading = label('Other projects')
-        self.other_heading.setFont(font)
-        layout.addWidget(self.other_heading)
-        command(layout, 'Open Local Project...', controller.window.open_project,
-                QStyle.StandardPixmap.SP_DirOpenIcon)
-        download = QPushButton('Download Assigned Work...')
-        download.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveNetIcon))
-        download.clicked.connect(controller.join_shared)
-        download_help = add_help_row(layout, download, 'download')
-        self.inbox.projects_visible.connect(lambda visible: (
-            download.setVisible(not visible), download_help.setVisible(not visible)))
-        command(layout, 'Create New Project...', controller.window.new_project,
-                QStyle.StandardPixmap.SP_FileIcon)
-        layout.addSpacing(10)
-        self.recovery_toggle = QToolButton()
-        self.recovery_toggle.setObjectName('recoveryToggle')
-        self.recovery_toggle.setText('Recovery')
-        self.recovery_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.recovery_toggle.setArrowType(Qt.ArrowType.RightArrow)
-        self.recovery_toggle.setCheckable(True)
-        layout.addWidget(self.recovery_toggle)
-        self.recovery = QWidget()
-        recovery_layout = QVBoxLayout(self.recovery)
-        recovery_layout.setContentsMargins(0, 0, 0, 0)
-        restore = QPushButton(RESTORE_LABEL)
-        restore.clicked.connect(controller.window.restore_project_backup)
-        add_help_row(recovery_layout, restore, 'restore')
-        layout.addWidget(self.recovery)
-        self.recovery.hide()
-        self.recovery_toggle.toggled.connect(self.show_recovery)
         self.auto_resume = QCheckBox('Reopen my last project on startup')
         # Native dark-theme indicators can remain pale on this light Home page.
         checkbox_style = QStyleFactory.create('Fusion')
@@ -201,52 +172,11 @@ class ProjectHome(QWidget):
         outer.addWidget(scroll)
         self.controller = controller
 
-    def show_recovery(self, visible):
-        self.recovery.setVisible(visible)
-        self.recovery_toggle.setArrowType(Qt.ArrowType.DownArrow if visible else Qt.ArrowType.RightArrow)
-
-    def selection_changed(self):
-        item = self.recent.currentItem()
-        path = item.data(Qt.ItemDataRole.UserRole) if item else ''
-        current = path and str(self.controller.window.project_path) == path
-        self.open_selected.setEnabled(bool(item))
-        self.open_selected.setText('Return to Project' if current else 'Open Selected Project')
-        self.context.setText(path)
-        self.context.setToolTip(path)
-        self.context.setVisible(bool(path))
-
-    def open_project(self):
-        item = self.recent.currentItem()
-        if item:
-            path = item.data(Qt.ItemDataRole.UserRole)
-            if str(self.controller.window.project_path) == path:
-                self.controller.resume()
-            else:
-                self.controller.window.open_recent_project(path)
-
     def refresh(self):
         window = self.controller.window
         session = window.contributor_session
         self.identity.setText('Working as ' + session['name'] if session else 'Contributor not selected')
-        self.recent.clear()
-        target = window.project_path or self.controller.last_project()
-        identity = (session or {}).get('id', '')
-        recent = self.controller.settings.value('workflow/recent_projects/' + identity, [], type=list)
-        paths = list(dict.fromkeys(str(path) for path in [target, *recent] if path))
-        for path in paths:
-            item = QListWidgetItem(Path(path).name)
-            item.setData(Qt.ItemDataRole.UserRole, str(path))
-            item.setToolTip(str(path))
-            item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
-            item.setSizeHint(QSize(0, 44))
-            self.recent.addItem(item)
-        self.recent.setFixedHeight(min(4, len(paths)) * 44 + 4)
-        for widget in (self.recent_heading, self.recent, self.open_selected):
-            widget.setVisible(bool(paths))
-        self.other_heading.setText('Other projects' if paths else 'Projects')
-        if paths:
-            self.recent.setCurrentRow(0)
-        self.selection_changed()
+        self.inbox.rebuild_projects()
 
 
 class WorkspaceController(QObject):
@@ -304,6 +234,12 @@ class WorkspaceController(QObject):
         self.tabs.currentChanged.connect(lambda i: self.activate(self.names[i]))
         header.addWidget(self.tabs)
         header.addStretch()
+        self.review_notification = QToolButton()
+        self.review_notification.setIcon(window.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.review_notification.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.review_notification.clicked.connect(lambda: self.home.inbox.manage_selected())
+        self.review_notification.hide()
+        header.addWidget(self.review_notification)
         self.person = QToolButton()
         self.person.setToolTip('Change contributor or import/export your profile')
         self.person.setMaximumWidth(200)
@@ -326,7 +262,7 @@ class WorkspaceController(QObject):
         self.check_button.setIcon(window.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.check_button.setToolTip('Check shared project for updates')
         self.check_button.setAccessibleName('Check shared project for updates')
-        self.check_button.clicked.connect(self.check_shared)
+        self.check_button.clicked.connect(lambda: self.home.inbox.retry_connection())
         status_layout.addWidget(self.check_button)
         self.update_button = command(status_layout, UPDATE_LABEL, window.update_current_project)
         self.update_help = help_button(self.status_bar, 'update')
@@ -378,6 +314,8 @@ class WorkspaceController(QObject):
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(2500)
         self.save_timer.timeout.connect(self.autosave)
+        from gui.automatic_work import AutomaticWork
+        self.automatic_work = AutomaticWork(self)
         self.update_button.hide()
         self.update_help.hide()
         self.show_home()
@@ -527,10 +465,11 @@ class WorkspaceController(QObject):
         name = session['name'] if session else 'Choose Contributor'
         self.person.setText(self.person.fontMetrics().elidedText(name, Qt.TextElideMode.ElideRight, 180))
         self.person.setToolTip(name + '\nChange contributor or import/export your profile')
-        self.upload_button.setText(ASSIGNED_LABEL if self.assigned() else BACKUP_LABEL)
+        self.upload_button.setText('Retry Upload' if self.assigned() else BACKUP_LABEL)
         self.home.refresh()
         self.assignment_role = None
         self.home.inbox.reset()
+        self.automatic_work.context_changed()
 
     def project_loaded(self):
         self.generation += 1
@@ -718,6 +657,7 @@ class WorkspaceController(QObject):
         self.generation += 1
         self.settings.setValue(self.key('unpublished'), True)
         self.settings.sync()
+        self.automatic_work.saved()
         self.update_save_status()
         if refresh and hasattr(self.window, 'annotation_work'):
             self.window.annotation_work.schedule()
@@ -744,8 +684,11 @@ class WorkspaceController(QObject):
             text = 'Unsaved changes'
         else:
             text = 'Saved locally'
-        if self.linked() and self.pending():
+        if self.linked() and self.pending() and not self.assigned():
             text += ' | Changes to upload'
+        automatic = self.automatic_work.description()
+        if automatic:
+            text += ' | ' + automatic
         self.local_status.setText(text)
 
     def autosave(self):
@@ -764,9 +707,18 @@ class WorkspaceController(QObject):
             self.local_status.setToolTip(str(exc))
 
     def upload(self):
-        self.window.sync_current_project()
+        if self.assigned():
+            self.automatic_work.retry()
+        else:
+            self.window.sync_current_project()
 
     def check_shared(self):
+        from gui.lab_startup import working_locally
+        if working_locally():
+            self.shared_status.setText('Working locally; shared updates have not been checked')
+            self.update_button.hide()
+            self.update_help.hide()
+            return
         if not self.linked() or (self.worker and self.worker.isRunning()) or self.window._sync_in_progress:
             return
         project = str(self.window.project_path)
@@ -809,6 +761,8 @@ class WorkspaceController(QObject):
         self.update_help.setVisible(not self.update_button.isHidden())
         if generation == self.generation and result['changed'] is not None:
             self.settings.setValue(self.key('unpublished'), result['changed'])
+            if result['changed']:
+                self.automatic_work.queue_existing()
         director = result.get('director')
         if director:
             actor = self.window.contributor_session or {}
@@ -821,7 +775,8 @@ class WorkspaceController(QObject):
 
     def stop_check(self):
         self.save_timer.stop()
-        stopped = self.home.inbox.stop()
+        stopped = self.automatic_work.stop()
+        stopped = self.home.inbox.stop() and stopped
         stopped = self.assignments_page.stop() and stopped
         stopped = self.window.video_browser.stop() and stopped
         stopped = self.window.annotation_work.review.stop() and stopped
@@ -831,6 +786,8 @@ class WorkspaceController(QObject):
         return stopped
 
     def confirm_upload_on_close(self):
+        if self.assigned():
+            return self.automatic_work.finish_session()
         if not self.linked() or not self.pending():
             return True
         box = QMessageBox(self.window)
@@ -863,6 +820,8 @@ class WorkspaceController(QObject):
                                 str(exc) + '\nThe application will stay open.')
             return False
         if not self.confirm_upload_on_close():
+            return False
+        if not self.assigned() and not self.automatic_work.finish_session():
             return False
         if not self.stop_check():
             window.status_label.setText('Shared-folder check is stopping; please close again in a moment')

@@ -27,6 +27,14 @@ class ProfileSyncService(QObject):
     def refresh(self):
         if self.stopping:
             return
+        from gui.lab_startup import working_locally
+        if working_locally():
+            if self.worker:
+                self.worker.requestInterruption()
+            self.again = False
+            self.status = 'Working locally. Shared profiles will refresh after reconnecting.'
+            self.changed.emit()
+            return
         if self.worker:
             self.again = True
             if self.context != preferences.setting_json('contributors/shared', {}):
@@ -53,6 +61,9 @@ class ProfileSyncService(QObject):
         worker.deleteLater()
         if self.stopping:
             return
+        from gui.lab_startup import working_locally
+        if working_locally():
+            return  # Do not apply late results after choosing Continue Locally.
         if self.context != preferences.setting_json('contributors/shared', {}):
             self.again = False
             self.refresh()
@@ -270,6 +281,8 @@ class LabConnectionDialog(SharedProfileSettingsDialog):
             return
         # Preserve storage preferences and per-project opt-in. Connecting is never a backup request.
         preferences.save_setting('project_sync/destination', dict(destination, **self.tested))
+        from gui.lab_startup import set_working_locally
+        set_working_locally(False)
         super().accept()
 
     def disconnect_lab(self):

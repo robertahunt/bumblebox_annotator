@@ -142,6 +142,12 @@ class AssignedReviewViews(QWidget):
     def refresh(self):
         if not self.context or self.stopping:
             return
+        from gui.lab_startup import working_locally
+        if working_locally():
+            self.pending = False
+            self.error = 'Working locally. Reconnect from Home to check published review status.'
+            self.update_labels()
+            return
         if self.worker:
             self.pending = True
             return

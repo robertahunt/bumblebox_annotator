@@ -1,13 +1,16 @@
 """Assignment discovery and explicit project-director setup."""
 
 from pathlib import Path
+from copy import deepcopy
+from datetime import datetime, timezone
 
-from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal
-from PyQt6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
-                            QScrollArea, QStyle, QToolButton, QVBoxLayout, QWidget)
+from PyQt6.QtCore import Qt, QTimer, QSize
+from PyQt6.QtWidgets import (QBoxLayout, QComboBox, QDialog, QHeaderView, QHBoxLayout, QLabel,
+                            QListWidget, QListWidgetItem, QMessageBox, QPushButton, QScrollArea,
+                            QStyle, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from core.assigned_work import (assignment_management, assignment_presence, establish_director,
-                                require_contributor)
+                                require_contributor, shared_assignment_progress)
 from core.project_sync import PROJECT_MARKER, _read_json
 from gui.assigned_work_dialog import AssignmentManagerDialog
 from gui.project_sync_dialog import (OperationWorker, SyncProgressDialog,
@@ -23,16 +26,25 @@ def text_label(text=''):
 
 class AssignmentInbox(QWidget):
     """A failed or stale background check must never become a 'no assignments' notice."""
-    projects_visible = pyqtSignal(bool)
-
-    def __init__(self, window):
+    def __init__(self, controller):
         super().__init__()
-        self.window = window
+        self.controller = controller
+        self.window = window = controller.window
         self.worker = None
         self.notice = None
         self.shown_empty = set()
         self.stopping = False
         self.result = None
+        self.shared_projects = []
+        self.project_actor = None
+        self.progress_worker = None
+        self.progress_context = None
+        self.progress_result = None
+        self.progress_error = None
+        self.progress_requested = False
+        self.progress_timer = QTimer(self)
+        self.progress_timer.setSingleShot(True)
+        self.progress_timer.timeout.connect(self.check_progress)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 8, 0, 8)
         row = QHBoxLayout()
@@ -42,48 +54,96 @@ class AssignmentInbox(QWidget):
         self.check.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.check.setAccessibleName('Check assignments again')
         self.check.setToolTip('Check assignments again')
-        self.check.clicked.connect(self.refresh)
+        self.check.clicked.connect(self.retry_connection)
         row.addWidget(self.check)
         layout.addLayout(row)
-        actions = QHBoxLayout()
-        self.share = QPushButton('Lab Connection...')
-        self.share.setToolTip('Make contributor profiles available on other computers through the shared folder')
+        self.share = QPushButton('Shared Drive Settings...')
+        self.share.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveNetIcon))
+        self.share.setToolTip('View or change the shared folder used for profiles, assignments, and backups')
         self.share.clicked.connect(self.configure_profiles)
-        self.download = QPushButton('Download Assigned Work...')
-        self.download.clicked.connect(lambda: window.workflow.join_shared())
-        self.configure = QPushButton('Connect to Lab...')
+        self.configure = QPushButton('Set Up Shared Drive...')
         self.configure.clicked.connect(self.connect_folder)
-        self.manage = QPushButton('Open Assignments')
-        self.manage.clicked.connect(window.manage_assignments)
-        for button in (self.share, self.download, self.configure, self.manage):
-            actions.addWidget(button)
+        self.manage = QPushButton('Manage Assignments...')
+        self.manage.clicked.connect(self.manage_selected)
+        for button in (self.share, self.configure):
+            row.insertWidget(row.count() - 1, button)
             button.hide()
-        actions.addStretch()
-        layout.addLayout(actions)
         from gui.drive_login import DriveLoginButton
         self.login = DriveLoginButton(self)
-        self.login.completed.connect(self.refresh)
+        self.login.completed.connect(self.retry_connection)
         layout.addWidget(self.login)
         self.login.hide()
+        self.body = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.body.setSpacing(24)
+        picker = QWidget()
+        picker_layout = QVBoxLayout(picker)
+        picker_layout.setContentsMargins(0, 0, 0, 0)
+        picker_layout.addWidget(text_label('Projects'))
         self.projects = QListWidget()
-        self.projects.setAccessibleName('My shared projects')
+        self.projects.setAccessibleName('Projects')
+        self.projects.setMinimumWidth(200)
+        self.projects.setMinimumHeight(180)
         self.projects.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.projects.itemActivated.connect(lambda item: self.open_selected())
         self.projects.currentItemChanged.connect(self.selection_changed)
-        layout.addWidget(self.projects)
+        picker_layout.addWidget(self.projects)
+        self.body.addWidget(picker, 2)
+        self.detail = QWidget()
+        detail = QVBoxLayout(self.detail)
+        detail.setContentsMargins(0, 0, 0, 0)
+        detail.setSpacing(12)
+        self.project_title = text_label('Choose a project')
+        self.project_title.setObjectName('selectedProjectTitle')
+        detail.addWidget(self.project_title)
+        self.project_status = text_label()
+        detail.addWidget(self.project_status)
+        self.copy_label = text_label('Local working copy')
+        detail.addWidget(self.copy_label)
+        self.copies = QComboBox()
+        self.copies.setAccessibleName('Local working copy')
+        self.copies.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.copies.setMinimumContentsLength(12)
+        self.copies.currentIndexChanged.connect(self.copy_changed)
+        detail.addWidget(self.copies)
+        self.assignment_summary = text_label()
+        detail.addWidget(self.assignment_summary)
+        self.videos = QTreeWidget()
+        self.videos.setHeaderLabels(['Assigned video', 'Work on', 'Frames', 'Shared Status'])
+        self.videos.headerItem().setToolTip(3, 'Published progress on the shared drive, not unuploaded local edits')
+        self.videos.setRootIsDecorated(False)
+        self.videos.setAlternatingRowColors(True)
+        self.videos.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
+        self.videos.setMinimumHeight(160)
+        self.videos.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in (1, 2, 3):
+            self.videos.header().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        detail.addWidget(self.videos, 1)
+        self.progress_note = text_label()
+        detail.addWidget(self.progress_note)
+        self.activity_note = text_label()
+        detail.addWidget(self.activity_note)
+        self.review_notice = QPushButton()
+        self.review_notice.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.review_notice.clicked.connect(self.manage_selected)
+        self.review_notice.hide()
+        detail.addWidget(self.review_notice)
         self.open = QPushButton('Download Assigned Work...')
+        self.open.setObjectName('openSelectedProject')
+        self.open.setMinimumHeight(40)
         self.open.clicked.connect(self.open_selected)
-        layout.addWidget(self.open)
+        detail.addWidget(self.open)
         self.download_more = QPushButton('Download Assigned Work...')
         self.download_more.setToolTip('Add or refresh assignments in your existing working copy; local edits are kept.')
         self.download_more.clicked.connect(self.download_selected)
-        layout.addWidget(self.download_more)
+        detail.addWidget(self.download_more)
+        detail.addWidget(self.manage)
+        self.body.addWidget(self.detail, 3)
+        layout.addLayout(self.body, 1)
         self.download_more.hide()
-        self.projects.hide()
-        self.open.hide()
+        self.selection_changed()
         self.timer = QTimer(self)
         self.timer.setInterval(60000)
-        self.timer.timeout.connect(lambda: self.refresh() if self.isVisible() else None)
+        self.timer.timeout.connect(self.refresh)
         self.timer.start()
 
     def context(self):
@@ -94,11 +154,9 @@ class AssignmentInbox(QWidget):
 
     def reset(self):
         self.result = None
-        self.projects.clear()
-        self.projects.hide()
-        self.open.hide()
-        self.projects_visible.emit(False)
-        self.download_more.hide()
+        self.shared_projects = []
+        self.project_actor = (self.window.contributor_session or {}).get('id')
+        self.rebuild_projects()
         if self.notice:
             self.notice.close()
             self.notice = None
@@ -114,12 +172,24 @@ class AssignmentInbox(QWidget):
         if not actor:
             self.summary.setText('Select a contributor profile to check assignments')
             return
+        from gui.lab_startup import working_locally
+        if working_locally():
+            self.summary.setText('Working locally | Shared assignments not checked')
+            self.summary.setToolTip('')
+            self.shared_projects = []
+            self.result = None
+            self.rebuild_projects()
+            self.login.show()
+            self.share.show()
+            self.configure.hide()
+            self.check.setEnabled(True)
+            return
         self.result = None
-        for button in (self.share, self.download, self.configure, self.manage):
+        for button in (self.share, self.configure):
             button.hide()
         self.summary.setText('Checking assignments...')
         self.check.setEnabled(False)
-        self.open.setEnabled(False)
+        # Local projects stay usable while the shared-drive lookup is in progress.
         self.download_more.setEnabled(False)
         context = self.context()
         project = self.window.project_path
@@ -138,12 +208,25 @@ class AssignmentInbox(QWidget):
         worker.finished.connect(lambda: self.finished(worker, context, actor))
         worker.start()
 
+    def retry_connection(self):
+        from gui.lab_startup import check_session_connection, working_locally
+        if working_locally() and not check_session_connection(
+                (self.window.contributor_session or {}).get('name', ''), self.window):
+            return
+        self.refresh()
+        self.window.workflow.check_shared()
+        self.window.workflow.automatic_work.retry()
+
     def finished(self, worker, context, actor):
         if worker is not self.worker:
             return
         self.worker = None
         worker.deleteLater()
         if self.stopping:
+            return
+        from gui.lab_startup import working_locally
+        if working_locally():
+            self.refresh()
             return
         self.check.setEnabled(True)
         if context != self.context():
@@ -152,24 +235,22 @@ class AssignmentInbox(QWidget):
         if worker.error:
             self.summary.setText('Unable to check assignments. Local work is still available.')
             self.summary.setToolTip(str(worker.error))
-            self.configure.show()
+            self.share.show()
+            self.configure.hide()
             self.login.show()
-            self.projects.hide()
-            self.open.hide()
-            self.download_more.hide()
-            self.projects_visible.emit(False)
+            self.shared_projects = []
+            self.rebuild_projects()
             return
         self.login.hide()
         self.result = result = worker.result
-        status, count = result['status'], result['count']
-        scope = result.get('scope', 'this project')
+        status = result['status']
         messages = {
-            'unconfigured': 'Shared folder not configured',
-            'unpublished': 'This local project has not been published for assignments',
-            'setup': 'Project director setup is required',
-            'director': f'Project director | {count} videos assigned to you',
-            'assigned': f'{count} videos assigned to {actor["name"]} in {scope}',
-            'empty': f'No work assigned to {actor["name"]} in {scope}',
+            'unconfigured': 'Local projects | Shared drive not set up',
+            'unpublished': 'Shared drive connected',
+            'setup': 'Shared drive connected',
+            'director': 'Shared drive connected',
+            'assigned': 'Shared drive connected',
+            'empty': 'Shared drive connected | No work assigned',
         }
         self.summary.setText(messages[status])
         self.summary.setToolTip('')
@@ -179,8 +260,6 @@ class AssignmentInbox(QWidget):
             self.login.show()
         self.configure.setVisible(status == 'unconfigured')
         self.share.setVisible(status != 'unconfigured')
-        self.download.setVisible(False)
-        self.manage.setVisible(bool(self.window.project_path) and status in ('director', 'setup', 'unpublished'))
         if self.window.project_path:
             self.window.workflow.assignment_role_changed(result)
         self.show_projects(result.get('projects', []))
@@ -204,7 +283,7 @@ class AssignmentInbox(QWidget):
             f'Ask {manager} to add you in People and assign videos to this profile. '
             'Local work remains available.'))
         row = QHBoxLayout()
-        share = QPushButton('Connect to Lab...')
+        share = QPushButton('Shared Drive Settings...')
         share.clicked.connect(self.configure_profiles)
         retry = QPushButton('Check Again')
         retry.clicked.connect(lambda: (notice.close(), self.refresh()))
@@ -232,25 +311,86 @@ class AssignmentInbox(QWidget):
         self.configure_profiles()
 
     def show_projects(self, projects):
+        self.shared_projects = projects
+        self.project_actor = (self.window.contributor_session or {}).get('id')
+        self.rebuild_projects()
+        self.request_progress(force=True)
+
+    def rebuild_projects(self):
+        """Merge shared identities with local copies without conflating names or deleting copies."""
         selected = self.projects.currentItem()
-        identity = selected.data(Qt.ItemDataRole.UserRole)['id'] if selected else None
+        identity = selected.data(Qt.ItemDataRole.UserRole).get('_key') if selected else None
+        old_copy = self.copies.currentData()
+        flow = self.controller
+        actor = self.window.contributor_session or {}
+        if self.project_actor != actor.get('id'):
+            self.shared_projects = []
+            self.project_actor = actor.get('id')
+            identity = old_copy = None
+        entries = {('shared', p['id']): dict(p, _key=('shared', p['id']), _paths=[], _shared=True)
+                   for p in self.shared_projects}
+        recent = flow.settings.value('workflow/recent_projects/' + actor.get('id', ''), [], type=list)
+        paths = list(dict.fromkeys(str(p) for p in [self.window.project_path, flow.last_project(), *recent] if p))
+        for entry in entries.values():
+            local = self.local_path(entry)
+            if local and local not in paths:
+                paths.append(local)
+        configuration = setting_json('project_sync/destination', {})
+        for local in paths:
+            path = Path(local)
+            if configuration.get('root') and path.absolute().is_relative_to(Path(configuration['root']).absolute()):
+                continue  # A shared backup is not a local working copy; avoid probing an offline mount here.
+            try:
+                state = require_contributor(path, actor)
+                marker_path = path / 'annotations' / PROJECT_MARKER
+                marker = _read_json(marker_path) if marker_path.is_file() else {}
+                key = ('shared', marker.get('project_id'))
+                if state and state['root_id'] != configuration.get('root_id'):
+                    key = ('local', local)
+                if key not in entries:
+                    key = ('local', local)
+                if key not in entries:
+                    entries[key] = {'id': marker.get('project_id'), 'name': path.name,
+                                    'role': 'local', 'count': 0, 'videos': {},
+                                    '_key': key, '_paths': [], '_shared': False}
+                entry = entries[key]
+                exists = (path / 'annotations' / 'project.json').is_file()
+                if exists:
+                    entry['_paths'].append(local)
+                if not entry['_shared'] and state:
+                    entry['videos'] = state['assignments']
+                    entry['count'] = len(state['assignments'])
+            except (OSError, ValueError, KeyError):
+                continue  # Never offer another contributor's selective working copy.
+        self.projects.blockSignals(True)
         self.projects.clear()
-        for project in projects:
-            role = 'Director' if project['role'] == 'director' else 'Contributor'
-            item = QListWidgetItem(f"{project['name']} | {role} | {project['count']} assigned videos")
-            item.setToolTip(item.text())
+        selected_row = 0
+        selection_found = False
+        for index, project in enumerate(entries.values()):
+            availability = 'On this computer' if project['_paths'] else (
+                'Shared drive' if project['_shared'] else 'Local folder unavailable')
+            item = QListWidgetItem(f"{project['name']}\n{availability}")
+            item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+            item.setToolTip(project['name'] + '\n' + '\n'.join(project['_paths']))
             item.setData(Qt.ItemDataRole.UserRole, project)
-            item.setSizeHint(QSize(0, 40))
+            item.setSizeHint(QSize(0, 64))
             self.projects.addItem(item)
-            if project['id'] == identity:
-                self.projects.setCurrentItem(item)
-        self.projects.setFixedHeight(min(4, len(projects)) * 40 + 4)
-        self.projects.setVisible(bool(projects))
-        self.open.setVisible(bool(projects))
-        self.projects_visible.emit(bool(projects))
-        if projects and self.projects.currentRow() < 0:
-            self.projects.setCurrentRow(0)
+            if project['_key'] == identity:
+                selected_row = index
+                selection_found = True
+            elif not selection_found and (old_copy or str(self.window.project_path)) in project['_paths']:
+                selected_row = index
+        self.projects.setCurrentRow(selected_row)
+        self.projects.blockSignals(False)
         self.selection_changed()
+        index = self.copies.findData(old_copy)
+        if index >= 0:
+            self.copies.setCurrentIndex(index)
+
+    def resizeEvent(self, event):
+        self.body.setDirection(QBoxLayout.Direction.TopToBottom if self.width() < 720 else
+                               QBoxLayout.Direction.LeftToRight)
+        super().resizeEvent(event)
 
     def local_path(self, project):
         from gui.assigned_work_dialog import assigned_local_path
@@ -264,9 +404,11 @@ class AssignmentInbox(QWidget):
                     return managed
             except (OSError, ValueError, KeyError):
                 return ''  # Do not silently fall back to a different copy when managed work is unavailable.
-        local = self.window.workflow.settings.value(
+        local = self.controller.settings.value(
             f'workflow/shared_projects/{actor}/{root}/{project["id"]}', '', type=str)
         if not local:
+            return ''
+        if configuration.get('root') and Path(local).absolute().is_relative_to(Path(configuration['root']).absolute()):
             return ''
         try:
             path = Path(local)
@@ -283,19 +425,229 @@ class AssignmentInbox(QWidget):
     def selection_changed(self):
         item = self.projects.currentItem()
         project = item.data(Qt.ItemDataRole.UserRole) if item else None
-        local = self.local_path(project) if project else ''
-        self.open.setText(('Open My Assigned Work' if project['count'] else 'Open Local Project')
-                          if local else 'Download Assigned Work...')
-        self.open.setEnabled(bool(project and (local or project['count'])))
+        paths = project.get('_paths', []) if project else []
+        self.copies.blockSignals(True)
+        self.copies.clear()
+        for path in paths:
+            self.copies.addItem(path, path)
+        current = self.copies.findData(str(self.window.project_path))
+        if current >= 0:
+            self.copies.setCurrentIndex(current)
+        self.copies.blockSignals(False)
+        self.copy_label.setVisible(len(paths) > 1)
+        self.copies.setVisible(len(paths) > 1)
+        self.project_title.setText(project['name'] if project else 'Choose a project')
+        self.videos.clear()
+        if project:
+            from core.annotation_work import task_label
+            for video, assignment in sorted(project.get('videos', {}).items()):
+                row = QTreeWidgetItem([video, task_label(assignment.get('task')), str(len(assignment['frames']))])
+                row.setData(0, Qt.ItemDataRole.UserRole, video)
+                row.setToolTip(0, video)
+                self.videos.addTopLevelItem(row)
+        self.videos.setVisible(self.videos.topLevelItemCount() > 0)
+        self.copy_changed()
+        self.request_progress()
+
+    def selected_progress_context(self):
+        from gui.lab_startup import working_locally
+        item = self.projects.currentItem()
+        project = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if working_locally() or not project or not project.get('_shared'):
+            return None
+        actor = self.window.contributor_session or {}
+        configuration = setting_json('project_sync/destination', {})
+        return (configuration.get('root'), configuration.get('root_id'), actor.get('id'),
+                actor.get('session_id'), project['id'],
+                tuple(sorted((v, a['id'], tuple(a['frames']), a.get('task'))
+                             for v, a in project['videos'].items())))
+
+    def request_progress(self, *, force=False):
+        if self.stopping:
+            return
+        context = self.selected_progress_context()
+        if context != self.progress_context:
+            self.progress_context = context
+            self.progress_result = self.progress_error = None
+            self.progress_requested = context is not None
+            self.progress_timer.stop()
+            if self.progress_worker:
+                self.progress_worker.requestInterruption()
+        elif force and context is not None and not self.progress_worker:
+            self.progress_requested = True
+            self.progress_result = self.progress_error = None
+        if self.progress_requested and not self.progress_worker:
+            self.progress_timer.start(0)
+        self.update_progress_rows()
+
+    def check_progress(self):
+        if self.stopping or self.progress_worker or not self.progress_context:
+            return
+        if self.selected_progress_context() != self.progress_context:
+            self.request_progress()
+            return
+        project = self.projects.currentItem().data(Qt.ItemDataRole.UserRole)
+        configuration = dict(setting_json('project_sync/destination', {}))
+        actor = dict(self.window.contributor_session or {})
+        assignments = deepcopy(project['videos'])
+        project_id = project['id']
+        worker = OperationWorker(lambda progress, cancelled:
+            shared_assignment_progress(configuration, project_id, actor, assignments, cancelled), self)
+        worker.context = self.progress_context
+        self.progress_worker = worker
+        self.progress_requested = False
+        worker.finished.connect(lambda: self.progress_finished(worker))
+        worker.start()
+        self.update_progress_rows()
+
+    def progress_finished(self, worker):
+        if worker is not self.progress_worker:
+            return
+        self.progress_worker = None
+        worker.deleteLater()
+        if self.stopping:
+            return
+        if worker.context != self.selected_progress_context() or worker.isInterruptionRequested():
+            self.progress_requested = self.selected_progress_context() is not None
+            self.request_progress()
+            return
+        self.progress_result = worker.result if not worker.error else None
+        self.progress_error = str(worker.error) if worker.error else None
+        self.update_progress_rows()
+
+    def update_progress_rows(self):
+        pending = bool(self.progress_worker or self.progress_requested or self.progress_timer.isActive())
+        for index in range(self.videos.topLevelItemCount()):
+            row = self.videos.topLevelItem(index)
+            video = row.data(0, Qt.ItemDataRole.UserRole)
+            record = (self.progress_result or {}).get('videos', {}).get(video)
+            text = 'Checking...' if self.progress_context and pending else 'Not checked'
+            detail = 'Local edits on either computer are not visible here until uploaded.'
+            if record:
+                text = record['status']
+                summary = record.get('completion') or {}
+                detail += '\nPublished completion: ' + summary.get('work_text', 'Unavailable')
+                detail += '\n' + summary.get('detail', '')
+                if summary.get('state') not in ('unknown', 'not_scanned', 'needs_review') and 'finished' in summary:
+                    if summary.get('shared'):
+                        text += '\nVideo task finished' if summary['finished'] == summary['total'] else '\nVideo task unfinished'
+                    else:
+                        text += f'\n{summary["finished"]}/{summary["total"]} frames finished'
+                if record['status'] == 'In Progress':
+                    detail += '\nIn Progress can mean downloaded or uploaded; it does not itself mean finished.'
+            elif self.progress_error:
+                text = 'Unavailable'
+                detail += '\n' + self.progress_error
+            row.setText(3, text)
+            row.setToolTip(3, detail)
+        self.progress_note.setVisible(self.videos.topLevelItemCount() > 0)
+        if self.progress_result:
+            checked = datetime.fromisoformat(self.progress_result['checked_at'].replace('Z', '+00:00')).astimezone()
+            self.progress_note.setText('Shared progress checked ' + checked.strftime('%H:%M:%S'))
+        elif self.progress_error:
+            self.progress_note.setText('Shared progress unavailable')
+        else:
+            self.progress_note.setText('Checking shared progress...' if self.progress_context and pending else
+                                       'Shared progress not checked')
+        self.progress_note.setToolTip(self.progress_error or
+            'Only uploaded work is included. This check does not download or replace annotations.')
+        self.update_activity()
+
+    def update_activity(self):
+        result = self.progress_result or {}
+        reports = result.get('activity', [])
+        def when(value):
+            try:
+                return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone().strftime('%b %d %H:%M')
+            except (ValueError, AttributeError, TypeError):
+                return 'unknown time'
+        lines = []
+        for report in reports:
+            name = report.get('device', {}).get('name', 'Unknown computer')
+            person = report.get('contributor', {}).get('name', 'Unknown contributor')
+            text = f'{person} on {name}: last heard from {when(report.get("reported_at"))}'
+            if report.get('state') == 'closed':
+                text += ' (session ended)'
+            else:
+                try:
+                    stamp = datetime.fromisoformat(report['reported_at'].replace('Z', '+00:00'))
+                    if (datetime.now(timezone.utc) - stamp).total_seconds() > 65 * 60:
+                        text += ' (connection status unknown)'
+                except (ValueError, TypeError, KeyError):
+                    text += ' (connection status unknown)'
+            if report.get('last_edited_at'):
+                text += f'; last edit {when(report["last_edited_at"])}'
+            if report.get('local_save_state') == 'failed':
+                text += '; local save needs attention'
+            elif report.get('local_save_state') in ('unsaved', 'saving'):
+                text += '; local save pending'
+            if report.get('pending'):
+                text += '; reported work waiting to upload'
+            lines.append(text)
+        self.activity_note.setText('\n'.join(lines[:3]))
+        self.activity_note.setVisible(bool(lines))
+        self.activity_note.setToolTip('\n'.join(lines) + '\n\nReports are sent every 30 minutes while '
+            'the app is open. An old report means current connection is unknown, not necessarily offline. '
+            'Reported edits may still be local; Shared Status shows verified uploads.')
+        ready = result.get('review_ready', [])
+        self.review_notice.setVisible(bool(ready))
+        self.review_notice.setText(f'{len(ready)} {"video" if len(ready) == 1 else "videos"} ready for review')
+        self.review_notice.setToolTip('\n'.join(r['video'] + ' - ' + r['contributor']['name'] for r in ready))
+        button = getattr(self.controller, 'review_notification', None)
+        if button:
+            button.setVisible(bool(ready))
+            button.setText(f'{len(ready)} ready for review')
+            button.setToolTip(self.project_title.text() + '\n' + self.review_notice.toolTip())
+
+    def copy_changed(self, *_):
+        item = self.projects.currentItem()
+        project = item.data(Qt.ItemDataRole.UserRole) if item else None
+        local = self.copies.currentData() or ''
+        shared = bool(project and project.get('_shared'))
+        count = project['count'] if project else 0
+        self.project_status.setText(('Project director' if project['role'] == 'director' else
+            'Contributor' if shared else 'Local project') if project else 'No projects available yet')
+        if local:
+            self.project_status.setText(self.project_status.text() + ' | Ready on this computer')
+        elif project and not shared:
+            self.project_status.setText('Local folder unavailable')
+        self.project_status.setToolTip(local)
+        self.assignment_summary.setText(
+            (f'{count} video' + ('s' if count != 1 else '') + ' assigned to you' if count else
+             'No videos assigned to you') if shared else
+            ('Downloaded assignments | Shared status not checked' if count else
+             'Assignments not checked for this project'))
+        self.assignment_summary.setVisible(bool(project))
+        self.open.setText(('Open My Assigned Work' if count else 'Open Project')
+                          if local or not shared else 'Download My Assigned Work...')
+        self.open.setVisible(bool(project))
+        self.open.setEnabled(bool(local or (shared and count)))
+        self.open.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon if local else
+                                                   QStyle.StandardPixmap.SP_ArrowDown))
         self.open.setToolTip('' if project and (local or project['count']) else
-            'No videos assigned. Directors can open their local project below to assign work.')
-        self.download_more.setVisible(bool(local and project['count']))
-        self.download_more.setEnabled(bool(project and project['count']))
+            'Open a local project copy or ask your director to assign work.')
+        self.download_more.setVisible(bool(local and shared and count))
+        self.download_more.setEnabled(bool(shared and count))
+        self.download_more.setText('Download / Update Assigned Work...')
+        current_setup = (local and str(self.window.project_path) == local and self.result and
+                         self.result['status'] in ('setup', 'unpublished'))
+        self.manage.setVisible(bool(local and ((project and project['role'] == 'director') or current_setup)))
+
+    def manage_selected(self):
+        local = self.copies.currentData()
+        if not local:
+            return
+        if str(self.window.project_path) != local:
+            self.window.open_recent_project(local)
+        if str(self.window.project_path) == local:
+            self.window.manage_assignments()
 
     def download_selected(self):
         item = self.projects.currentItem()
         if item:
             project = item.data(Qt.ItemDataRole.UserRole)
+            if not project.get('_shared'):
+                return
             if not self.window.open_assigned_work(project_id=project['id']):
                 return
             if self.local_path(project) and self.window.project_path and project.get('videos'):
@@ -307,7 +659,7 @@ class AssignmentInbox(QWidget):
         if not item:
             return
         project = item.data(Qt.ItemDataRole.UserRole)
-        local = self.local_path(project)
+        local = self.copies.currentData() or ''
         if local:
             if str(self.window.project_path) != local:
                 self.window.open_recent_project(local)
@@ -318,7 +670,7 @@ class AssignmentInbox(QWidget):
             else:
                 self.window.workflow.activate('Annotate')
                 self.window.video_dock.show()
-        elif project['count']:
+        elif project.get('_shared') and project['count']:
             self.download_selected()
 
     def show_assigned_work(self, project):
@@ -404,12 +756,13 @@ class AssignmentInbox(QWidget):
     def stop(self):
         self.stopping = True
         self.timer.stop()
+        self.progress_timer.stop()
         if self.notice:
             self.notice.close()
-        if self.worker and self.worker.isRunning():
-            self.worker.requestInterruption()
-            return self.worker.wait(2000)
-        return True
+        workers = [worker for worker in (self.worker, self.progress_worker) if worker and worker.isRunning()]
+        for worker in workers:
+            worker.requestInterruption()
+        return all([worker.wait(2000) for worker in workers])
 
 
 class AssignmentWorkspace(QScrollArea):
@@ -500,6 +853,11 @@ class AssignmentWorkspace(QScrollArea):
         self.cancel_requested = False
         self.clear()
         window = self.window
+        from gui.lab_startup import working_locally
+        if working_locally():
+            self.status.setText('Working locally. Reconnect from Home to manage shared assignments.')
+            self.retry.hide()
+            return
         if not window.project_path or not window.contributor_session:
             self.status.setText('Open a local project and choose your profile first.')
             return

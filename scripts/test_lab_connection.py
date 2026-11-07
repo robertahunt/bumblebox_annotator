@@ -447,7 +447,7 @@ class ProjectPeopleGuiTests(unittest.TestCase):
         flow = self.load()
         inbox = self.settle()
         self.assertEqual(inbox.projects.count(), 1)
-        self.assertEqual(inbox.open.text(), 'Open Local Project')
+        self.assertEqual(inbox.open.text(), 'Open Project')
         with patch.object(flow, 'activate') as activate:
             inbox.open_selected()
             activate.assert_called_once_with('Annotate')
@@ -455,11 +455,14 @@ class ProjectPeopleGuiTests(unittest.TestCase):
         self.window.set_contributor(self.alex)
         self.settle()
         flow.home.refresh()
-        self.assertEqual(flow.home.recent.count(), 0)
+        # Alex sees the shared project even though no local copy has been opened yet.
+        self.assertEqual(flow.home.inbox.projects.count(), 1)
+        self.assertEqual(flow.home.inbox.copies.count(), 0)
         self.window.set_contributor(self.coordinator)
         self.settle()
         flow.home.refresh()
-        self.assertEqual(flow.home.recent.count(), 1)
+        self.assertEqual(flow.home.inbox.projects.count(), 1)
+        self.assertEqual(flow.home.inbox.copies.count(), 1)
 
     def test_open_my_work_in_full_project_clears_filters_and_selects_assigned_frame(self):
         choices = dict(self.choices)
@@ -527,8 +530,8 @@ class ProjectPeopleGuiTests(unittest.TestCase):
         key = f'workflow/shared_projects/{self.sam["id"]}/{self.configuration["root_id"]}/{self.project_id}'
         for path in (str(self.base / 'missing'), str(local)):
             self.settings.setValue(key, path)
-            inbox.selection_changed()
-            self.assertEqual(inbox.open.text(), 'Download Assigned Work...')
+            inbox.rebuild_projects()
+            self.assertEqual(inbox.open.text(), 'Download My Assigned Work...')
             with patch.object(self.window, 'open_assigned_work') as download:
                 inbox.open_selected()
                 download.assert_called_once_with(project_id=self.project_id)

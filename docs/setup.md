@@ -289,12 +289,14 @@ separately and regenerate those exports as needed.
 
 On the new computer:
 
-1. Activate the environment and run `python main.py`.
-2. Set your contributor identity and optionally configure external sync. These
-   machine-local settings are not transferred by Git. Entering the same name on
-   a new installation creates a new contributor ID; there is no automatic
-   cross-machine account/profile migration. Existing annotation attribution is
-   preserved. See [the sync guide](project_sync.md).
+1. Use the installed launcher, or activate the environment and run `python main.py`.
+2. Complete the one-time computer setup with **Connect to a Lab...** or **Use
+   Locally**, then select your contributor profile. Lab connections discover
+   existing identities automatically; do not create another profile just because
+   this is a new computer. Machine-local connection settings are not transferred
+   by Git. For offline identity transfer, use **Manage Profiles > Advanced > Import
+   Profile...**. Existing annotation attribution is preserved. See
+   [shared profiles](shared_profiles.md) and [the sync guide](project_sync.md).
 3. Open the copied project folder. Re-select checkpoint, video, and sync paths
    where the old machine's absolute paths no longer apply.
 4. Confirm annotation policy and outstanding imported-frame reviews. Copying a
