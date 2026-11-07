@@ -1196,6 +1196,9 @@ class MainWindow(QMainWindow):
         self.manage_assignments_action = QAction('Video Assignments...', self)
         self.manage_assignments_action.triggered.connect(self.manage_assignments)
         project_menu.addAction(self.manage_assignments_action)
+        submission_review_action = QAction('Review Submitted Work...', self)
+        submission_review_action.triggered.connect(self.review_submissions)
+        project_menu.addAction(submission_review_action)
         self.ready_work_action = QAction('Submit Current Video for Review...', self)
         self.ready_work_action.triggered.connect(lambda: self.publish_assigned_work(ready=True))
         self.ready_work_action.setVisible(False)
@@ -1303,6 +1306,24 @@ class MainWindow(QMainWindow):
                 if self.project_path:
                     timer.start()
             self._sync_in_progress = False
+
+    def review_submissions(self):
+        if self._sync_in_progress:
+            return
+        if not self.project_path or not self.contributor_session:
+            QMessageBox.information(self, 'Open a Project', 'Open the director\'s local project before reviewing submissions.')
+            return
+        try:
+            require_full_project(self.project_path)
+            from gui.submission_review import SubmissionReviewDock
+            if not getattr(self, 'submission_review_dock', None):
+                self.submission_review_dock = SubmissionReviewDock(self)
+                self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.submission_review_dock)
+                self.splitDockWidget(self.submission_review_dock, self.frame_dock, Qt.Orientation.Vertical)
+                self.workflow.docks.append(self.submission_review_dock)
+            self.submission_review_dock.start()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Review Queue Unavailable', str(exc))
 
     def manage_assignments(self):
         if not self.project_path or not self.contributor_session:
@@ -1949,6 +1970,9 @@ class MainWindow(QMainWindow):
     
     def toggle_video_sidebar(self):
         """Toggle visibility of video sidebar"""
+        review = getattr(self, 'submission_review_dock', None)
+        if review and review.is_focused():
+            return
         if self.video_dock.isVisible():
             self.video_dock.hide()
             self.toggle_video_sidebar_action.setText("Show Video &List")
@@ -4355,7 +4379,7 @@ class MainWindow(QMainWindow):
         In the new structure, frames are named frame_XXXXXX.jpg where XXXXXX
         is the frame index within the video. We extract this from the frame path.
         """
-        if list_idx >= len(self.frames):
+        if not 0 <= list_idx < len(self.frames):
             return list_idx
         
         frame = self.frames[list_idx]
@@ -5181,6 +5205,10 @@ class MainWindow(QMainWindow):
         """Load frames from a specific video for annotation"""
         if not self.project_path:
             return
+        review = getattr(self, 'submission_review_dock', None)
+        if review and review.is_focused() and not review.review_assignment(video_id):
+            review.open_video(video_id)
+            return
         assigned = workspace(self.project_path)
         if assigned and video_id not in assigned['assignments']:
             return
@@ -5241,6 +5269,10 @@ class MainWindow(QMainWindow):
             frame_files = sorted(frames_dir.glob('frame_*.jpg'))
             if assigned:
                 frame_files = [p for p in frame_files if int(p.stem.split('_')[1]) in assigned['assignments'][video_id]['frames']]
+            review = getattr(self, 'submission_review_dock', None)
+            review_entry = review.review_assignment(video_id) if review else None
+            if review_entry:
+                frame_files = [p for p in frame_files if int(p.stem.split('_')[1]) in review_entry['frames']]
             split = self.project_manager.get_video_split(video_id)
             
             # Load metadata to see which frames are selected
@@ -5388,7 +5420,7 @@ class MainWindow(QMainWindow):
                 split_tag = f"[{split.upper()}] "
             else:
                 split_tag = ""
-            label = f"{split_tag}Frame {i:04d}"
+            label = f"{split_tag}Frame {self._get_frame_idx_in_video(i):04d}"
             self.frame_list.addItem(label)
             
             # Store mapping from list row to actual frame index

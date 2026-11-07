@@ -124,7 +124,7 @@ class AssignmentInbox(QWidget):
         detail.addWidget(self.activity_note)
         self.review_notice = QPushButton()
         self.review_notice.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
-        self.review_notice.clicked.connect(self.manage_selected)
+        self.review_notice.clicked.connect(self.review_selected)
         self.review_notice.hide()
         detail.addWidget(self.review_notice)
         self.open = QPushButton('Download Assigned Work...')
@@ -641,6 +641,17 @@ class AssignmentInbox(QWidget):
             self.window.open_recent_project(local)
         if str(self.window.project_path) == local:
             self.window.manage_assignments()
+
+    def review_selected(self):
+        local = self.copies.currentData()
+        if not local:
+            QMessageBox.information(self.window, 'Open a Local Project',
+                'Choose a local director project copy before reviewing submissions. Shared backups are not edited in place.')
+            return
+        if str(self.window.project_path) != local:
+            self.window.open_recent_project(local)
+        if str(self.window.project_path) == local:
+            self.window.review_submissions()
 
     def download_selected(self):
         item = self.projects.currentItem()

@@ -159,6 +159,10 @@ class AnnotationWorkBrowser(QObject):
     def scan_context(self):
         w = self.window
         project = str(w.project_path or '')
+        review = getattr(w, 'submission_review_dock', None)
+        if review and review.is_focused():
+            videos = (review.active['video'],) if review.active else ()
+            return project, self.filters.task.currentData(), videos
         state = workspace(project) if project else None
         videos = []
         for row in range(w.video_list.count()):
@@ -236,6 +240,9 @@ class AnnotationWorkBrowser(QObject):
         return video, frame, entry
 
     def context_changed(self):
+        submission_review = getattr(self.window, 'submission_review_dock', None)
+        if submission_review:
+            submission_review.update_buttons()
         video = self.window.current_video_id
         if str(self.window.project_path or '') != self.project:
             self.index = {'version': 1, 'videos': {}}

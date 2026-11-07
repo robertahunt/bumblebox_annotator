@@ -100,7 +100,7 @@ def check_space(project, root, before, after):
 
 
 def apply_delta(project, configuration, before, after, sources, project_id,
-                post_files, include_videos, check_unchanged, progress, cancelled):
+                post_files, include_videos, check_unchanged, progress, cancelled, *, scoped=False):
     """Stage replacements and old affected files before any live file is changed."""
     project = Path(project).resolve()
     require_no_update(project)
@@ -126,6 +126,8 @@ def apply_delta(project, configuration, before, after, sources, project_id,
             'project_id': project_id, 'created_at': datetime.now(timezone.utc).isoformat(),
             'before': before, 'after': after, 'post_files': post_files,
             'include_videos': include_videos, 'status': 'staging'}
+        if scoped:
+            manifest['scope'] = sorted(before)
         _write_json(backup / 'manifest.json', manifest)
         for index, name in enumerate(sorted(before), 1):
             if cancelled():
@@ -249,9 +251,15 @@ def rollback_update(project, bundle, configuration, progress=None, cancelled=Non
     if (manifest.get('kind') != 'local-update-delta' or manifest.get('project') != str(project)
             or manifest.get('status') != 'complete'):
         raise ValueError('Choose a completed rollback bundle for this working copy.')
+    _check_names(manifest['before'], manifest['after'])
+    if 'scope' in manifest and set(manifest['scope']) != manifest['after'].keys():
+        raise ValueError('Invalid scoped rollback record.')
     def unchanged():
         current = {name: file_record(project / name)
-                   for name in _inventory(project, manifest['include_videos'])}
+                   for name in manifest.get('scope', ())} if 'scope' in manifest else {
+                       name: file_record(project / name)
+                       for name in _inventory(project, manifest['include_videos'])}
+        current = {name: record for name, record in current.items() if record is not None}
         if current != manifest['post_files']:
             raise ValueError('This project has changed since the update. Rollback would overwrite newer work.')
         for name, expected in manifest['after'].items():
@@ -261,7 +269,7 @@ def rollback_update(project, bundle, configuration, progress=None, cancelled=Non
     before, after = manifest['after'], manifest['before']
     post = dict(manifest['post_files'])
     for name, entry in after.items():
-        if name in ('annotations/' + LOCAL_STATE, 'annotations/' + WORK_STATE) or name.startswith('annotations/coco/') or name == 'dataset_info.json':
+        if 'scope' not in manifest and (name in ('annotations/' + LOCAL_STATE, 'annotations/' + WORK_STATE) or name.startswith('annotations/coco/') or name == 'dataset_info.json'):
             continue
         if entry is None:
             post.pop(name, None)
@@ -270,7 +278,7 @@ def rollback_update(project, bundle, configuration, progress=None, cancelled=Non
     return apply_delta(project, configuration, before, after,
         {name: _safe_child(bundle / 'before', name) for name, entry in after.items() if entry},
         manifest['project_id'], post, manifest['include_videos'], unchanged,
-        progress or (lambda text: None), cancelled or (lambda: False))
+        progress or (lambda text: None), cancelled or (lambda: False), scoped='scope' in manifest)
 
 
 def rollback_bundles(project, configuration):

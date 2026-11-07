@@ -338,13 +338,75 @@ one shared completion. Unknown tasks or outstanding import reviews block automat
 submission. Full-project backups and exceptional File-menu manual submissions
 remain explicit. See [automatic work and computer reports](workspaces.md#automatic-assigned-work-and-computer-reports).
 
-Use **File > Review Shared Updates** in the coordinator's full project to get the
-latest combined publication, review the assigned frames and shared masks, then
-select the video and **Accept Reviewed Submission...**. Acceptance checks that
-the local annotations actually match the submission. After two students publish
-in sequence, select the later publication, which includes both contributions.
-Students publishing different assigned videos do not need to download each
-other's frames.
+Click **N ready for review** on Home or in the header, or use **Project > Review
+Submitted Work...**. The first submission opens automatically in the annotation
+editor. A **Review Submissions** sidebar replaces the normal project-video browser
+and lists only published submissions awaiting review, with contributor, assigned
+task, and frame count. Selecting another entry opens that submission directly;
+there is no separate Open for Review step. An unavailable drive is reported as
+unavailable, not as an empty queue. If entry is cancelled or fails, the previous
+view remains available rather than showing an unrelated video as a review.
+Queue discovery reads published assignment receipts, not image/mask payloads.
+Its progress lists only submitted candidates, not every assigned colony/video.
+While focused review is active, the local mask-summary scanner is limited to the
+current review video; it returns to the normal browser scope on exit.
+
+When opening a submission, the app saves current edits, verifies the selected
+publication and images, and loads only its
+assigned frame annotations and video-wide masks into the director's local project.
+Missing assigned images can be copied. Differing source images or annotation
+scope/label-meaning policies still stop the update. Independent local annotation
+edits instead open **Resolve Annotation Conflict** with side-by-side local and
+submitted overlays on the same verified image. Zoom/pan are linked; choose a frame,
+mask category, and opacity for inspection. The file-details expander also exposes
+metadata/completion-record conflicts that may have identical-looking masks.
+
+Neither version is selected by default. Choose **Keep local annotations** or
+**Use submitted annotations**, then **Use Selection and Review**. This selects a
+complete version for all annotation types on the assigned frames and shared-video
+masks, including their metadata and completion records. It is **not** a per-instance
+or per-category merge; the Show filter changes only the preview. Unassigned frame
+files and other videos are untouched. The normal editor then opens for final edits,
+and approval is still separate. Cancelling does not replace local files.
+
+The original affected local files are retained in **File > Local Rollback History**,
+including when the local version is chosen, and the submitted version remains in
+its immutable published backup. The choice is saved in the local review state and
+the eventual approval receipt. Files and submission freshness are rechecked after
+comparison, so concurrent changes require reopening it.
+Other videos and unassigned frame annotations are not replaced. Reopening the same
+unfinished review preserves local corrections. If a newer submission supersedes an
+unfinished review, its saved corrections become the local side of the comparison;
+nothing is overwritten automatically.
+
+The normal annotation editor shows the assigned frames with their source-video
+frame numbers. Masks for the assigned task are made visible. Inspect each frame
+and make corrections with the usual tools. Shared-mask changes still affect the
+whole video. **Approve & Next** saves and publishes corrections for the reviewed
+frames/shared masks, records the exact original submission and reviewer, removes
+that submission from the queue, and opens the next item. Approval is an explicit
+confirmation that all assigned frames and shared masks have been inspected; it
+does not infer inspection from opening a frame. **Exit Review** (or closing the
+sidebar) leaves saved corrections locally without approving and returns to the
+previous project view, video, and frame. Completing the final submission also
+exits review. Project-video navigation is unavailable until review is exited.
+
+Approval and corrected geometry are stored in one immutable publication and become
+visible together. Publication rechecks assignment identity, policy, original images,
+and submission freshness. Concurrent changes to this video block approval; uploads
+to unrelated videos are retained. Only the reviewed annotations and instance-ID
+counter are uploaded, not unrelated local changes or the complete local dataset.
+Local sync ancestry is not advanced as though all remote changes had been downloaded;
+the normal shared-update workflow is still needed before a later full-project backup
+when other shared work has changed. Rolling back local review files does not undo
+an already published approval.
+
+Use the same updated app on director and contributor computers: older versions do
+not understand corrected-review receipts and can report Changed Since Submission
+instead of Accepted. The older **Review Shared Updates > Accept Reviewed
+Submission...** route remains available for accepting an unmodified submission;
+that button still requires an exact local match. Students publishing different
+assigned videos do not need to download each other's frames.
 
 An unchanged repeat publication retains Accepted status. Further annotation edits
 invalidate completion and return the video to In Progress until finished again

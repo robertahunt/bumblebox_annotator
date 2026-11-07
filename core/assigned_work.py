@@ -111,6 +111,19 @@ def _video_files(files, video):
             (name.startswith('input_data/') and Path(name).stem == video)}
 
 
+def video_digest(files, video):
+    return bytes_record(json.dumps(_video_files(files, video), sort_keys=True).encode())['sha256']
+
+
+def reviewed_submission(manifest, entry, revision, original_files):
+    """Approval and corrected geometry are published in the same immutable version."""
+    receipt = manifest.get('submission_reviews', {}).get(entry['video'], {})
+    return bool(receipt and receipt.get('assignment_id') == entry['id'] and
+                receipt.get('submission') == [entry['contributor']['id'], revision] and
+                receipt.get('submitted_digest') == video_digest(original_files, entry['video']) and
+                receipt.get('reviewed_digest') == video_digest(manifest['files'], entry['video']))
+
+
 def _global_files(files):
     return {name: record for name, record in files.items()
             if name.startswith('annotations/') and _annotation_video(name) is None}
@@ -270,19 +283,26 @@ def assignment_status(view, entry, *, heads=None, current=None, cancelled=lambda
             submitted = view.snapshot(snapshot['reference'])
             if current is None:
                 current, _ = latest_snapshot(view)
-            if _video_files(submitted['manifest']['files'], video) != _video_files(current['manifest']['files'], video):
-                return 'Changed Since Submission', revision
+            same_video = (_video_files(submitted['manifest']['files'], video) ==
+                          _video_files(current['manifest']['files'], video))
             if video in submission.get('ready', []):
                 original = submission.get('ready_revisions', {}).get(video, revision)
+                prior = submitted if original == revision else view.snapshot((entry['contributor']['id'], original))
+                reviewed = reviewed_submission(current['manifest'], entry, original, prior['manifest']['files'])
                 if original != revision:
-                    prior = view.snapshot((entry['contributor']['id'], original))
                     prior_work = prior['manifest'].get('assigned_work', {})
                     if (prior_work.get('assignments', {}).get(video) != entry['id'] or
                             video not in prior_work.get('ready', []) or
-                            _video_files(prior['manifest']['files'], video) !=
-                            _video_files(submitted['manifest']['files'], video)):
+                            (_video_files(prior['manifest']['files'], video) !=
+                             _video_files(submitted['manifest']['files'], video) and not (reviewed and same_video))):
                         raise ValueError('Review receipt no longer matches the submitted video.')
+                if reviewed:
+                    return 'Accepted', original
+                if not same_video:
+                    return 'Changed Since Submission', revision
                 return ('Accepted' if entry.get('accepted_revision') == original else 'Ready for Review'), original
+            if not same_video:
+                return 'Changed Since Submission', revision
             return 'In Progress', revision
         revision = snapshot['parents'].get(entry['contributor']['id'])
     return ('In Progress' if entry.get('started_at') else 'Assigned'), None

@@ -237,7 +237,7 @@ class WorkspaceController(QObject):
         self.review_notification = QToolButton()
         self.review_notification.setIcon(window.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
         self.review_notification.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.review_notification.clicked.connect(lambda: self.home.inbox.manage_selected())
+        self.review_notification.clicked.connect(lambda: self.home.inbox.review_selected())
         self.review_notification.hide()
         header.addWidget(self.review_notification)
         self.person = QToolButton()
@@ -458,6 +458,9 @@ class WorkspaceController(QObject):
         return self.settings.value('workflow/last_project/' + identity, '', type=str)
 
     def identity_changed(self):
+        review = getattr(self.window, 'submission_review_dock', None)
+        if review:
+            review.context_changed()
         self.window.invalidate_backup_estimate()
         self.window.video_browser.set_my_work(None, {})
         self.window.annotation_work.apply()
@@ -559,6 +562,9 @@ class WorkspaceController(QObject):
             transform.m22(), transform.dx(), transform.dy(), center.x(), center.y(), state['zoom_factor']])
 
     def restore_view(self):
+        review = getattr(self.window, 'submission_review_dock', None)
+        if review and review.is_focused():
+            return
         values = self.settings.value(self.key('view'))
         if not isinstance(values, list) or len(values) != 9:
             return
