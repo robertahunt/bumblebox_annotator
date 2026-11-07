@@ -125,6 +125,19 @@ after the current file operation; assignment table edits are preserved. Subseque
 filter changes use the in-memory index. Publishing a backup with this app includes
 the summary for later sessions; merely inspecting a backup does not modify it.
 
+In **Annotate**, `Hive: Loading...` (or another task label) means the app is checking
+**local saved mask status**, not downloading masks or scanning the shared archive.
+This scan checks only videos in the current assignment/experiment view and only
+the selected **Work on** mask type. It starts with the current video and updates
+each row as that video's result becomes available. Changing mask type or widening
+the video view schedules the newly needed checks. Shared masks are checked once
+per video; missing shared masks still trigger a check for legacy frame-local data.
+Cached results are reused within the session only when source metadata matches.
+Video navigation remains available while status loads; Mark Finished waits for a
+valid status for the current task. The separate instance counter also runs in the
+background. It counts the full local project, or assigned videos in a selective
+working copy, without decoding mask pixels.
+
 ## Compare Local and Shared Work
 
 **Review Local vs Shared Changes...** compares saved annotation files and project

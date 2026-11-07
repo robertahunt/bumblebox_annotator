@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 
@@ -175,12 +176,13 @@ def _pending_imports(source, video, frames, policies):
 
 
 def build_index(files, resolve, *, previous=None, cancelled=lambda: False,
-                cached_only=False, progress=lambda message: None):
+                cached_only=False, progress=lambda message: None, task=None):
     """Build sparse summaries, reusing videos whose saved source records match."""
     if cancelled():
         raise InterruptedError('Annotation summary cancelled')
     source = Sources(files, resolve)
     policies = category_policies(source.json('annotations/project.json', {}))
+    requested = task_categories(task)
     videos = {}
     video_files = {}
     for name in files:
@@ -202,7 +204,8 @@ def build_index(files, resolve, *, previous=None, cancelled=lambda: False,
         if 'annotations/import_review.json' in files:
             relevant['annotations/import_review.json'] = files['annotations/import_review.json']
         fingerprint = _hash([policies, relevant])
-        if old.get(video, {}).get('fingerprint') == fingerprint:
+        unchanged = old.get(video, {}).get('fingerprint') == fingerprint
+        if unchanged and set(requested) <= set(old[video].get('categories', {})):
             result['videos'][video] = old[video]
             continue
         if cached_only:
@@ -210,14 +213,18 @@ def build_index(files, resolve, *, previous=None, cancelled=lambda: False,
                                       'error': 'Mask status has not been scanned for this published version'}
             continue
         progress(f'Scanning mask status: video {position}/{len(videos)} | {video}')
-        entry = {'fingerprint': fingerprint, 'frames': indices, 'categories': {}}
+        # A local task scan is partial. Never let it stand in for unchecked
+        # categories in a full publication or completion check.
+        retained = dict(old[video].get('categories', {})) if unchanged else {}
+        entry = {'fingerprint': fingerprint, 'frames': indices, 'categories': retained}
+        scan_policies = {c: policies[c] for c in requested if c not in retained}
         try:
             entry['import_pending'] = _pending_imports(source, video, indices, policies)
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             entry['error'] = 'Import review unavailable: ' + str(exc)
             entry['import_pending'] = {}
         missing_shared = set()
-        for category, policy in policies.items():
+        for category, policy in scan_policies.items():
             units = {}
             if policy['scope'] == 'video':
                 shared_name = f'annotations/json/{video}/video_annotations.json'
@@ -231,20 +238,24 @@ def build_index(files, resolve, *, previous=None, cancelled=lambda: False,
             entry['categories'][category] = {'scope': policy['scope'], 'policy': policy, 'units': units}
         source.cache = {k: v for k, v in source.cache.items() if not isinstance(k, tuple) or k[0] != 'mask'}
         # At most one frame's legacy raster is resident, regardless of video length.
-        for frame_position, i in enumerate(indices, 1):
+        frame_policies = {c: p for c, p in scan_policies.items() if p['scope'] == 'frame'}
+        scan_frames = indices if frame_policies or missing_shared else []
+        for frame_position, i in enumerate(scan_frames, 1):
             if cancelled():
                 raise InterruptedError('Annotation summary cancelled')
             if frame_position == 1 or frame_position % 25 == 0:
                 progress(f'Scanning mask status: video {position}/{len(videos)} | {video}\n'
                          f'Frame {frame_position}/{len(indices)} (source frame {i})')
-            for category, policy in policies.items():
-                if policy['scope'] != 'frame':
-                    continue
+            for category, policy in frame_policies.items():
                 unit = _unit(source, video, i, category, policy)
                 if unit['status'] != 'not_started':
                     entry['categories'][category]['units'][str(i)] = unit
             frame_json = f'annotations/json/{video}/frame_{i:06d}.json'
             try:
+                # Shared masks that exist need no frame-by-frame mask decoding.
+                # Missing shared masks still need the legacy-scope safety check.
+                if not missing_shared:
+                    continue
                 legacy = {r.get('category', 'bee') for r in _records(source.json(frame_json, [])) if not r.get('bbox_only')}
                 for category in legacy & missing_shared:
                     entry['categories'][category]['units']['video'] = {
@@ -254,9 +265,10 @@ def build_index(files, resolve, *, previous=None, cancelled=lambda: False,
                 for category in missing_shared:
                     entry['categories'][category]['units']['video'] = {
                         'count': None, 'signature': None, 'status': 'unknown', 'error': 'Unreadable frame metadata'}
-            source.cache = {k: v for k, v in source.cache.items() if not isinstance(k, tuple) or k[0] != 'mask'}
-            source.cache.pop(frame_json, None)
-            source.cache.pop(f'annotations/work/{video}/frame_{i:06d}.json', None)
+            finally:
+                source.cache = {k: v for k, v in source.cache.items() if not isinstance(k, tuple) or k[0] != 'mask'}
+                source.cache.pop(frame_json, None)
+                source.cache.pop(f'annotations/work/{video}/frame_{i:06d}.json', None)
         if any(n.startswith((f'annotations/pkl/{video}/', f'annotations/frames/{video}/')) for n in relevant):
             entry['error'] = 'Legacy annotations need conversion before mask availability can be determined'
         result['videos'][video] = entry
@@ -265,15 +277,70 @@ def build_index(files, resolve, *, previous=None, cancelled=lambda: False,
     return result
 
 
-def local_index(project, *, previous=None, cancelled=lambda: False, video=None):
-    from core.project_sync import _inventory, _safe_child
+def _local_video_files(project, video, cancelled):
+    """Inventory only this video's summary sources, never the whole project."""
+    from core.project_sync import _safe_child
+    if not isinstance(video, str) or not video or Path(video).name != video or video in ('.', '..'):
+        raise ValueError('Invalid video ID')
+    files = {}
+
+    def add(path):
+        if cancelled():
+            raise InterruptedError('Annotation summary cancelled')
+        if path.is_symlink() or not path.is_file():
+            raise ValueError('Annotation summaries require ordinary files: ' + str(path))
+        stat = path.stat()
+        files[path.relative_to(project).as_posix()] = (
+            stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev, stat.st_ino)
+
+    for name in ('annotations/project.json', 'annotations/import_review.json'):
+        path = _safe_child(project, name)
+        if path.exists():
+            add(path)
+    names = [f'frames/{video}'] + [f'annotations/{kind}/{video}'
+             for kind in ('json', 'png', 'bbox', 'work', 'pkl', 'frames')]
+    def failed(error):
+        raise error
+
+    for name in names:
+        base = _safe_child(project, name)
+        if not base.exists():
+            continue
+        for directory, directories, filenames in os.walk(base, followlinks=False, onerror=failed):
+            if cancelled():
+                raise InterruptedError('Annotation summary cancelled')
+            for child in directories:
+                if (Path(directory) / child).is_symlink():
+                    raise ValueError('Annotation summaries do not follow symbolic links')
+            for filename in filenames:
+                if not filename.startswith('.'):
+                    add(Path(directory) / filename)
+    return files
+
+
+def local_index(project, *, previous=None, cancelled=lambda: False, video=None,
+                videos=None, task=None, video_ready=lambda video, entry: None):
+    from core.project_sync import _safe_child
     project = Path(project)
-    files = _inventory(project, False, with_identity=True)
     if video is not None:
-        files = {n: r for n, r in files.items() if n in ('annotations/project.json', 'annotations/import_review.json')
-                 or n.startswith(f'frames/{video}/')
-                 or any(n.startswith(f'annotations/{k}/{video}/') for k in ('json', 'png', 'bbox', 'work', 'pkl', 'frames'))}
-    return build_index(files, lambda n: _safe_child(project, n), previous=previous, cancelled=cancelled)
+        if videos is not None:
+            raise ValueError('Choose video or videos, not both')
+        videos = [video]
+    if videos is None:
+        frames = _safe_child(project, 'frames')
+        videos = sorted(p.name for p in frames.iterdir() if p.is_dir()) if frames.exists() else []
+    result = {'version': VERSION, 'videos': {}}
+    for name in dict.fromkeys(videos):
+        if cancelled():
+            raise InterruptedError('Annotation summary cancelled')
+        files = _local_video_files(project, name, cancelled)
+        index = build_index(files, lambda n: _safe_child(project, n), previous=previous,
+                            cancelled=cancelled, task=task)
+        entry = index['videos'].get(name)
+        if entry is not None:
+            result['videos'][name] = entry
+            video_ready(name, entry)
+    return result
 
 
 def published_index(snapshot, *, cached_only=False, progress=lambda message: None,
@@ -317,6 +384,9 @@ def summarize(entry, task, frames=None):
         return {'presence': 'unknown', 'state': 'unknown', 'mask_text': 'Unknown',
                 'work_text': 'Unknown', 'detail': (entry or {}).get('error', 'Summary unavailable')}
     categories = task_categories(task)
+    if not set(categories) <= set(entry.get('categories', {})):
+        return {'presence': 'unknown', 'state': 'not_scanned', 'mask_text': 'Not scanned',
+                'work_text': 'Not scanned', 'detail': 'This mask type has not been checked yet.'}
     frames = list(entry['frames'] if frames is None else frames)
     if not frames or not set(frames) <= set(entry['frames']):
         return summarize(None, task)
@@ -370,7 +440,7 @@ def mark_finished(project, video, frame, task, contributor, *, complete=True, ca
     require_assigned_frame(project, contributor, video, frame)
     if task is None:
         raise ValueError('Choose a mask type before marking work finished')
-    entry = local_index(project, video=video, cancelled=cancelled)['videos'].get(video)
+    entry = local_index(project, video=video, task=task, cancelled=cancelled)['videos'].get(video)
     if not entry or frame not in entry['frames']:
         raise ValueError('Choose an available frame')
     if entry.get('error'):

@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (QComboBox, QFormLayout, QHBoxLayout, QLabel, QMessa
                             QPushButton, QStyle, QToolButton, QVBoxLayout, QWidget)
 
 from core.annotation_work import (TASKS, local_index, mark_finished, matches, summarize,
-                                  task_label)
+                                  task_categories, task_label)
 from core.assigned_work import workspace
 from gui.assigned_review import AssignedReviewViews
 from gui.project_sync_dialog import OperationWorker, SyncProgressDialog
@@ -84,6 +84,15 @@ class WorkFilters(QWidget):
                  matches(summary, self.show.currentData(), self.presence.currentData())))
 
 
+class SummaryWorker(OperationWorker):
+    video_ready = pyqtSignal(str, object)
+
+    def __init__(self, project, videos, task, previous, parent):
+        super().__init__(lambda progress, cancelled: local_index(
+            project, videos=videos, task=task, previous=previous, cancelled=cancelled,
+            video_ready=self.video_ready.emit), parent)
+
+
 class AnnotationWorkBrowser(QObject):
     def __init__(self, window, layout):
         super().__init__(window)
@@ -130,6 +139,8 @@ class AnnotationWorkBrowser(QObject):
         self.pending = False
         self.stopping = False
         self.video = None
+        self.request = None
+        self.scanned_videos = set()
         self._summaries = OrderedDict()
         self.apply_timer = QTimer(self)
         self.apply_timer.setSingleShot(True)
@@ -145,36 +156,76 @@ class AnnotationWorkBrowser(QObject):
         if not self.stopping:
             self.timer.start()
 
+    def scan_context(self):
+        w = self.window
+        project = str(w.project_path or '')
+        state = workspace(project) if project else None
+        videos = []
+        for row in range(w.video_list.count()):
+            video = w.video_list.item(row).data(Qt.ItemDataRole.UserRole)
+            if video and w.video_browser.accepts(video) and (
+                    not state or video in state['assignments']):
+                videos.append(video)
+        return project, self.filters.task.currentData(), tuple(sorted(set(videos)))
+
+    def check_context(self):
+        request = self.scan_context()
+        if request == self.request:
+            return
+        self.request = request
+        self.checked, self.error = False, None
+        self.scanned_videos = set()
+        if request[0] != self.project:
+            self._summaries.clear()
+            self.project = request[0]
+            self.index = {'version': 1, 'videos': {}}
+        if self.worker:
+            self.worker.requestInterruption()
+        self.schedule()
+
     def refresh(self):
-        project = str(self.window.project_path or '')
+        self.check_context()
+        self.timer.stop()
+        project, task, videos = self.request
         if not project or self.stopping:
             return
         if self.worker:
             self.pending = True
             return
-        previous = self.index if project == self.project else None
-        if project != self.project:
-            self._summaries.clear()
-            self.project, self.index = project, {'version': 1, 'videos': {}}
-            self.checked = False
+        previous = self.index
+        request = self.request
+        current = self.window.current_video_id
+        videos = sorted(videos, key=lambda v: (v != current, v))
         self.error = None
-        self.worker = OperationWorker(lambda progress, cancelled:
-            local_index(project, previous=previous, cancelled=cancelled), self)
-        self.worker.finished.connect(lambda: self.loaded(project))
+        self.scanned_videos = set()
+        self.worker = SummaryWorker(project, videos, task, previous, self)
+        self.worker.video_ready.connect(lambda video, entry: self.video_loaded(request, video, entry))
+        self.worker.finished.connect(lambda: self.loaded(request))
         self.apply()
         self.worker.start()
 
-    def loaded(self, project):
+    def video_loaded(self, request, video, entry):
+        if (self.stopping or request != self.request or
+                request[0] != str(self.window.project_path or '')):
+            return
+        self.index = dict(self.index, videos=dict(self.index['videos'], **{video: entry}))
+        self.scanned_videos.add(video)
+        # Batch visual updates without withholding completed videos until the end.
+        if not self.apply_timer.isActive():
+            self.apply_timer.start()
+
+    def loaded(self, request):
         worker, self.worker = self.worker, None
         worker.deleteLater()
         if self.stopping:
             return
-        if project == str(self.window.project_path or ''):
-            self.index = worker.result if not worker.error else {'version': 1, 'videos': {}}
+        if request == self.scan_context():
+            if not worker.error:
+                self.index = dict(self.index, videos=dict(self.index['videos'], **worker.result['videos']))
             self.checked = True
             self.error = str(worker.error) if worker.error else None
             self.apply()
-        if self.pending or project != str(self.window.project_path or ''):
+        if self.pending or request != self.scan_context():
             self.pending = False
             self.schedule()
 
@@ -202,7 +253,8 @@ class AnnotationWorkBrowser(QObject):
         self.apply()
 
     def summary(self, entry, task, frames=None):
-        if entry is None and self.window.project_path and (
+        missing = entry is None or not set(task_categories(task)) <= set(entry.get('categories', {}))
+        if missing and self.window.project_path and (
                 not self.checked or self.worker or self.timer.isActive()):
             return {'presence': 'loading', 'state': 'loading', 'mask_text': 'Loading...',
                     'work_text': 'Loading...', 'detail': 'Checking local saved masks...'}
@@ -236,6 +288,7 @@ class AnnotationWorkBrowser(QObject):
             self.apply_timer.start()
             return
         self.apply_timer.stop()
+        self.check_context()
         self.source.setText('Local working copy\n' + Path(w.project_path).name if w.project_path else 'No local project open')
         self.source.setToolTip(str(w.project_path or ''))
         task = self.filters.task.currentData()
@@ -250,7 +303,7 @@ class AnnotationWorkBrowser(QObject):
             if not video:
                 continue
             entry = self.index['videos'].get(video)
-            assigned_frames = (state or {}).get('assignments', {}).get(video, {}).get('frames')
+            assigned_frames = assignments.get(video, {}).get('frames')
             summary = self.summary(entry, task, assigned_frames)
             base = item.data(Qt.ItemDataRole.UserRole + 40)
             if base is None:
@@ -279,19 +332,22 @@ class AnnotationWorkBrowser(QObject):
         self.note.setText('Unsaved edits; showing saved status' if dirty else
                           'Local saved annotations' if not video else self.summary_text(summary))
         if self.worker or summary['state'] == 'loading':
-            self.note.setText(self.note.text() + '\nChecking local saved masks...')
+            progress = f' {len(self.scanned_videos)}/{len(self.request[2])} videos' if self.worker else ''
+            self.note.setText(self.note.text() + '\nChecking local saved masks...' + progress)
         elif self.error:
             self.note.setText('Mask summary unavailable: ' + self.error)
         if video and not (w.video_browser.accepts(video) and self.review.accepts(video)):
             self.note.setText(self.note.text() + '\nCurrent video is outside the video filters')
         elif video and summary['state'] != 'loading' and not self.filters.accepts(self.summary(entry, task)):
             self.note.setText(self.note.text() + '\nCurrent video kept visible outside these filters')
-        self.finish.setEnabled(bool(video and entry and task and summary['state'] not in ('unknown', 'loading')))
+        available = summary['state'] not in ('unknown', 'loading', 'not_scanned')
+        self.finish.setEnabled(bool(video and entry and task and available))
         self.finish.setText('Reopen Work' if not dirty and summary.get('finished', 0) == summary.get('total', -1)
                             else 'Mark Finished')
-        self.finish.setToolTip('Records completion for the selected mask type. Shared masks are recorded once per video. '
-                               'Does not approve imported frames or submit work to the director.')
-        self.next.setEnabled(bool(video and entry and task))
+        self._finish_tip = self.completion_tip(summary, state, task, video)
+        self.finish.setToolTip(self.completion_tip(summary, state, task, video, reopening=True)
+                               if self.finish.text() == 'Reopen Work' else self._finish_tip)
+        self.next.setEnabled(bool(video and entry and task and available))
         if hasattr(w, 'frame_list'):
             for row, index in enumerate(w.frame_list_to_frames_map):
                 item = w.frame_list.item(row)
@@ -306,6 +362,36 @@ class AnnotationWorkBrowser(QObject):
                 item.setText(base + ' | ' + details['work_text'])
                 item.setToolTip(details['mask_text'] + '\n' + details.get('detail', ''))
 
+    def mark_dirty(self):
+        self.note.setText('Unsaved edits; showing saved status')
+        self.finish.setText('Mark Finished')
+        self.finish.setToolTip(self._finish_tip)
+
+    def completion_tip(self, summary, state, task, video, *, reopening=False):
+        if task is None:
+            return 'Choose a mask type in Work on before marking it finished.'
+        if not video:
+            return 'Choose a video and frame before marking work finished.'
+        if summary['state'] == 'loading':
+            return f'Checking saved {task_label(task)} status. You can keep annotating while it loads.'
+        if summary['state'] in ('unknown', 'not_scanned'):
+            return ('Saved mask status must be available before marking work finished.\n'
+                    'Refresh mask summaries and resolve any missing or unsupported annotation data.')
+        scope = 'the whole video (shared mask)' if summary.get('shared') else 'the current frame'
+        text = (f'Mark {task_label(task)} unfinished for {scope}.' if reopening else
+                f'Record that you checked {task_label(task)} for {scope}, including if none is present.')
+        if state:
+            text += '\nSaved changes are queued for automatic upload; offline work waits for a connection.'
+            if state.get('assignments', {}).get(video, {}).get('task'):
+                text += ('\nWhen all required work for the assigned task is finished,\n'
+                         'a verified upload makes this video ready for director review.')
+            else:
+                text += '\nA director must set an assigned mask task before automatic review submission is available.'
+        else:
+            text += '\nThis local project is not an assigned working copy; completion does not automatically upload or submit it.'
+        text += '\nImported-frame approval and director acceptance are separate.'
+        return text
+
     def complete(self):
         w = self.window
         task = self.filters.task.currentData()
@@ -318,7 +404,7 @@ class AnnotationWorkBrowser(QObject):
                 return
             # Re-read after the save: the last brush stroke may have changed presence.
             entry = SyncProgressDialog('Check Saved Annotation Work', lambda progress, cancelled:
-                local_index(w.project_path, video=video, cancelled=cancelled), w).run()['videos'].get(video)
+                local_index(w.project_path, video=video, task=task, cancelled=cancelled), w).run()['videos'].get(video)
             summary = summarize(entry, task, [frame])
             text = (f'Mark {task_label(task)} work unfinished?' if reopen else
                     f'Mark {task_label(task)} work finished?' if summary['presence'] != 'none' else

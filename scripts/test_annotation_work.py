@@ -11,7 +11,7 @@ import numpy as np
 from core.annotation import AnnotationManager
 from core.annotation_policy import default_policy
 from core.annotation_work import (build_index, local_index, mark_finished, matches, published_index,
-                                  summarize, unit_for)
+                                  summarize, unit_for, Sources)
 from core.assigned_work import (catalog, latest_snapshot, publish_work, read_assignments,
                                save_assignments, workspace)
 from core.contributors import new_session
@@ -162,6 +162,100 @@ class AnnotationWorkTests(unittest.TestCase):
         with patch('core.annotation_work.Sources.mask', side_effect=AssertionError('No raster reload')):
             second = local_index(self.project, previous=first)
         self.assertIs(first['videos']['video'], second['videos']['video'])
+
+    def test_shared_hive_scan_does_not_read_other_masks_or_frame_metadata(self):
+        self.shared()
+        reads = []
+        original = Sources.json
+        def record(source, name, default=None):
+            reads.append(name)
+            return original(source, name, default)
+        with patch.object(Sources, 'json', record):
+            index = local_index(self.project, video='video', task='hive')
+        entry = index['videos']['video']
+        self.assertEqual(set(entry['categories']), {'hive'})
+        self.assertEqual(summarize(entry, 'hive')['mask_text'], 'Shared mask')
+        self.assertFalse(any('/frame_' in name for name in reads))
+        self.assertEqual(summarize(entry, 'bee')['state'], 'not_scanned')
+        self.assertEqual(summarize(entry, None)['state'], 'not_scanned')
+
+    def test_partial_cache_can_expand_but_cannot_certify_unchecked_categories(self):
+        self.shared()
+        hive = local_index(self.project, task='hive')
+        bee = local_index(self.project, task='bee', previous=hive)
+        self.assertEqual(set(bee['videos']['video']['categories']), {'bee', 'hive'})
+        self.assertIs(bee['videos']['video']['categories']['hive'], hive['videos']['video']['categories']['hive'])
+        from core.project_sync import _inventory, _safe_child
+        files = _inventory(self.project, False, with_identity=True)
+        cached = build_index(files, lambda n: _safe_child(self.project, n), previous=bee, cached_only=True)
+        self.assertEqual(summarize(cached['videos']['video'], None)['state'], 'not_scanned')
+        full = local_index(self.project, previous=bee)
+        self.assertNotEqual(summarize(full['videos']['video'], None)['state'], 'not_scanned')
+        # The partial input is immutable and is never silently promoted to full.
+        self.assertEqual(set(hive['videos']['video']['categories']), {'hive'})
+
+    def test_video_scope_never_walks_unrelated_directories(self):
+        self.shared()
+        import os
+        real_walk, visited = os.walk, []
+        def walk(path, *args, **kwargs):
+            visited.append(str(path))
+            return real_walk(path, *args, **kwargs)
+        (self.project / 'frames/unrelated').symlink_to(self.project / 'frames/video', target_is_directory=True)
+        with patch('core.annotation_work.os.walk', walk), patch('core.project_sync._inventory',
+                side_effect=AssertionError('No project-wide sync inventory')):
+            index = local_index(self.project, videos=['video'], task='hive')
+        self.assertEqual(set(index['videos']), {'video'})
+        self.assertTrue(visited)
+        self.assertTrue(all(path.endswith('/video') for path in visited))
+        with self.assertRaisesRegex(ValueError, 'symbolic'):
+            local_index(self.project, video='unrelated')
+
+    def test_incremental_results_follow_requested_priority_and_cancellation(self):
+        import shutil
+        shutil.copytree(self.project / 'frames/video', self.project / 'frames/other')
+        delivered = []
+        result = local_index(self.project, videos=['video', 'other'], task='bee',
+                             video_ready=lambda video, entry: delivered.append(video))
+        self.assertEqual(delivered, ['video', 'other'])
+        self.assertEqual(set(result['videos']), {'video', 'other'})
+        delivered.clear()
+        with self.assertRaises(InterruptedError):
+            local_index(self.project, videos=['video', 'other'], task='bee',
+                        video_ready=lambda video, entry: delivered.append(video),
+                        cancelled=lambda: bool(delivered))
+        self.assertEqual(delivered, ['video'])
+
+    def test_task_scan_keeps_legacy_and_import_review_safety_checks(self):
+        self.shared()
+        _write_json(self.project / 'annotations/json/video/video_annotations.json', [])
+        self.manager.save_frame_annotations(self.project, 'video', 0, [annotation(3, 'hive')])
+        entry = local_index(self.project, video='video', task='hive')['videos']['video']
+        self.assertEqual(summarize(entry, 'hive')['state'], 'unknown')
+        self.shared()
+        records = {'version': 1, 'frames': {}, 'shared': {}}
+        policy = self.info['annotation_policy']['categories']['hive']
+        add_review(records, 'video', 0, 'hive', {'reasons': ['shared import'],
+                   'source_policy': policy, 'destination_policy': policy}, shared=True)
+        _write_json(self.project / 'annotations/import_review.json', records)
+        entry = local_index(self.project, video='video', task='hive')['videos']['video']
+        self.assertEqual(summarize(entry, 'hive')['state'], 'needs_review')
+
+    def test_partial_cache_invalidates_after_save_and_policy_change(self):
+        self.shared()
+        mark_finished(self.project, 'video', 0, 'hive', self.actor)
+        first = local_index(self.project, task='hive')
+        self.assertEqual(summarize(first['videos']['video'], 'hive')['state'], 'finished')
+        mask = annotation(7, 'hive')
+        mask['mask'][0, 0] = 255
+        self.manager.save_video_annotations(self.project, 'video', [mask])
+        second = local_index(self.project, task='hive', previous=first)
+        self.assertEqual(summarize(second['videos']['video'], 'hive')['state'], 'changed')
+        self.info = {'hive_annotation_scope': 'frame'}
+        self.info['annotation_policy'] = default_policy(self.info)
+        _write_json(self.project / 'annotations/project.json', self.info)
+        third = local_index(self.project, task='hive', previous=second)
+        self.assertEqual(third['videos']['video']['categories']['hive']['scope'], 'frame')
 
     def test_import_reviews_are_not_approved_by_completion(self):
         records = {'version': 1, 'frames': {}, 'shared': {}}

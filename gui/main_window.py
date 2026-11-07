@@ -544,6 +544,12 @@ class MainWindow(QMainWindow):
         self.done_counter_saved_counts = self._zero_annotation_counts()
         self.done_counter_session_baseline_counts = self._zero_annotation_counts()
         self.done_counter_saved_counts_dirty = True
+        self._count_scan_worker = None
+        self._count_scan_revision = 0
+        self._count_scan_stopping = False
+        self._count_scan_error = None
+        self._count_baseline_pending = True
+        self._count_baseline_sources = {}
 
         self.done_counter_overlay = QWidget(self.canvas.viewport())
         self.done_counter_overlay.setObjectName("doneCounterOverlay")
@@ -621,52 +627,6 @@ class MainWindow(QMainWindow):
             )
         return counts
 
-    def _read_annotation_records(self, json_path):
-        if not json_path or not Path(json_path).exists():
-            return []
-        try:
-            with open(json_path, 'r') as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            print(f"Warning: failed to read annotation counts from {json_path}: {e}")
-            return []
-
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get('annotations', [])
-        return []
-
-    def _count_annotation_records(self, records, bbox_only=False):
-        counts = self._zero_annotation_counts()
-        seen = set()
-
-        for index, annotation in enumerate(records or []):
-            if not isinstance(annotation, dict):
-                continue
-            if bbox_only and (
-                not annotation.get('bbox_only', False) or
-                annotation.get('from_mask', False)
-            ):
-                continue
-
-            category = annotation.get('category', 'bee')
-            if category not in counts:
-                continue
-
-            instance_id = annotation.get(
-                'mask_id',
-                annotation.get('instance_id', annotation.get('id'))
-            )
-            key = (category, instance_id) if instance_id is not None else (category, index)
-            if key in seen:
-                continue
-
-            seen.add(key)
-            counts[category] += 1
-
-        return counts
-
     def _annotation_count_cache(self):
         project = str(self.project_path or '')
         if getattr(self, '_count_cache_project', None) != project:
@@ -675,28 +635,22 @@ class MainWindow(QMainWindow):
         return self._count_cache
 
     def _annotation_file_counts(self, path, bbox_only=False):
-        path = Path(path)
+        from core.annotation_counts import file_counts
         cache = self._annotation_count_cache()
-        key = (str(path), bbox_only)
         try:
-            stat = path.stat()
-        except FileNotFoundError:
-            cache.pop(key, None)
-            return self._zero_annotation_counts()
-        signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-        previous = cache.get(key)
-        if previous is not None and previous[0] == signature:
-            return dict(previous[1])
-        counts = self._count_annotation_records(self._read_annotation_records(path), bbox_only=bbox_only)
-        cache[key] = (signature, dict(counts))
-        return counts
+            return file_counts(path, bbox_only, cache)
+        except (OSError, ValueError, TypeError):
+            self._schedule_done_counter_update(saved_counts_dirty=True)
+            previous = cache.get((str(path), bbox_only))
+            return dict(previous[1]) if previous else self._zero_annotation_counts()
 
     def _refresh_saved_annotation_files(self, project, video, frame):
         """Update the total from changed source files, including deletion/empty saves."""
         if str(self.project_path) != str(project):
             return
-        if getattr(self, 'done_counter_saved_counts_dirty', True):
-            self._schedule_done_counter_update()
+        if getattr(self, 'done_counter_saved_counts_dirty', True) or self._count_scan_error:
+            # A scan may have read a mixture of old and newly saved metadata.
+            self._schedule_done_counter_update(saved_counts_dirty=True)
             return
         cache = self._annotation_count_cache()
         root = Path(project) / 'annotations'
@@ -733,30 +687,71 @@ class MainWindow(QMainWindow):
         record = self._annotation_count_cache().get((str(path), False))
         return dict(record[1]) if record is not None else self._zero_annotation_counts()
 
-    def _scan_saved_annotation_counts(self):
-        """Inventory sources; parse only files changed since the preceding scan."""
-        counts = self._zero_annotation_counts()
-        cache = self._annotation_count_cache()
-        found = set()
-        if self.project_path:
-            root = Path(self.project_path) / 'annotations'
-            for folder, bbox_only in (('json', False), ('bbox', True)):
-                base = root / folder
-                if not base.exists():
-                    continue
-                for video_dir in base.iterdir():
-                    if not video_dir.is_dir():
-                        continue
-                    paths = list(video_dir.glob('frame_*.json'))
-                    if not bbox_only:
-                        paths.append(video_dir / 'video_annotations.json')
-                    for path in paths:
-                        key = (str(path), bbox_only)
-                        found.add(key)
-                        counts = self._add_annotation_counts(counts, self._annotation_file_counts(path, bbox_only))
-        for key in set(cache) - found:
-            del cache[key]
-        return counts
+    def _start_annotation_count_scan(self):
+        from core.annotation_counts import scan_counts
+        from core.assigned_work import workspace
+        from gui.project_sync_dialog import OperationWorker
+        if self._count_scan_worker or self._count_scan_stopping:
+            return
+        project = str(self.project_path or '')
+        if not project:
+            self.done_counter_saved_counts = self._zero_annotation_counts()
+            self.done_counter_saved_counts_dirty = False
+            return
+        revision = self._count_scan_revision
+        previous = dict(self._annotation_count_cache())
+        state = workspace(project)
+        videos = tuple(state['assignments']) if state else None
+        self._count_scan_worker = OperationWorker(lambda progress, cancelled:
+            scan_counts(project, previous, videos=videos, cancelled=cancelled), self)
+        self._count_scan_worker.finished.connect(lambda: self._annotation_counts_loaded(project, revision))
+        self._count_scan_worker.start()
+
+    def _capture_count_baseline(self, video, frame, save_frame, save_video):
+        """Preserve pre-edit counts if a user saves before the initial scan ends."""
+        if not getattr(self, '_count_baseline_pending', False):
+            return
+        from core.annotation_counts import file_counts
+        root = Path(self.project_path) / 'annotations'
+        paths = [(root / 'json' / video / 'video_annotations.json', False)] if save_video else []
+        if save_frame:
+            paths += [(root / kind / video / f'frame_{frame:06d}.json', bbox)
+                      for kind, bbox in (('json', False), ('bbox', True))]
+        for path, bbox in paths:
+            key = (str(path), bbox)
+            if key not in self._count_baseline_sources:
+                try:
+                    self._count_baseline_sources[key] = file_counts(path, bbox, {})
+                except (OSError, ValueError, TypeError):
+                    pass  # A broken counter must never prevent annotation saves.
+
+    def _annotation_counts_loaded(self, project, revision):
+        worker, self._count_scan_worker = self._count_scan_worker, None
+        worker.deleteLater()
+        if self._count_scan_stopping:
+            return
+        if project == str(self.project_path or '') and not worker.error:
+            # Saved edits invalidate totals, not every parsed file. The retry
+            # rechecks file identities before reusing these metadata counts.
+            self._count_cache = dict(worker.result[1])
+            self._count_cache_project = project
+        if project == str(self.project_path or '') and revision == self._count_scan_revision:
+            self._count_scan_error = str(worker.error) if worker.error else None
+            if not worker.error:
+                self.done_counter_saved_counts, self._count_cache = worker.result
+                self._count_cache_project = project
+                if self._count_baseline_pending:
+                    baseline = dict(self.done_counter_saved_counts)
+                    for key, before in self._count_baseline_sources.items():
+                        current = self._count_cache.get(key)
+                        if current:
+                            baseline = self._add_annotation_counts(baseline, current[1], sign=-1)
+                        baseline = self._add_annotation_counts(baseline, before)
+                    self.done_counter_session_baseline_counts = baseline
+                    self._count_baseline_pending = False
+                    self._count_baseline_sources.clear()
+            self.done_counter_saved_counts_dirty = False
+        self._schedule_done_counter_update()
 
     def _live_canvas_annotation_counts(self):
         counts = self._zero_annotation_counts()
@@ -777,8 +772,7 @@ class MainWindow(QMainWindow):
 
     def _current_annotation_counts(self):
         if getattr(self, 'done_counter_saved_counts_dirty', True):
-            self.done_counter_saved_counts = self._scan_saved_annotation_counts()
-            self.done_counter_saved_counts_dirty = False
+            self._start_annotation_count_scan()
 
         counts = dict(getattr(self, 'done_counter_saved_counts', self._zero_annotation_counts()))
 
@@ -822,13 +816,21 @@ class MainWindow(QMainWindow):
 
     def _reset_done_counter_baseline(self):
         self.done_counter_saved_counts_dirty = True
-        current_counts = self._current_annotation_counts()
-        self.done_counter_session_baseline_counts = dict(current_counts)
+        self._count_scan_revision += 1
+        self._count_scan_error = None
+        self._count_baseline_pending = True
+        self._count_baseline_sources = {}
+        self.done_counter_saved_counts = self._zero_annotation_counts()
+        self.done_counter_session_baseline_counts = self._zero_annotation_counts()
+        if self._count_scan_worker:
+            self._count_scan_worker.requestInterruption()
         self._refresh_done_counter_labels()
 
     def _schedule_done_counter_update(self, saved_counts_dirty=False):
         if saved_counts_dirty:
             self.done_counter_saved_counts_dirty = True
+            self._count_scan_revision += 1
+            self._count_scan_error = None
 
         timer = getattr(self, 'done_counter_update_timer', None)
         if timer is not None:
@@ -842,6 +844,15 @@ class MainWindow(QMainWindow):
             timer.start()
             return
         counts = self._current_annotation_counts()
+        if self.done_counter_saved_counts_dirty or self._count_scan_error:
+            self.done_counter_summary_label.setText(
+                'Counting saved instances...' if self.done_counter_saved_counts_dirty else 'Instance count unavailable')
+            self.done_counter_summary_label.setToolTip(self._count_scan_error or '')
+            for label in self.done_counter_category_labels.values():
+                label.hide()
+            self._position_done_counter_overlay()
+            return
+        self.done_counter_summary_label.setToolTip('')
         baseline_counts = getattr(
             self,
             'done_counter_session_baseline_counts',
@@ -4395,8 +4406,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'workflow'):
             self.workflow.edited()
         if hasattr(self, 'annotation_work'):
-            self.annotation_work.note.setText('Unsaved edits; showing saved status')
-            self.annotation_work.finish.setText('Mark Finished')
+            self.annotation_work.mark_dirty()
 
     def _commit_canvas_edit_if_needed(self):
         """Commit an active canvas edit and mark it dirty if it contains pixels."""
@@ -4440,6 +4450,7 @@ class MainWindow(QMainWindow):
             save_video = force or self.current_frame_modified or target_video_id in self.dirty_video_annotation_ids
             if not save_frame and not save_video:
                 return {'saved_any': False, 'reason': 'clean'}
+            self._capture_count_baseline(target_video_id, frame_idx_in_video, save_frame, save_video)
             task = SnapshotSave(AnnotationSnapshot.capture(self.canvas),
                                 frozenset(frame_categories(self.annotation_manager.project_info)),
                                 save_frame, save_video, self._annotation_revision)
@@ -4476,6 +4487,7 @@ class MainWindow(QMainWindow):
                 'video_id': target_video_id,
             }
 
+        self._capture_count_baseline(target_video_id, frame_idx_in_video, save_frame, save_video)
         frame_annotations, video_level_annotations = self._split_source_annotations(annotations)
         saved_files = []
 
@@ -13249,6 +13261,11 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, 'annotation_work'):
             self.annotation_work.stop()
+        self._count_scan_stopping = True
+        self.done_counter_update_timer.stop()
+        if self._count_scan_worker:
+            self._count_scan_worker.requestInterruption()
+            self._count_scan_worker.wait()
         
         # Stop and wait for save worker to finish
         if hasattr(self, 'save_worker'):

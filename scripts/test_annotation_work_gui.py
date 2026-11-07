@@ -10,7 +10,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QMessageBox, QDialog
 
-from core.annotation_work import local_index, mark_finished, summarize
+from core.annotation_work import local_index, mark_finished, summarize, _local_video_files
 from core.assigned_work import catalog, latest_snapshot, read_assignments, save_assignments
 from gui.assigned_work_dialog import AssignmentManagerDialog, BulkAssignmentDialog
 from gui.annotation_work import WorkFilters
@@ -53,6 +53,7 @@ class AnnotationWorkGuiTests(unittest.TestCase):
                     self.assertFalse(item.isHidden())
                 self.assertIn('Loading...', window.frame_list.item(0).text())
                 self.assertFalse(browser.finish.isEnabled())
+                self.assertIn('Checking saved Hive status', browser.finish.toolTip())
                 deadline = time.monotonic() + 5
                 while not started.is_set():
                     QTest.qWait(10)
@@ -87,6 +88,103 @@ class AnnotationWorkGuiTests(unittest.TestCase):
         self.assertIn('Hive: Shared mask | Not checked', window.video_list.item(0).text())
         self.assertTrue(browser.finish.isEnabled())
         self.assertIsNone(browser.error)
+
+    def test_only_mine_scan_excludes_other_local_videos_and_categories(self):
+        window = self.make_window(self.source)
+        browser = window.annotation_work
+        window.video_browser.set_my_work(window.project_path, {'alpha': self.choices['alpha']}, enabled=True)
+        browser.filters.task.setCurrentIndex(browser.filters.task.findData('hive'))
+        with patch('gui.annotation_work.local_index', wraps=local_index) as scan:
+            browser.apply()
+            self.settle(browser)
+        self.assertTrue(scan.called)
+        self.assertTrue(all(call.kwargs['videos'] == ['alpha'] and call.kwargs['task'] == 'hive'
+                            for call in scan.call_args_list))
+        self.assertEqual(set(browser.index['videos']), {'alpha'})
+        self.assertEqual(set(browser.index['videos']['alpha']['categories']), {'hive'})
+        window.video_browser.only_mine.setChecked(False)
+        self.settle(browser)
+        self.assertEqual(set(browser.index['videos']), {'alpha', 'beta'})
+
+    def test_current_video_is_ready_while_later_scan_still_runs_and_navigation_works(self):
+        window = self.make_window(self.source)
+        browser = window.annotation_work
+        browser.filters.task.setCurrentIndex(browser.filters.task.findData('hive'))
+        window.load_video_frames('beta')
+        self.settle(browser)
+        browser.index = {'version': 1, 'videos': {}}
+        browser.checked = False
+        started, release = Event(), Event()
+        visited = []
+        def inventory(project, video, cancelled):
+            visited.append(video)
+            if video == 'alpha':
+                started.set()
+                if not release.wait(5):
+                    raise TimeoutError('Test did not release video scan')
+            return _local_video_files(project, video, cancelled)
+        with patch('core.annotation_work._local_video_files', inventory):
+            try:
+                browser.refresh()
+                deadline = time.monotonic() + 5
+                while not started.is_set() or 'beta' not in browser.index['videos']:
+                    QTest.qWait(10)
+                    self.assertLess(time.monotonic(), deadline)
+                QTest.qWait(150)
+                self.assertEqual(visited, ['beta', 'alpha'])
+                self.assertIsNotNone(browser.worker)
+                self.assertIn('1/2 videos', browser.note.text())
+                self.assertTrue(browser.finish.isEnabled())
+                self.assertTrue(window.video_list.isEnabled())
+                rows = {window.video_list.item(i).data(Qt.ItemDataRole.UserRole): window.video_list.item(i)
+                        for i in range(window.video_list.count())}
+                self.assertIn('Hive: Shared mask', rows['beta'].text())
+                self.assertIn('Hive: Loading...', rows['alpha'].text())
+                window.video_list.itemClicked.emit(rows['alpha'])
+                self.assertEqual(window.current_video_id, 'alpha')
+            finally:
+                release.set()
+            self.settle(browser)
+
+    def test_task_change_drops_stale_incremental_results(self):
+        window = self.make_window(self.source)
+        browser = window.annotation_work
+        browser.filters.task.setCurrentIndex(browser.filters.task.findData('hive'))
+        old_request = browser.scan_context()
+        old_entry = local_index(self.source, video='alpha', task='hive')['videos']['alpha']
+        browser.filters.task.setCurrentIndex(browser.filters.task.findData('bee'))
+        browser.video_loaded(old_request, 'alpha', old_entry)
+        self.assertNotIn('alpha', browser.index['videos'])
+        self.settle(browser)
+        self.assertEqual(set(browser.index['videos']['alpha']['categories']), {'bee'})
+        self.assertIn('Bee:', window.video_list.item(0).text())
+
+    def test_completion_tooltip_explains_assigned_uploads_and_local_only_completion(self):
+        self.choices['alpha']['task'] = 'hive'
+        save_assignments(self.source, self.configuration, self.coordinator, self.choices,
+                         read_assignments(self.view())['revision'])
+        window = self.make_window(self.download())
+        browser = window.annotation_work
+        self.settle(browser)
+        tip = browser.finish.toolTip()
+        self.assertIn('whole video', tip)
+        self.assertIn('queued for automatic upload', tip)
+        self.assertIn('offline', tip)
+        self.assertIn('all required work', tip)
+        self.assertIn('director review', tip)
+        self.assertNotIn('Does not approve imported frames or submit', tip)
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
+            browser.finish.click()
+        self.settle(browser)
+        self.assertIn('unfinished', browser.finish.toolTip())
+        browser.mark_dirty()
+        self.assertEqual(browser.finish.text(), 'Mark Finished')
+        self.assertNotIn('unfinished', browser.finish.toolTip())
+        window.load_project(self.source)
+        browser.filters.task.setCurrentIndex(browser.filters.task.findData('bee'))
+        self.settle(browser)
+        self.assertIn('current frame', browser.finish.toolTip())
+        self.assertIn('does not automatically upload', browser.finish.toolTip())
 
     def test_assignment_filters_are_category_specific_and_clear_hidden_checks(self):
         dialog = AssignmentManagerDialog(self.source, self.configuration, self.coordinator)
