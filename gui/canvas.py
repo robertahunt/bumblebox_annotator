@@ -22,6 +22,8 @@ import time
 from core.mask_editing import enclosed_mask_region
 from core.mask_geometry import MaskGeometryCache, measure_mask
 from core.instance_colors import contrasting_instance_colors
+from gui.keypoint_layer import KeypointLayer
+from core import keypoints as keypoints_module
 
 
 class OutwardBBoxRectItem(QGraphicsRectItem):
@@ -243,8 +245,14 @@ class ImageCanvas(QGraphicsView):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._create_brush_size_overlay()
         
+        # Optional keypoints: inactive until a project keypoint config is set.
+        self.keypoint_layer = KeypointLayer(self)
+
     def keyPressEvent(self, event):
         """Handle key press events"""
+        if self.current_tool == 'keypoint' and self.keypoint_layer.handle_key(event):
+            event.accept()
+            return
         if self.current_tool == 'no_draw_zone':
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self._finish_no_draw_polygon()
@@ -1129,6 +1137,8 @@ class ImageCanvas(QGraphicsView):
         self._last_brush_cursor_pos = None
         self._set_default_cursor_for_current_tool()
         self.scene.clear()
+        self.keypoint_layer.forget_items()
+        self.keypoint_layer.reset_for_frame()
         self.scene.setSceneRect(QRectF())
         self.current_image = None
         self.image_path = None
@@ -1282,6 +1292,8 @@ class ImageCanvas(QGraphicsView):
             self._remove_dimension_label('bbox_dimension_label_item')
         if previous_tool == 'measure' and tool_name != 'measure':
             self.is_drawing = False
+        if previous_tool == 'keypoint' and tool_name != 'keypoint':
+            self.keypoint_layer.on_tool_left()
         
         self.current_tool = tool_name
         
@@ -1307,6 +1319,8 @@ class ImageCanvas(QGraphicsView):
                 self.setCursor(Qt.CursorShape.CrossCursor)
             elif tool_name == 'measure':
                 self.setCursor(Qt.CursorShape.CrossCursor)
+            elif tool_name == 'keypoint':
+                self.setCursor(Qt.CursorShape.CrossCursor)
 
         if (
             tool_name == 'bbox' and
@@ -1319,6 +1333,9 @@ class ImageCanvas(QGraphicsView):
 
     def mouseDoubleClickEvent(self, event):
         """Treat brush/eraser double-clicks as regular taps for switch counting."""
+        if self.current_tool == 'keypoint' and self.keypoint_layer.enabled:
+            self.mousePressEvent(event)  # quick successive keypoint clicks
+            return
         if (
             self.current_tool == 'no_draw_zone' and
             event.button() == Qt.MouseButton.LeftButton
@@ -1351,6 +1368,11 @@ class ImageCanvas(QGraphicsView):
     def mousePressEvent(self, event):
         """Handle mouse press"""
         if self.current_image is None:
+            return
+
+        if self.current_tool == 'keypoint' and self.keypoint_layer.handle_mouse_press(
+                event, self.mapToScene(event.pos())):
+            event.accept()
             return
 
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -1823,7 +1845,8 @@ class ImageCanvas(QGraphicsView):
         old_metadata = self.annotation_metadata.get(old_instance_id, {})
         skip_keys = {
             'marker', 'bbox', 'bbox_only', 'mask', 'mask_rle', 'mask_id',
-            'instance_id', 'id', 'label', 'area'
+            'instance_id', 'id', 'label', 'area',
+            'keypoints',  # one bee's landmarks; they stay with the original instance
         }
         metadata = {
             key: value
@@ -2007,6 +2030,10 @@ class ImageCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.pos())
         self._queue_brush_cursor_preview(scene_pos)
 
+        if self.current_tool == 'keypoint' and self.keypoint_layer.handle_mouse_move(event, scene_pos):
+            event.accept()
+            return
+
         if self.current_tool == 'no_draw_zone':
             if self.no_draw_polygon_points:
                 self._update_no_draw_polygon_preview(scene_pos)
@@ -2157,6 +2184,11 @@ class ImageCanvas(QGraphicsView):
     def mouseReleaseEvent(self, event):
         """Handle mouse release"""
         if self.current_image is None:
+            return
+
+        if self.current_tool == 'keypoint' and self.keypoint_layer.handle_mouse_release(
+                event, self.mapToScene(event.pos())):
+            event.accept()
             return
 
         if self._pending_switch_tap is not None:
@@ -3390,6 +3422,7 @@ class ImageCanvas(QGraphicsView):
                 self._draw_bboxes_from_metadata()
                 self._draw_or_update_editing_bbox()
             self._sync_editing_mask_visibility()
+            self.keypoint_layer.redraw()  # bbox-only instances may carry keypoints
             return
         
         # Collect all instance IDs from all masks
@@ -3469,6 +3502,7 @@ class ImageCanvas(QGraphicsView):
         self.update_instance_labels()
         self.update_aruco_labels()
         self._sync_editing_mask_visibility()
+        self.keypoint_layer.redraw()
     
     def _draw_bboxes(self):
         """Draw bounding boxes for all instances from masks and metadata"""
@@ -4181,6 +4215,7 @@ class ImageCanvas(QGraphicsView):
         self._bee_display_colors.clear()
         self.next_mask_id = 1
         self.annotation_metadata = {}  # Clear metadata
+        self.keypoint_layer.reset_for_frame()
         
         # Clear selection border
         if self.selection_border_item:
@@ -4463,6 +4498,15 @@ class ImageCanvas(QGraphicsView):
                 if new_id in self.annotation_metadata:
                     if 'marker' in old_metadata and 'marker' not in self.annotation_metadata[new_id]:
                         self.annotation_metadata[new_id]['marker'] = old_metadata['marker']
+                    # Keypoints: keep new_id's points, fill names it lacks from old_id.
+                    if keypoints_module.get_keypoints(old_metadata):
+                        keypoints_module.set_keypoints(
+                            self.annotation_metadata[new_id],
+                            keypoints_module.merge_keypoints(
+                                keypoints_module.get_keypoints(self.annotation_metadata[new_id]),
+                                keypoints_module.get_keypoints(old_metadata),
+                            ),
+                        )
             
             # Keep color of new_id
             if old_id in self.mask_colors:
@@ -4502,6 +4546,7 @@ class ImageCanvas(QGraphicsView):
             self.selected_mask_idx = new_id
         if self.editing_instance_id == old_id:
             self.editing_instance_id = new_id
+        self.keypoint_layer.on_instance_renamed(old_id, new_id)
         
         return True
     

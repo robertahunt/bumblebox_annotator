@@ -46,6 +46,9 @@ from .project_sync_dialog import (ProjectSyncDialog, SyncProgressDialog, choose_
                                   show_publication_review, TransferConfirmationDialog)
 from .workflow_help import (ASSIGNED_LABEL, BACKUP_LABEL, HELP, RESTORE_LABEL, UPDATE_LABEL,
                             add_help_row)
+from .keypoint_toolbar import KeypointToolbar
+from .keypoint_settings_dialog import KeypointSettingsDialog
+from core import keypoints as keypoints_module
 from .project_import_dialog import ProjectImportDialog
 from .annotation_policy_dialog import AnnotationPolicyDialog, ImportedFrameReviewDialog
 from core.annotation_policy import (category_policies, policy_needs_confirmation,
@@ -441,6 +444,12 @@ class MainWindow(QMainWindow):
         self.hive_chamber_toolbar.nectar_inference_requested.connect(self.run_nectar_inference)
         self.hive_chamber_toolbar.both_inference_requested.connect(self.run_hive_chamber_both)
         
+        # Optional keypoint workflow: hidden and inert unless the project turns it on.
+        self.keypoint_toolbar = KeypointToolbar(self.canvas.keypoint_layer, self)
+        self.keypoint_toolbar.tool_changed.connect(self.on_keypoint_tool_requested)
+        self.keypoint_toolbar.settings_requested.connect(self.show_keypoint_settings)
+        self.keypoint_toolbar.hide()
+
         # Create layout
         central_widget = QWidget()
         layout = QVBoxLayout(central_widget)
@@ -450,6 +459,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.yolo_instance_focused_toolbar)
         layout.addWidget(self.yolo_bbox_toolbar)
         layout.addWidget(self.hive_chamber_toolbar)
+        layout.addWidget(self.keypoint_toolbar)
         self.policy_label = QLabel('Annotation policy: no project')
         self.policy_label.setWordWrap(True)
         layout.addWidget(self.policy_label)
@@ -1170,6 +1180,15 @@ class MainWindow(QMainWindow):
         self.hive_chamber_toolbar_action.triggered.connect(self.toggle_hive_chamber_toolbar)
         toolbars_menu.addAction(self.hive_chamber_toolbar_action)
 
+        # Keypoint Toolbar toggle (available only in projects that use keypoints)
+        self.keypoint_toolbar_action = QAction("&Keypoint Toolbar", self)
+        self.keypoint_toolbar_action.setCheckable(True)
+        self.keypoint_toolbar_action.setChecked(False)
+        self.keypoint_toolbar_action.setEnabled(False)
+        self.keypoint_toolbar_action.setToolTip("Turn on keypoints in Project > Keypoints...")
+        self.keypoint_toolbar_action.triggered.connect(self.toggle_keypoint_toolbar)
+        toolbars_menu.addAction(self.keypoint_toolbar_action)
+
         toolbars_menu.addSeparator()
 
         hide_visible_toolbars_action = QAction("&Hide Checked Visible Toolbars", self)
@@ -1187,6 +1206,10 @@ class MainWindow(QMainWindow):
         policy_action = QAction('Annotation Policy...', self)
         policy_action.triggered.connect(self.show_annotation_policy)
         project_menu.addAction(policy_action)
+        keypoints_action = QAction('Keypoints...', self)
+        keypoints_action.setToolTip('Optional per-bee keypoints (head, thorax, abdomen tip, ...)')
+        keypoints_action.triggered.connect(self.show_keypoint_settings)
+        project_menu.addAction(keypoints_action)
         review_action = QAction('Imported Frame Review...', self)
         review_action.triggered.connect(self.show_import_reviews)
         project_menu.addAction(review_action)
@@ -1927,6 +1950,66 @@ class MainWindow(QMainWindow):
         else:
             self.hive_chamber_toolbar.hide()
 
+    def toggle_keypoint_toolbar(self):
+        """Toggle visibility of the optional keypoint toolbar."""
+        if self.keypoint_toolbar_action.isChecked() and self.canvas.keypoint_layer.enabled:
+            self.keypoint_toolbar.show()
+        else:
+            self.keypoint_toolbar.hide()
+            if self.canvas.current_tool == 'keypoint':
+                self.toolbar.set_tool('pan')
+
+    def on_keypoint_tool_requested(self, tool_name):
+        """Place Keypoints on/off; turning it off returns to Pan."""
+        if tool_name == 'keypoint':
+            self.on_tool_changed('keypoint')
+        else:
+            self.toolbar.set_tool('pan')
+
+    def _apply_project_keypoint_config(self):
+        """Turn the keypoint layer and toolbar on or off for the open project."""
+        info = getattr(self.annotation_manager, 'project_info', None) or {}
+        config = keypoints_module.config_from_project_info(info.get('project_info', info))
+        was_enabled = self.canvas.keypoint_layer.enabled
+        self.canvas.keypoint_layer.set_config(config)
+        self.keypoint_toolbar_action.setEnabled(config is not None)
+        if config is None:
+            self.keypoint_toolbar_action.setChecked(False)
+            self.keypoint_toolbar.hide()
+            if self.canvas.current_tool == 'keypoint':
+                self.toolbar.set_tool('pan')
+        elif not was_enabled:
+            self.keypoint_toolbar_action.setChecked(True)
+            self.keypoint_toolbar.show()
+
+    def show_keypoint_settings(self, checked=False):
+        """Project > Keypoints...: turn keypoints on/off and choose their names."""
+        if not self.project_path:
+            QMessageBox.warning(self, 'No Project', 'Please open a project first.')
+            return
+        try:
+            info = read_project_info(self.project_path)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Keypoints Unavailable', str(exc))
+            return
+        stored = keypoints_module.stored_project_config(info)
+        enabled = keypoints_module.config_from_project_info(info.get('project_info', info)) is not None
+        dialog = KeypointSettingsDialog(stored, enabled, self)
+        if not dialog.exec() or dialog.result_config() is None:
+            return
+        config, enabled = dialog.result_config()
+        try:
+            updated = keypoints_module.save_project_config(self.project_path, config, enabled)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Keypoint Settings Not Saved', str(exc))
+            return
+        self.annotation_manager.project_info = updated.get('project_info', updated)
+        self.coco_export_dirty = True
+        self._apply_project_keypoint_config()
+        self.status_label.setText(
+            f"Keypoints on: {', '.join(config.names)}" if enabled else
+            "Keypoints off for this project (saved keypoints are kept)")
+
     def _optional_top_toolbar_entries(self):
         """Return optional top toolbars controlled by the Toolbars menu."""
         return [
@@ -1939,7 +2022,7 @@ class MainWindow(QMainWindow):
             ),
             ("YOLO bbox", self.yolo_bbox_toolbar, self.yolo_bbox_toolbar_action),
             ("Hive/Chamber/Pollen/Nectar", self.hive_chamber_toolbar, self.hive_chamber_toolbar_action),
-        ]
+        ]  # The keypoint toolbar is an annotation tool, not model assistance: kept separate.
 
     def hide_checked_visible_top_toolbars(self):
         """Hide optional top toolbars that are both checked and currently visible."""
@@ -4936,6 +5019,7 @@ class MainWindow(QMainWindow):
             self._reset_done_counter_baseline()
             self.add_recent_project(self.project_path)
             self._update_annotation_policy_label()
+            self._apply_project_keypoint_config()
             self._update_import_review_controls()
             self.workflow.project_loaded()
             self.show_annotation_policy(automatic=True)
@@ -5783,6 +5867,16 @@ class MainWindow(QMainWindow):
         # When switching to SAM2 tools, uncheck annotation toolbar buttons
         if tool_name in ['sam2_prompt', 'sam2_box']:
             self.toolbar.uncheck_all_tools()
+
+        # The keypoint tool lives on its own toolbar.
+        if tool_name == 'keypoint':
+            self.toolbar.uncheck_all_tools()
+            self.keypoint_toolbar.set_tool_checked(True)
+            self.status_label.setText(
+                "Place Keypoints: click a bee, then its keypoints in order; drag to move, "
+                "right-click for hidden/delete, Esc finishes the bee")
+        else:
+            self.keypoint_toolbar.uncheck_tools()
 
         if tool_name == 'no_draw_zone':
             self.status_label.setText(
@@ -10525,10 +10619,14 @@ class MainWindow(QMainWindow):
             
     def undo(self):
         """Undo last action"""
+        if self.canvas.current_tool == 'keypoint' and self.canvas.keypoint_layer.undo():
+            return
         self.canvas.undo()
         
     def redo(self):
         """Redo last undone action"""
+        if self.canvas.current_tool == 'keypoint' and self.canvas.keypoint_layer.redo():
+            return
         self.canvas.redo()
         
     def load_frames_from_project(self):

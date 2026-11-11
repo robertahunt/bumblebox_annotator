@@ -120,6 +120,10 @@ def _mask_evidence(source, name, category, *, shared=False):
             area = int(np.count_nonzero(binary))
             digest = hashlib.sha256(binary.tobytes()).hexdigest()
         if area:
+            # Keypoint edits also change a finished frame; rows without keypoints
+            # keep their existing evidence (and so their completion signature).
+            if row.get('keypoints'):
+                digest += ':keypoints:' + _hash(row['keypoints'])
             geometry.append(digest)
     return sorted(geometry)
 

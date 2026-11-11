@@ -14,6 +14,7 @@ from core.annotation_scope import frame_categories, read_project_info, merge_ann
 from core.coco_masks import encode_mask, decode_segmentation
 from core.annotation_policy import category_policies
 from core.import_review import require_reviewed, selected_frames, export_review_metadata
+from core import keypoints as keypoints_module
 
 
 def export_coco_per_video(project_path: Path, video_ids: List[str], 
@@ -52,6 +53,8 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
     project_info = read_project_info(project_path)
     per_frame_categories = frame_categories(project_info)
     policies = category_policies(project_info)
+    keypoint_config = keypoints_module.config_from_project_info(
+        project_info.get('project_info', project_info))  # None unless the project uses keypoints
     require_reviewed(project_path, selected_frames(project_path, video_ids))
     
     # Create category name to ID mapping
@@ -68,6 +71,8 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
             'supercategory': supercategories.get(class_name, 'object')
         })
     
+    keypoints_module.coco_add_category_fields(categories, keypoint_config)
+
     # Create output directory for this split
     output_dir = project_path / 'annotations' / 'coco' / split_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -111,6 +116,9 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
             'annotations': []
         }
         
+        if keypoint_config is not None:
+            coco_data['info']['keypoints'] = keypoint_config.to_dict()
+
         # Load annotations for this video (PNG+JSON format for masks, bbox folder for bbox-only)
         video_png_dir = project_path / 'annotations/png' / video_name
         video_json_dir = project_path / 'annotations/json' / video_name
@@ -334,6 +342,7 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                         coco_ann['track_id'] = ann['mask_id']
                         coco_ann['instance_id'] = ann['mask_id']
                     
+                    keypoints_module.coco_add_instance_keypoints(coco_ann, ann, keypoint_config)
                     coco_data['annotations'].append(coco_ann)
                     annotation_id += 1
                 
@@ -377,6 +386,7 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                         if 'source' in ann:
                             coco_ann['source'] = ann['source']
                         
+                        keypoints_module.coco_add_instance_keypoints(coco_ann, ann, keypoint_config)
                         coco_data['annotations'].append(coco_ann)
                         annotation_id += 1
             
@@ -429,6 +439,8 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
     project_info = read_project_info(project_path)
     per_frame_categories = frame_categories(project_info)
     policies = category_policies(project_info)
+    keypoint_config = keypoints_module.config_from_project_info(
+        project_info.get('project_info', project_info))  # None unless the project uses keypoints
     require_reviewed(project_path, selected_frames(project_path, video_ids))
 
     # Create category name to ID mapping
@@ -463,6 +475,10 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
             'supercategory': 'insect'
         })
     
+    keypoints_module.coco_add_category_fields(coco_data['categories'], keypoint_config)
+    if keypoint_config is not None:
+        coco_data['info']['keypoints'] = keypoint_config.to_dict()
+
     image_id = 1
     annotation_id = 1
     video_id_map = {}  # Map video_name -> video_id_int
@@ -703,6 +719,7 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
                         coco_ann['track_id'] = track_id
                         coco_ann['instance_id'] = ann['mask_id']  # Local to video
                     
+                    keypoints_module.coco_add_instance_keypoints(coco_ann, ann, keypoint_config)
                     coco_data['annotations'].append(coco_ann)
                     annotation_id += 1
                 
@@ -747,6 +764,7 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
                         if 'source' in ann:
                             coco_ann['source'] = ann['source']
                         
+                        keypoints_module.coco_add_instance_keypoints(coco_ann, ann, keypoint_config)
                         coco_data['annotations'].append(coco_ann)
                         annotation_id += 1
             

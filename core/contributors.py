@@ -38,8 +38,9 @@ def new_session(name, contributor_id=None, *, device=None):
 
 def annotation_digest(annotation):
     """Compare scientific content, ignoring derived/display/attribution fields."""
+    # 'keypoints' counts only when present, so digests of rows without them are unchanged.
     content = {key: annotation[key] for key in
-               ('category', 'marker', 'aruco_id', 'track_id', 'source', 'confidence')
+               ('category', 'marker', 'aruco_id', 'track_id', 'source', 'confidence', 'keypoints')
                if key in annotation}
     content.setdefault('category', 'bee')
     mask = annotation.get('mask')
