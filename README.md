@@ -48,6 +48,12 @@ bring bees at the edge of the image toward the center of the screen. Brush and
 eraser strokes cannot start in the margin, and image/mask dimensions stay
 unchanged. **Fit to Window** (F) recenters and fits the image, not the margin.
 
+Assignments can use **Bees + Hive (nest)** to request both mask types together.
+**Mark Finished** checks off both, using the project's saved scope for each:
+for example, frame-specific bees and a video-wide hive mask. Automatic review
+submission waits for both types on every assigned frame. Update all annotating
+computers before using this task; older versions do not recognize it.
+
 For terminal use, the existing entry point remains available:
 
 ```bash

@@ -11,7 +11,7 @@ import numpy as np
 from core.annotation import AnnotationManager
 from core.annotation_policy import default_policy
 from core.annotation_work import (build_index, local_index, mark_finished, matches, published_index,
-                                  summarize, unit_for, Sources)
+                                  summarize, unit_for, Sources, task_categories, task_label)
 from core.assigned_work import (catalog, latest_snapshot, publish_work, read_assignments,
                                save_assignments, workspace)
 from core.contributors import new_session
@@ -143,6 +143,40 @@ class AnnotationWorkTests(unittest.TestCase):
         self.assertEqual(summarize(self.entry(), 'queen_brood', [0])['presence'], 'none')
         self.manager.save_frame_annotations(self.project, 'video', 0, [annotation(8, 'brood_late')])
         self.assertEqual(summarize(self.entry(), 'brood', [0])['state'], 'changed')
+
+    def test_bee_hive_task_tracks_only_both_categories_at_their_saved_scopes(self):
+        self.shared()
+        self.assertEqual(task_categories('bee_hive'), ('bee', 'hive'))
+        self.assertEqual(task_label('bee_hive'), 'Bees + Hive (nest)')
+        mark_finished(self.project, 'video', 0, 'bee', self.actor)
+        self.assertNotEqual(summarize(self.entry(), 'bee_hive', [0])['state'], 'finished')
+        mark_finished(self.project, 'video', 0, 'bee_hive', self.actor)
+        entry = self.entry()
+        summary = summarize(entry, 'bee_hive', [0])
+        self.assertEqual(summary['state'], 'finished')
+        self.assertTrue(summary['mixed_scope'])
+        self.assertEqual(summary['detail'], 'Frame-specific: Bee; shared across video: Hive')
+        self.assertNotEqual(summarize(entry, 'bee_hive', [2])['state'], 'finished')
+        self.assertEqual(summarize(entry, 'hive', [2])['state'], 'finished')
+        self.assertEqual(set(_read_json(self.project / 'annotations/work/video/frame_000000.json')['categories']), {'bee'})
+        self.assertEqual(set(_read_json(self.project / 'annotations/work/video/video_work.json')['categories']), {'hive'})
+        self.manager.save_frame_annotations(self.project, 'video', 0, [annotation(1), annotation(8, 'brood_middle')])
+        self.assertEqual(summarize(self.entry(), 'bee_hive', [0])['state'], 'finished')
+        hive = annotation(7, 'hive')
+        hive['mask'][0, 0] = 255
+        self.manager.save_video_annotations(self.project, 'video', [hive])
+        self.assertEqual(summarize(self.entry(), 'bee_hive', [0])['state'], 'changed')
+        mark_finished(self.project, 'video', 0, 'bee_hive', self.actor, complete=False)
+        self.assertEqual(summarize(self.entry(), 'bee_hive', [0])['state'], 'not_checked')
+
+    def test_bee_hive_task_respects_frame_specific_hive_policy(self):
+        mark_finished(self.project, 'video', 0, 'bee_hive', self.actor)
+        entry = self.entry()
+        self.assertEqual(summarize(entry, 'bee_hive', [0])['state'], 'finished')
+        self.assertFalse(summarize(entry, 'bee_hive', [0])['mixed_scope'])
+        self.assertNotEqual(summarize(entry, 'bee_hive', [2])['state'], 'finished')
+        self.assertEqual(set(_read_json(self.project / 'annotations/work/video/frame_000000.json')['categories']),
+                         {'bee', 'hive'})
 
     def test_corrupt_missing_and_legacy_sources_are_unknown_not_absent(self):
         self.shared()
@@ -308,6 +342,20 @@ class PublishedWorkTests(unittest.TestCase):
     view = assigned.AssignedWorkTests.view
     download = assigned.AssignedWorkTests.download
     status = assigned.AssignedWorkTests.status
+
+    def test_combined_task_requires_both_categories_before_auto_submission(self):
+        data = read_assignments(self.view())
+        self.choices['alpha'].update(task='bee_hive', frames=[0])
+        save_assignments(self.source, self.configuration, self.coordinator, self.choices, data['revision'])
+        local = self.download()
+        self.assertEqual(workspace(local)['assignments']['alpha']['task'], 'bee_hive')
+        mark_finished(local, 'alpha', 0, 'bee', self.alex)
+        result = publish_work(local, self.configuration, self.alex, auto_ready=True)
+        self.assertNotIn('alpha', result['ready'])
+        mark_finished(local, 'alpha', 0, 'hive', self.alex)
+        result = publish_work(local, self.configuration, self.alex, auto_ready=True)
+        self.assertIn('alpha', result['ready'])
+        self.assertEqual(self.status()[0], 'Ready for Review')
 
     def test_publication_embeds_index_and_catalog_does_not_open_images(self):
         snapshot, _ = latest_snapshot(self.view())

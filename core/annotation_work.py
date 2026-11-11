@@ -18,10 +18,12 @@ from core.contributors import utc_now
 VERSION = 1
 TASKS = {c: (c,) for c in CATEGORIES}
 TASKS.update(brood=STANDARD_BROOD_CATEGORIES, queen_brood=QUEEN_BROOD_CATEGORIES)
+TASKS['bee_hive'] = ('bee', 'hive')
 
 
 def task_label(task):
     return {'brood': 'Brood (all stages)', 'queen_brood': 'Queen brood (all stages)',
+            'bee_hive': 'Bees + Hive (nest)',
             None: 'All mask types'}.get(task, category_label(task))
 
 
@@ -390,7 +392,10 @@ def summarize(entry, task, frames=None):
     frames = list(entry['frames'] if frames is None else frames)
     if not frames or not set(frames) <= set(entry['frames']):
         return summarize(None, task)
-    shared = all(entry['categories'][c]['scope'] == 'video' for c in categories)
+    shared_categories = [c for c in categories if entry['categories'][c]['scope'] == 'video']
+    frame_categories = [c for c in categories if c not in shared_categories]
+    shared = not frame_categories
+    mixed_scope = bool(shared_categories and frame_categories)
     # Display summaries never use completion signatures. In particular, do not
     # hash the same empty policy for every unannotated frame/category.
     def display_unit(category, frame):
@@ -413,10 +418,13 @@ def summarize(entry, task, frames=None):
                  'finished': 'Finished' if present else 'Checked: none present', 'changed': 'Changed; recheck',
                  'not_started': 'Not started', 'not_checked': 'Not checked' if not finished else f'{finished}/{total} finished'}[state]
     detail = 'Shared across video' if shared else 'Frame-specific'
+    if mixed_scope:
+        detail = ('Frame-specific: ' + ', '.join(category_label(c) for c in frame_categories) +
+                  '; shared across video: ' + ', '.join(category_label(c) for c in shared_categories))
     if unknown:
         detail = '; '.join(sorted({u['error'] for row in units for u in row if u.get('error')})) or 'Mask data unavailable'
     return dict(presence=presence, state=state, mask_text=mask_text, work_text=work_text,
-                finished=finished, total=total, shared=shared, detail=detail)
+                finished=finished, total=total, shared=shared, mixed_scope=mixed_scope, detail=detail)
 
 
 def matches(summary, show='all', presence='any'):

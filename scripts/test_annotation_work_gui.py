@@ -353,6 +353,25 @@ class AnnotationWorkGuiTests(unittest.TestCase):
         window.video_dock.grab().save('/tmp/bumblebox-work-sidebar.png')
         self.assertLess(browser.filters.geometry().bottom(), window.video_list.geometry().top())
 
+    def test_combined_assigned_task_opens_and_marks_both_categories_finished(self):
+        data = read_assignments(self.view())
+        self.choices['alpha'].update(task='bee_hive', frames=[0])
+        save_assignments(self.source, self.configuration, self.coordinator, self.choices, data['revision'])
+        window = self.make_window(self.download())
+        browser = window.annotation_work
+        self.settle(browser)
+        self.assertEqual(browser.filters.task.currentData(), 'bee_hive')
+        self.assertIn('shared across video: Hive', browser.finish.toolTip())
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes) as question:
+            browser.finish.click()
+        self.settle(browser)
+        self.warnings.assert_not_called()
+        self.assertIn('Shared-mask completion applies to the whole video', question.call_args.args[2])
+        self.assertEqual(browser.finish.text(), 'Reopen Work')
+        entry = local_index(window.project_path)['videos']['alpha']
+        for task in ('bee', 'hive', 'bee_hive'):
+            self.assertEqual(summarize(entry, task, [0])['state'], 'finished')
+
     def test_completion_saves_and_reopens_without_submission(self):
         window = self.make_window(self.download())
         browser = window.annotation_work

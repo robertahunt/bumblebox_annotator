@@ -18,7 +18,7 @@ from gui.video_browsing import SORT_ROLE
 def task_combo(parent=None):
     combo = QComboBox(parent)
     combo.addItem('All mask types', None)
-    for task in ('hive', 'bee', 'pollen', 'nectar', 'chamber', 'brood', 'queen_brood'):
+    for task in ('hive', 'bee', 'bee_hive', 'pollen', 'nectar', 'chamber', 'brood', 'queen_brood'):
         combo.addItem(task_label(task), task)
     for task in TASKS:
         if task.startswith(('brood_', 'queen_brood_')):
@@ -387,6 +387,8 @@ class AnnotationWorkBrowser(QObject):
         scope = 'the whole video (shared mask)' if summary.get('shared') else 'the current frame'
         text = (f'Mark {task_label(task)} unfinished for {scope}.' if reopening else
                 f'Record that you checked {task_label(task)} for {scope}, including if none is present.')
+        if summary.get('mixed_scope'):
+            text += '\n' + summary['detail'] + '. Shared-mask completion applies to the whole video.'
         if state:
             text += '\nSaved changes are queued for automatic upload; offline work waits for a connection.'
             if state.get('assignments', {}).get(video, {}).get('task'):
@@ -418,6 +420,8 @@ class AnnotationWorkBrowser(QObject):
                     f'Confirm that you checked and no {task_label(task).lower()} is present?')
             if summary.get('shared'):
                 text += '\n\nThis records the shared mask for the whole video, not just this frame.'
+            elif summary.get('mixed_scope'):
+                text += '\n\n' + summary['detail'] + '. Shared-mask completion applies to the whole video.'
             if summary['state'] == 'needs_review':
                 text += '\n\nImported-frame reviews remain required separately.'
             if QMessageBox.question(w, 'Annotation Work', text,
