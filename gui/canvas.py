@@ -1952,6 +1952,19 @@ class ImageCanvas(QGraphicsView):
         )
         menu.addAction(neighbor_fill_action)
 
+        if self.editing_instance_category == 'hive':
+            bee_fill_action = QAction("Fill to Bee Masks", self)
+            bee_fill_action.setEnabled(fill_action.isEnabled())
+            bee_fill_action.setToolTip(
+                "Fill visible hive up to bee masks, including hidden bees. "
+                "Bee pixels are excluded; this does not reconstruct hive behind bees."
+            )
+            bee_fill_action.triggered.connect(
+                lambda checked=False, pos=QPointF(scene_pos):
+                self.fill_enclosed_region_at(pos, use_bee_masks=True)
+            )
+            menu.addAction(bee_fill_action)
+
         subtract_action = QAction("Subtract Filled Area", self)
         subtract_action.setEnabled(
             self.editing_mask is not None and self.editing_instance_id > 0
@@ -2598,12 +2611,14 @@ class ImageCanvas(QGraphicsView):
         
         # Only emit annotation_changed for final stroke (on release) to avoid slowdown
 
-    def fill_enclosed_region_at(self, scene_pos, *, use_neighbor_masks=False):
+    def fill_enclosed_region_at(self, scene_pos, *, use_neighbor_masks=False,
+                                use_bee_masks=False):
         """Fill the enclosed blank region under the cursor in the editing mask.
 
         The current instance's nonzero pixels act as the boundary. Optionally,
         other same-category masks also act as boundaries, regardless of display
-        visibility. Bounding boxes and other categories do not block filling.
+        visibility. Hive editing can explicitly use bee masks as boundaries too.
+        Bounding boxes never block filling; existing overlap pixels are kept.
         If the region reaches the image edge, no fill is applied.
         """
         if self.current_image is None:
@@ -2615,6 +2630,10 @@ class ImageCanvas(QGraphicsView):
 
         if self.editing_mask is None or self.editing_instance_id <= 0:
             print("Fill skipped: no active brush-edit instance.")
+            return False
+
+        if use_bee_masks and self.editing_instance_category != 'hive':
+            print("Fill skipped: select a hive instance to fill to bee masks.")
             return False
 
         x = int(scene_pos.x())
@@ -2633,9 +2652,13 @@ class ImageCanvas(QGraphicsView):
             neighbors = self._get_mask_array_by_category(self.editing_instance_category)
             if neighbors is not None:
                 boundary_mask = (neighbors > 0) & (neighbors != self.editing_instance_id)
-                if boundary_mask[y, x]:
-                    print("Fill skipped: click in the unfilled area, not on a neighboring mask.")
-                    return False
+        if use_bee_masks:
+            bees = self._get_mask_array_by_category('bee')
+            if bees is not None:
+                boundary_mask = bees > 0 if boundary_mask is None else boundary_mask | (bees > 0)
+        if boundary_mask is not None and boundary_mask[y, x]:
+            print("Fill skipped: click in the unfilled area, not on a boundary mask.")
+            return False
 
         fill_region = enclosed_mask_region(
             self.editing_mask, (x, y), protected_mask=self.no_draw_zone_mask,

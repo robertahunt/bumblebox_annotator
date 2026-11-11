@@ -347,6 +347,121 @@ class EditingToolTests(unittest.TestCase):
             action = next(a for a in menu.actions() if a.text() == 'Fill to Neighboring Masks')
             self.assertFalse(action.isEnabled())
 
+    def make_hive_bee_fill_canvas(self):
+        canvas = self.make_neighbor_fill_canvas('hive')
+        canvas.bee_mask = canvas.hive_mask.copy()
+        canvas.hive_mask.fill(0)
+        canvas.annotation_metadata[2]['category'] = 'bee'
+        return canvas
+
+    def test_hive_fill_to_bees_preserves_bees_and_supports_undo_redo_and_commit(self):
+        canvas = self.make_hive_bee_fill_canvas()
+        self.add_square_zone(canvas)
+        canvas.editing_mask[45, 65] = 255  # Keep any existing hive behind a bee.
+        canvas.editing_mask[85:90, 85:90] = 255
+        original = canvas.editing_mask.copy()
+        bees = canvas.bee_mask.copy()
+        changes = []
+        canvas.annotation_changed.connect(lambda: changes.append(True))
+        self.assertFalse(canvas.fill_enclosed_region_at(QPointF(35, 35)))
+        self.assertFalse(canvas.fill_enclosed_region_at(QPointF(35, 35), use_neighbor_masks=True))
+        self.assertTrue(canvas.fill_enclosed_region_at(QPointF(35, 35), use_bee_masks=True))
+        expected = original.copy()
+        expected[21:79, 21:60] = 255
+        excluded = (bees > 0) | (canvas.no_draw_zone_mask > 0)
+        expected[excluded] = original[excluded]
+        np.testing.assert_array_equal(canvas.editing_mask, expected)
+        np.testing.assert_array_equal(canvas.bee_mask, bees)
+        self.assertEqual(changes, [True])
+        self.assertEqual(len(canvas.brush_undo_stack), 1)
+        self.assertEqual(canvas.editing_instance_category, 'hive')
+        canvas.undo()
+        np.testing.assert_array_equal(canvas.editing_mask, original)
+        np.testing.assert_array_equal(canvas.bee_mask, bees)
+        canvas.redo()
+        np.testing.assert_array_equal(canvas.editing_mask, expected)
+        canvas.commit_editing()
+        np.testing.assert_array_equal(canvas.bee_mask, bees)
+        np.testing.assert_array_equal(canvas.hive_mask > 0, expected > 0)
+        annotations = {ann['mask_id']: ann for ann in canvas.get_annotations()}
+        self.assertEqual(annotations[1]['category'], 'hive')
+        self.assertEqual(annotations[2]['category'], 'bee')
+        np.testing.assert_array_equal(annotations[1]['mask'], expected)
+        np.testing.assert_array_equal(annotations[2]['mask'] > 0, bees > 0)
+
+    def test_hive_fill_uses_hidden_bees_regardless_of_current_creation_category(self):
+        canvas = self.make_hive_bee_fill_canvas()
+        canvas.current_annotation_type = 'pollen'
+        canvas.set_instance_visible(2, 'bee', False)
+        canvas.set_annotation_type_visibility('bee', False)
+        canvas.set_annotation_overlay_visibility(False, False)
+        self.assertTrue(canvas.fill_enclosed_region_at(QPointF(35, 35), use_bee_masks=True))
+        self.assertEqual(canvas.editing_mask[35, 59], 255)
+        self.assertEqual(canvas.editing_mask[45, 50], 0)
+        self.assertFalse(canvas.is_annotation_instance_visible(2, 'bee'))
+
+    def test_hive_fill_rejects_gap_bad_seed_and_other_category(self):
+        canvas = self.make_hive_bee_fill_canvas()
+        changes = []
+        canvas.annotation_changed.connect(lambda: changes.append(True))
+        for point in (QPointF(65, 35), QPointF(20, 20), QPointF(0, 0), QPointF(-1, -1)):
+            self.assertFalse(canvas.fill_enclosed_region_at(point, use_bee_masks=True))
+        canvas.editing_instance_category = 'pollen'
+        self.assertFalse(canvas.fill_enclosed_region_at(QPointF(35, 35), use_bee_masks=True))
+        canvas.editing_instance_category = 'hive'
+        canvas.editing_mask[20, 35] = 0
+        original = canvas.editing_mask.copy()
+        self.assertFalse(canvas.fill_enclosed_region_at(QPointF(35, 35), use_bee_masks=True))
+        np.testing.assert_array_equal(canvas.editing_mask, original)
+        self.assertFalse(canvas.brush_undo_stack)
+        self.assertEqual(changes, [])
+
+    def test_hive_fill_does_not_use_bee_boxes_or_unrelated_mask_categories(self):
+        canvas = self.make_hive_bee_fill_canvas()
+        canvas.pollen_mask = canvas.bee_mask.copy()
+        canvas.bee_mask.fill(0)
+        canvas.annotation_metadata[2] = {'mask_id': 2, 'category': 'bee',
+                                         'bbox_only': True, 'bbox': [60, 20, 20, 60]}
+        self.assertFalse(canvas.fill_enclosed_region_at(QPointF(35, 35), use_bee_masks=True))
+        self.assertFalse(canvas.brush_undo_stack)
+
+    def test_hive_fill_cannot_fill_hole_enclosed_only_by_bees(self):
+        canvas = self.make_hive_bee_fill_canvas()
+        canvas.bee_mask[5:15, 5:15] = 2
+        canvas.bee_mask[6:14, 6:14] = 0
+        self.assertFalse(canvas.fill_enclosed_region_at(QPointF(10, 10), use_bee_masks=True))
+        self.assertFalse(canvas.brush_undo_stack)
+
+    def test_hive_bee_fill_menu_only_offered_for_active_hive_in_brush_and_eraser(self):
+        canvas = self.make_hive_bee_fill_canvas()
+
+        class Event:
+            def pos(self):
+                return QPoint(35, 35)
+
+        for category in CATEGORIES:
+            for tool in ('brush', 'eraser'):
+                with self.subTest(category=category, tool=tool):
+                    canvas.editing_instance_category = category
+                    canvas.current_tool = tool
+                    with patch('gui.canvas.QMenu.exec'), \
+                            patch.object(canvas, 'mapToScene', return_value=QPointF(35, 35)), \
+                            patch.object(canvas, '_event_global_pos', return_value=QPoint(35, 35)), \
+                            patch.object(canvas, 'fill_enclosed_region_at') as fill:
+                        previous = set(canvas.findChildren(QMenu))
+                        canvas._show_brush_context_menu(Event())
+                        menu = next(m for m in canvas.findChildren(QMenu) if m not in previous
+                                    and any(a.text() == 'Fill Enclosed Area' for a in m.actions()))
+                        actions = [a for a in menu.actions() if a.text() == 'Fill to Bee Masks']
+                        self.assertEqual(len(actions), 1 if category == 'hive' else 0)
+                        if actions:
+                            self.assertTrue(actions[0].isEnabled())
+                            self.assertIn('does not reconstruct', actions[0].toolTip())
+                            actions[0].trigger()
+                            fill.assert_called_once_with(QPointF(35, 35), use_bee_masks=True)
+                        else:
+                            fill.assert_not_called()
+
     def test_one_pixel_diagonal_fill_and_subtract_support_undo_redo(self):
         for subtract in (False, True):
             with self.subTest(subtract=subtract):

@@ -84,6 +84,14 @@ region is filled, protected areas remain untouched, and the fill is one undo
 step. Existing brush overlaps are not trimmed. **Fill Enclosed Area** retains
 its original behavior, using only the selected instance's outline.
 
+When editing a hive instance, **Fill to Bee Masks** also lets bee masks complete
+the outline. Right-click the empty hive area enclosed by your outline and the
+bee masks. Bee pixels are excluded (even for hidden bees), and neither the bee
+masks nor existing hive pixels are changed. The fill supports undo/redo and
+protected areas. This labels **visible hive**, not hive hidden behind bees:
+when your project's policy requires the complete hive, fill those occlusion
+gaps separately before marking the annotation finished.
+
 See [importing between projects](docs/project_import.md) to copy selected frames and annotations, including converting frame-specific hive masks into an editable video-wide mask.
 Import previews disclose scope/meaning conflicts. **Project > Imported Frame Review...** opens the review queue; correct each affected frame and check **Imported labels reviewed for this frame** before training/export.
 
