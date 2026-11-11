@@ -24,9 +24,21 @@ UNLABELLED = 0
 
 PROJECT_KEY = 'keypoints'
 INSTANCE_KEY = 'keypoints'
-DEFAULT_KEYPOINT_NAMES = ('head', 'thorax', 'abdomen_tip')
-DEFAULT_EDGES = (('head', 'thorax'), ('thorax', 'abdomen_tip'))
+# Body axis first (clicked on every bee), then the antenna tips (skipped when not visible).
+# Left and right are the bee's own left and right.
+DEFAULT_KEYPOINT_NAMES = ('head', 'thorax', 'abdomen_tip', 'left_antenna_tip', 'right_antenna_tip')
+DEFAULT_EDGES = (('head', 'thorax'), ('thorax', 'abdomen_tip'),
+                 ('head', 'left_antenna_tip'), ('head', 'right_antenna_tip'))
 CONFIG_VERSION = 1
+
+
+def symmetric_pairs(names):
+    """``(left_x, right_x)`` pairs present in ``names``; pose tools swap these on mirroring."""
+    pairs = []
+    for name in names:
+        if name.startswith('left_') and 'right_' + name[len('left_'):] in names:
+            pairs.append((name, 'right_' + name[len('left_'):]))
+    return tuple(pairs)
 
 
 def _clean_name(name):
@@ -41,7 +53,7 @@ class KeypointConfig:
     """Project-level keypoint definition."""
 
     names: tuple = DEFAULT_KEYPOINT_NAMES
-    edges: tuple = DEFAULT_EDGES
+    edges: tuple | None = None  # None: the default lines between keypoints that exist
     category: str = 'bee'
     enabled: bool = True
     # Keypoint filled from an instance's ArUco marker centre on request (or None).
@@ -54,8 +66,10 @@ class KeypointConfig:
             raise ValueError('A keypoint configuration needs at least one keypoint.')
         if len(set(names)) != len(names):
             raise ValueError('Keypoint names must be unique.')
+        source = self.edges if self.edges is not None else tuple(
+            (a, b) for a, b in DEFAULT_EDGES if a in names and b in names)
         edges = []
-        for edge in self.edges:
+        for edge in source:
             a, b = (_clean_name(n) for n in edge)
             if a not in names or b not in names:
                 raise ValueError(f'Skeleton edge {a}-{b} uses a keypoint that is not defined.')
@@ -72,6 +86,10 @@ class KeypointConfig:
         object.__setattr__(self, 'edges', tuple(edges))
         object.__setattr__(self, 'marker_keypoint', marker)
 
+    @property
+    def symmetries(self):
+        return symmetric_pairs(self.names)
+
     def to_dict(self):
         data = dict(self.extra)
         data.update(
@@ -80,6 +98,7 @@ class KeypointConfig:
             category=self.category,
             names=list(self.names),
             edges=[list(e) for e in self.edges],
+            symmetries=[list(p) for p in self.symmetries],  # derived from left_/right_ names
             marker_keypoint=self.marker_keypoint,
         )
         return data
@@ -88,10 +107,11 @@ class KeypointConfig:
     def from_dict(cls, data):
         if not isinstance(data, dict):
             raise ValueError('Keypoint settings must be a JSON object.')
-        known = {'version', 'enabled', 'category', 'names', 'edges', 'marker_keypoint'}
+        known = {'version', 'enabled', 'category', 'names', 'edges', 'marker_keypoint', 'symmetries'}
         return cls(
             names=tuple(data.get('names') or DEFAULT_KEYPOINT_NAMES),
-            edges=tuple(tuple(e) for e in (data.get('edges') or ())),
+            edges=(tuple(tuple(e) for e in data['edges'])
+                   if data.get('edges') is not None else None),
             category=str(data.get('category') or 'bee'),
             enabled=bool(data.get('enabled', True)),
             marker_keypoint=data.get('marker_keypoint', 'thorax'),
@@ -353,14 +373,15 @@ def coco_add_instance_keypoints(coco_ann, ann, config):
 
 
 def summary_text(keypoints, names):
-    """Short status like ``head ✓  thorax (hidden)  abdomen_tip –``."""
+    """Short status like ``head ✓  thorax (hidden)  abdomen tip –``."""
     parts = []
     for name in names:
         point = (keypoints or {}).get(name)
+        label = name.replace('_', ' ')
         if point is None:
-            parts.append(f'{name} –')
+            parts.append(f'{label} –')
         elif point[2] == OCCLUDED:
-            parts.append(f'{name} (hidden)')
+            parts.append(f'{label} (hidden)')
         else:
-            parts.append(f'{name} ✓')
+            parts.append(f'{label} ✓')
     return '  '.join(parts)

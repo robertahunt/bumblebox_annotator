@@ -17,16 +17,35 @@ from PyQt6.QtWidgets import QApplication
 
 from core import keypoints as kp
 
+BODY = kp.KeypointConfig(names=('head', 'thorax', 'abdomen_tip'),
+                         edges=(('head', 'thorax'), ('thorax', 'abdomen_tip')))
+
 
 class KeypointModelTests(unittest.TestCase):
     def test_default_config_round_trips_through_project_info(self):
         config = kp.default_config()
         info = {'name': 'p', kp.PROJECT_KEY: config.to_dict()}
         loaded = kp.config_from_project_info(info)
-        self.assertEqual(loaded.names, ('head', 'thorax', 'abdomen_tip'))
-        self.assertEqual(loaded.edges, (('head', 'thorax'), ('thorax', 'abdomen_tip')))
+        self.assertEqual(loaded.names, ('head', 'thorax', 'abdomen_tip',
+                                        'left_antenna_tip', 'right_antenna_tip'))
+        self.assertEqual(loaded.edges, (('head', 'thorax'), ('thorax', 'abdomen_tip'),
+                                        ('head', 'left_antenna_tip'), ('head', 'right_antenna_tip')))
         self.assertEqual(loaded.marker_keypoint, 'thorax')
-        self.assertEqual(loaded.coco_category_fields()['skeleton'], [[1, 2], [2, 3]])
+        self.assertEqual(loaded.coco_category_fields()['skeleton'], [[1, 2], [2, 3], [1, 4], [1, 5]])
+        self.assertEqual(loaded.symmetries, (('left_antenna_tip', 'right_antenna_tip'),))
+        self.assertEqual(config.to_dict()['symmetries'], [['left_antenna_tip', 'right_antenna_tip']])
+
+    def test_unspecified_lines_use_defaults_between_defined_keypoints_only(self):
+        self.assertEqual(kp.KeypointConfig(names=('head', 'thorax', 'sting')).edges, (('head', 'thorax'),))
+        self.assertEqual(kp.KeypointConfig(names=('head', 'thorax'), edges=()).edges, ())
+        loaded = kp.KeypointConfig.from_dict({'names': ['head', 'left_antenna_tip']})
+        self.assertEqual(loaded.edges, (('head', 'left_antenna_tip'),))
+
+    def test_symmetric_pairs_need_both_sides(self):
+        self.assertEqual(kp.symmetric_pairs(('head', 'left_antenna_tip')), ())
+        self.assertEqual(kp.symmetric_pairs(('left_eye', 'right_eye', 'left_antenna_tip')),
+                         (('left_eye', 'right_eye'),))
+        self.assertEqual(BODY.symmetries, ())
 
     def test_missing_disabled_or_malformed_settings_mean_off(self):
         self.assertIsNone(kp.config_from_project_info({}))
@@ -131,7 +150,7 @@ class KeypointCanvasTests(unittest.TestCase):
     def test_click_sequence_places_points_in_order_and_undo(self):
         canvas = self.make_canvas()
         layer = canvas.keypoint_layer
-        layer.set_config(kp.default_config())
+        layer.set_config(BODY)
         canvas.set_tool('keypoint')
         changes = []
         canvas.annotation_changed.connect(lambda: changes.append(1))
@@ -269,6 +288,37 @@ class KeypointToolbarTests(unittest.TestCase):
         self.assertEqual(emitted, ['keypoint'])
 
 
+class KeypointSettingsDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_defaults_restore_and_layout_does_not_overlap(self):
+        from PyQt6.QtGui import QFont
+        from PyQt6.QtWidgets import QLabel
+        from gui.keypoint_settings_dialog import KeypointSettingsDialog
+        original = self.app.font()
+        self.addCleanup(self.app.setFont, original)
+        for size in (9, 14):
+            self.app.setFont(QFont(original.family(), size))
+            dialog = KeypointSettingsDialog(BODY, enabled=True)
+            self.addCleanup(dialog.close)
+            dialog.show()
+            self.app.processEvents()
+            # Word-wrapped labels make Qt size the window too short; keep text on explicit lines.
+            self.assertFalse(any(label.wordWrap() for label in dialog.findChildren(QLabel)))
+            names = dialog.names_edit.geometry()
+            below = [w for w in dialog.findChildren(QLabel) if w.text().startswith('One per line')][0]
+            self.assertLessEqual(names.bottom(), below.geometry().top())
+            self.assertGreaterEqual(names.height(), dialog.names_edit.minimumHeight())
+        dialog.restore_defaults()
+        dialog._accept()
+        config, enabled = dialog.result_config()
+        self.assertEqual(config.names, kp.DEFAULT_KEYPOINT_NAMES)
+        self.assertEqual(config.marker_keypoint, 'thorax')
+        self.assertTrue(enabled)
+
+
 class KeypointProjectTests(unittest.TestCase):
     """Settings in project.json, edit tracking, and COCO export on disposable projects."""
 
@@ -366,13 +416,17 @@ class KeypointProjectTests(unittest.TestCase):
         for data in (_read_json(export_coco_per_video(self.project, ['video'], 'train')[0]),
                      _read_json(export_coco_with_tracking(self.project, ['video'], 'train'))):
             bee_cat = next(c for c in data['categories'] if c['name'] == 'bee')
-            self.assertEqual(bee_cat['keypoints'], ['head', 'thorax', 'abdomen_tip'])
-            self.assertEqual(bee_cat['skeleton'], [[1, 2], [2, 3]])
-            self.assertEqual(data['info']['keypoints']['names'], ['head', 'thorax', 'abdomen_tip'])
+            names = ['head', 'thorax', 'abdomen_tip', 'left_antenna_tip', 'right_antenna_tip']
+            self.assertEqual(bee_cat['keypoints'], names)
+            self.assertEqual(bee_cat['skeleton'], [[1, 2], [2, 3], [1, 4], [1, 5]])
+            self.assertEqual(data['info']['keypoints']['names'], names)
+            self.assertEqual(data['info']['keypoints']['symmetries'],
+                             [['left_antenna_tip', 'right_antenna_tip']])
             bees = [a for a in data['annotations'] if a['category_id'] == bee_cat['id']]
             self.assertEqual(len(bees), 2)
             for ann in bees:
-                self.assertEqual(ann['keypoints'], [20.5, 12.0, 2, 0, 0, 0, 30.0, 40.0, 1])
+                self.assertEqual(ann['keypoints'],
+                                 [20.5, 12.0, 2, 0, 0, 0, 30.0, 40.0, 1, 0, 0, 0, 0, 0, 0])
                 self.assertEqual(ann['num_keypoints'], 2)
 
     def test_main_window_turns_keypoints_on_and_off_per_project(self):

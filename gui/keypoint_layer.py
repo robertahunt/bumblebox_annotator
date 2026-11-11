@@ -26,6 +26,8 @@ _BASE_COLORS = {
     'head': (255, 70, 70),
     'thorax': (255, 215, 0),
     'abdomen_tip': (60, 150, 255),
+    'left_antenna_tip': (0, 220, 120),     # distinct left/right colours help keep sides consistent
+    'right_antenna_tip': (255, 120, 220),
 }
 _PALETTE = [(0, 220, 120), (255, 120, 220), (255, 150, 40), (150, 110, 255), (0, 230, 230),
             (200, 255, 80), (255, 255, 255)]

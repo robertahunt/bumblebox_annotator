@@ -1,7 +1,7 @@
 # Keypoints (optional)
 
-Keypoints are landmarks on each bee, such as head, thorax and abdomen tip. They are
-saved with the bee's mask and exported to COCO. They are **off by default**. A project
+Keypoints are landmarks on each bee, such as head, thorax, abdomen tip and antenna tips.
+They are saved with the bee's mask and exported to COCO. They are **off by default**. A project
 that never turns them on looks and behaves exactly as before.
 
 This is phase 1 of the SLEAP plan: placing keypoints by hand. It needs no extra packages.
@@ -13,10 +13,15 @@ the app, come later.
 **Project > Keypoints...** opens the settings:
 
 - **Use keypoints in this project:** the on/off switch.
-- **Keypoints (in order):** one name per line. The default is `head`, `thorax`,
-  `abdomen_tip`. Use letters, digits and underscores, such as `left_antenna_tip`.
+- **Keypoints (in order):** one name per line, in clicking order. The default is `head`,
+  `thorax`, `abdomen_tip`, `left_antenna_tip`, `right_antenna_tip`: the body axis first, then
+  the antennae, which are often hidden. Use letters, digits and underscores.
+  **Left and right are the bee's own left and right**, not the image's. Names that start
+  with `left_` and `right_` are recorded as mirror pairs (`symmetries`), which pose tools
+  such as SLEAP use to swap the two sides when they flip images during training.
+  **Restore Bee Defaults** puts the default list back.
 - **Skeleton lines:** pairs to connect on screen and in the COCO skeleton, for example
-  `head-thorax, thorax-abdomen_tip`.
+  `head-thorax, thorax-abdomen_tip, head-left_antenna_tip, head-right_antenna_tip`.
 - **Fill from ArUco tag:** the keypoint that **Thorax from ArUco Tags** sets to each tag's
   centre. The default is `thorax`.
 
@@ -42,6 +47,9 @@ Toolbar** hides or shows it.
    even when the click lands on a neighbouring bee (for example an antenna tip). When the bee
    is complete, a click on another bee starts that one.
 4. Change **Next:** at any time to redo a particular point.
+5. When an antenna tip isn't visible, press N to skip it, or Esc to finish the bee. Leave it
+   unlabelled rather than guessing. Use **hidden** only for a point whose position you can
+   still tell, for example a tip just under a neighbour's wing.
 
 | Action | How |
 |---|---|
@@ -81,7 +89,8 @@ Coordinates are full-resolution image pixels. The third value follows COCO: 2 = 
 With keypoints on, the bee category gets COCO `keypoints` (names) and a 1-based `skeleton`.
 Every bee annotation gets `keypoints` (flat `x, y, v` triples in the configured order, with
 `0, 0, 0` when unlabelled) and `num_keypoints`. The settings are recorded in
-`info.keypoints`. With keypoints off, exports are unchanged.
+`info.keypoints`, including the left/right `symmetries`. With keypoints off, exports are
+unchanged.
 
 ## Known limits (phase 1)
 
