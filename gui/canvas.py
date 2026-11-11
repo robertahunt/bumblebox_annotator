@@ -81,6 +81,7 @@ class ImageCanvas(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setBackgroundBrush(QColor("#303030"))
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
         
@@ -853,6 +854,11 @@ class ImageCanvas(QGraphicsView):
         return QRectF(float(x), float(y), width, height)
 
     def _can_start_brush_stroke_at(self, scene_pos):
+        if self.current_image is None:
+            return False
+        height, width = self.current_image.shape[:2]
+        if not (0 <= scene_pos.x() < width and 0 <= scene_pos.y() < height):
+            return False
         bbox_rect = self._active_brush_bbox_rect()
         if bbox_rect is None:
             return True
@@ -1105,9 +1111,7 @@ class ImageCanvas(QGraphicsView):
         # Add image to scene
         self.image_item = QGraphicsPixmapItem(pixmap)
         self.scene.addItem(self.image_item)
-        # Labels, outward box strokes and cursor rings must not resize the
-        # scrollable canvas or shift the image when they cross an image edge.
-        self.scene.setSceneRect(QRectF(0, 0, w, h))
+        self._update_pan_extent()
         
         self._view_restore_token += 1
         view_token = self._view_restore_token
@@ -1158,6 +1162,19 @@ class ImageCanvas(QGraphicsView):
             self.fitInView(self.image_item, Qt.AspectRatioMode.KeepAspectRatio)
             self.zoom_factor = 1.0
 
+    def _update_pan_extent(self):
+        """Add display-only room to center edge pixels, even at fit-to-window."""
+        if self.image_item is None:
+            return
+        rect = self.image_item.boundingRect()
+        viewport = self.viewport().rect()
+        aspect = max(1, viewport.width()) / max(1, viewport.height())
+        # Reserve most of a fitted viewport on each side. Derive this from the
+        # image and viewport, never annotation items, so overlays cannot move it.
+        pad_x = 0.75 * max(rect.width(), rect.height() * aspect)
+        pad_y = 0.75 * max(rect.height(), rect.width() / aspect)
+        self.scene.setSceneRect(rect.adjusted(-pad_x, -pad_y, pad_x, pad_y))
+
     def _apply_initial_view(self, token, view_state):
         """Apply the queued fit/restore for the latest loaded image only."""
         if token != self._view_restore_token:
@@ -1173,6 +1190,7 @@ class ImageCanvas(QGraphicsView):
         return {
             'transform': QTransform(self.transform()),
             'center': QPointF(self.mapToScene(viewport_center)),
+            'viewport_size': (self.viewport().width(), self.viewport().height()),
             'h_scroll': self.horizontalScrollBar().value(),
             'v_scroll': self.verticalScrollBar().value(),
             'zoom_factor': self.zoom_factor,
@@ -1184,7 +1202,11 @@ class ImageCanvas(QGraphicsView):
             return
 
         self.setTransform(state['transform'])
-        if 'center' in state:
+        if state.get('viewport_size') == (self.viewport().width(), self.viewport().height()):
+            # Re-centering a rounded viewport center loses a pixel per frame.
+            self.horizontalScrollBar().setValue(state['h_scroll'])
+            self.verticalScrollBar().setValue(state['v_scroll'])
+        elif 'center' in state:
             self.centerOn(state['center'])
         else:
             self.horizontalScrollBar().setValue(state['h_scroll'])
@@ -1193,11 +1215,21 @@ class ImageCanvas(QGraphicsView):
             
     def resizeEvent(self, event):
         """Handle resize event to fit image to new window size"""
+        view_state = self.get_view_state() if self.image_item and self.zoom_factor != 1.0 else None
+        if view_state is not None and event.oldSize().isValid():
+            # Qt has already resized the viewport when this handler is entered.
+            old_size = event.oldSize()
+            view_state['center'] = self.mapToScene(
+                (old_size.width() - 1) // 2, (old_size.height() - 1) // 2)
+            view_state['viewport_size'] = (old_size.width(), old_size.height())
         super().resizeEvent(event)
         self._position_brush_size_overlay()
-        if self.image_item and self.zoom_factor == 1.0:
-            # Only auto-fit if not zoomed in/out
-            self.fit_to_window()
+        if self.image_item:
+            self._update_pan_extent()
+            if view_state is not None:
+                self.restore_view_state(view_state)
+            else:
+                self.fit_to_window()
             
     def zoom_in(self):
         """Zoom in"""
@@ -1885,6 +1917,7 @@ class ImageCanvas(QGraphicsView):
         """Show brush-specific actions at the cursor."""
         scene_pos = self.mapToScene(event.pos())
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         instance_id, current_category = self._context_instance_at_scene_pos(
             scene_pos,
             allow_active_fallback=True
@@ -1906,6 +1939,18 @@ class ImageCanvas(QGraphicsView):
 
         if not fill_action.isEnabled():
             fill_action.setText("Fill Enclosed Area (select/draw an instance first)")
+
+        neighbor_fill_action = QAction("Fill to Neighboring Masks", self)
+        neighbor_fill_action.setEnabled(fill_action.isEnabled())
+        neighbor_fill_action.setToolTip(
+            "Use other masks of the same category as part of the fill boundary. "
+            "Their pixels are excluded, even if hidden."
+        )
+        neighbor_fill_action.triggered.connect(
+            lambda checked=False, pos=QPointF(scene_pos):
+            self.fill_enclosed_region_at(pos, use_neighbor_masks=True)
+        )
+        menu.addAction(neighbor_fill_action)
 
         subtract_action = QAction("Subtract Filled Area", self)
         subtract_action.setEnabled(
@@ -2553,12 +2598,13 @@ class ImageCanvas(QGraphicsView):
         
         # Only emit annotation_changed for final stroke (on release) to avoid slowdown
 
-    def fill_enclosed_region_at(self, scene_pos):
+    def fill_enclosed_region_at(self, scene_pos, *, use_neighbor_masks=False):
         """Fill the enclosed blank region under the cursor in the editing mask.
 
-        The current instance's nonzero pixels act as the boundary. If the
-        clicked blank region reaches the image edge, the outline is considered
-        open and no fill is applied.
+        The current instance's nonzero pixels act as the boundary. Optionally,
+        other same-category masks also act as boundaries, regardless of display
+        visibility. Bounding boxes and other categories do not block filling.
+        If the region reaches the image edge, no fill is applied.
         """
         if self.current_image is None:
             return False
@@ -2582,8 +2628,18 @@ class ImageCanvas(QGraphicsView):
             print("Fill skipped: click inside the unfilled enclosed area, not on the outline.")
             return False
 
+        boundary_mask = None
+        if use_neighbor_masks:
+            neighbors = self._get_mask_array_by_category(self.editing_instance_category)
+            if neighbors is not None:
+                boundary_mask = (neighbors > 0) & (neighbors != self.editing_instance_id)
+                if boundary_mask[y, x]:
+                    print("Fill skipped: click in the unfilled area, not on a neighboring mask.")
+                    return False
+
         fill_region = enclosed_mask_region(
-            self.editing_mask, (x, y), protected_mask=self.no_draw_zone_mask
+            self.editing_mask, (x, y), protected_mask=self.no_draw_zone_mask,
+            boundary_mask=boundary_mask,
         )
         if fill_region is None:
             print("Fill skipped: the clicked region is open or protected.")

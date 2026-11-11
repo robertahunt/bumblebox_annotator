@@ -43,6 +43,11 @@ Then open **Bumblebox Annotator** from the applications menu or desktop and sele
 your profile. Students do not need a terminal, Conda activation, or CUDA to draw
 masks. See [desktop launcher setup and troubleshooting](docs/setup.md#desktop-launcher).
 
+The image canvas has a gray, display-only margin on every side. Use **Pan** to
+bring bees at the edge of the image toward the center of the screen. Brush and
+eraser strokes cannot start in the margin, and image/mask dimensions stay
+unchanged. **Fit to Window** (F) recenters and fits the image, not the margin.
+
 For terminal use, the existing entry point remains available:
 
 ```bash
@@ -62,6 +67,16 @@ Colors stay fixed while drawing or hiding instances; the adjacent refresh icon
 recalculates contrast after large edits. New frames favor previous colors within
 the same video where contrast allows. This affects the annotation canvas only,
 not annotation pixels, IDs, training data, or exported video colors.
+
+In Brush or Eraser mode, **Fill to Neighboring Masks** in the right-click menu
+uses other masks of the same category to complete an outline. For example, draw
+the visible part of a bee up to an overlapping bee's mask, then right-click in
+the empty interior and fill. New pixels stop exactly at the neighboring mask;
+hidden masks still count, but bounding boxes and other categories do not.
+The outline must meet the neighboring mask without a gap. Only the clicked
+region is filled, protected areas remain untouched, and the fill is one undo
+step. Existing brush overlaps are not trimmed. **Fill Enclosed Area** retains
+its original behavior, using only the selected instance's outline.
 
 See [importing between projects](docs/project_import.md) to copy selected frames and annotations, including converting frame-specific hive masks into an editable video-wide mask.
 Import previews disclose scope/meaning conflicts. **Project > Imported Frame Review...** opens the review queue; correct each affected frame and check **Imported labels reviewed for this frame** before training/export.

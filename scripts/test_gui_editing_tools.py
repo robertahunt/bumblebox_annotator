@@ -5,15 +5,16 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
-from PyQt6.QtCore import QPointF, QRectF
+from PyQt6.QtCore import QPoint, QPointF, QRectF
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMenu
 
 from core.categories import CATEGORIES
 from gui.canvas import ImageCanvas
@@ -212,6 +213,139 @@ class EditingToolTests(unittest.TestCase):
         self.assertEqual(canvas.editing_mask[7, 7], 255)
         canvas.undo()
         np.testing.assert_array_equal(canvas.editing_mask, original)
+
+    def make_neighbor_fill_canvas(self, category='bee'):
+        canvas = self.make_canvas()
+        self.addCleanup(canvas.close)
+        self.addCleanup(canvas._viz_update_timer.stop)
+        canvas.current_tool = 'brush'
+        canvas.editing_instance_category = category
+        canvas.selected_instance_category = category
+        canvas.annotation_metadata[1]['category'] = category
+        canvas.editing_mask[20, 20:60] = 255
+        canvas.editing_mask[79, 20:60] = 255
+        canvas.editing_mask[20:80, 20] = 255
+        neighbors = np.zeros((100, 100), dtype=np.int32)
+        neighbors[20:80, 60:80] = 2
+        neighbors[40:50, 50:70] = 2
+        canvas._set_mask_array_by_category(category, neighbors)
+        canvas.annotation_metadata[2] = {'mask_id': 2, 'category': category}
+        return canvas
+
+    def test_neighbor_fill_preserves_other_masks_and_supports_undo_redo_and_commit(self):
+        canvas = self.make_neighbor_fill_canvas()
+        self.add_square_zone(canvas)
+        original = canvas.editing_mask.copy()
+        neighbors = canvas.bee_mask.copy()
+        changes = []
+        canvas.annotation_changed.connect(lambda: changes.append(True))
+        self.assertFalse(canvas.fill_enclosed_region_at(QPointF(35, 35)))
+        self.assertTrue(canvas.fill_enclosed_region_at(QPointF(35, 35), use_neighbor_masks=True))
+        expected = original.copy()
+        expected[21:79, 21:60] = 255
+        expected[neighbors > 0] = 0
+        expected[canvas.no_draw_zone_mask > 0] = original[canvas.no_draw_zone_mask > 0]
+        np.testing.assert_array_equal(canvas.editing_mask, expected)
+        np.testing.assert_array_equal(canvas.bee_mask, neighbors)
+        self.assertEqual(changes, [True])
+        self.assertEqual(len(canvas.brush_undo_stack), 1)
+        self.assertEqual(canvas.editing_instance_id, 1)
+        canvas.undo()
+        np.testing.assert_array_equal(canvas.editing_mask, original)
+        canvas.redo()
+        np.testing.assert_array_equal(canvas.editing_mask, expected)
+        canvas.commit_editing()
+        np.testing.assert_array_equal(canvas.bee_mask == 2, neighbors == 2)
+        annotations = {ann['mask_id']: ann for ann in canvas.get_annotations()}
+        np.testing.assert_array_equal(annotations[1]['mask'], expected)
+        np.testing.assert_array_equal(annotations[2]['mask'] > 0, neighbors == 2)
+
+    def test_neighbor_fill_uses_active_category_and_hidden_masks(self):
+        for category in CATEGORIES:
+            with self.subTest(category=category):
+                canvas = self.make_neighbor_fill_canvas(category)
+                canvas.set_instance_visible(2, category, False)
+                canvas.set_annotation_type_visibility(category, False)
+                canvas.set_annotation_overlay_visibility(False, False)
+                self.assertTrue(canvas.fill_enclosed_region_at(QPointF(35, 35), use_neighbor_masks=True))
+                self.assertEqual(canvas.editing_mask[35, 59], 255)
+                self.assertEqual(canvas.editing_mask[45, 50], 0)
+                self.assertFalse(canvas.is_annotation_instance_visible(2, category))
+
+    def test_neighbor_fill_does_not_use_other_categories_or_bounding_boxes(self):
+        canvas = self.make_neighbor_fill_canvas()
+        canvas.hive_mask = canvas.bee_mask.copy()
+        canvas.bee_mask.fill(0)
+        canvas.annotation_metadata[2] = {'mask_id': 2, 'category': 'hive'}
+        canvas.annotation_metadata[3] = {'mask_id': 3, 'category': 'bee',
+                                         'bbox_only': True, 'bbox': [60, 20, 20, 60]}
+        self.assertFalse(canvas.fill_enclosed_region_at(QPointF(35, 35), use_neighbor_masks=True))
+        self.assertFalse(canvas.brush_undo_stack)
+        canvas.editing_mask[20:80, 60] = 255
+        self.assertTrue(canvas.fill_enclosed_region_at(QPointF(35, 35), use_neighbor_masks=True))
+        self.assertEqual(canvas.editing_mask[45, 55], 255)
+
+    def test_neighbor_fill_rejects_bad_seed_or_gap_without_history_or_signal(self):
+        canvas = self.make_neighbor_fill_canvas()
+        changes = []
+        canvas.annotation_changed.connect(lambda: changes.append(True))
+        for point in (QPointF(65, 35), QPointF(20, 20), QPointF(0, 0), QPointF(-1, -1)):
+            self.assertFalse(canvas.fill_enclosed_region_at(point, use_neighbor_masks=True))
+        canvas.editing_mask[20, 35] = 0
+        original = canvas.editing_mask.copy()
+        self.assertFalse(canvas.fill_enclosed_region_at(QPointF(35, 35), use_neighbor_masks=True))
+        np.testing.assert_array_equal(canvas.editing_mask, original)
+        self.assertFalse(canvas.brush_undo_stack)
+        self.assertEqual(changes, [])
+
+    def test_neighbor_fill_leaves_previous_strokes_and_disconnected_components_alone(self):
+        canvas = self.make_neighbor_fill_canvas()
+        canvas.editing_mask[85:90, 85:90] = 255
+        canvas.editing_mask[45, 65] = 255  # A pre-existing brush overlap, not a fill pixel.
+        self.assertTrue(canvas.fill_enclosed_region_at(QPointF(35, 35), use_neighbor_masks=True))
+        self.assertTrue(np.all(canvas.editing_mask[85:90, 85:90] == 255))
+        self.assertEqual(canvas.editing_mask[45, 65], 255)
+        self.assertEqual(canvas.bee_mask[45, 65], 2)
+
+    def test_original_fill_still_uses_only_selected_outline(self):
+        canvas = self.make_neighbor_fill_canvas()
+        canvas.editing_mask[20:80, 59] = 255
+        self.assertTrue(canvas.fill_enclosed_region_at(QPointF(35, 35)))
+        self.assertEqual(canvas.editing_mask[45, 55], 255)
+        self.assertEqual(canvas.bee_mask[45, 55], 2)
+
+    def test_neighbor_fill_menu_routes_to_active_mask_in_brush_and_eraser(self):
+        canvas = self.make_neighbor_fill_canvas()
+
+        class Event:
+            def pos(self):
+                return QPoint(35, 35)
+
+        for tool in ('brush', 'eraser'):
+            canvas.current_tool = tool
+            with patch('gui.canvas.QMenu.exec') as show_menu, \
+                    patch.object(canvas, 'mapToScene', return_value=QPointF(35, 35)), \
+                    patch.object(canvas, '_event_global_pos', return_value=QPoint(35, 35)), \
+                    patch.object(canvas, 'fill_enclosed_region_at') as fill:
+                canvas._show_brush_context_menu(Event())
+                # Menus are parented to the canvas, following the existing pattern.
+                menu = [m for m in canvas.findChildren(QMenu)
+                        if any(a.text() == 'Fill to Neighboring Masks' for a in m.actions())][-1]
+                action = next(a for a in menu.actions() if a.text() == 'Fill to Neighboring Masks')
+                self.assertTrue(action.isEnabled())
+                action.trigger()
+                fill.assert_called_once_with(QPointF(35, 35), use_neighbor_masks=True)
+                show_menu.assert_called_once()
+
+        canvas.editing_instance_id = -1
+        canvas.editing_mask = None
+        with patch('gui.canvas.QMenu.exec'), \
+                patch.object(canvas, '_event_global_pos', return_value=QPoint(35, 35)):
+            canvas._show_brush_context_menu(Event())
+            menu = [m for m in canvas.findChildren(QMenu)
+                    if any(a.text() == 'Fill to Neighboring Masks' for a in m.actions())][-1]
+            action = next(a for a in menu.actions() if a.text() == 'Fill to Neighboring Masks')
+            self.assertFalse(action.isEnabled())
 
     def test_one_pixel_diagonal_fill_and_subtract_support_undo_redo(self):
         for subtract in (False, True):

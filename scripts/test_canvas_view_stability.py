@@ -44,10 +44,11 @@ class CanvasViewStabilityTests(unittest.TestCase):
                 canvas.set_tool('brush')
                 canvas.set_brush_size(200)
                 before = canvas.get_view_state()
+                extent = QRectF(canvas.scene.sceneRect())
                 for point in (QPointF(1, 1), QPointF(999, 999), QPointF(500, 1)):
                     canvas._update_brush_cursor_preview(point)
                     self.app.processEvents()
-                    self.assertEqual(canvas.scene.sceneRect(), QRectF(0, 0, 1000, 1000))
+                    self.assertEqual(canvas.scene.sceneRect(), extent)
                     self.assertEqual(canvas.get_view_state(), before)
                 canvas.set_brush_cursor_preview_enabled(False)
                 box = OutwardBBoxRectItem(-30, -30, 1100, 1100)
@@ -145,11 +146,144 @@ class CanvasViewStabilityTests(unittest.TestCase):
 
     def test_new_image_resets_canvas_extent(self):
         canvas = self.canvas()
+        old_extent = QRectF(canvas.scene.sceneRect())
         canvas.load_image(np.zeros((200, 300), dtype=np.uint8))
         self.app.processEvents()
-        self.assertEqual(canvas.scene.sceneRect(), QRectF(0, 0, 300, 200))
+        self.assertEqual(canvas.image_item.boundingRect(), QRectF(0, 0, 300, 200))
+        extent = canvas.scene.sceneRect()
+        self.assertNotEqual(extent, old_extent)
+        self.assertEqual(extent.center(), QPointF(150, 100))
+        self.assertLess(extent.left(), 0)
+        self.assertLess(extent.top(), 0)
+        self.assertGreater(extent.right(), 300)
+        self.assertGreater(extent.bottom(), 200)
         canvas.clear_image()
         self.assertTrue(canvas.scene.sceneRect().isEmpty())
+
+    def assert_centered(self, canvas, point):
+        on_screen = canvas.mapFromScene(point)
+        center = canvas.viewport().rect().center()
+        self.assertLessEqual(abs(on_screen.x() - center.x()), 2)
+        self.assertLessEqual(abs(on_screen.y() - center.y()), 2)
+
+    def test_all_image_corners_can_be_centered_at_fit_and_zoomed_sizes(self):
+        for shape, viewport_size in (((1000, 1000), (800, 600)),
+                                     ((1000, 200), (1200, 400)),
+                                     ((200, 1000), (400, 900)),
+                                     ((30, 40), (800, 600))):
+            with self.subTest(shape=shape, viewport=viewport_size):
+                canvas = self.canvas()
+                canvas.resize(*viewport_size)
+                canvas.load_image(np.zeros(shape, np.uint8))
+                self.app.processEvents()
+                self.app.processEvents()
+                for zoomed in (False, True):
+                    if zoomed:
+                        canvas.zoom_in()
+                        canvas.zoom_in()
+                    for x in (0, shape[1] - 1):
+                        for y in (0, shape[0] - 1):
+                            point = QPointF(x, y)
+                            canvas.centerOn(point)
+                            self.app.processEvents()
+                            self.assert_centered(canvas, point)
+
+    def test_fit_uses_original_image_not_padding(self):
+        canvas = self.canvas()
+        canvas.centerOn(999, 999)
+        canvas.fit_to_window()
+        self.app.processEvents()
+        self.assert_centered(canvas, QPointF(500, 500))
+        scale = canvas.transform().m11()
+        expected = min(canvas.viewport().width(), canvas.viewport().height()) / 1000
+        self.assertAlmostEqual(scale / expected, 1, delta=.02)
+        self.assertEqual(canvas.current_image.shape, (1000, 1000))
+        self.assertEqual(canvas.image_item.pixmap().size().width(), 1000)
+
+    def test_pan_drag_in_margin_moves_view_without_annotation_changes(self):
+        canvas = self.canvas()
+        canvas.set_tool('pan')
+        canvas.centerOn(500, 950)
+        self.app.processEvents()
+        center = canvas.viewport().rect().center()
+        start = QPoint(center.x(), center.y() + 110)
+        self.assertGreater(canvas.mapToScene(start).y(), 1000)
+        before = canvas.get_view_state()['center']
+        changes = []
+        canvas.annotation_changed.connect(lambda: changes.append(True))
+        QTest.mousePress(canvas.viewport(), Qt.MouseButton.LeftButton, pos=start)
+        end = start - QPoint(0, 100)
+        move = QMouseEvent(QEvent.Type.MouseMove, QPointF(end),
+                          QPointF(canvas.viewport().mapToGlobal(end)),
+                          Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+                          Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(canvas.viewport(), move)
+        QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.LeftButton, pos=end)
+        self.assertGreater(canvas.get_view_state()['center'].y(), before.y() + 50)
+        self.assertEqual(changes, [])
+        self.assertFalse(canvas.get_annotations())
+
+    def test_margin_clicks_cannot_start_brush_or_eraser_steps(self):
+        canvas = self.canvas()
+        mask = np.zeros((1000, 1000), np.uint8)
+        mask[-20:, -20:] = 255
+        canvas.set_annotations([{'mask_id': 1, 'category': 'bee', 'mask': mask}])
+        canvas.start_editing_instance(1, 'bee')
+        canvas.centerOn(999, 999)
+        changes = []
+        canvas.annotation_changed.connect(lambda: changes.append(True))
+        for tool in ('brush', 'eraser'):
+            canvas.set_tool(tool)
+            for point in (QPointF(-.1, 10), QPointF(10, -.1),
+                          QPointF(1000, 990), QPointF(990, 1000)):
+                self.assertFalse(canvas._can_start_brush_stroke_at(point))
+                self.assertFalse(canvas._start_brush_stroke_at(point))
+            pos = canvas.mapFromScene(QPointF(1010, 1010))
+            QTest.mousePress(canvas.viewport(), Qt.MouseButton.LeftButton, pos=pos)
+            QTest.mouseMove(canvas.viewport(), canvas.mapFromScene(QPointF(990, 990)))
+            QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.LeftButton,
+                               pos=canvas.mapFromScene(QPointF(990, 990)))
+            np.testing.assert_array_equal(canvas.editing_mask, mask)
+            self.assertFalse(canvas.brush_undo_stack)
+            self.assertFalse(canvas.is_drawing)
+        self.assertEqual(changes, [])
+
+    def test_strokes_crossing_edge_stay_in_original_mask_dimensions(self):
+        canvas = self.canvas()
+        canvas.set_annotations([{'mask_id': 1, 'category': 'bee',
+                                 'mask': np.zeros((1000, 1000), np.uint8)}])
+        canvas.start_editing_instance(1, 'bee')
+        canvas.set_tool('brush')
+        canvas.set_brush_size(3)
+        self.assertTrue(canvas._start_brush_stroke_at(QPointF(990, 990)))
+        canvas.draw_on_mask(QPointF(990, 990), QPointF(1100, 1100))
+        canvas._finish_brush_history_step()
+        canvas.is_drawing = False
+        self.assertEqual(canvas.editing_mask.shape, (1000, 1000))
+        self.assertEqual(canvas.editing_mask[999, 999], 255)
+        canvas.commit_editing()
+        annotation = canvas.get_annotations()[0]
+        self.assertEqual(annotation['mask'].shape, (1000, 1000))
+        x, y, width, height = annotation['bbox']
+        self.assertLessEqual(x + width, 1000)
+        self.assertLessEqual(y + height, 1000)
+
+    def test_padded_edge_view_survives_resize_and_next_frame(self):
+        canvas = self.canvas()
+        canvas.zoom_in()
+        canvas.centerOn(999, 999)
+        self.app.processEvents()
+        before_scale = canvas.transform().m11()
+        canvas.resize(1100, 500)
+        self.app.processEvents()
+        self.app.processEvents()
+        self.assertEqual(canvas.transform().m11(), before_scale)
+        self.assert_centered(canvas, QPointF(999, 999))
+        before = canvas.get_view_state()
+        canvas.load_image(np.ones((1000, 1000), np.uint8), preserve_view=True)
+        self.app.processEvents()
+        self.app.processEvents()
+        self.assertEqual(canvas.get_view_state(), before)
 
     def test_next_frame_preserves_view_after_queued_layout_updates(self):
         canvas = self.canvas()

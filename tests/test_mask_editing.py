@@ -126,6 +126,81 @@ class EnclosedMaskTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             enclosed_mask_region(np.zeros((2, 2, 3)), (1, 1))
 
+    def open_outline_and_neighbor(self):
+        outline = np.zeros((30, 30), dtype=np.uint8)
+        outline[5, 5:24] = 255
+        outline[24, 5:24] = 255
+        outline[5:25, 5] = 255
+        neighbor = np.zeros_like(outline, dtype=bool)
+        neighbor[5:25, 24:28] = True
+        expected = np.zeros_like(outline, dtype=bool)
+        expected[6:24, 6:24] = True
+        return outline, neighbor, expected
+
+    def test_neighbor_completes_outline_at_exact_pixel_edge_without_mutation(self):
+        outline, neighbor, expected = self.open_outline_and_neighbor()
+        originals = outline.copy(), neighbor.copy()
+        self.assertIsNone(enclosed_mask_region(outline, (15, 15)))
+        region = enclosed_mask_region(outline, (15, 15), boundary_mask=neighbor)
+        np.testing.assert_array_equal(region, expected)
+        np.testing.assert_array_equal(outline, originals[0])
+        np.testing.assert_array_equal(neighbor, originals[1])
+        self.assertFalse(np.any(region & neighbor))
+
+    def test_neighbor_fill_excludes_intruding_pixels_and_protected_interior(self):
+        outline, neighbor, expected = self.open_outline_and_neighbor()
+        neighbor[12:18, 18:25] = True
+        protection = np.zeros_like(outline)
+        protection[8:11, 8:11] = 255
+        region = enclosed_mask_region(outline, (15, 15), boundary_mask=neighbor,
+                                      protected_mask=protection)
+        np.testing.assert_array_equal(region, expected & ~neighbor & (protection == 0))
+        self.assertIsNone(enclosed_mask_region(outline, (20, 15), boundary_mask=neighbor))
+        self.assertIsNone(enclosed_mask_region(outline, (9, 9), boundary_mask=neighbor,
+                                              protected_mask=protection))
+
+    def test_neighbor_cannot_close_an_actual_gap_or_repurpose_protection(self):
+        outline, neighbor, _ = self.open_outline_and_neighbor()
+        outline[5, 15] = 0
+        protection = np.zeros_like(outline)
+        protection[5, 15] = 255
+        self.assertIsNone(enclosed_mask_region(outline, (15, 15), boundary_mask=neighbor,
+                                              protected_mask=protection))
+
+    def test_neighbor_does_not_make_an_edge_connected_region_fillable(self):
+        outline, neighbor, _ = self.open_outline_and_neighbor()
+        self.assertIsNone(enclosed_mask_region(outline, (2, 2), boundary_mask=neighbor))
+
+    def test_neighbor_fill_requires_selected_outline_to_border_region(self):
+        neighbor = self.mask > 0
+        for focal in (np.zeros_like(self.mask), np.eye(30, dtype=np.uint8)):
+            # A distant selected component must not authorize filling a hole
+            # belonging entirely to the neighboring instance.
+            focal[5:25, 5:25] = 0
+            self.assertIsNone(enclosed_mask_region(focal, (15, 15), boundary_mask=neighbor))
+
+    def test_neighbor_diagonal_edge_closes_one_pixel_outline(self):
+        outline, expected = self.diamond_outline()
+        neighbor = np.zeros_like(outline)
+        neighbor[:26, 25:] = outline[:26, 25:]
+        outline[neighbor > 0] = 0
+        region = enclosed_mask_region(outline, (25, 25), boundary_mask=neighbor)
+        np.testing.assert_array_equal(region, expected)
+
+    def test_neighbor_fill_handles_multiple_disconnected_regions_separately(self):
+        outline, neighbor, expected = self.open_outline_and_neighbor()
+        neighbor[15, 6:25] = True
+        expected[15:] = False
+        np.testing.assert_array_equal(
+            enclosed_mask_region(outline, (15, 10), boundary_mask=neighbor), expected)
+
+    def test_boundary_shape_and_subtract_misuse_are_rejected(self):
+        with self.assertRaises(ValueError):
+            enclosed_mask_region(self.mask, (15, 15), boundary_mask=np.zeros((2, 2)))
+        with self.assertRaises(ValueError):
+            enclosed_mask_region(self.mask, (5, 5), filled=True,
+                                 boundary_mask=np.zeros_like(self.mask))
+
 
 if __name__ == "__main__":
     unittest.main()
