@@ -169,7 +169,8 @@ class VideoBrowsingGuiTests(unittest.TestCase):
                     videos.doItemsLayout()
                     image = videos.viewport().grab().toImage()
                     ratio = image.devicePixelRatio()
-                    return image.pixelColor(int((videos.viewport().width() - 8) * ratio),
+                    # The left margin: the row's right side now holds its status mark and count.
+                    return image.pixelColor(int(2 * ratio),
                                             int(videos.visualItemRect(item).center().y() * ratio)).name()
                 self.assertEqual(background(first), base)
                 self.assertEqual(background(second), stripe)
@@ -194,6 +195,82 @@ class VideoBrowsingGuiTests(unittest.TestCase):
         self.assertEqual(self.visible(window), [window.current_video_id])
         filters.show.setCurrentIndex(filters.show.findData('not_started'))
         self.assertEqual(self.visible(window), ['alpha', 'beta'])
+
+    def test_sidebar_keeps_work_on_visible_and_other_filters_behind_one_button(self):
+        from PyQt6.QtWidgets import QLabel
+        from gui.video_browsing import SPLIT_ROLE, STATUS_ROLE
+        self.setups()
+        window = self.make_window(self.source)
+        self.settle(window.annotation_work)
+        window.resize(1500, 1050)
+        window.show()
+        self.app.processEvents()
+        dock, work = window.video_dock, window.annotation_work
+        filters, controls = work.filters, window.video_browser
+        self.assertTrue(filters.task.isVisibleTo(dock))
+        self.assertTrue(controls.search.isVisibleTo(dock))
+        self.assertTrue(filters.extra.isHidden())
+        for widget in (filters.show, filters.presence, controls.experiment, controls.sort,
+                       window.video_split_filter_combo, window.tracking_filter_checkbox):
+            self.assertTrue(filters.extra.isAncestorOf(widget))
+        self.assertEqual(filters.more.text(), 'Filters')
+        controls.experiment.setCurrentIndex(controls.experiment.findData('2024 rig build'))
+        filters.show.setCurrentIndex(filters.show.findData('not_checked'))
+        self.assertEqual(filters.more.text(), 'Filters (2)')
+        self.assertIn('Experiment / setup: 2024 rig build', filters.more.toolTip())
+        self.assertIn('Status: Not Checked', filters.more.toolTip())
+        work.clear_filters_button.click()
+        self.assertEqual(filters.more.text(), 'Filters')
+        self.assertEqual(self.visible(window), ['alpha', 'beta'])
+
+        # Search matches names and imaging setups without rescanning saved masks.
+        request = work.request
+        controls.search.setText('ALP')
+        self.assertEqual(self.visible(window), ['alpha'])
+        controls.search.setText('rig')
+        self.assertEqual(self.visible(window), ['beta'])
+        self.assertEqual(work.request, request)
+        controls.search.clear()
+        self.assertEqual(self.visible(window), ['alpha', 'beta'])
+
+        # One line per video; the full description stays in the item text and tooltip.
+        videos = window.video_list
+        self.assertEqual(videos.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        first = videos.item(0)
+        self.assertLessEqual(videos.visualItemRect(first).height(), videos.fontMetrics().height() + 12)
+        self.assertEqual(first.data(SPLIT_ROLE), 'TRAIN')
+        self.assertIn(first.data(STATUS_ROLE)['state'], ('not_started', 'not_checked', 'finished'))
+        self.assertIn('All mask types:', first.text())
+        self.assertIn('Imaging setup: 2021 bumblebox', first.toolTip())
+
+        # No repeated project name in the sidebar; Mark Finished sits with the frames.
+        self.assertFalse(any(label.text().startswith('Local working copy')
+                             for label in dock.findChildren(QLabel)))
+        self.assertTrue(window.frame_dock.isAncestorOf(work.finish))
+        self.assertFalse(dock.isAncestorOf(work.finish))
+        frames = [window.frame_list.item(i) for i in range(window.frame_list.count())]
+        self.assertTrue(frames)
+        self.assertTrue(all(item.text().startswith('Frame ') for item in frames))
+        self.assertFalse(any('[' in item.text() for item in frames))
+        self.assertFalse(frames[0].icon().isNull())
+        self.assertTrue(work.frame_note.text().startswith('This frame:'))
+        window.video_dock.grab().save('/tmp/bumblebox-compact-sidebar.png')
+
+        # Frames from every video (before one is chosen) name their video and use its status.
+        window.last_project_path = None
+        current = window.current_video_id
+        with patch.object(work, 'summary', wraps=work.summary) as summary:
+            window.load_frames_from_project()
+        rows = [(window.frame_video_ids[i], window.frame_list.item(row))
+                for row, i in enumerate(window.frame_list_to_frames_map)]
+        others = [(video, item) for video, item in rows if video != current]
+        self.assertTrue(others)
+        for video, item in rows:
+            self.assertTrue(item.text().endswith(' · ' + video), item.text())
+        other_entry = work.index['videos'][others[0][0]]
+        frame_calls = [call for call in summary.call_args_list
+                       if len(call.args) > 2 and isinstance(call.args[2], list)]
+        self.assertTrue(any(call.args[0] is other_entry for call in frame_calls))
 
     def test_assignment_table_sorts_and_filters_without_mixing_row_identities(self):
         self.setups()

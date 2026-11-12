@@ -8,9 +8,10 @@ from gui.category_menu import add_category_menu_actions
 
 import math
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QToolButton, QButtonGroup,
-                             QSlider, QLabel, QSpinBox, QCheckBox, QMenu, QComboBox, QLayout, QStyle)
+                             QSlider, QLabel, QSpinBox, QCheckBox, QMenu, QComboBox, QLayout, QStyle,
+                             QWidgetItem)
 from PyQt6.QtCore import Qt, pyqtSignal, QSignalBlocker, QPoint, QRect, QSize
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QAction, QIcon
 
 
 class _VisibilityGroupCheckBox(QCheckBox):
@@ -34,6 +35,11 @@ class FlowLayout(QLayout):
 
     def addItem(self, item):
         self.item_list.append(item)
+
+    def insertWidget(self, index, widget):
+        self.addChildWidget(widget)
+        self.item_list.insert(index, QWidgetItem(widget))
+        self.invalidate()
 
     def count(self):
         return len(self.item_list)
@@ -186,6 +192,15 @@ class AnnotationToolbar(QWidget):
             "after calibration, centimeters"
         )
         row1.addWidget(self.measure_btn)
+
+        self.keypoint_btn = self.create_tool_button("Keypoints", "keypoint")
+        self.keypoint_btn.setToolTip(
+            "Place keypoints (head, thorax, antenna tips, ...) on bees. "
+            "Shown in projects that use keypoints (Project > Keypoints)"
+        )
+        self.keypoint_btn.hide()
+        row1.addWidget(self.keypoint_btn)
+        self.tools_row = row1
         
         row1.addWidget(self.create_separator())
         
@@ -288,8 +303,14 @@ class AnnotationToolbar(QWidget):
         main_layout.addLayout(row1)
         main_layout.addWidget(self.visibility_panel)
         
-        # Second row: Controls and action buttons
+        # Second row: options for the current tool (shown per tool), then display settings.
         row2 = FlowLayout(hspacing=5, vspacing=4)
+        self.options_row = row2
+        self.tool_hint_label = QLabel()
+        hint_font = self.tool_hint_label.font()
+        hint_font.setItalic(True)  # normal text colour: pale grey hints were hard to read
+        self.tool_hint_label.setFont(hint_font)
+        row2.addWidget(self.tool_hint_label)
         
         # Brush size control (log_2 scale up to 1000)
         brush_group = QWidget()
@@ -328,9 +349,7 @@ class AnnotationToolbar(QWidget):
         )
         row2.addWidget(self.clear_no_draw_zones_btn)
         
-        row2.addWidget(self.create_separator())
-        
-        # Mask opacity control
+        # Mask opacity control (display setting; placed after the tool options below)
         opacity_group = QWidget()
         opacity_layout = QHBoxLayout(opacity_group)
         opacity_layout.setContentsMargins(0, 0, 0, 0)
@@ -347,7 +366,6 @@ class AnnotationToolbar(QWidget):
         self.opacity_label = QLabel("25%")
         self.opacity_label.setMinimumWidth(35)
         opacity_layout.addWidget(self.opacity_label)
-        row2.addWidget(opacity_group)
 
         bee_colors_group = QWidget()
         bee_colors_layout = QHBoxLayout(bee_colors_group)
@@ -368,16 +386,12 @@ class AnnotationToolbar(QWidget):
         self.refresh_bee_colors_btn.clicked.connect(self.refresh_bee_colors_requested.emit)
         bee_colors_layout.addWidget(self.distinct_bee_colors_checkbox)
         bee_colors_layout.addWidget(self.refresh_bee_colors_btn)
-        row2.addWidget(bee_colors_group)
         
-        row2.addWidget(self.create_separator())
-        
-        # Instance controls
+        # Instance controls (tool row)
         self.clear_instance_btn = QToolButton()
         self.clear_instance_btn.setText("Clear Instance")
         self.clear_instance_btn.setToolTip("Clear selected instance mask and points (C)")
         self.clear_instance_btn.clicked.connect(self.on_clear_instance)
-        row2.addWidget(self.clear_instance_btn)
 
         self.new_instance_btn = QToolButton()
         self.new_instance_btn.setText("New Instance")
@@ -390,40 +404,47 @@ class AnnotationToolbar(QWidget):
                 lambda checked=False, cat=category: self.new_instance_requested.emit(cat)
             )
         self.new_instance_btn.setMenu(self.new_instance_menu)
-        row2.addWidget(self.new_instance_btn)
-        
-        self.detect_aruco_btn = QToolButton()
-        self.detect_aruco_btn.setText("Detect ArUco")
-        self.detect_aruco_btn.setToolTip("Detect ArUco markers on bee instances only")
-        self.detect_aruco_btn.setStyleSheet("QToolButton { color: blue; font-weight: bold; }")
-        self.detect_aruco_btn.clicked.connect(self.on_detect_aruco)
-        row2.addWidget(self.detect_aruco_btn)
+        row1.addWidget(self.new_instance_btn)
+        row1.addWidget(self.clear_instance_btn)
 
-        self.load_aruco_csv_btn = QToolButton()
-        self.load_aruco_csv_btn.setText("Load ArUco CSV")
-        self.load_aruco_csv_btn.setToolTip("Load ArUco/tag detections from a CSV for the current frame")
-        self.load_aruco_csv_btn.setStyleSheet("QToolButton { color: blue; font-weight: bold; }")
-        self.load_aruco_csv_btn.clicked.connect(self.on_load_aruco_csv)
-        row2.addWidget(self.load_aruco_csv_btn)
-        
-        self.clear_aruco_btn = QToolButton()
-        self.clear_aruco_btn.setText("Clear ArUco")
-        self.clear_aruco_btn.setToolTip("Remove all ArUco tracking for this video")
-        self.clear_aruco_btn.setStyleSheet("QToolButton { color: orange; font-weight: bold; }")
-        self.clear_aruco_btn.clicked.connect(self.on_clear_all_aruco)
-        row2.addWidget(self.clear_aruco_btn)
-        
-        self.delete_all_btn = QToolButton()
-        self.delete_all_btn.setText("Delete All Bee Instances")
-        self.delete_all_btn.setToolTip("Delete all bee instances in the current frame and remove annotations from disk (preserves hive/chamber)")
-        self.delete_all_btn.setStyleSheet("QToolButton { color: red; font-weight: bold; }")
-        self.delete_all_btn.clicked.connect(self.on_delete_all)
-        row2.addWidget(self.delete_all_btn)
-        
+        # Occasional and bulk actions: out of the way of everyday editing, in one menu.
+        self.more_btn = QToolButton()
+        self.more_btn.setText("More")
+        self.more_btn.setToolTip("ArUco tags, physical scale, and bulk actions")
+        self.more_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.more_menu = QMenu(self.more_btn)
+        self.detect_aruco_action = QAction("Detect ArUco Tags on Bees", self.more_menu)
+        self.detect_aruco_action.setToolTip("Detect ArUco markers on bee instances only")
+        self.detect_aruco_action.triggered.connect(self.on_detect_aruco)
+        self.load_aruco_csv_action = QAction("Load ArUco Tags from CSV...", self.more_menu)
+        self.load_aruco_csv_action.setToolTip("Load ArUco/tag detections from a CSV for the current frame")
+        self.load_aruco_csv_action.triggered.connect(self.on_load_aruco_csv)
+        self.clear_aruco_action = QAction("Clear ArUco Tracking for This Video...", self.more_menu)
+        self.clear_aruco_action.setToolTip("Remove all ArUco tracking for this video (asks first)")
+        self.clear_aruco_action.triggered.connect(self.on_clear_all_aruco)
+        self.calibrate_action = QAction("Physical Scale and Imaging Setup...", self.more_menu)
+        self.calibrate_action.setToolTip("Opens the Measure tool, which shows the scale calibration")
+        self.calibrate_action.triggered.connect(lambda checked=False: self.set_tool('measure'))
+        self.delete_all_action = QAction("Delete All Bee Instances on This Frame...", self.more_menu)
+        self.delete_all_action.setToolTip(
+            "Delete all bee instances in the current frame and remove them from disk "
+            "(keeps hive/chamber; asks first)")
+        self.delete_all_action.triggered.connect(self.on_delete_all)
+        for action in (self.detect_aruco_action, self.load_aruco_csv_action, self.clear_aruco_action):
+            self.more_menu.addAction(action)
+        self.more_menu.addSeparator()
+        self.more_menu.addAction(self.calibrate_action)
+        self.more_menu.addSeparator()
+        self.more_menu.addAction(self.delete_all_action)
+        self.more_menu.setToolTipsVisible(True)
+        self.more_btn.setMenu(self.more_menu)
+        row1.addWidget(self.more_btn)
+
         main_layout.addLayout(row2)
 
-        # Third row: physical-distance calibration and measurement controls.
-        row3 = FlowLayout(hspacing=5, vspacing=4)
+        # Physical-distance calibration: options of the Measure tool.
+        row3 = row2
+        calibration_start = row3.count()
         row3.addWidget(QLabel("Imaging setup:"))
 
         self.imaging_setup_combo = QComboBox()
@@ -499,10 +520,33 @@ class AnnotationToolbar(QWidget):
         )
         row3.addWidget(self.clear_measurement_line_btn)
 
-        self.calibration_widgets = [row3.itemAt(i).widget() for i in range(row3.count())]
-        main_layout.addLayout(row3)
+        self.calibration_widgets = [row3.itemAt(i).widget()
+                                    for i in range(calibration_start, row3.count())]
+        self._calibration_allowed = True
+        self._tool_options = {
+            'brush': [brush_group, self.brush_cursor_checkbox],
+            'eraser': [brush_group, self.brush_cursor_checkbox],
+            'no_draw_zone': [self.clear_no_draw_zones_btn],
+            'measure': list(self.calibration_widgets),
+        }
+        self._tool_hints = {
+            'pan': 'Drag to move, scroll to zoom, click a mask to select it',
+            'bbox': 'Drag to draw a box; drag a corner or edge to resize',
+            'no_draw_zone': 'Click vertices; double-click or Enter closes; Backspace undoes a vertex',
+            'measure': 'Drag a line; Set Scale from Line turns a known length into px/cm',
+            'sam2_prompt': 'Left-click adds a positive point, right-click a negative one',
+            'sam2_box': 'Drag a box around the object',
+        }
+        self.current_tool_name = 'pan'
+
+        # Display settings: always shown, after the tool options.
+        self.display_separator = self.create_separator()
+        row2.addWidget(self.display_separator)
+        row2.addWidget(opacity_group)
+        row2.addWidget(bee_colors_group)
 
         self.set_imaging_setups([], None)
+        self.show_tool_options('pan')
         
     def create_tool_button(self, text, tool_name):
         """Create a tool button"""
@@ -524,7 +568,52 @@ class AnnotationToolbar(QWidget):
         
     def on_tool_clicked(self, tool_name):
         """Handle tool button click"""
+        self.show_tool_options(tool_name)
         self.tool_changed.emit(tool_name)
+
+    def show_tool_options(self, tool_name):
+        """Show only the options row controls that belong to ``tool_name``.
+
+        Called for every tool change, including SAM2 and keypoint tools selected
+        on other toolbars, so the options row always matches the active tool.
+        """
+        self.current_tool_name = tool_name
+        shown = set(map(id, self._tool_options.get(tool_name, [])))
+        calibration = set(map(id, self.calibration_widgets))
+        for widgets in self._tool_options.values():
+            for widget in widgets:
+                visible = id(widget) in shown
+                if id(widget) in calibration:
+                    visible = visible and self._calibration_allowed
+                widget.setVisible(visible)
+        hint = self._tool_hints.get(tool_name, '')
+        if tool_name == 'measure' and self._calibration_allowed:
+            hint = ''  # the calibration controls explain themselves
+        self.tool_hint_label.setText(hint)
+        self.tool_hint_label.setVisible(bool(hint))
+        self.options_row.invalidate()
+        self.updateGeometry()
+
+    def set_calibration_allowed(self, allowed):
+        """Imaging setup and scale calibration are hidden in assigned workspaces."""
+        self._calibration_allowed = bool(allowed)
+        self.show_tool_options(self.current_tool_name)
+
+    def set_keypoints_available(self, available):
+        """Show the Keypoints tool only in projects that use keypoints."""
+        self.keypoint_btn.setVisible(bool(available))
+        self.tools_row.invalidate()
+        self.updateGeometry()
+
+    def check_tool_button(self, tool_name):
+        """Check a tool's button without emitting (tool chosen elsewhere)."""
+        for btn in self.button_group.buttons():
+            if btn.property('tool_name') == tool_name:
+                btn.blockSignals(True)
+                btn.setChecked(True)
+                btn.blockSignals(False)
+                return True
+        return False
         
     def on_brush_size_changed(self, value):
         """Handle brush size change (converts from log_2 scale)"""
@@ -642,6 +731,7 @@ class AnnotationToolbar(QWidget):
         for btn in self.button_group.buttons():
             if btn.property('tool_name') == tool_name:
                 btn.setChecked(True)
+                self.show_tool_options(tool_name)
                 self.tool_changed.emit(tool_name)
                 break
 

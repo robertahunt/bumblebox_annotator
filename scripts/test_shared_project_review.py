@@ -179,8 +179,11 @@ class SharedProjectReviewGuiTests(unittest.TestCase):
             review.grab().save('/tmp/bumblebox-local-shared-comparison.png')
             review.close()
             window = self.make_window(self.source)
-            self.assertIn('Local working copy', window.annotation_work.source.text())
-            self.assertEqual(window.annotation_work.source.toolTip(), str(self.source))
+            # The project name lives in the header; the sidebar no longer repeats it.
+            self.assertEqual(window.workflow.project_label.text(), self.source.name)
+            self.assertIn('Local working copy', window.workflow.project_label.toolTip())
+            self.assertIn(str(self.source), window.workflow.project_label.toolTip())
+            self.assertFalse(hasattr(window.annotation_work, 'source'))
         finally:
             dialog.shared_version.stop()
             dialog.close()

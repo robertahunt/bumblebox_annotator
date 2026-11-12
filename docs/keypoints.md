@@ -38,10 +38,11 @@ frame files and simply aren't shown or exported.
 
 ## Placing keypoints
 
-When keypoints are on, the **Keypoint toolbar** appears above the image. **Toolbars > Keypoint
-Toolbar** hides or shows it.
+When keypoints are on, a **Keypoints** tool joins the editing tools. While it is active, the
+keypoint options (Next, Place as hidden, Show keypoints, Thorax from ArUco Tags, ...) appear
+under the tool row.
 
-1. Press **Place Keypoints**.
+1. Choose the **Keypoints** tool.
 2. Click a bee. The click selects it and places its first missing keypoint.
 3. Keep clicking. Each click places the next keypoint, shown in **Next:**, for that same bee,
    even when the click lands on a neighbouring bee (for example an antenna tip). When the bee
@@ -54,12 +55,14 @@ Toolbar** hides or shows it.
 | Action | How |
 |---|---|
 | Move a point | Drag it (any visible bee) |
-| Mark a point hidden (occluded) or visible again | Right-click it, or tick **Place as hidden** (H) before clicking |
+| Place one point as hidden (occluded) | Shift+click where it goes |
+| Switch an existing point between hidden and visible | Shift+click it, or right-click it |
+| Place every following point as hidden | Tick **Place as hidden** (H); untick to stop |
 | Delete a point | Right-click it, or hover and press Backspace/Delete |
 | Remove the last point placed | Backspace |
 | Skip to the next keypoint name | N |
 | Finish the bee | Esc, or right-click > **Finish Bee** |
-| Undo/redo keypoint edits on this frame | Ctrl+Z / Ctrl+Shift+Z while Place Keypoints is active |
+| Undo/redo keypoint edits on this frame | Ctrl+Z / Ctrl+Shift+Z while the Keypoints tool is active |
 | Thorax from every tag on the frame | **Thorax from ArUco Tags** (only fills missing points; one undo step) |
 
 Points are drawn at a fixed screen size. Hidden points are drawn as dashed rings, and

@@ -179,6 +179,28 @@ class KeypointCanvasTests(unittest.TestCase):
         self.assertEqual(sorted(saved[1]['keypoints']), ['abdomen_tip', 'head', 'thorax'])
         self.assertGreater(len(layer.items), 0)
 
+    def test_shift_click_places_hidden_and_toggles_existing_points(self):
+        canvas = self.make_canvas()
+        layer = canvas.keypoint_layer
+        layer.set_config(BODY)
+        canvas.set_tool('keypoint')
+        shift = Qt.KeyboardModifier.ShiftModifier
+        QTest.mouseClick(canvas.viewport(), Qt.MouseButton.LeftButton, shift,
+                         canvas.mapFromScene(QPointF(30, 40)), 5)
+        self.app.processEvents()
+        self.assertEqual(layer.keypoints_for(1)['head'][2], kp.OCCLUDED)
+        self.assertFalse(layer.place_occluded)  # no lasting mode
+        self.click(canvas, 60, 50)
+        self.assertEqual(layer.keypoints_for(1)['thorax'][2], kp.VISIBLE)
+        # Shift+click on an existing point switches it, without moving it.
+        QTest.mouseClick(canvas.viewport(), Qt.MouseButton.LeftButton, shift,
+                         canvas.mapFromScene(QPointF(60, 50)), 5)
+        self.app.processEvents()
+        thorax = layer.keypoints_for(1)['thorax']
+        self.assertEqual(thorax[2], kp.OCCLUDED)
+        self.assertAlmostEqual(thorax[0], 60, delta=1)
+        self.assertNotIn('abdomen_tip', layer.keypoints_for(1))
+
     def test_drag_moves_point_and_is_one_undo_step(self):
         canvas = self.make_canvas()
         layer = canvas.keypoint_layer
@@ -454,29 +476,36 @@ class KeypointProjectTests(unittest.TestCase):
                 window.load_project(self.project)
                 errors.assert_not_called()
 
+        keypoint_button = window.toolbar.keypoint_btn
         load()
         self.assertFalse(window.canvas.keypoint_layer.enabled)
-        self.assertFalse(window.keypoint_toolbar_action.isEnabled())
+        self.assertFalse(keypoint_button.isVisibleTo(window))
         self.assertFalse(window.keypoint_toolbar.isVisibleTo(window))
 
         kp.save_project_config(self.project, kp.default_config(), enabled=True)
         load()
         self.assertTrue(window.canvas.keypoint_layer.enabled)
-        self.assertTrue(window.keypoint_toolbar_action.isChecked())
-        self.assertTrue(window.keypoint_toolbar.isVisibleTo(window))
+        self.assertTrue(keypoint_button.isVisibleTo(window))
+        # The keypoint options appear only while the Keypoints tool is active.
+        self.assertFalse(window.keypoint_toolbar.isVisibleTo(window))
+        self.assertFalse(window.keypoint_toolbar.place_btn.isVisibleTo(window))
 
-        # Tool switching between toolbars, and undo routed to keypoints while placing them.
-        window.keypoint_toolbar.place_btn.click()
+        keypoint_button.click()
         self.assertEqual(window.canvas.current_tool, 'keypoint')
-        self.assertTrue(window.keypoint_toolbar.place_btn.isChecked())
+        self.assertTrue(keypoint_button.isChecked())
+        self.assertTrue(window.keypoint_toolbar.isVisibleTo(window))
         window.toolbar.pan_btn.click()
         self.assertEqual(window.canvas.current_tool, 'pan')
-        self.assertFalse(window.keypoint_toolbar.place_btn.isChecked())
+        self.assertFalse(keypoint_button.isChecked())
+        self.assertFalse(window.keypoint_toolbar.isVisibleTo(window))
 
+        # Turning keypoints off while the tool is active returns to Pan.
+        keypoint_button.click()
         kp.save_project_config(self.project, kp.default_config(), enabled=False)
         load()
         self.assertFalse(window.canvas.keypoint_layer.enabled)
-        self.assertFalse(window.keypoint_toolbar_action.isEnabled())
+        self.assertEqual(window.canvas.current_tool, 'pan')
+        self.assertFalse(keypoint_button.isVisibleTo(window))
         self.assertFalse(window.keypoint_toolbar.isVisibleTo(window))
 
 

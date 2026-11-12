@@ -15,18 +15,24 @@ class KeypointToolbar(QWidget):
 
     HELP = (
         "Place Keypoints: click a bee, then click its keypoints in order (the next one is "
-        "shown here and advances automatically). Drag a point to move it. Right-click a point "
-        "to mark it hidden/visible or delete it. Esc finishes the bee, Backspace removes the "
+        "shown here and advances automatically). Drag a point to move it. Shift+click places a "
+        "point as hidden, or switches an existing point between hidden and visible; right-click "
+        "a point for the same and to delete it. Esc finishes the bee, Backspace removes the "
         "hovered or last point, N skips to the next keypoint name, H toggles 'place as hidden'. "
         "Ctrl+Z / Ctrl+Shift+Z undo and redo keypoint edits on this frame."
     )
 
-    def __init__(self, layer, parent=None):
+    def __init__(self, layer, parent=None, show_place_button=True):
+        """``show_place_button=False`` when the main tool row has a Keypoints tool button
+        and this toolbar serves as that tool's options strip."""
         super().__init__(parent)
+        self._show_place_button = bool(show_place_button)
         self.layer = layer
         layout = FlowLayout(self, margin=5, hspacing=10, vspacing=4)
 
-        layout.addWidget(QLabel("<b>Keypoints:</b>"))
+        title = QLabel("<b>Keypoints:</b>")
+        title.setToolTip(self.HELP)
+        layout.addWidget(title)
 
         self.place_btn = QToolButton()
         self.place_btn.setText("Place Keypoints")
@@ -34,6 +40,7 @@ class KeypointToolbar(QWidget):
         self.place_btn.setToolTip(self.HELP)
         self.place_btn.clicked.connect(self._on_place_clicked)
         layout.addWidget(self.place_btn)
+        self.place_btn.setVisible(self._show_place_button)
 
         layout.addWidget(QLabel("Next:"))
         self.next_combo = QComboBox()
@@ -43,8 +50,8 @@ class KeypointToolbar(QWidget):
 
         self.hidden_checkbox = QCheckBox("Place as hidden")
         self.hidden_checkbox.setToolTip(
-            "Mark new points as labelled but not visible (occluded), e.g. a head under "
-            "another bee. Shortcut: H")
+            "Mark every new point as labelled but not visible (occluded) until unticked. "
+            "For a single point, Shift+click instead. Shortcut: H")
         self.hidden_checkbox.toggled.connect(self.layer.set_place_occluded)
         layout.addWidget(self.hidden_checkbox)
 

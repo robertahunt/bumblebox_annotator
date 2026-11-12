@@ -1,6 +1,5 @@
 """Shared work filters and a nonblocking annotation-sidebar inventory."""
 
-from pathlib import Path
 from collections import OrderedDict
 
 from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal
@@ -12,7 +11,7 @@ from core.annotation_work import (TASKS, local_index, mark_finished, matches, su
 from core.assigned_work import workspace
 from gui.assigned_review import AssignedReviewViews
 from gui.project_sync_dialog import OperationWorker, SyncProgressDialog
-from gui.video_browsing import SORT_ROLE
+from gui.video_browsing import SORT_ROLE, STATE_NAMES, STATUS_ROLE, status_count, status_icon
 
 
 def task_combo(parent=None):
@@ -30,33 +29,55 @@ def task_combo(parent=None):
 
 
 class WorkFilters(QWidget):
+    """Work on, status and mask filters.
+
+    sidebar=True: one "Work on" row, then a row for the caller's search box and a
+    Filters button that opens every other filter (status, masks and any rows the
+    caller adds to extra_form). The button shows how many filters are active.
+    """
     changed = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, sidebar=False):
         super().__init__(parent)
+        self.sidebar = sidebar
+        self.external_filters = []  # callables returning descriptions of active filters
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         form = QFormLayout()
         self.task = task_combo(self)
+        if sidebar:
+            self.task.setToolTip('The mask type you are working on. Status marks, counts and '
+                                 'Mark Finished follow it.')
         self.show = QComboBox()
         for title, value in (('All Work', 'all'), ('Not Started', 'not_started'),
                              ('Not Checked', 'not_checked'), ('Finished', 'finished')):
             self.show.addItem(title, value)
         form.addRow('Work on:', self.task)
-        form.addRow('Show:', self.show)
+        if not sidebar:
+            form.addRow('Show:', self.show)
         layout.addLayout(form)
         self.more = QToolButton()
-        self.more.setText('More filters')
+        self.more.setText('Filters' if sidebar else 'More filters')
         self.more.setCheckable(True)
         self.more.setArrowType(Qt.ArrowType.RightArrow)
         self.more.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        layout.addWidget(self.more)
+        if sidebar:
+            self.more.setAccessibleName('Filters')
+            self.search_row = QHBoxLayout()
+            self.search_row.addWidget(self.more)
+            layout.addLayout(self.search_row)
+        else:
+            layout.addWidget(self.more)
         self.extra = QWidget()
         extra = QFormLayout(self.extra)
-        extra.setContentsMargins(0, 0, 0, 0)
+        extra.setContentsMargins(12 if sidebar else 0, 0, 0, 0)
+        self.extra_form = extra
+        if sidebar:
+            extra.addRow('Status:', self.show)
         self.presence = QComboBox()
-        for title, value in (('Any mask availability', 'any'), ('Has masks', 'has'), ('No masks', 'none'),
-                             ('Some frames lack masks', 'some'), ('Unknown availability', 'unknown')):
+        for title, value in (('Any' if sidebar else 'Any mask availability', 'any'), ('Has masks', 'has'),
+                             ('No masks', 'none'), ('Some frames lack masks', 'some'),
+                             ('Unknown' if sidebar else 'Unknown availability', 'unknown')):
             self.presence.addItem(title, value)
         extra.addRow('Masks:', self.presence)
         self.split = QComboBox()
@@ -64,6 +85,10 @@ class WorkFilters(QWidget):
         for split in ('train', 'val', 'test', 'inference'):
             self.split.addItem(split.title(), split)
         extra.addRow('Split:', self.split)
+        for combo in (self.show, self.presence, self.split) if sidebar else ():
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(10)
+            combo.setMinimumWidth(0)
         layout.addWidget(self.extra)
         self.extra.hide()
         def toggle(visible):
@@ -74,9 +99,27 @@ class WorkFilters(QWidget):
             combo.currentIndexChanged.connect(self.changed)
         self.changed.connect(self.update_filter_label)
 
+    def active_filters(self):
+        """Short descriptions of the filters in the Filters panel that hide work."""
+        active = []
+        if self.sidebar and self.show.currentData() != 'all':
+            active.append('Status: ' + self.show.currentText())
+        if self.presence.currentData() != 'any':
+            active.append('Masks: ' + self.presence.currentText())
+        if self.split.currentData() is not None:
+            active.append('Split: ' + self.split.currentText())
+        for describe in self.external_filters:
+            active.extend(describe())
+        return active
+
     def update_filter_label(self):
-        active = int(self.presence.currentData() != 'any') + int(self.split.currentData() is not None)
-        self.more.setText(f'More filters ({active})' if active else 'More filters')
+        active = self.active_filters()
+        if not self.sidebar:
+            self.more.setText(f'More filters ({len(active)})' if active else 'More filters')
+            return
+        self.more.setText(f'Filters ({len(active)})' if active else 'Filters')
+        self.more.setToolTip('Active filters:\n' + '\n'.join(active) if active else
+                             'Status, masks, split, experiment and sort order')
 
     def accepts(self, summary, split=None):
         return (self.split.currentData() in (None, split) and
@@ -97,20 +140,41 @@ class AnnotationWorkBrowser(QObject):
     def __init__(self, window, layout):
         super().__init__(window)
         self.window = window
-        self.source = QLabel()
-        self.source.setTextFormat(Qt.TextFormat.PlainText)
-        self.source.setWordWrap(True)
-        layout.insertWidget(0, self.source)
+        browser = window.video_browser
         self.review = AssignedReviewViews()
         layout.insertWidget(layout.indexOf(window.video_list), self.review)
         self.review.changed.connect(self.apply)
-        self.filters = WorkFilters()
-        self.filters.split.hide()  # The existing sidebar already has a split selector.
-        self.filters.extra.layout().labelForField(self.filters.split).hide()
-        layout.insertWidget(layout.indexOf(window.video_list), self.filters)
-        self.note = QLabel('Local saved annotations')
+        # Work on stays visible; every other filter lives behind one Filters button.
+        self.filters = filters = WorkFilters(sidebar=True)
+        form = filters.extra_form
+        form.setRowVisible(filters.split, False)  # The window's per-video split filter replaces it.
+        filters.search_row.insertWidget(0, browser.search, 1)
+        form.insertRow(1, window.video_filter_label, window.video_split_filter_combo)
+        form.addRow('Experiment / setup:', browser.experiment)
+        form.addRow('Sort:', browser.sort)
+        form.addRow(browser.only_mine)
+        form.addRow(window.tracking_filter_checkbox)
+        self.clear_filters_button = QPushButton('Clear Filters')
+        self.clear_filters_button.setToolTip('Show all videos again (search text is kept)')
+        self.clear_filters_button.clicked.connect(self.clear_filters)
+        clear_row = QHBoxLayout()
+        clear_row.addWidget(self.clear_filters_button)
+        clear_row.addStretch()
+        form.addRow(clear_row)
+        filters.external_filters.append(self.sidebar_filters)
+        layout.insertWidget(layout.indexOf(window.video_list), filters)
+        # List-level notes only (checking progress, filtered-out current video); hidden when empty.
+        self.note = QLabel()
         self.note.setWordWrap(True)
-        layout.addWidget(self.note)
+        self.note.hide()
+        layout.insertWidget(layout.indexOf(window.video_list) + 1, self.note)
+        # The current frame's status and Mark Finished; the window puts this in the Frames panel.
+        self.frame_controls = QWidget()
+        frame_layout = QVBoxLayout(self.frame_controls)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        self.frame_note = QLabel('Local saved annotations')
+        self.frame_note.setWordWrap(True)
+        frame_layout.addWidget(self.frame_note)
         row = QHBoxLayout()
         self.finish = QPushButton('Mark Finished')
         self.finish.setIcon(window.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
@@ -119,17 +183,19 @@ class AnnotationWorkBrowser(QObject):
         self.next = QToolButton()
         self.next.setIcon(window.style().standardIcon(QStyle.StandardPixmap.SP_ArrowRight))
         self.next.setToolTip('Next unfinished frame in this video')
+        self.next.setAccessibleName('Next unfinished frame')
         self.next.clicked.connect(self.next_frame)
         row.addWidget(self.next)
         self.refresh_button = QToolButton()
         self.refresh_button.setIcon(window.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.refresh_button.setToolTip('Refresh saved mask summaries')
+        self.refresh_button.setAccessibleName('Refresh saved mask summaries')
         self.refresh_button.clicked.connect(self.schedule)
         self.refresh_button.clicked.connect(window.video_browser.schedule)
         self.refresh_button.clicked.connect(
             lambda: window._schedule_done_counter_update(saved_counts_dirty=True))
         row.addWidget(self.refresh_button)
-        layout.addLayout(row)
+        frame_layout.addLayout(row)
         self.filters.changed.connect(self.apply)
         self.worker = None
         self.project = None
@@ -150,6 +216,25 @@ class AnnotationWorkBrowser(QObject):
         self.timer.setSingleShot(True)
         self.timer.setInterval(300)
         self.timer.timeout.connect(self.refresh)
+        self.apply()
+
+    def sidebar_filters(self):
+        w = self.window
+        active = []
+        if getattr(w, 'video_split_filter', 'all') != 'all':
+            active.append('Split: ' + w.video_split_filter_combo.currentText())
+        active.extend(w.video_browser.active_filters())
+        if w.tracking_filter_checkbox.isChecked():
+            active.append('Only videos with tracking sequences')
+        return active
+
+    def clear_filters(self):
+        w, filters = self.window, self.filters
+        for combo in (filters.show, filters.presence, filters.split,
+                      w.video_browser.experiment, w.video_split_filter_combo):
+            combo.setCurrentIndex(0)
+        w.tracking_filter_checkbox.setChecked(False)
+        w.video_browser.only_mine.setChecked(False)
         self.apply()
 
     def schedule(self):
@@ -287,6 +372,16 @@ class AnnotationWorkBrowser(QObject):
         return ('Loading...' if summary['state'] == 'loading' else
                 summary['mask_text'] + ' | ' + summary['work_text'])
 
+    @staticmethod
+    def frame_text(summary):
+        """The current frame's status in plain words, e.g. 'This frame: Has masks · Not checked'."""
+        if summary['state'] == 'loading':
+            return 'This frame: Loading...'
+        masks = summary['mask_text']
+        if summary.get('total') == 1 and masks.startswith('Masks on'):
+            masks = 'Has masks'
+        return 'This frame: ' + masks + ' · ' + summary['work_text']
+
     def apply(self):
         if self.stopping:
             return
@@ -296,8 +391,6 @@ class AnnotationWorkBrowser(QObject):
             return
         self.apply_timer.stop()
         self.check_context()
-        self.source.setText('Local working copy\n' + Path(w.project_path).name if w.project_path else 'No local project open')
-        self.source.setToolTip(str(w.project_path or ''))
         task = self.filters.task.currentData()
         state = workspace(w.project_path) if w.project_path else None
         assignments = state['assignments'] if state else (
@@ -316,16 +409,24 @@ class AnnotationWorkBrowser(QObject):
             if base is None:
                 base = item.text()
                 item.setData(Qt.ItemDataRole.UserRole + 40, base)
-            item.setText(base + '\n' + task_label(task) + ': ' + self.summary_text(summary))
+            # The full text stays the item's text (screen readers, tooltips); the row
+            # delegate paints one line from SPLIT_ROLE and STATUS_ROLE.
+            status = task_label(task) + ': ' + self.summary_text(summary)
+            item.setText(base + '\n' + status)
             review_text = self.review.status_text(video)
             if review_text:
                 item.setText(item.text() + '\n' + review_text)
-            item.setToolTip(base + '\nLocal saved annotations\n' + summary.get('detail', '') +
+            count = status_count(summary)
+            item.setData(STATUS_ROLE, {'state': summary['state'], 'count': count})
+            item.setToolTip(base + '\n' + status +
+                            (f'\nFinished frames: {count}' if count else '') +
+                            '\nLocal saved annotations: ' + summary.get('detail', '') +
                             '\n' + w.video_browser.tooltip(video) + ('\n' + review_text if review_text else ''))
-            # Mask filters retain the active item; experiment/review filters are exact.
+            # Mask filters retain the active item; experiment/review/search filters are exact.
             # Neither changes the video currently displayed on the canvas.
-            visible = w.video_browser.accepts(video) and self.review.accepts(video) and (
-                summary['state'] == 'loading' or video == w.current_video_id or self.filters.accepts(summary))
+            visible = (w.video_browser.accepts(video) and w.video_browser.matches_search(video) and
+                       self.review.accepts(video) and (
+                summary['state'] == 'loading' or video == w.current_video_id or self.filters.accepts(summary)))
             item.setHidden(not visible)
             visible_count += int(visible)
             if not visible:
@@ -336,17 +437,23 @@ class AnnotationWorkBrowser(QObject):
         video, frame, entry = self.current()
         summary = self.summary(entry, task, [frame])
         dirty = bool(getattr(w, 'current_frame_modified', False))
-        self.note.setText('Unsaved edits; showing saved status' if dirty else
-                          'Local saved annotations' if not video else self.summary_text(summary))
+        self.frame_note.setText('This frame: unsaved edits; showing saved status' if dirty else
+                                'Choose a video to see its saved work' if not video else
+                                self.frame_text(summary))
+        notes = []
         if self.worker or summary['state'] == 'loading':
             progress = f' {len(self.scanned_videos)}/{len(self.request[2])} videos' if self.worker else ''
-            self.note.setText(self.note.text() + '\nChecking local saved masks...' + progress)
+            notes.append('Checking local saved masks...' + progress)
         elif self.error:
-            self.note.setText('Mask summary unavailable: ' + self.error)
-        if video and not (w.video_browser.accepts(video) and self.review.accepts(video)):
-            self.note.setText(self.note.text() + '\nCurrent video is outside the video filters')
+            notes.append('Mask summary unavailable: ' + self.error)
+        if video and not (w.video_browser.accepts(video) and w.video_browser.matches_search(video)
+                          and self.review.accepts(video)):
+            notes.append('Current video is outside the video filters')
         elif video and summary['state'] != 'loading' and not self.filters.accepts(self.summary(entry, task)):
-            self.note.setText(self.note.text() + '\nCurrent video kept visible outside these filters')
+            notes.append('Current video kept visible outside these filters')
+        self.note.setText('\n'.join(notes))
+        self.note.setVisible(bool(notes))
+        self.filters.update_filter_label()
         available = summary['state'] not in ('unknown', 'loading', 'not_scanned')
         self.finish.setEnabled(bool(video and entry and task and available))
         self.finish.setText('Reopen Work' if not dirty and summary.get('finished', 0) == summary.get('total', -1)
@@ -365,12 +472,20 @@ class AnnotationWorkBrowser(QObject):
                     base = item.text()
                     item.setData(Qt.ItemDataRole.UserRole + 40, base)
                 number = w._get_frame_idx_in_video(index)
-                details = self.summary(entry, task, [number])
-                item.setText(base + ' | ' + details['work_text'])
-                item.setToolTip(details['mask_text'] + '\n' + details.get('detail', ''))
+                # Before a video is chosen the list holds frames from every video.
+                frame_video = w.frame_video_ids[index] if index < len(w.frame_video_ids) else video
+                frame_entry = entry if frame_video == video else self.index['videos'].get(frame_video)
+                details = self.summary(frame_entry, task, [number])
+                video_name = item.data(Qt.ItemDataRole.UserRole + 44)  # only when several videos are listed
+                item.setText(base + ' · ' + details['work_text'] + (' · ' + video_name if video_name else ''))
+                item.setIcon(status_icon(details['state']))
+                note = item.data(Qt.ItemDataRole.UserRole + 43)
+                item.setToolTip(STATE_NAMES.get(details['state'], details['work_text']) + ': ' +
+                                details['mask_text'] + '\n' + details.get('detail', '') +
+                                ('\n' + note if note else ''))
 
     def mark_dirty(self):
-        self.note.setText('Unsaved edits; showing saved status')
+        self.frame_note.setText('This frame: unsaved edits; showing saved status')
         self.finish.setText('Mark Finished')
         self.finish.setToolTip(self._finish_tip)
 

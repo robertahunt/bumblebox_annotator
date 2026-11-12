@@ -343,7 +343,7 @@ class HousekeepingTests(unittest.TestCase):
     def test_summary_refresh_is_deferred_during_stroke(self):
         w = self.window
         w.canvas.is_drawing = True
-        with patch.object(w.annotation_work.source, 'setText') as update:
+        with patch.object(w.annotation_work, 'check_context') as update:
             w.annotation_work.apply()
             w.annotation_work.apply()
             update.assert_not_called()

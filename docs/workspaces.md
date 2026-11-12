@@ -91,9 +91,24 @@ shared folder or alter annotation ownership.
   are remembered separately for each contributor/project on that device.
 - **Annotate** keeps editing and frame navigation visible. Class/global visibility
   controls sit above the instance list. Model assistance is an optional panel,
-  showing one model toolbar at a time. Additional tools reveals calibration,
-  ArUco operations, protected-area clearing, and bulk deletion. Hiding a model
-  panel does not unload its model or change annotation visibility.
+  showing one model toolbar at a time. Hiding a model panel does not unload its
+  model or change annotation visibility.
+- The **tool row** holds undo/redo, the editing tools (plus **Keypoints** in projects
+  that use them), New/Clear Instance, and **More**. The **options row** below it
+  shows only what the current tool needs, followed by the display settings
+  (opacity, distinct neighbouring bees):
+  - Brush/Eraser: brush size and brush cursor;
+  - No Draw Zone: Clear Zones;
+  - Measure: imaging setup and physical-scale calibration (not shown in assigned
+    workspaces);
+  - Keypoints: the keypoint options.
+- **More** holds occasional and bulk actions: detect/load/clear ArUco tags,
+  Physical Scale and Imaging Setup (opens Measure), and, separated at the bottom,
+  Delete All Bee Instances on This Frame. Clearing ArUco tracking and deleting
+  all bees both ask before doing anything.
+- The brush-size **– / +** buttons on the image appear only with Brush or Eraser.
+  **Instances made** is a one-line summary in the image corner; click it for counts
+  by class, and click again to collapse it.
 - **Review** adds imported-frame review controls and tracking sequences to the
   same editor. The annotation policy remains visible in both editing workspaces.
   It is still possible to correct labels during review.
@@ -190,8 +205,8 @@ do not silently change masks, classes, or the selected editing tool.
 
 ## Video Browsing
 
-Annotate labels its video list **Local working copy**, with the project name and
-folder path in the tooltip. Assignments labels its source **Shared version**, with
+Annotate's video list is the **local working copy**; the project name sits in the
+header, with the folder path in its tooltip. Assignments labels its source **Shared version**, with
 publisher and publication time. These are deliberately different data sources.
 Its separate last-checked time and newer-publication notice never imply local and
 shared annotations match. The source header can show the exact archive location
@@ -199,7 +214,21 @@ and open a read-only, video-grouped comparison of local saved annotations agains
 the displayed shared version. See
 [assigned_work.md](assigned_work.md#compare-local-and-shared-work).
 
-The Annotate video sidebar and the Assignments table have an **Experiment / setup**
+The Annotate video sidebar keeps **Work on** visible, with a **Search videos** box
+(matching words in the video name or imaging setup) and a **Filters** button beside
+it. Filters opens Status, Split, Masks, Experiment / setup, Sort and, where they
+apply, the "only my assigned videos" and tracking-sequence options; the button
+shows how many filters are active (for example **Filters (2)**), its tooltip lists
+them, and **Clear Filters** shows every video again (search text is kept).
+
+Each video is one line: a coloured **Train / Val / Test / Infer** tag, the name
+(shortened in the middle when the sidebar is narrow), a status mark and the number
+of finished frames, such as **0/5**. The marks are a check (finished), a half circle
+(not checked), an empty ring (not started), **!** (changed, or import review needed),
+**?** (unknown or not scanned) and a dotted ring (loading). Hover a row for the full
+name, imaging setup, mask availability and review status.
+
+The Annotate Filters panel and the Assignments table both have an **Experiment / setup**
 filter and a **Sort** menu. Experiments use the existing imaging setup names, not
 new project folders. Filtering does not change assignments, calibration, annotations,
 or the current canvas. The experiment filter is exact: the active video's list item
@@ -219,9 +248,12 @@ files can affect dates; this is not a shared contributor edit history. See
 
 ### Mask Work in the Annotation Sidebar
 
-The video list has **Work on**, **Show**, and **More filters** controls, matching
-the assignment table. Each video shows mask availability and completion for the
-selected type; each frame shows its work status. These are **local saved** results,
+The video list has **Work on** plus the **Filters** panel (Status and Masks match
+the assignment table's Show and More filters). Each video shows completion for the
+selected type, with mask availability in its tooltip; each frame shows its status
+mark and work status. Frames list only the frame number (the split is on the
+video's tag); frames that are not selected for the split are shown in italics,
+since training exports skip them. These are **local saved** results,
 not the published backup. Unsaved edits are identified separately. The summary
 refreshes in the background after saves; the refresh icon also checks external
 changes. Before the initial scan finishes, videos and frames show **Loading...**
@@ -236,12 +268,14 @@ the visible video rows, including after filtering or sorting.
 Filtering never changes mask visibility, the drawing category, zoom, or training
 selection.
 
-**Show** offers All Work, Not Started, Not Checked, and Finished. Not Started is
+**Status** (called **Show** in Assignments) offers All Work, Not Started, Not Checked, and Finished. Not Started is
 untouched work for the selected mask type. Not Checked includes existing masks
 without full completion, changed work, pending import reviews, and unknown status;
 each row still shows its specific status. Finished also includes checked absence.
 
 Choose a mask type and use **Mark Finished** after checking the current frame.
+Mark Finished, the next-unfinished arrow and the refresh button sit at the top of
+the **Frames** panel, under a "This frame: ..." line with the saved status.
 For a shared-video category, the confirmation explicitly applies to the shared
 mask once for the whole video. With no mask, confirmation records **Checked: none
 present**, rather than treating a checked negative example as permanently unfinished.

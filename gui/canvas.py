@@ -349,12 +349,13 @@ class ImageCanvas(QGraphicsView):
         """)
         self._brush_size_overlay.adjustSize()
         self._position_brush_size_overlay()
-        self._brush_size_overlay.show()
+        # Brush size only matters for Brush/Eraser; elsewhere the buttons look like zoom.
+        self._brush_size_overlay.setVisible(self.current_tool in ('brush', 'eraser'))
 
     def _create_brush_size_button(self, label, direction):
         button = QPushButton(label, self._brush_size_overlay)
         button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        button.setToolTip("Decrease brush size by 1" if direction < 0 else "Increase brush size by 1")
+        button.setToolTip("Brush size: smaller by 1" if direction < 0 else "Brush size: larger by 1")
         button.clicked.connect(lambda checked=False, step=direction: self._request_brush_size_step(step))
         return button
 
@@ -1296,6 +1297,7 @@ class ImageCanvas(QGraphicsView):
             self.keypoint_layer.on_tool_left()
         
         self.current_tool = tool_name
+        self._brush_size_overlay.setVisible(tool_name in ('brush', 'eraser'))
         
         if tool_name == 'pan':
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)

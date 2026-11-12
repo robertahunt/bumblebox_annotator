@@ -195,7 +195,8 @@ class MainlineGuiCompatibilityTests(PolicyFixture):
         for width in (900, 1280):
             host.resize(width, 900)
             self.app.processEvents()
-            for flow in [toolbar.layout().itemAt(i).layout() for i in range(3)] + [structures.layout()]:
+            for flow in [toolbar.tools_row, toolbar.visibility_panel.layout(), toolbar.options_row,
+                         structures.layout()]:
                 self.assertIsInstance(flow, FlowLayout)
                 for index in range(flow.count()):
                     item = flow.itemAt(index)

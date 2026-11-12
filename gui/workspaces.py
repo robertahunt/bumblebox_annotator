@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QPointF, QSize, Qt, QTimer
-from PyQt6.QtGui import QAction, QColor, QIcon, QPalette, QTransform
+from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPalette, QTransform
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDockWidget, QHBoxLayout,
                             QLabel, QMenu, QMessageBox,
                             QPushButton, QScrollArea, QStackedWidget, QStyle,
@@ -30,6 +30,53 @@ def label(text, *, heading=False):
         font.setBold(True)
         widget.setFont(font)
     return widget
+
+
+class ElidedLabel(QLabel):
+    """One-line label that shortens with "..." instead of wrapping when space runs out.
+
+    Wrapped status labels side by side ended up on different lines and heights.
+    The full text stays in text() and, unless a tooltip is set, in the tooltip.
+    """
+
+    def __init__(self, text=''):
+        super().__init__(text)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setWordWrap(False)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+    def minimumSizeHint(self):
+        return QSize(min(60, super().sizeHint().width()), super().minimumSizeHint().height())
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight, self.width())
+        painter.drawText(self.rect(), int(self.alignment()), text)
+
+    def event(self, event):
+        if event.type() == event.Type.ToolTip and not self.toolTip():
+            from PyQt6.QtWidgets import QToolTip
+            if self.fontMetrics().horizontalAdvance(self.text()) > self.width():
+                QToolTip.showText(event.globalPos(), self.text(), self)
+            return True
+        return super().event(event)
+
+
+def shared_status_text(result):
+    """Plain-language summary of a project_activity() result; the full message goes in a tooltip."""
+    status, changed, message = result.get('status'), result.get('changed'), result.get('message', '')
+    if status == 'local':
+        return 'Local project (no shared copy)'
+    if status == 'unpublished':
+        return 'Shared copy: not backed up yet'
+    if status == 'current':
+        return 'Shared copy: up to date'
+    if status == 'update':
+        return 'Shared copy is newer; review before updating' if changed else 'Shared copy is newer'
+    if message == 'Shared history differs; review before updating':
+        return 'Shared copy changed differently from yours; review before updating'
+    return message
 
 
 def command(layout, text, callback, icon=None):
@@ -254,10 +301,15 @@ class WorkspaceController(QObject):
         self.status_bar = QWidget()
         status_layout = QHBoxLayout(self.status_bar)
         status_layout.setContentsMargins(8, 0, 8, 0)
-        self.local_status = label('Saved locally')
-        self.shared_status = label('Local project')
+        self.status_layout = status_layout  # editor controls are inserted at the left
+        status_layout.addStretch(1)
+        # "This computer" status, then the shared-folder status, each on one line.
+        self.local_status = ElidedLabel('Saved on this computer')
+        self.status_separator = QLabel('\u00b7')
+        self.shared_status = ElidedLabel('Local project (no shared copy)')
         status_layout.addWidget(self.local_status)
-        status_layout.addWidget(self.shared_status, 1)
+        status_layout.addWidget(self.status_separator)
+        status_layout.addWidget(self.shared_status)
         self.check_button = QToolButton()
         self.check_button.setIcon(window.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.check_button.setToolTip('Check shared project for updates')
@@ -374,16 +426,24 @@ class WorkspaceController(QObject):
             action.triggered.connect(lambda checked, widget=toolbar: self.select_assistance(widget, checked))
         self.assist_choice.currentIndexChanged.connect(self.refresh_assistance)
         layout.insertWidget(0, self.assist)
-        controls = QHBoxLayout()
+        self.editor_controls = QWidget()
+        controls = QHBoxLayout(self.editor_controls)
+        controls.setContentsMargins(0, 0, 0, 0)
         self.assist_toggle = QCheckBox('Model assistance')
         self.assist_toggle.toggled.connect(self.refresh_assistance)
         controls.addWidget(self.assist_toggle)
         controls.addWidget(self.assist_choice)
-        controls.addStretch()
+        controls.addSpacing(16)
+        # The policy summary sits beside its button instead of on a row of its own.
+        layout.removeWidget(window.policy_label)
+        window.policy_label.setWordWrap(False)
+        controls.addWidget(window.policy_label)
         policy = QPushButton('Annotation Policy')
         policy.clicked.connect(window.show_annotation_policy)
         controls.addWidget(policy)
-        layout.insertLayout(0, controls)
+        # One header row: editor controls on the left, save/shared status on the right.
+        self.status_layout.insertWidget(0, self.editor_controls)
+        self.editor_controls.hide()
         self.refresh_assistance()
 
     def select_assistance(self, toolbar, checked):
@@ -413,36 +473,25 @@ class WorkspaceController(QObject):
         toolbar = self.window.toolbar
         toolbar.layout().removeWidget(toolbar.visibility_panel)
         self.window.instance_dock.widget().layout().insertWidget(0, toolbar.visibility_panel)
-        self.details = QCheckBox('Additional tools')
-        self.details.setToolTip('ArUco, calibration, protected areas, and bulk deletion')
-        toolbar.layout().insertWidget(2, self.details)
-        self.details.toggled.connect(self.refresh_details)
-        undo_row = QHBoxLayout()
-        for text, callback, icon in (
-            ('Undo', self.window.undo, QStyle.StandardPixmap.SP_ArrowBack),
-            ('Redo', self.window.redo, QStyle.StandardPixmap.SP_ArrowForward),
-        ):
+        # Undo/redo lead the tool row. ArUco, scale calibration and bulk deletion live in
+        # the toolbar's More menu; tool-specific options appear with their tool.
+        for index, (text, callback, icon) in enumerate((
+            ('Undo (Ctrl+Z)', self.window.undo, QStyle.StandardPixmap.SP_ArrowBack),
+            ('Redo (Ctrl+Shift+Z)', self.window.redo, QStyle.StandardPixmap.SP_ArrowForward),
+        )):
             button = QToolButton()
             button.setIcon(self.window.style().standardIcon(icon))
             button.setToolTip(text)
-            button.setAccessibleName(text)
+            button.setAccessibleName(text.split(' (')[0])
             button.setMinimumSize(30, 30)
             button.clicked.connect(callback)
-            undo_row.addWidget(button)
-        toolbar.layout().removeWidget(self.details)
-        undo_row.addWidget(self.details)
-        undo_row.addStretch()
-        toolbar.layout().insertLayout(2, undo_row)
+            toolbar.tools_row.insertWidget(index, button)
+        toolbar.tools_row.insertWidget(2, toolbar.create_separator())
         self.refresh_details()
 
     def refresh_details(self, *_):
-        toolbar = self.window.toolbar
-        enabled = self.details.isChecked()
-        for widget in (toolbar.detect_aruco_btn, toolbar.load_aruco_csv_btn, toolbar.clear_aruco_btn,
-                       toolbar.delete_all_btn, toolbar.clear_no_draw_zones_btn):
-            widget.setVisible(enabled)
-        for widget in toolbar.calibration_widgets:
-            widget.setVisible(enabled and not self.assigned())
+        """Scale calibration is a coordinator setting: hidden in assigned workspaces."""
+        self.window.toolbar.set_calibration_allowed(not self.assigned())
 
     def assigned(self):
         return bool(workspace(self.window.project_path))
@@ -481,7 +530,7 @@ class WorkspaceController(QObject):
         self.identity_changed()
         project = self.window.project_path
         self.project_label.setText(project.name)
-        self.project_label.setToolTip(str(project))
+        self.project_label.setToolTip('Local working copy:\n' + str(project))
         identity = (self.window.contributor_session or {}).get('id', '')
         self.settings.setValue('workflow/last_project/' + identity, str(project))
         recent_key = 'workflow/recent_projects/' + identity
@@ -518,7 +567,8 @@ class WorkspaceController(QObject):
         self.update_save_status()
         self.update_button.hide()
         self.update_help.hide()
-        self.shared_status.setText('Shared status not checked' if self.linked() else 'Local project')
+        self.shared_status.setText('Shared copy: not checked yet' if self.linked()
+                                   else 'Local project (no shared copy)')
         self.check_button.setVisible(self.linked())
         self.upload_button.setVisible(self.linked())
         self.upload_help.setVisible(self.linked())
@@ -632,6 +682,8 @@ class WorkspaceController(QObject):
         self.window.video_batch_help.hide()
         self.window.tracking_filter_checkbox.setVisible(name == 'Review' and not self.assigned())
         self.status_bar.setVisible(bool(self.window.project_path))
+        if hasattr(self, 'editor_controls'):
+            self.editor_controls.setVisible(entering_editor)
         if name != 'Home':
             self.settings.setValue(self.key('workspace'), name)
         if name == 'Assignments':
@@ -675,7 +727,7 @@ class WorkspaceController(QObject):
         self.settings.setValue(self.key('unpublished'), False)
         self.settings.sync()
         self.update_save_status()
-        self.shared_status.setText('Upload verified')
+        self.shared_status.setText('Shared copy: upload verified')
         self.update_button.hide()
         self.update_help.hide()
         self.window.annotation_work.review.schedule()
@@ -683,18 +735,22 @@ class WorkspaceController(QObject):
     def update_save_status(self):
         window = self.window
         if window.save_worker.failed_tasks:
-            text = 'Local save failed'
+            text = 'Save failed on this computer'
         elif window.save_worker.save_queue.unfinished_tasks:
-            text = 'Saving locally...'
+            text = 'Saving...'
         elif window.current_frame_modified:
             text = 'Unsaved changes'
         else:
-            text = 'Saved locally'
+            text = 'Saved on this computer'
         if self.linked() and self.pending() and not self.assigned():
-            text += ' | Changes to upload'
+            text = 'Saved here; not uploaded yet' if text == 'Saved on this computer' else (
+                text + '; not uploaded yet')
+        self.local_status.setToolTip(
+            'Annotations save automatically on this computer. "Not uploaded yet" means the shared '
+            'folder does not have your latest edits; the upload button on the right sends them.')
         automatic = self.automatic_work.description()
         if automatic:
-            text += ' | ' + automatic
+            text += ' \u00b7 ' + automatic
         self.local_status.setText(text)
 
     def autosave(self):
@@ -709,7 +765,7 @@ class WorkspaceController(QObject):
             window._save_annotation_sources(use_background=True)
             self.update_save_status()
         except Exception as exc:
-            self.local_status.setText('Local save failed')
+            self.local_status.setText('Save failed on this computer')
             self.local_status.setToolTip(str(exc))
 
     def upload(self):
@@ -721,7 +777,7 @@ class WorkspaceController(QObject):
     def check_shared(self):
         from gui.lab_startup import working_locally
         if working_locally():
-            self.shared_status.setText('Working locally; shared updates have not been checked')
+            self.shared_status.setText('Working locally; shared copy not checked')
             self.update_button.hide()
             self.update_help.hide()
             return
@@ -730,7 +786,7 @@ class WorkspaceController(QObject):
         project = str(self.window.project_path)
         generation = self.generation
         configuration = setting_json('project_sync/destination', {})
-        self.shared_status.setText('Checking shared project...')
+        self.shared_status.setText('Shared copy: checking...')
         self.check_button.setEnabled(False)
         self.worker = OperationWorker(lambda progress, cancelled:
                                       project_activity(project, configuration, cancelled), self)
@@ -749,19 +805,19 @@ class WorkspaceController(QObject):
                 QTimer.singleShot(0, self.check_shared)
             return
         if generation != self.generation:
-            self.shared_status.setText('Local work changed during the check; check again for shared status')
+            self.shared_status.setText('Shared copy: you edited during the check; check again')
             self.update_button.hide()
             self.update_help.hide()
             return
         if worker.error:
-            self.shared_status.setText('Shared folder unavailable or needs attention; local work is available')
+            self.shared_status.setText('Shared folder unavailable; your work is saved on this computer')
             self.shared_status.setToolTip(str(worker.error))
             self.update_button.hide()
             self.update_help.hide()
             return
         result = worker.result
         self.status = result
-        self.shared_status.setText(result['message'])
+        self.shared_status.setText(shared_status_text(result))
         self.shared_status.setToolTip(result['message'])
         self.update_button.setVisible(result['status'] in ('update', 'attention') and not self.assigned())
         self.update_help.setVisible(not self.update_button.isHidden())

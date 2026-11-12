@@ -8,10 +8,10 @@ import torch
 import csv
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QSplitter, QFileDialog, QMessageBox, QStatusBar,
-                             QDockWidget, QListWidget, QToolBar, QLabel, 
+                             QDockWidget, QListWidget, QListWidgetItem, QToolBar, QLabel, 
                              QApplication, QDialog, QPushButton, QScrollArea,
                              QInputDialog, QSlider, QProgressDialog, QCheckBox, QStyle)
-from PyQt6.QtCore import Qt, pyqtSignal, QSettings, QThread, QTimer, QEvent
+from PyQt6.QtCore import Qt, pyqtSignal, QSettings, QThread, QTimer, QEvent, QSize
 from PyQt6.QtGui import QAction, QKeySequence, QActionGroup
 from pathlib import Path
 from datetime import datetime
@@ -68,7 +68,8 @@ from core.contributors import utc_now, provenance_records
 from .tracking_validation_dialog import TrackingValidationConfigDialog, TrackingValidationProgressDialog
 from .tracking_validation_worker import TrackingValidationWorker
 from .project_overview_dialog import ProjectOverviewDialog
-from .video_browsing import VideoBrowserControls, VideoListItem, VideoRowColors
+from .video_browsing import (SPLIT_ROLE, OneLineDelegate, VideoBrowserControls, VideoListItem,
+                             VideoRowColors, VideoRowDelegate)
 from .workspaces import WorkspaceController
 from core.video_processor import VideoProcessor
 from core.annotation import AnnotationManager
@@ -445,7 +446,8 @@ class MainWindow(QMainWindow):
         self.hive_chamber_toolbar.both_inference_requested.connect(self.run_hive_chamber_both)
         
         # Optional keypoint workflow: hidden and inert unless the project turns it on.
-        self.keypoint_toolbar = KeypointToolbar(self.canvas.keypoint_layer, self)
+        self.keypoint_toolbar = KeypointToolbar(self.canvas.keypoint_layer, self,
+                                                show_place_button=False)
         self.keypoint_toolbar.tool_changed.connect(self.on_keypoint_tool_requested)
         self.keypoint_toolbar.settings_requested.connect(self.show_keypoint_settings)
         self.keypoint_toolbar.hide()
@@ -601,6 +603,10 @@ class MainWindow(QMainWindow):
             }
         """)
 
+        # Collapsed to one line by default so it covers little of the image; click toggles.
+        self.done_counter_expanded = False
+        self.done_counter_overlay.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.done_counter_overlay.installEventFilter(self)
         self._refresh_done_counter_labels()
         self.done_counter_overlay.adjustSize()
         self.done_counter_overlay.show()
@@ -854,6 +860,10 @@ class MainWindow(QMainWindow):
             timer.start()
             return
         counts = self._current_annotation_counts()
+        expanded = getattr(self, 'done_counter_expanded', True)
+        self.done_counter_title_label.setVisible(expanded)
+        self.done_counter_overlay.setToolTip(
+            'Click to hide counts by class' if expanded else 'Click for counts by class')
         if self.done_counter_saved_counts_dirty or self._count_scan_error:
             self.done_counter_summary_label.setText(
                 'Counting saved instances...' if self.done_counter_saved_counts_dirty else 'Instance count unavailable')
@@ -878,12 +888,14 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, 'done_counter_summary_label'):
             self.done_counter_summary_label.setText(
-                f"Project: {project_total} (+{session_total} session)"
+                f"Project: {project_total} (+{session_total} session)" if expanded else
+                f"Instances made: {project_total} (+{session_total} this session)  \u25be"
             )
 
         if hasattr(self, 'done_counter_category_labels'):
             for category, label in self.done_counter_category_labels.items():
-                label.setVisible(category not in BROOD_CATEGORIES or counts.get(category, 0) > 0)
+                label.setVisible(expanded and (
+                    category not in BROOD_CATEGORIES or counts.get(category, 0) > 0))
                 label.setText(
                     f"{self._category_display_name(category)}: "
                     f"{counts.get(category, 0)} (+{session_counts.get(category, 0)})"
@@ -893,6 +905,13 @@ class MainWindow(QMainWindow):
             self._position_done_counter_overlay()
 
     def eventFilter(self, obj, event):
+        if (
+            obj is getattr(self, 'done_counter_overlay', None) and
+            event.type() == QEvent.Type.MouseButtonPress
+        ):
+            self.done_counter_expanded = not self.done_counter_expanded
+            self._refresh_done_counter_labels()
+            return True
         if (
             hasattr(self, 'canvas') and
             obj is self.canvas.viewport() and
@@ -1180,15 +1199,6 @@ class MainWindow(QMainWindow):
         self.hive_chamber_toolbar_action.triggered.connect(self.toggle_hive_chamber_toolbar)
         toolbars_menu.addAction(self.hive_chamber_toolbar_action)
 
-        # Keypoint Toolbar toggle (available only in projects that use keypoints)
-        self.keypoint_toolbar_action = QAction("&Keypoint Toolbar", self)
-        self.keypoint_toolbar_action.setCheckable(True)
-        self.keypoint_toolbar_action.setChecked(False)
-        self.keypoint_toolbar_action.setEnabled(False)
-        self.keypoint_toolbar_action.setToolTip("Turn on keypoints in Project > Keypoints...")
-        self.keypoint_toolbar_action.triggered.connect(self.toggle_keypoint_toolbar)
-        toolbars_menu.addAction(self.keypoint_toolbar_action)
-
         toolbars_menu.addSeparator()
 
         hide_visible_toolbars_action = QAction("&Hide Checked Visible Toolbars", self)
@@ -1257,14 +1267,14 @@ class MainWindow(QMainWindow):
         self.refresh_backup_actions()
         for widget in (self.video_filter_label, self.frame_filter_label, self.video_split_filter_combo,
                        self.split_filter_combo, self.tracking_filter_checkbox, self.video_batch_help,
-                       self.import_review_controls, self.sam2_toolbar.finetune_btn,
-                       *self.toolbar.calibration_widgets):
+                       self.import_review_controls, self.sam2_toolbar.finetune_btn):
             widget.setVisible(not assigned)
+        self.toolbar.set_calibration_allowed(not assigned)
         for widget in (self.video_split_filter_combo, self.tracking_filter_checkbox,
                        self.split_filter_combo, self.video_batch_help, self.tracking_sequences_panel,
                        self.toolbar.imaging_setup_combo, self.toolbar.apply_imaging_setup_btn,
                        self.toolbar.new_imaging_setup_btn, self.toolbar.set_measurement_scale_btn,
-                       self.toolbar.clear_measurement_scale_btn, self.toolbar.clear_aruco_btn):
+                       self.toolbar.clear_measurement_scale_btn, self.toolbar.clear_aruco_action):
             widget.setEnabled(not assigned)
         if assigned:
             self.assigned_status.setText('Assigned work: ' + self.contributor_session['name'])
@@ -1950,15 +1960,6 @@ class MainWindow(QMainWindow):
         else:
             self.hive_chamber_toolbar.hide()
 
-    def toggle_keypoint_toolbar(self):
-        """Toggle visibility of the optional keypoint toolbar."""
-        if self.keypoint_toolbar_action.isChecked() and self.canvas.keypoint_layer.enabled:
-            self.keypoint_toolbar.show()
-        else:
-            self.keypoint_toolbar.hide()
-            if self.canvas.current_tool == 'keypoint':
-                self.toolbar.set_tool('pan')
-
     def on_keypoint_tool_requested(self, tool_name):
         """Place Keypoints on/off; turning it off returns to Pan."""
         if tool_name == 'keypoint':
@@ -1970,17 +1971,11 @@ class MainWindow(QMainWindow):
         """Turn the keypoint layer and toolbar on or off for the open project."""
         info = getattr(self.annotation_manager, 'project_info', None) or {}
         config = keypoints_module.config_from_project_info(info.get('project_info', info))
-        was_enabled = self.canvas.keypoint_layer.enabled
         self.canvas.keypoint_layer.set_config(config)
-        self.keypoint_toolbar_action.setEnabled(config is not None)
-        if config is None:
-            self.keypoint_toolbar_action.setChecked(False)
-            self.keypoint_toolbar.hide()
-            if self.canvas.current_tool == 'keypoint':
-                self.toolbar.set_tool('pan')
-        elif not was_enabled:
-            self.keypoint_toolbar_action.setChecked(True)
-            self.keypoint_toolbar.show()
+        self.toolbar.set_keypoints_available(config is not None)
+        if config is None and self.canvas.current_tool == 'keypoint':
+            self.toolbar.set_tool('pan')
+        self.keypoint_toolbar.setVisible(config is not None and self.canvas.current_tool == 'keypoint')
 
     def show_keypoint_settings(self, checked=False):
         """Project > Keypoints...: turn keypoints on/off and choose their names."""
@@ -3187,11 +3182,12 @@ class MainWindow(QMainWindow):
             return (setup_name is None, (setup_name or "").casefold(), video_id.casefold())
 
         def video_item_text(split_label, video_id):
+            # Full description for screen readers and the tooltip; the row itself
+            # paints a split tag and the name (VideoRowDelegate).
             if assigned:
                 return video_id
-            setup_name = self.video_imaging_setups.get(video_id)
-            setup_suffix = f"  •  {setup_name}" if setup_name else "  •  unassigned"
-            return f"[{split_label}] {video_id}{setup_suffix}"
+            setup_name = self.video_imaging_setups.get(video_id) or "unassigned"
+            return f"{video_id}\nSplit: {split_label.title()}  •  Imaging setup: {setup_name}"
         
         # Get videos with tracking sequences if filter is enabled
         videos_with_tracking = None
@@ -3252,6 +3248,7 @@ class MainWindow(QMainWindow):
             item_text = video_item_text("TRAIN", video_id)
             item = VideoListItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
+            item.setData(SPLIT_ROLE, None if assigned else "TRAIN")
             item.setToolTip(item_text)
             
             # Highlight current video
@@ -3268,6 +3265,7 @@ class MainWindow(QMainWindow):
             item_text = video_item_text("VAL", video_id)
             item = VideoListItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
+            item.setData(SPLIT_ROLE, None if assigned else "VAL")
             item.setToolTip(item_text)
             
             # Highlight current video
@@ -3284,6 +3282,7 @@ class MainWindow(QMainWindow):
             item_text = video_item_text("TEST", video_id)
             item = VideoListItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
+            item.setData(SPLIT_ROLE, None if assigned else "TEST")
             item.setToolTip(item_text)
             
             # Highlight current video
@@ -3300,6 +3299,7 @@ class MainWindow(QMainWindow):
             item_text = video_item_text("INFERENCE", video_id)
             item = VideoListItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, video_id)  # Store video_id
+            item.setData(SPLIT_ROLE, None if assigned else "INFERENCE")
             item.setToolTip(item_text)
             
             # Highlight current video
@@ -3353,12 +3353,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
 
-        self.video_browser = VideoBrowserControls()
-        layout.addWidget(self.video_browser)
-
-        split_filter_layout = QHBoxLayout()
+        # The search box, experiment, sort and split filters are placed in the
+        # sidebar's Filters panel by AnnotationWorkBrowser below.
+        self.video_browser = VideoBrowserControls(compact=True)
         self.video_filter_label = QLabel('Split:')
-        split_filter_layout.addWidget(self.video_filter_label)
         self.video_split_filter_combo = QComboBox()
         self.video_split_filter_combo.addItems([
             'All Videos',
@@ -3371,23 +3369,28 @@ class MainWindow(QMainWindow):
         self.video_split_filter_combo.currentTextChanged.connect(
             self.on_video_split_filter_changed
         )
-        split_filter_layout.addWidget(self.video_split_filter_combo)
-        layout.addLayout(split_filter_layout)
-        
+        self.video_split_filter_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.video_split_filter_combo.setMinimumContentsLength(10)
+        self.video_split_filter_combo.setMinimumWidth(0)
+
         # Tracking filter checkbox
         self.tracking_filter_checkbox = QCheckBox("Show only videos with tracking sequences")
         self.tracking_filter_checkbox.stateChanged.connect(self.on_tracking_filter_changed)
-        layout.addWidget(self.tracking_filter_checkbox)
-        
-        # Create video list widget
+
+        # Create video list widget: one line per video, no horizontal scrolling.
         self.video_list = QListWidget()
         VideoRowColors(self.video_list)
+        self.video_list.setItemDelegate(VideoRowDelegate(self.video_list))
+        self.video_list.setUniformItemSizes(True)
+        self.video_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.video_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.video_list.itemClicked.connect(self.on_video_item_clicked)
         self.video_list.itemActivated.connect(self.on_video_item_activated)
         self.video_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.video_list.customContextMenuRequested.connect(self.show_video_context_menu)
         layout.addWidget(self.video_list)
+        layout.addWidget(self.video_browser)  # status line while reading modification times
 
         from gui.annotation_work import AnnotationWorkBrowser
         self.annotation_work = AnnotationWorkBrowser(self, layout)
@@ -3449,7 +3452,10 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
-        
+
+        # This frame's saved status, Mark Finished and next unfinished frame.
+        layout.addWidget(self.annotation_work.frame_controls)
+
         # Split filter dropdown
         filter_layout = QHBoxLayout()
         self.frame_filter_label = QLabel('Show:')
@@ -3467,8 +3473,11 @@ class MainWindow(QMainWindow):
         filter_layout.addWidget(self.split_filter_combo)
         layout.addLayout(filter_layout)
         
-        # Frame list
+        # Frame list: a status mark per frame; long names shorten instead of scrolling.
         self.frame_list = QListWidget()
+        self.frame_list.setItemDelegate(OneLineDelegate(self.frame_list))
+        self.frame_list.setIconSize(QSize(14, 14))
+        self.frame_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.frame_list.currentRowChanged.connect(self.on_frame_changed)
         self.frame_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(self.frame_list)
@@ -5464,7 +5473,8 @@ class MainWindow(QMainWindow):
         """Update the frame list widget with split indicators"""
         self.frame_list.clear()
         self.frame_list_to_frames_map = []  # Reset mapping
-        
+        multiple_videos = len(set(self.frame_video_ids)) > 1
+
         for i, frame_path in enumerate(self.frames):
             # Get split and selection status for this frame
             split = self.frame_splits[i] if i < len(self.frame_splits) else 'unknown'
@@ -5499,13 +5509,22 @@ class MainWindow(QMainWindow):
             elif self.split_filter == 'inference' and (not is_selected or split != 'inference'):
                 continue
             
-            # Create label with split indicator (only for selected frames)
-            if is_selected and split != 'unknown':
-                split_tag = f"[{split.upper()}] "
-            else:
-                split_tag = ""
-            label = f"{split_tag}Frame {self._get_frame_idx_in_video(i):04d}"
-            self.frame_list.addItem(label)
+            # The video's split is shown in the video list; here only the frame
+            # number, plus the video name when frames from several videos are listed.
+            label = f"Frame {self._get_frame_idx_in_video(i):04d}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole + 40, label)  # base text for status updates
+            if multiple_videos and i < len(self.frame_video_ids):
+                item.setData(Qt.ItemDataRole.UserRole + 44, self.frame_video_ids[i])
+                item.setText(f"{label} · {self.frame_video_ids[i]}")
+            if not (is_selected and split != 'unknown'):
+                # Frames outside the selected set are not exported for training.
+                font = item.font()
+                font.setItalic(True)
+                item.setFont(font)
+                item.setData(Qt.ItemDataRole.UserRole + 43,
+                             'Not a selected frame: training exports skip it')
+            self.frame_list.addItem(item)
             
             # Store mapping from list row to actual frame index
             self.frame_list_to_frames_map.append(i)
@@ -5868,15 +5887,15 @@ class MainWindow(QMainWindow):
         if tool_name in ['sam2_prompt', 'sam2_box']:
             self.toolbar.uncheck_all_tools()
 
-        # The keypoint tool lives on its own toolbar.
-        if tool_name == 'keypoint':
-            self.toolbar.uncheck_all_tools()
-            self.keypoint_toolbar.set_tool_checked(True)
+        # Options row follows the active tool, whichever toolbar chose it.
+        self.toolbar.show_tool_options(tool_name)
+        keypoints = tool_name == 'keypoint' and self.canvas.keypoint_layer.enabled
+        self.keypoint_toolbar.setVisible(keypoints)
+        if keypoints:
+            self.toolbar.check_tool_button('keypoint')
             self.status_label.setText(
-                "Place Keypoints: click a bee, then its keypoints in order; drag to move, "
-                "right-click for hidden/delete, Esc finishes the bee")
-        else:
-            self.keypoint_toolbar.uncheck_tools()
+                "Keypoints: click a bee, then its keypoints in order; Shift+click = hidden; "
+                "drag to move; right-click for more; Esc finishes the bee")
 
         if tool_name == 'no_draw_zone':
             self.status_label.setText(

@@ -91,13 +91,14 @@ class AutomaticWork(QObject):
     def description(self):
         if not self.pending():
             return ''
+        # Shown after the save status ("Saved on this computer"), so no need to repeat it.
         if self.blocked:
-            return 'Upload needs attention; work is saved locally'
+            return 'upload needs attention'
         if working_locally():
-            return 'Saved locally; upload waiting for connection'
+            return 'upload waiting for connection'
         if self.worker:
-            return 'Uploading saved annotations...'
-        return 'Saved locally; upload queued'
+            return 'uploading...'
+        return 'upload queued'
 
     def retry(self):
         self.blocked = False

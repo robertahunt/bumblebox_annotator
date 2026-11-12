@@ -8,6 +8,8 @@ of the annotation without changes to the file format.
 Mouse, with the canvas tool set to ``'keypoint'``:
   * left-click            place the next missing keypoint of the current bee; when it
                           is complete (or none is chosen), a click on a bee starts it
+  * shift+click           place the next keypoint as hidden (occluded); on an existing
+                          point, switch it between hidden and visible
   * drag a keypoint       move it (any visible bee)
   * right-click           menu: hidden/visible, delete point, clear bee, finish bee
   * double-click          same as a click (quick successive placements)
@@ -346,11 +348,15 @@ class KeypointLayer(QObject):
         x = min(max(scene_pos.x(), 0.0), w - 1.0)
         y = min(max(scene_pos.y(), 0.0), h - 1.0)
 
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
         picked = self.hit(scene_pos)
         if picked is not None:
             instance_id, name = picked
             if instance_id != self.target_id:
                 self.set_target(instance_id)
+            if shift:  # one point hidden/visible without a menu or a mode
+                self.toggle_visibility(instance_id, name)
+                return True
             self._drag = {'id': instance_id, 'name': name,
                           'before': self.keypoints_for(instance_id), 'moved': False}
             return True
@@ -368,7 +374,8 @@ class KeypointLayer(QObject):
                 self.set_target(candidate)
             if self.active_name is None:
                 return True  # bee already complete: just selected it
-        self.place(self.target_id, self.active_name, x, y)
+        hidden = self.place_occluded or shift
+        self.place(self.target_id, self.active_name, x, y, kp.OCCLUDED if hidden else kp.VISIBLE)
         return True
 
     def handle_mouse_move(self, event, scene_pos):
