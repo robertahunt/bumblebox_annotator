@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from core.assigned_work import publish_work, read_assignments, save_assignments, workspace
 from core.assigned_workspace import PreparedAssignedDownload, existing_copies, managed_directory
+from core.project_activity import project_activity
 from core.project_delta import file_record, rollback_update
 from core.project_sync import (_inventory, _read_json, _write_json, SyncConflictError,
                                snapshot_file, sync_project, update_journal_path)
@@ -142,6 +143,39 @@ class AssignedWorkspaceTests(unittest.TestCase):
         _write_json(path, data)
         sync_project(self.source, self.configuration, self.coordinator)
         with self.assertRaisesRegex(SyncConflictError, 'policy'):
+            self.prepare(local)
+
+    def test_new_imaging_setup_entries_do_not_block_upload_or_download(self):
+        """Adding videos updates imaging_setups.json; outstanding work must keep flowing."""
+        name = 'annotations/imaging_setups.json'
+        local = self.download()
+        self.change(local)  # Unsent edits, like a contributor partway through a round.
+        setups = {'version': 1, 'setups': {'rig': {'pixels_per_cm': 10.0}},
+                  'video_assignments': {'alpha': 'rig', 'beta': 'rig'}}
+        _write_json(self.source / name, setups)
+        sync_project(self.source, self.configuration, self.coordinator)
+        choices = deepcopy(self.choices)
+        choices['beta']['contributor'] = self.alex
+        self.assign(choices)
+
+        self.assertNotEqual(project_activity(local, self.configuration)['status'], 'attention')
+        published = publish_work(local, self.configuration, self.alex)
+        self.assertTrue(published['copied_files'])
+        files = _read_json(Path(published['path']) / 'manifest.json')['files']
+        self.assertEqual(files[name], file_record(self.source / name))
+
+        plan = self.prepare(local, ('beta',))
+        self.assertEqual(plan.new_videos, ['beta'])
+        plan.apply()
+        self.assertEqual((local / name).read_bytes(), (self.source / name).read_bytes())
+        self.assertEqual(workspace(local)['local_files'][name], file_record(local / name))
+        self.assertFalse(self.prepare(local).apply()['updated'])
+        self.change(local, 'beta', 1)
+        self.assertTrue(publish_work(local, self.configuration, self.alex)['copied_files'])
+
+        # Contributors still may not edit it themselves.
+        _write_json(local / name, dict(setups, video_assignments={}))
+        with self.assertRaisesRegex(SyncConflictError, 'Local project settings'):
             self.prepare(local)
 
     def test_local_change_after_preview_rejected(self):

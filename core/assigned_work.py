@@ -129,6 +129,18 @@ def _global_files(files):
             if name.startswith('annotations/') and _annotation_video(name) is None}
 
 
+# Project-wide files that describe videos rather than how to annotate them: which
+# imaging setup each video came from, and each setup's scale calibration. The
+# coordinator changes this whenever videos are added, and no assigned annotation
+# depends on it, so contributor copies take the latest version instead of stopping.
+SHARED_METADATA = frozenset({'annotations/imaging_setups.json'})
+
+
+def _policy_files(files):
+    """Project-wide files whose change means outstanding assigned work needs review."""
+    return {name: record for name, record in _global_files(files).items() if name not in SHARED_METADATA}
+
+
 def _verified_json(snapshot, name):
     path = snapshot_file(snapshot['manifest_path'], snapshot['manifest'], name)
     if file_record(path) != snapshot['manifest']['files'][name]:
@@ -794,7 +806,7 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
         current, heads = latest_snapshot(view)
         base = view.snapshot(tuple(state['base_reference']))
         before, incoming = base['manifest']['files'], current['manifest']['files']
-        if _global_files(before) != _global_files(incoming):
+        if _policy_files(before) != _policy_files(incoming):
             raise SyncConflictError('Project policy or shared metadata changed. Keep this work for coordinator review.')
         for video in assignments:
             if _video_files(before, video) != _video_files(incoming, video):

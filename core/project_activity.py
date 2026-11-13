@@ -7,7 +7,7 @@ Only annotation/configuration files are compared locally, not cached source medi
 from pathlib import Path
 
 from core.assigned_work import (workspace, read_assignments, latest_snapshot,
-                                _check_owned, _global_files, _video_files)
+                                _check_owned, _policy_files, _video_files)
 from core.project_delta import file_record
 from core.project_sync import PROJECT_MARKER, SyncConflictError, _read_local_state, _inventory
 from core.project_update import PublishedProject, _base_snapshot
@@ -47,7 +47,7 @@ def project_activity(project, configuration, cancelled=lambda: False):
                     'changed': None, 'director': director}
         base = view.snapshot(tuple(state['base_reference']))
         before, incoming = base['manifest']['files'], current['manifest']['files']
-        relevant_change = (_global_files(before) != _global_files(incoming) or any(
+        relevant_change = (_policy_files(before) != _policy_files(incoming) or any(
             _video_files(before, video) != _video_files(incoming, video) for video in state['assignments']))
         status = 'attention' if relevant_change else 'current'
         message = ('Shared annotations or policy changed; keep local work for director review'

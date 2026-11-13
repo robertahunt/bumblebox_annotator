@@ -6,8 +6,8 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from core.assigned_work import (ASSIGNMENTS, _check_owned, _global_files, _video_files,
-    assignment_review_snapshot, download_plan, download_work, read_assignments, require_contributor)
+from core.assigned_work import (ASSIGNMENTS, SHARED_METADATA, _check_owned, _global_files, _policy_files,
+    _video_files, assignment_review_snapshot, download_plan, download_work, read_assignments, require_contributor)
 from core.contributors import utc_now
 from core.project_delta import apply_delta, bytes_record, file_record
 from core.project_sync import (WORK_STATE, SyncConflictError, _digest, _inventory,
@@ -175,7 +175,7 @@ class PreparedAssignedDownload:
         if not view.descends_from(current['reference'], self.base['reference']):
             raise SyncConflictError('Shared history differs from this working copy. Keep it for director review.')
         before, incoming = self.base['manifest']['files'], current['manifest']['files']
-        if _global_files(before) != _global_files(incoming):
+        if _policy_files(before) != _policy_files(incoming):
             raise SyncConflictError('Project policy or shared settings changed. Keep this copy for director review before updating.')
         baseline = self.state['local_files']
         dirty = {name for name in baseline.keys() | self.local.keys()
@@ -228,6 +228,18 @@ class PreparedAssignedDownload:
                     new_state['local_files'].pop(name, None)
                 if self.local.get(name) != record:
                     self.before[name], self.after[name], self.sources[name] = self.local.get(name), record, source
+
+        # Local copies of shared metadata are never edited (checked above), so take the latest.
+        for name in SHARED_METADATA:
+            record = incoming.get(name)
+            if record:
+                new_state['local_files'][name] = record
+            else:
+                new_state['local_files'].pop(name, None)
+            if self.local.get(name) != record:
+                self.before[name], self.after[name] = self.local.get(name), record
+                self.sources[name] = (snapshot_file(current['manifest_path'], current['manifest'], name)
+                                      if record else None)
 
         new_state['assignments'] = self.plan['assignments']
         new_state['base_reference'] = list(current['reference'])

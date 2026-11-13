@@ -431,13 +431,16 @@ selection. They preserve local edits when the published video is unchanged, and
 update clean videos when shared annotations change. If both sides changed any
 part of the same video, the whole update stops: mask PNGs and annotation JSONs
 are not merged file by file. Changed project-wide policy/settings also require
-director review. A simultaneous change after the preview requires a fresh check.
+director review. The exception is `annotations/imaging_setups.json` (each video's
+imaging setup and scale calibration): it changes whenever the director adds
+videos, so a working copy simply takes the latest version, and changing it never
+blocks uploads or downloads. A simultaneous change after the preview requires a fresh check.
 Reassigned videos are retained on disk, removed from active work, and excluded
 from uploads when downloading other current assignments. They are never deleted
 automatically; unpublished retained work still needs director review.
 
 Publishing also stops if someone else changed any part of the assigned video, or
-changed project-wide settings after the download. This includes two computers
+changed project-wide settings (other than imaging setups) after the download. This includes two computers
 using the same contributor profile on the same video. It does not choose a winner
 or merge masks automatically. Keep both working copies and ask the coordinator to
 compare/import the intended annotations into the full project, then issue fresh
