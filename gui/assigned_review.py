@@ -28,6 +28,7 @@ class AssignedReviewViews(QWidget):
         self.pending = False
         self.stopping = False
         self.visible_count = None
+        self.busy = lambda: False  # The owner sets this; True while a stroke is being drawn.
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         row = QHBoxLayout()
@@ -150,6 +151,10 @@ class AssignedReviewViews(QWidget):
             return
         if self.worker:
             self.pending = True
+            return
+        if self.busy():
+            # A background check competes with drawing for the interpreter; wait for the stroke.
+            self.timer.start(1000)
             return
         project, actor = self.project, dict(self.contributor)
         configuration, assignments = dict(self.configuration), deepcopy(self.assignments)

@@ -1,5 +1,6 @@
 """Published-review views, using disposable projects and offscreen Qt windows."""
 
+from pathlib import Path
 from threading import Event
 import time
 import unittest
@@ -8,8 +9,9 @@ from unittest.mock import patch
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 
-from core.assigned_work import (accept_submission, assigned_review_statuses, publish_work,
-                                read_assignments, save_assignments, workspace)
+from core.assigned_work import (_NO_FILES_DIGEST, _annotation_video, _video_digests, accept_submission,
+                                assigned_review_statuses, latest_snapshot, publish_work,
+                                read_assignments, save_assignments, video_digest, workspace)
 from core.contributors import new_session
 from core.project_sync import sync_project
 from core.project_update import PreparedUpdate, PublishedProject
@@ -95,12 +97,52 @@ class AssignedReviewTests(unittest.TestCase):
         with self.assertRaises(InterruptedError):
             assigned_review_statuses(local, self.configuration, self.alex, assignments, lambda: True)
 
+    def test_repeat_checks_read_no_manifest_and_a_new_version_only_once(self):
+        """The check runs every minute beside drawing; published versions never change."""
+        local = self.download()
+        publish_work(local, self.configuration, self.alex, ready=['alpha'])
+        self.assertEqual(self.check(local), {'alpha': 'Ready for Review'})
+        original, read = PublishedProject.snapshot, []
+        def counting(view, reference, metadata_only=False):
+            read.append(tuple(reference))
+            return original(view, reference, metadata_only)
+        with patch.object(PublishedProject, 'snapshot', counting):
+            self.assertEqual(self.check(local), {'alpha': 'Ready for Review'})
+            self.assertEqual(read, [])
+            self.change(local)
+            newest = Path(publish_work(local, self.configuration, self.alex)['path']).name
+            del read[:]  # Publishing reads manifests itself; only the checks are counted.
+            first = self.check(local)
+            self.assertEqual(read, [(self.alex['id'], newest)])
+            self.assertEqual(self.check(local), first)
+            self.assertEqual(len(read), 1)
+        self.assertEqual(first['alpha'], self.status()[0])
+
+    def test_one_pass_video_digests_match_the_per_video_digest(self):
+        local = self.download()
+        self.change(local)
+        publish_work(local, self.configuration, self.alex)
+        files = latest_snapshot(self.view())[0]['manifest']['files']
+        self.assertIn('input_data/train/alpha.mp4', files)
+        digests = _video_digests(files)
+        self.assertEqual(set(digests), {'alpha', 'beta'})
+        for video in ('alpha', 'beta', 'not-a-video'):
+            self.assertEqual(digests.get(video, _NO_FILES_DIGEST), video_digest(files, video))
+        self.assertNotEqual(digests['alpha'], digests['beta'])
+        for name, video in (('annotations/json/alpha/frame_000000.json', 'alpha'),
+                            ('annotations/work/beta/video_work.json', 'beta'),
+                            ('annotations/project.json', None), ('annotations/coco/alpha/x.json', None),
+                            ('annotations/json/alpha/deeper/x.json', None), ('frames/alpha/frame_000000.jpg', None)):
+            self.assertEqual(_annotation_video(name), video)
+
     def test_concurrent_publication_discards_the_mixed_result(self):
         local = self.download()
         original = PublishedProject.heads
+        reads = []
         def changed_heads(view, **kwargs):
+            reads.append(kwargs)
             heads = original(view, **kwargs)
-            return {} if kwargs.get('validate_snapshots') is False else heads
+            return heads if len(reads) == 1 else {}  # Someone published after the first read.
         with patch.object(PublishedProject, 'heads', changed_heads), self.assertRaisesRegex(ValueError, 'changed during'):
             self.check(local)
 
@@ -149,6 +191,24 @@ class AssignedReviewGuiTests(unittest.TestCase):
         self.assertEqual((w.current_video_id, w.current_frame_idx), (video, frame))
         self.assertEqual(w.canvas.transform(), transform)
         self.assertIn('alpha', workspace(local)['assignments'])
+
+    def test_check_waits_for_a_stroke_to_finish(self):
+        local = self.download()
+        w = self.make_window(local)
+        controls = w.annotation_work.review
+        self.settle(controls)
+        w.canvas.is_drawing = True
+        with patch('gui.assigned_review.assigned_review_statuses', wraps=assigned_review_statuses) as check:
+            controls.check.click()
+            QTest.qWait(60)
+            check.assert_not_called()
+            self.assertIsNone(controls.worker)
+            self.assertTrue(controls.timer.isActive())  # It will try again, not give up.
+            w.canvas.is_drawing = False
+            controls.timer.start(0)
+            self.settle(controls)
+            check.assert_called_once()
+        self.assertEqual(controls.statuses, {'alpha': 'In Progress'})
 
     def test_acceptance_refresh_and_completion_filter_remain_independent(self):
         local = self.download()

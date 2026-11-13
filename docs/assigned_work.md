@@ -326,7 +326,10 @@ Submitting or accepting work does not remove its assignment, lock editing, or de
 
 Review status is checked in the background when opening assigned work, after an
 upload, every minute while these controls are visible, and using the refresh icon
-next to **Review**. It reads publication metadata, not every image or mask. If the
+next to **Review**. It reads publication metadata, not every image or mask. Each
+published version's listing is read once per app session, the first time it is seen;
+later checks read only small pointer files unless someone has published since. A check
+never starts in the middle of a brush stroke. If the
 drive cannot be checked, the status is explicitly unavailable and unchecked work
 stays accessible in Active Work and All Assigned. Unsaved or saved-but-unuploaded
 edits do not change this published status until the automatic upload succeeds.

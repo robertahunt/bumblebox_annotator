@@ -142,6 +142,7 @@ class AnnotationWorkBrowser(QObject):
         self.window = window
         browser = window.video_browser
         self.review = AssignedReviewViews()
+        self.review.busy = lambda: bool(getattr(window.canvas, 'is_drawing', False))
         layout.insertWidget(layout.indexOf(window.video_list), self.review)
         self.review.changed.connect(self.apply)
         # Work on stays visible; every other filter lives behind one Filters button.

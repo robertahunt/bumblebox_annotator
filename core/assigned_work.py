@@ -4,6 +4,7 @@ Assignments are workflow controls, not authenticated access control. Publication
 remain complete manifests: omitted local files are never interpreted as deletions.
 """
 
+from collections import OrderedDict
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
+import threading
 from uuid import uuid4
 
 from core.contributors import contributor_profile, utc_now
@@ -83,7 +85,9 @@ def require_assigned_frame(project, contributor, video, frame=None):
 
 
 def _annotation_video(name):
-    parts = Path(name).parts
+    # Names are normalized POSIX paths (project inventories and validated manifests), and
+    # this runs for every file of every published version, so avoid building Path objects.
+    parts = name.split('/')
     if len(parts) == 4 and parts[0] == 'annotations' and parts[1] in ANNOTATION_KINDS:
         return parts[2]
     return None
@@ -111,17 +115,91 @@ def _video_files(files, video):
             (name.startswith('input_data/') and Path(name).stem == video)}
 
 
+def _files_digest(files):
+    return bytes_record(json.dumps(files, sort_keys=True).encode())['sha256']
+
+
 def video_digest(files, video):
-    return bytes_record(json.dumps(_video_files(files, video), sort_keys=True).encode())['sha256']
+    return _files_digest(_video_files(files, video))
+
+
+_NO_FILES_DIGEST = _files_digest({})
+
+
+def _video_digests(files):
+    """video_digest() for every video of a version, in one pass over its files."""
+    groups = {}
+    for name, record in files.items():
+        video = _annotation_video(name)
+        if video is None:
+            if name.startswith('frames/'):
+                parts = name.split('/')
+                video = parts[1] if len(parts) > 2 else None
+            elif name.startswith('input_data/'):
+                video = Path(name).stem
+        if video is not None:
+            groups.setdefault(video, {})[name] = record
+    return {video: _files_digest(group) for video, group in groups.items()}
+
+
+# A published version never changes, and review status needs very little of it. Keeping
+# that little for the life of the process means a status check reads a multi-megabyte
+# manifest only for a version it has not seen, instead of every version on every check.
+_VERSION_FACTS = OrderedDict()
+_VERSION_FACTS_LIMIT = 256
+_VERSION_FACTS_LOCK = threading.Lock()
+
+
+def _version_facts(view, reference):
+    """The parts of one published version that assignment status depends on."""
+    reference = tuple(reference)
+    key = (view.configuration['root_id'], view.project_id) + reference
+    with _VERSION_FACTS_LOCK:
+        facts = _VERSION_FACTS.get(key)
+        if facts is not None:
+            _VERSION_FACTS.move_to_end(key)
+            return facts
+    already_loaded = (reference, False) in view.cache
+    snapshot = view.snapshot(reference)  # Fully validated the first time it is seen.
+    manifest = snapshot['manifest']
+    facts = {'reference': reference, 'parents': dict(snapshot['parents']),
+             'assigned_work': deepcopy(manifest.get('assigned_work', {})),
+             'submission_reviews': deepcopy(manifest.get('submission_reviews', {})),
+             'video_digests': _video_digests(manifest['files'])}
+    if not already_loaded:
+        view.cache.pop((reference, False), None)  # Do not hold whole histories in memory.
+    with _VERSION_FACTS_LOCK:
+        _VERSION_FACTS[key] = facts
+        while len(_VERSION_FACTS) > _VERSION_FACTS_LIMIT:
+            _VERSION_FACTS.popitem(last=False)
+    return facts
+
+
+def _current_reference(view, heads):
+    """The published head that includes every other head (the rule _base_snapshot uses)."""
+    candidates = []
+    for reference in heads.items():
+        covered = dict(_version_facts(view, reference)['parents'])
+        covered[reference[0]] = reference[1]
+        if covered == heads:
+            candidates.append(reference)
+    if len(candidates) != 1:
+        raise ValueError('The starting snapshot is ambiguous. Use a verified local copy; automatic updating is unsafe.')
+    return candidates[0]
+
+
+def _review_receipt_matches(receipt, entry, revision, submitted_digest, reviewed_digest):
+    return bool(receipt and receipt.get('assignment_id') == entry['id'] and
+                receipt.get('submission') == [entry['contributor']['id'], revision] and
+                receipt.get('submitted_digest') == submitted_digest and
+                receipt.get('reviewed_digest') == reviewed_digest)
 
 
 def reviewed_submission(manifest, entry, revision, original_files):
     """Approval and corrected geometry are published in the same immutable version."""
-    receipt = manifest.get('submission_reviews', {}).get(entry['video'], {})
-    return bool(receipt and receipt.get('assignment_id') == entry['id'] and
-                receipt.get('submission') == [entry['contributor']['id'], revision] and
-                receipt.get('submitted_digest') == video_digest(original_files, entry['video']) and
-                receipt.get('reviewed_digest') == video_digest(manifest['files'], entry['video']))
+    return _review_receipt_matches(
+        manifest.get('submission_reviews', {}).get(entry['video'], {}), entry, revision,
+        video_digest(original_files, entry['video']), video_digest(manifest['files'], entry['video']))
 
 
 def _global_files(files):
@@ -280,7 +358,12 @@ def add_project_member(project, configuration, contributor, member, expected_rev
 
 
 def assignment_status(view, entry, *, heads=None, current=None, cancelled=lambda: False):
-    revision = (view.heads() if heads is None else heads).get(entry['contributor']['id'])
+    """Published state of one assignment. `current` is the latest snapshot or its reference."""
+    contributor, video = entry['contributor']['id'], entry['video']
+    if heads is None:
+        heads = view.heads()
+    digest = lambda facts: facts['video_digests'].get(video, _NO_FILES_DIGEST)
+    revision = heads.get(contributor)
     visited = set()
     while revision:
         if cancelled():
@@ -288,25 +371,23 @@ def assignment_status(view, entry, *, heads=None, current=None, cancelled=lambda
         if revision in visited or len(visited) >= 1000:
             raise ValueError('Assignment publication history needs coordinator review.')
         visited.add(revision)
-        snapshot = view.snapshot((entry['contributor']['id'], revision), metadata_only=True)
-        submission = snapshot['manifest'].get('assigned_work', {})
-        video = entry['video']
+        submitted = _version_facts(view, (contributor, revision))
+        submission = submitted['assigned_work']
         if submission.get('assignments', {}).get(video) == entry['id']:
-            submitted = view.snapshot(snapshot['reference'])
             if current is None:
-                current, _ = latest_snapshot(view)
-            same_video = (_video_files(submitted['manifest']['files'], video) ==
-                          _video_files(current['manifest']['files'], video))
+                current = _current_reference(view, heads)
+            latest = _version_facts(view, current['reference'] if isinstance(current, dict) else current)
+            same_video = digest(submitted) == digest(latest)
             if video in submission.get('ready', []):
                 original = submission.get('ready_revisions', {}).get(video, revision)
-                prior = submitted if original == revision else view.snapshot((entry['contributor']['id'], original))
-                reviewed = reviewed_submission(current['manifest'], entry, original, prior['manifest']['files'])
+                prior = submitted if original == revision else _version_facts(view, (contributor, original))
+                reviewed = _review_receipt_matches(latest['submission_reviews'].get(video, {}), entry, original,
+                                                   digest(prior), digest(latest))
                 if original != revision:
-                    prior_work = prior['manifest'].get('assigned_work', {})
+                    prior_work = prior['assigned_work']
                     if (prior_work.get('assignments', {}).get(video) != entry['id'] or
                             video not in prior_work.get('ready', []) or
-                            (_video_files(prior['manifest']['files'], video) !=
-                             _video_files(submitted['manifest']['files'], video) and not (reviewed and same_video))):
+                            (digest(prior) != digest(submitted) and not (reviewed and same_video))):
                         raise ValueError('Review receipt no longer matches the submitted video.')
                 if reviewed:
                     return 'Accepted', original
@@ -316,7 +397,7 @@ def assignment_status(view, entry, *, heads=None, current=None, cancelled=lambda
             if not same_video:
                 return 'Changed Since Submission', revision
             return 'In Progress', revision
-        revision = snapshot['parents'].get(entry['contributor']['id'])
+        revision = submitted['parents'].get(contributor)
     return ('In Progress' if entry.get('started_at') else 'Assigned'), None
 
 
@@ -330,15 +411,14 @@ def assigned_review_statuses(project, configuration, contributor, assignments, c
     if state and state['root_id'] != configuration['root_id']:
         raise ValueError('Choose the shared folder used for this assignment.')
     view = PublishedProject(project, configuration)
-    return assignment_review_snapshot(view, contributor, assignments, cancelled)['statuses']
-
-
-def assignment_review_snapshot(view, contributor, assignments, cancelled=lambda: False):
-    """Read a coherent publication and review states for the expected assignments."""
-    if cancelled():
-        raise InterruptedError('Assignment check cancelled')
+    # This runs every minute beside the annotator's drawing, so it must stay light: only the
+    # small pointer files are read unless someone has published a version not seen before.
     data = read_assignments(view)
-    current, heads = latest_snapshot(view)
+    heads = view.heads(validate_snapshots=False)
+    return _review_statuses(view, contributor, assignments, data, heads, None, cancelled)
+
+
+def _review_statuses(view, contributor, assignments, data, heads, current, cancelled):
     statuses = {}
     for video, expected in assignments.items():
         if cancelled():
@@ -352,6 +432,16 @@ def assignment_review_snapshot(view, contributor, assignments, cancelled=lambda:
     if (view.heads(validate_snapshots=False) != heads or
             read_assignments(view)['revision'] != data['revision']):
         raise ValueError('Shared work changed during the check. Refresh review status.')
+    return statuses
+
+
+def assignment_review_snapshot(view, contributor, assignments, cancelled=lambda: False):
+    """Read a coherent publication and review states for the expected assignments."""
+    if cancelled():
+        raise InterruptedError('Assignment check cancelled')
+    data = read_assignments(view)
+    current, heads = latest_snapshot(view)
+    statuses = _review_statuses(view, contributor, assignments, data, heads, current, cancelled)
     return {'statuses': statuses, 'snapshot': current, 'heads': heads,
             'assignment_revision': data['revision']}
 
