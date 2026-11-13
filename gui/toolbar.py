@@ -195,7 +195,7 @@ class AnnotationToolbar(QWidget):
 
         self.keypoint_btn = self.create_tool_button("Keypoints", "keypoint")
         self.keypoint_btn.setToolTip(
-            "Place keypoints (head, thorax, antenna tips, ...) on bees. "
+            "Place keypoints (head, thorax, antenna and leg tips, ...) on bees. "
             "Shown in projects that use keypoints (Project > Keypoints)"
         )
         self.keypoint_btn.hide()

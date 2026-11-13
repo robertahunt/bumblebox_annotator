@@ -13,12 +13,38 @@ from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QApplication, QGraphicsTextItem
 
 from core.categories import CATEGORY_COLORS
-from core.instance_colors import BEE_PALETTE, contrasting_instance_colors, neighboring_boxes
+import colorsys
+
+from core.instance_colors import (BEE_PALETTE, MIN_SATURATION, MIN_VALUE, contrasting_instance_colors,
+                                  neighboring_boxes, random_vivid_color, vivid_color)
 from gui.canvas import ImageCanvas
 from gui.toolbar import AnnotationToolbar
 
 
+def is_vivid(color):
+    _, saturation, value = colorsys.rgb_to_hsv(*(c / 255 for c in color))
+    return saturation >= MIN_SATURATION and value >= MIN_VALUE
+
+
 class InstanceColorTests(unittest.TestCase):
+    def test_no_grey_bee_colors_for_greyscale_frames(self):
+        self.assertTrue(all(is_vivid(c) for c in BEE_PALETTE), BEE_PALETTE)
+        self.assertEqual(len(set(BEE_PALETTE)), len(BEE_PALETTE))
+        for c in BEE_PALETTE:
+            self.assertEqual(vivid_color(c), c)
+        for grey in ((60, 60, 60), (235, 235, 245), (128, 128, 128), (0, 0, 0), (255, 255, 255),
+                     (200, 180, 160), (20, 40, 30)):
+            self.assertTrue(is_vivid(vivid_color(grey)), grey)
+            self.assertEqual(vivid_color(grey), vivid_color(grey))
+        # A weak tint keeps its hue.
+        hue = colorsys.rgb_to_hsv(*(c / 255 for c in (200, 170, 170)))[0]
+        self.assertAlmostEqual(colorsys.rgb_to_hsv(*(c / 255 for c in vivid_color((200, 170, 170))))[0], hue,
+                               places=2)
+        state = np.random.get_state()
+        self.assertTrue(all(is_vivid(random_vivid_color()) for _ in range(500)))
+        self.assertEqual(random_vivid_color(7), random_vivid_color(7))
+        np.testing.assert_array_equal(state[1], np.random.get_state()[1])
+
     def test_touching_long_bodies_are_neighbors_not_just_close_centroids(self):
         graph = neighboring_boxes({1: (0, 0, 150, 10), 2: (150, 0, 150, 10),
                                    3: (1000, 0, 10, 10)})
@@ -116,6 +142,20 @@ class CanvasColorTests(unittest.TestCase):
         self.assertEqual(c.display_color_for_instance(3), CATEGORY_COLORS['hive'])
         self.assertEqual(c.mask_colors[1], (60, 60, 60))
 
+    def test_grey_saved_colors_display_vivid_without_changing_them(self):
+        c = self.canvas()
+        c.set_distinct_bee_colors(False)
+        for iid in (1, 2, 4):
+            self.assertTrue(is_vivid(c.display_color_for_instance(iid, 'bee')))
+        self.assertNotEqual(c.display_color_for_instance(1), c.display_color_for_instance(2))
+        self.assert_base_colors_match(c)
+        self.assertEqual(c.mask_colors[1], (60, 60, 60))
+        # Fixed category colours are never adjusted, even the soft brood ones.
+        self.assertEqual(c.display_color_for_instance(3), CATEGORY_COLORS['hive'])
+        c.annotation_metadata[9] = {'category': 'brood_middle_late'}
+        self.assertEqual(c.display_color_for_instance(9, 'brood_middle_late'),
+                         CATEGORY_COLORS['brood_middle_late'])
+
     def test_toggle_refresh_preserve_pending_annotations_history_and_view(self):
         c = self.canvas()
         c.start_editing_instance(1, 'bee')
@@ -165,7 +205,11 @@ class CanvasColorTests(unittest.TestCase):
         c = self.canvas()
         contrast = dict(c._bee_display_colors)
         c.set_distinct_bee_colors(False)
-        self.assertEqual(c.display_color_for_instance(1), (60, 60, 60))
+        # Original colours, except that grey ones are shown vivid on greyscale frames.
+        self.assertEqual(c.display_color_for_instance(1), vivid_color((60, 60, 60)))
+        c.mask_colors[2] = (0, 170, 255)
+        self.assertEqual(c.display_color_for_instance(2), (0, 170, 255))
+        c.rebuild_visualizations()
         self.assert_base_colors_match(c)
         c.set_distinct_bee_colors(True)
         self.assertEqual(c._bee_display_colors, contrast)

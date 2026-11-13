@@ -1,5 +1,6 @@
 """Deterministic, spatially contrasting display colors; no annotation mutations."""
 
+import colorsys
 import math
 
 import cv2
@@ -9,12 +10,39 @@ import numpy as np
 BEE_PALETTE = (
     (0, 170, 255), (255, 80, 90), (80, 225, 95), (210, 95, 245),
     (255, 205, 40), (0, 220, 200), (255, 135, 35), (110, 125, 255),
-    (245, 120, 195), (180, 235, 45), (35, 165, 125), (235, 235, 245),
+    (245, 120, 195), (180, 235, 45), (35, 165, 125), (255, 0, 187),
 )
+# Frames are often greyscale, so bee colours must never be grey, white or near-black.
+MIN_SATURATION = 0.45
+MIN_VALUE = 0.55
 _LAB = cv2.cvtColor(
     np.asarray([BEE_PALETTE], dtype=np.float32) / 255, cv2.COLOR_RGB2Lab
 )[0]
 _DISTANCES = np.linalg.norm(_LAB[:, None] - _LAB[None, :], axis=2)
+
+
+def random_vivid_color(seed=None):
+    """A saturated, bright RGB colour. Uses its own generator, never the global one."""
+    rng = np.random.default_rng(None if seed is None else abs(int(seed)))
+    hue = rng.random()
+    saturation = rng.uniform(0.7, 1.0)
+    value = rng.uniform(0.85, 1.0)
+    return tuple(int(round(c * 255)) for c in colorsys.hsv_to_rgb(hue, saturation, value))
+
+
+def vivid_color(color):
+    """Return ``color`` unchanged if it stands out on a grey frame, else a vivid version.
+
+    A weakly tinted colour keeps its hue. A true grey gets a hue derived from its value,
+    so the same stored colour always maps to the same display colour.
+    """
+    r, g, b = (min(255, max(0, int(c))) for c in color[:3])
+    hue, saturation, value = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+    if saturation >= MIN_SATURATION and value >= MIN_VALUE:
+        return (r, g, b)
+    if saturation < 0.15:
+        hue = ((r * 7919 + g * 104729 + b * 1299709) % 360) / 360
+    return tuple(int(round(c * 255)) for c in colorsys.hsv_to_rgb(hue, 0.85, 0.95))
 
 
 def neighboring_boxes(boxes):

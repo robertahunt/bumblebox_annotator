@@ -15,10 +15,12 @@ class KeypointToolbar(QWidget):
 
     HELP = (
         "Place Keypoints: click a bee, then click its keypoints in order (the next one is "
-        "shown here and advances automatically). Drag a point to move it. Shift+click places a "
-        "point as hidden, or switches an existing point between hidden and visible; right-click "
-        "a point for the same and to delete it. Esc finishes the bee, Backspace removes the "
-        "hovered or last point, N skips to the next keypoint name, H toggles 'place as hidden'. "
+        "shown here and advances automatically). Right-click anywhere (or press N) to skip a "
+        "keypoint you can't see; the bee is finished once every keypoint is placed or skipped. "
+        "Drag a point to move it. Shift+click places a point as hidden, or switches an existing "
+        "point between hidden and visible; right-click a point for the same and to delete it. "
+        "Esc finishes the bee early, Backspace removes the hovered point or undoes the last "
+        "placement or skip, H toggles 'place as hidden'. "
         "Ctrl+Z / Ctrl+Shift+Z undo and redo keypoint edits on this frame."
     )
 
@@ -146,9 +148,9 @@ class KeypointToolbar(QWidget):
         if not enabled:
             self.status_label.setText("Keypoints are off for this project")
         elif layer.target_id:
-            done = kp.summary_text(layer.keypoints_for(layer.target_id), config.names)
-            nxt = layer.active_name.replace('_', ' ') if layer.active_name else 'all placed'
-            self.status_label.setText(f"Bee {layer.target_id}: {done}   |   next: {nxt}")
+            done = kp.summary_text(layer.keypoints_for(layer.target_id), config.names, layer.skipped)
+            nxt = f"next: {layer.active_name.replace('_', ' ')}" if layer.active_name else 'bee done'
+            self.status_label.setText(f"Bee {layer.target_id}: {done}   |   {nxt}")
         else:
             labelled = layer.labelled_instance_count()
             self.status_label.setText(

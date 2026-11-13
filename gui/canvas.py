@@ -21,7 +21,7 @@ import cv2
 import time
 from core.mask_editing import enclosed_mask_region
 from core.mask_geometry import MaskGeometryCache, measure_mask
-from core.instance_colors import contrasting_instance_colors
+from core.instance_colors import contrasting_instance_colors, random_vivid_color, vivid_color
 from gui.keypoint_layer import KeypointLayer
 from core import keypoints as keypoints_module
 
@@ -729,7 +729,7 @@ class ImageCanvas(QGraphicsView):
         if instance_id is not None and instance_id in self.mask_colors:
             return self._normalize_color(self.mask_colors[instance_id])
 
-        return tuple(np.random.randint(0, 255, 3).tolist())
+        return random_vivid_color()
 
     def ensure_instance_color(self, instance_id, category=None, preferred_color=None):
         """Store and return the correct display color for an instance."""
@@ -750,7 +750,12 @@ class ImageCanvas(QGraphicsView):
             color = self._bee_display_colors.get(instance_id)
             if color is not None:
                 return color
-        return self.ensure_instance_color(instance_id, category)
+        color = self.ensure_instance_color(instance_id, category)
+        if self.annotation_type_colors.get(category) is None:
+            # Stored identity colours (old saves, tracking) may be grey, which disappears
+            # on greyscale frames. Category colours are fixed and left alone.
+            color = vivid_color(color)
+        return color
 
     def set_bee_color_context(self, context):
         """Carry color preferences between frames, but not unrelated projects/videos."""
@@ -3839,7 +3844,7 @@ class ImageCanvas(QGraphicsView):
         
         # Use provided color or generate random one
         if color is None:
-            color = np.random.randint(0, 255, 3)
+            color = random_vivid_color()
         self.mask_colors.append(color)
         overlay[mask > 0] = [color[0], color[1], color[2], self.mask_opacity]
         

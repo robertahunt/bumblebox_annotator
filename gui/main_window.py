@@ -80,6 +80,7 @@ from core.annotation_scope import split_annotations, merge_annotations, frame_ca
 from core.annotation_copy import training_copy_targets, selected_copy_masks, merge_copied_masks
 from core.project_manager import ProjectManager
 from core.instance_tracker import InstanceTracker, Detection, Track
+from core.instance_colors import random_vivid_color
 from core.frame_cache import FrameCache, PreloadWorker
 from core.marker_detector import MarkerDetector, MarkerDetection
 from core.tracking_sequence_manager import TrackingSequenceManager
@@ -10144,10 +10145,8 @@ class MainWindow(QMainWindow):
                         else:
                             # Generate consistent color based on instance ID
                             # Use a pseudo-random but deterministic color based on ID
-                            np.random.seed(instance_id)
-                            color = tuple(np.random.randint(50, 255, 3).tolist())
+                            color = random_vivid_color(instance_id)
                             self.video_mask_colors[self.current_video_id][instance_id] = color
-                            np.random.seed()  # Reset seed
                         
                         color_bgr = (int(color[2]), int(color[1]), int(color[0]))  # RGB to BGR
                         
@@ -10528,10 +10527,8 @@ class MainWindow(QMainWindow):
                 color = self.video_mask_colors[video_id][instance_id]
             else:
                 # Generate consistent color based on instance ID
-                np.random.seed(instance_id)
-                color = tuple(np.random.randint(50, 255, 3).tolist())
+                color = random_vivid_color(instance_id)
                 self.video_mask_colors[video_id][instance_id] = color
-                np.random.seed()  # Reset seed
             
             color_bgr = (int(color[2]), int(color[1]), int(color[0]))  # RGB to BGR
             
@@ -11077,7 +11074,7 @@ class MainWindow(QMainWindow):
 
                     color = self.video_mask_colors[self.current_video_id].get(track_id)
                     if color is None:
-                        color = tuple(np.random.randint(0, 255, 3).tolist())
+                        color = random_vivid_color()
                         self.video_mask_colors[self.current_video_id][track_id] = color
 
                     x1, y1, x2, y2 = detection.bbox
@@ -11141,7 +11138,7 @@ class MainWindow(QMainWindow):
                     
                     color = self.video_mask_colors[self.current_video_id].get(track_id)
                     if color is None:
-                        color = tuple(np.random.randint(0, 255, 3).tolist())
+                        color = random_vivid_color()
                         self.video_mask_colors[self.current_video_id][track_id] = color
                     
                     # Convert bbox from [x1, y1, x2, y2] to [x, y, w, h]
@@ -11703,7 +11700,7 @@ class MainWindow(QMainWindow):
                 
                 color = self.video_mask_colors[self.current_video_id].get(new_mask_id)
                 if color is None:
-                    color = tuple(np.random.randint(0, 255, 3).tolist())
+                    color = random_vivid_color()
                     self.video_mask_colors[self.current_video_id][new_mask_id] = color
                 
                 # Build updated annotation preserving format (bbox-only vs mask-based)
@@ -11923,7 +11920,7 @@ class MainWindow(QMainWindow):
                         
                         # Ensure we have a color for this track
                         if track_id not in self.video_mask_colors[self.current_video_id]:
-                            self.video_mask_colors[self.current_video_id][track_id] = tuple(np.random.randint(0, 255, 3).tolist())
+                            self.video_mask_colors[self.current_video_id][track_id] = random_vivid_color()
                         
                         # Convert bbox from xyxy to xywh
                         x1, y1, x2, y2 = boxes[i]
@@ -12185,7 +12182,7 @@ class MainWindow(QMainWindow):
                         
                         # Ensure we have a color for this track
                         if track_id not in self.video_mask_colors[self.current_video_id]:
-                            self.video_mask_colors[self.current_video_id][track_id] = tuple(np.random.randint(0, 255, 3).tolist())
+                            self.video_mask_colors[self.current_video_id][track_id] = random_vivid_color()
                         
                         # Calculate bbox from mask
                         coords = np.where(mask > 0)
@@ -12539,7 +12536,7 @@ class MainWindow(QMainWindow):
                         
                         # Ensure we have a color for this track
                         if track_id not in self.video_mask_colors[self.current_video_id]:
-                            self.video_mask_colors[self.current_video_id][track_id] = tuple(np.random.randint(0, 255, 3).tolist())
+                            self.video_mask_colors[self.current_video_id][track_id] = random_vivid_color()
                         
                         # Calculate bbox from mask
                         coords = np.where(mask > 0)

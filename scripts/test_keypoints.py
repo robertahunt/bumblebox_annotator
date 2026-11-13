@@ -26,14 +26,26 @@ class KeypointModelTests(unittest.TestCase):
         config = kp.default_config()
         info = {'name': 'p', kp.PROJECT_KEY: config.to_dict()}
         loaded = kp.config_from_project_info(info)
-        self.assertEqual(loaded.names, ('head', 'thorax', 'abdomen_tip',
-                                        'left_antenna_tip', 'right_antenna_tip'))
+        self.assertEqual(loaded.names, (
+            'head', 'thorax', 'abdomen_tip', 'left_antenna_tip',
+            'left_front_leg_tip', 'left_mid_leg_tip', 'left_hind_leg_tip',
+            'right_hind_leg_tip', 'right_mid_leg_tip', 'right_front_leg_tip', 'right_antenna_tip'))
+        legs = [n for n in loaded.names if n.endswith('_leg_tip')]
         self.assertEqual(loaded.edges, (('head', 'thorax'), ('thorax', 'abdomen_tip'),
-                                        ('head', 'left_antenna_tip'), ('head', 'right_antenna_tip')))
+                                        ('head', 'left_antenna_tip'), ('head', 'right_antenna_tip'),
+                                        *(('thorax', leg) for leg in legs)))
         self.assertEqual(loaded.marker_keypoint, 'thorax')
-        self.assertEqual(loaded.coco_category_fields()['skeleton'], [[1, 2], [2, 3], [1, 4], [1, 5]])
-        self.assertEqual(loaded.symmetries, (('left_antenna_tip', 'right_antenna_tip'),))
-        self.assertEqual(config.to_dict()['symmetries'], [['left_antenna_tip', 'right_antenna_tip']])
+        self.assertEqual(loaded.coco_category_fields()['skeleton'],
+                         [[1, 2], [2, 3], [1, 4], [1, 11], [2, 5], [2, 6], [2, 7], [2, 8], [2, 9], [2, 10]])
+        pairs = (('left_antenna_tip', 'right_antenna_tip'), ('left_front_leg_tip', 'right_front_leg_tip'),
+                 ('left_mid_leg_tip', 'right_mid_leg_tip'), ('left_hind_leg_tip', 'right_hind_leg_tip'))
+        self.assertEqual(loaded.symmetries, pairs)
+        self.assertEqual(config.to_dict()['symmetries'], [list(p) for p in pairs])
+        # Projects saved with the earlier five-point default keep their list.
+        five = kp.KeypointConfig(names=('head', 'thorax', 'abdomen_tip', 'left_antenna_tip', 'right_antenna_tip'))
+        self.assertEqual(kp.config_from_project_info({kp.PROJECT_KEY: five.to_dict()}).names, five.names)
+        self.assertEqual(five.edges, (('head', 'thorax'), ('thorax', 'abdomen_tip'),
+                                      ('head', 'left_antenna_tip'), ('head', 'right_antenna_tip')))
 
     def test_unspecified_lines_use_defaults_between_defined_keypoints_only(self):
         self.assertEqual(kp.KeypointConfig(names=('head', 'thorax', 'sting')).edges, (('head', 'thorax'),))
@@ -88,8 +100,23 @@ class KeypointModelTests(unittest.TestCase):
         self.assertEqual(kp.next_unlabelled({'head': [0, 0, 2]}, names, after='head'), 'thorax')
         self.assertEqual(kp.next_unlabelled({'thorax': [0, 0, 2]}, names, after='abdomen_tip'), 'head')
         self.assertIsNone(kp.next_unlabelled({n: [0, 0, 2] for n in names}, names))
+        self.assertEqual(kp.next_unlabelled({'head': [0, 0, 2]}, names, after='head', skip={'thorax'}),
+                         'abdomen_tip')
+        self.assertIsNone(kp.next_unlabelled({'head': [0, 0, 2]}, names, skip={'thorax', 'abdomen_tip'}))
         merged = kp.merge_keypoints({'head': [1, 1, 2]}, {'head': [9, 9, 2], 'thorax': [2, 2, 1]})
         self.assertEqual(merged, {'head': [1, 1, 2], 'thorax': [2, 2, 1]})
+
+    def test_point_colours_mark_sides_and_avoid_grey(self):
+        import colorsys
+        from gui.keypoint_layer import keypoint_color
+        names = ('head', 'thorax', 'left_antenna_tip', 'right_antenna_tip', 'left_front_leg_tip',
+                 'right_front_leg_tip', 'left_forewing_tip', 'right_forewing_tip', 'sting', 'mandible')
+        colors = {n: keypoint_color(n, i) for i, n in enumerate(names)}
+        self.assertEqual({colors[n] for n in names if n.startswith('left_')}, {colors['left_antenna_tip']})
+        self.assertEqual({colors[n] for n in names if n.startswith('right_')}, {colors['right_antenna_tip']})
+        self.assertNotEqual(colors['left_front_leg_tip'], colors['right_front_leg_tip'])
+        for c in colors.values():
+            self.assertGreaterEqual(colorsys.rgb_to_hsv(*(v / 255 for v in c))[1], 0.45, c)
 
     def test_coco_keypoints_and_marker_center(self):
         flat, n = kp.coco_keypoints({'head': [1.234, 2, 2], 'abdomen_tip': [5, 6, 1]},
@@ -200,6 +227,75 @@ class KeypointCanvasTests(unittest.TestCase):
         self.assertEqual(thorax[2], kp.OCCLUDED)
         self.assertAlmostEqual(thorax[0], 60, delta=1)
         self.assertNotIn('abdomen_tip', layer.keypoints_for(1))
+
+    def right_click(self, canvas, x, y, modifier=Qt.KeyboardModifier.NoModifier):
+        """Right-click at (x, y); returns the text of each menu that opened."""
+        from unittest.mock import patch
+        menus = []
+        with patch('gui.keypoint_layer.QMenu.exec',
+                   lambda menu, *a: menus.append([a.text() for a in menu.actions() if a.text()])):
+            QTest.mouseClick(canvas.viewport(), Qt.MouseButton.RightButton, modifier,
+                             canvas.mapFromScene(QPointF(x, y)), 5)
+            self.app.processEvents()
+        return menus
+
+    def test_right_click_skips_without_a_menu_and_finishes_the_bee(self):
+        canvas = self.make_canvas()
+        layer = canvas.keypoint_layer
+        layer.set_config(kp.KeypointConfig(names=('head', 'thorax', 'abdomen_tip', 'left_antenna_tip', 'right_antenna_tip')))
+        canvas.set_tool('keypoint')
+        self.assertEqual(self.right_click(canvas, 30, 40), [])  # starts bee 1, skips its head
+        self.assertEqual((layer.target_id, layer.active_name), (1, 'thorax'))
+        self.click(canvas, 60, 50)
+        self.assertEqual(self.right_click(canvas, 250, 20), [])  # off any bee: still skips
+        self.assertEqual(layer.active_name, 'left_antenna_tip')
+        self.click(canvas, 40, 30)
+        self.assertEqual(self.right_click(canvas, 200, 150), [])  # over bee 2: still bee 1's
+        # Skipped points don't come back round, so the bee is done without Esc.
+        self.assertIsNone(layer.active_name)
+        self.assertEqual(layer.target_id, 1)
+        self.assertEqual(sorted(layer.keypoints_for(1)), ['left_antenna_tip', 'thorax'])
+        self.assertEqual(layer.skipped, {'head', 'abdomen_tip', 'right_antenna_tip'})
+        self.click(canvas, 200, 150)  # so the next click starts bee 2 (head already placed)
+        self.assertEqual(layer.target_id, 2)
+        self.assertEqual(sorted(layer.keypoints_for(2)), ['head', 'thorax'])
+        self.assertEqual(layer.skipped, set())
+        # Coming back to bee 1 offers its skipped points again.
+        layer.set_target(1)
+        self.assertEqual(layer.active_name, 'head')
+
+    def test_point_menu_shift_right_click_and_backspace_undoes_a_skip(self):
+        from gui.keypoint_toolbar import KeypointToolbar
+        canvas = self.make_canvas()
+        layer = canvas.keypoint_layer
+        layer.set_config(BODY)
+        toolbar = KeypointToolbar(layer)
+        canvas.set_tool('keypoint')
+        self.assertEqual(len(self.right_click(canvas, 250, 20)), 1)  # nothing to skip: menu
+        self.click(canvas, 30, 40)
+        menus = self.right_click(canvas, 30, 40)  # on the head point: its menu, no skip
+        self.assertEqual(len(menus), 1)
+        self.assertTrue(any(t.startswith('Delete head') for t in menus[0]))
+        self.assertEqual(len(self.right_click(canvas, 60, 50, Qt.KeyboardModifier.ShiftModifier)), 1)
+        self.assertEqual(layer.active_name, 'thorax')
+
+        self.right_click(canvas, 60, 50)
+        self.assertEqual(layer.active_name, 'abdomen_tip')
+        self.assertIn('thorax skipped', toolbar.status_label.text())
+        backspace = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Backspace, Qt.KeyboardModifier.NoModifier)
+        canvas.keyPressEvent(backspace)  # undoes the skip, keeps the head
+        self.assertEqual(layer.active_name, 'thorax')
+        self.assertEqual(sorted(layer.keypoints_for(1)), ['head'])
+        self.assertNotIn('skipped', toolbar.status_label.text())
+
+        n_key = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_N, Qt.KeyboardModifier.NoModifier)
+        canvas.keyPressEvent(n_key)  # N skips the same way
+        self.assertEqual(layer.active_name, 'abdomen_tip')
+        self.click(canvas, 110, 60)
+        self.assertIsNone(layer.active_name)
+        self.assertIn('bee done', toolbar.status_label.text())
+        canvas.keyPressEvent(backspace)  # after a placement, Backspace removes that point
+        self.assertEqual(sorted(layer.keypoints_for(1)), ['head'])
 
     def test_drag_moves_point_and_is_one_undo_step(self):
         canvas = self.make_canvas()
@@ -434,7 +530,7 @@ class KeypointProjectTests(unittest.TestCase):
         self.assertTrue(all('keypoints' not in a for a in plain['annotations']))
         self.assertTrue(all('skeleton' not in c for c in plain['categories']))
 
-        kp.save_project_config(self.project, kp.default_config(), enabled=True)
+        kp.save_project_config(self.project, kp.KeypointConfig(names=('head', 'thorax', 'abdomen_tip', 'left_antenna_tip', 'right_antenna_tip')), enabled=True)
         for data in (_read_json(export_coco_per_video(self.project, ['video'], 'train')[0]),
                      _read_json(export_coco_with_tracking(self.project, ['video'], 'train'))):
             bee_cat = next(c for c in data['categories'] if c['name'] == 'bee')

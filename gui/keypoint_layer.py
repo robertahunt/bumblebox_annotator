@@ -11,10 +11,13 @@ Mouse, with the canvas tool set to ``'keypoint'``:
   * shift+click           place the next keypoint as hidden (occluded); on an existing
                           point, switch it between hidden and visible
   * drag a keypoint       move it (any visible bee)
-  * right-click           menu: hidden/visible, delete point, clear bee, finish bee
+  * right-click           skip the keypoint a left-click would place (leave it unlabelled);
+                          the bee is finished once every keypoint is placed or skipped
+  * right-click a point,  menu: hidden/visible, delete point, clear bee, finish bee
+    or shift+right-click
   * double-click          same as a click (quick successive placements)
-Keys: Esc finishes the bee, Backspace/Delete removes the hovered or last-placed point,
-N moves to the next keypoint name, H toggles "place as hidden".
+Keys: Esc finishes the bee, Backspace/Delete removes the hovered point or undoes the last
+placement or skip, N skips like a right-click, H toggles "place as hidden".
 Undo/redo (``undo()``/``redo()``) cover keypoint edits on the current frame.
 """
 
@@ -28,17 +31,24 @@ _BASE_COLORS = {
     'head': (255, 70, 70),
     'thorax': (255, 215, 0),
     'abdomen_tip': (60, 150, 255),
-    'left_antenna_tip': (0, 220, 120),     # distinct left/right colours help keep sides consistent
-    'right_antenna_tip': (255, 120, 220),
 }
-_PALETTE = [(0, 220, 120), (255, 120, 220), (255, 150, 40), (150, 110, 255), (0, 230, 230),
-            (200, 255, 80), (255, 255, 255)]
+# Every left_ point is green and every right_ point pink (antennae, legs, wings), so a
+# left/right swap stands out. Other points cycle through colours that show on grey frames.
+_LEFT_COLOR = (0, 220, 120)
+_RIGHT_COLOR = (255, 120, 220)
+_PALETTE = [(255, 150, 40), (150, 110, 255), (0, 230, 230), (200, 255, 80)]
 Z_EDGE = 125
 Z_POINT = 126
 
 
 def keypoint_color(name, index):
-    return _BASE_COLORS.get(name) or _PALETTE[index % len(_PALETTE)]
+    if name in _BASE_COLORS:
+        return _BASE_COLORS[name]
+    if name.startswith('left_'):
+        return _LEFT_COLOR
+    if name.startswith('right_'):
+        return _RIGHT_COLOR
+    return _PALETTE[index % len(_PALETTE)]
 
 
 class KeypointLayer(QObject):
@@ -59,6 +69,9 @@ class KeypointLayer(QObject):
         self.target_id = 0
         self.active_name = None
         self.last_placed = None
+        # Names deliberately left unlabelled on the bee being labelled (not saved).
+        self.skipped = set()
+        self.last_skipped = None
         self.items = []
         self.undo_stack = []
         self.redo_stack = []
@@ -80,6 +93,7 @@ class KeypointLayer(QObject):
         self.config = config
         self._drag = None
         self._hover = None
+        self._forget_skips()
         if config is None:
             self.target_id = 0
             self.active_name = None
@@ -102,6 +116,7 @@ class KeypointLayer(QObject):
         self.target_id = 0
         self.active_name = self.names[0] if self.names else None
         self.last_placed = None
+        self._forget_skips()
         self._drag = None
         self._hover = None
         self.undo_stack.clear()
@@ -201,8 +216,13 @@ class KeypointLayer(QObject):
     def _next_name(self, instance_id, after=None):
         if not self.enabled:
             return None
+        skip = self.skipped if instance_id and instance_id == self.target_id else ()
         return kp.next_unlabelled(self.keypoints_for(instance_id) if instance_id else {},
-                                  self.names, after=after)
+                                  self.names, after=after, skip=skip)
+
+    def _forget_skips(self):
+        self.skipped = set()
+        self.last_skipped = None
 
     def set_target(self, instance_id, select=True):
         """Make ``instance_id`` the bee being labelled (0 to finish/clear)."""
@@ -211,6 +231,7 @@ class KeypointLayer(QObject):
             return False
         self.target_id = int(instance_id or 0)
         self.last_placed = None
+        self._forget_skips()
         self.active_name = self._next_name(self.target_id) if self.target_id else (
             self.names[0] if self.names else None)
         if select and self.target_id:
@@ -222,7 +243,34 @@ class KeypointLayer(QObject):
     def set_active_name(self, name):
         if name in self.names:
             self.active_name = name
+            self.skipped.discard(name)
+            self.last_skipped = None
             self.state_changed.emit()
+
+    def skip_active_name(self):
+        """Leave the next keypoint of the bee being labelled unlabelled and move on.
+
+        Skipped names are not offered again for this bee, so it is finished once every
+        keypoint is placed or skipped. Returns False when there is nothing to skip.
+        """
+        if not (self.enabled and self.target_id and self.active_name is not None):
+            return False
+        name = self.active_name
+        self.skipped.add(name)
+        self.last_skipped = name
+        self.active_name = self._next_name(self.target_id, after=name)
+        self.state_changed.emit()
+        return True
+
+    def unskip_last(self):
+        """Undo the most recent skip: make that keypoint the next one again."""
+        name, self.last_skipped = self.last_skipped, None
+        if not (name and self.target_id):
+            return False
+        self.skipped.discard(name)
+        self.active_name = name
+        self.state_changed.emit()
+        return True
 
     def advance_active_name(self):
         if not self.names:
@@ -241,6 +289,7 @@ class KeypointLayer(QObject):
         if self._store({instance_id: points}):
             self.last_placed = name
             if instance_id == self.target_id:
+                self.last_skipped = None
                 self.active_name = self._next_name(instance_id, after=name)
             self.state_changed.emit()
             return True
@@ -263,6 +312,7 @@ class KeypointLayer(QObject):
         if changed and instance_id == self.target_id:
             self.active_name = self.names[0] if self.names else None
             self.last_placed = None
+            self._forget_skips()
             self.state_changed.emit()
         return changed
 
@@ -336,10 +386,7 @@ class KeypointLayer(QObject):
         if not self.enabled:
             return False
         button = event.button()
-        if button == Qt.MouseButton.RightButton:
-            self._show_context_menu(event, scene_pos)
-            return True
-        if button != Qt.MouseButton.LeftButton:
+        if button not in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             return False
         image = self.canvas.current_image
         if image is None:
@@ -350,6 +397,12 @@ class KeypointLayer(QObject):
 
         shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
         picked = self.hit(scene_pos)
+        if button == Qt.MouseButton.RightButton:
+            # Skip the point a left-click would place; the menu is for existing points,
+            # Shift+right-click, or when there is nothing to skip.
+            if shift or picked is not None or not (self._click_target(x, y) and self.skip_active_name()):
+                self._show_context_menu(event, scene_pos)
+            return True
         if picked is not None:
             instance_id, name = picked
             if instance_id != self.target_id:
@@ -361,22 +414,31 @@ class KeypointLayer(QObject):
                           'before': self.keypoints_for(instance_id), 'moved': False}
             return True
 
-        target_ok = bool(self.target_id) and self._is_target_category(self._metadata(self.target_id))
-        if not target_ok or self.active_name is None:
-            candidate = self._instance_at(x, y)
-            if not candidate and not target_ok:
-                selected = self.canvas.selected_mask_idx
-                if selected > 0 and self._is_target_category(self._metadata(selected)):
-                    candidate = selected
-            if not candidate:
-                return True  # clicked off any bee with nothing to place
-            if candidate != self.target_id:
-                self.set_target(candidate)
-            if self.active_name is None:
-                return True  # bee already complete: just selected it
+        if not self._click_target(x, y):
+            return True
         hidden = self.place_occluded or shift
         self.place(self.target_id, self.active_name, x, y, kp.OCCLUDED if hidden else kp.VISIBLE)
         return True
+
+    def _click_target(self, x, y):
+        """Choose the bee a click at (x, y) acts on. False when it has no keypoint to act on.
+
+        While a bee has keypoints left, every click is for that bee, even over a neighbour.
+        Otherwise the click starts the bee under it (or the selected bee).
+        """
+        target_ok = bool(self.target_id) and self._is_target_category(self._metadata(self.target_id))
+        if target_ok and self.active_name is not None:
+            return True
+        candidate = self._instance_at(x, y)
+        if not candidate and not target_ok:
+            selected = self.canvas.selected_mask_idx
+            if selected > 0 and self._is_target_category(self._metadata(selected)):
+                candidate = selected
+        if not candidate:
+            return False  # clicked off any bee with nothing to place
+        if candidate != self.target_id:
+            self.set_target(candidate)
+        return self.active_name is not None  # False: bee already complete, just selected
 
     def handle_mouse_move(self, event, scene_pos):
         if not self.enabled:
@@ -433,11 +495,14 @@ class KeypointLayer(QObject):
             if self._hover is not None:
                 self.delete_point(*self._hover)
                 self._hover = None
+            elif self.last_skipped:
+                self.unskip_last()
             elif self.target_id and self.last_placed:
                 self.delete_point(self.target_id, self.last_placed)
             return True
         if key == Qt.Key.Key_N:
-            self.advance_active_name()
+            if not self.skip_active_name():
+                self.advance_active_name()  # no bee yet: choose which keypoint comes first
             return True
         if key == Qt.Key.Key_H:
             self.set_place_occluded(not self.place_occluded)

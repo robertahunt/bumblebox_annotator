@@ -24,11 +24,17 @@ UNLABELLED = 0
 
 PROJECT_KEY = 'keypoints'
 INSTANCE_KEY = 'keypoints'
-# Body axis first (clicked on every bee), then the antenna tips (skipped when not visible).
-# Left and right are the bee's own left and right.
-DEFAULT_KEYPOINT_NAMES = ('head', 'thorax', 'abdomen_tip', 'left_antenna_tip', 'right_antenna_tip')
+# Body axis first (the thorax usually comes from the ArUco tag), then once around the bee:
+# left antenna, left legs front to back, right legs back to front, right antenna. Points that
+# aren't visible are skipped. Left and right are the bee's own left and right.
+LEG_TIPS = tuple(f'{side}_{leg}_leg_tip' for side, legs in (('left', ('front', 'mid', 'hind')),
+                                                           ('right', ('hind', 'mid', 'front')))
+                 for leg in legs)
+DEFAULT_KEYPOINT_NAMES = ('head', 'thorax', 'abdomen_tip', 'left_antenna_tip', *LEG_TIPS,
+                          'right_antenna_tip')
 DEFAULT_EDGES = (('head', 'thorax'), ('thorax', 'abdomen_tip'),
-                 ('head', 'left_antenna_tip'), ('head', 'right_antenna_tip'))
+                 ('head', 'left_antenna_tip'), ('head', 'right_antenna_tip'),
+                 *(('thorax', leg) for leg in LEG_TIPS))
 CONFIG_VERSION = 1
 
 
@@ -285,15 +291,16 @@ def with_toggled_visibility(keypoints, name):
     return out
 
 
-def next_unlabelled(keypoints, names, after=None):
-    """First name in ``names`` without a point, searching after ``after`` and wrapping."""
+def next_unlabelled(keypoints, names, after=None, skip=()):
+    """First name in ``names`` without a point and not in ``skip``, searching after
+    ``after`` and wrapping."""
     names = list(names)
     if not names:
         return None
     start = names.index(after) + 1 if after in names else 0
     for offset in range(len(names)):
         name = names[(start + offset) % len(names)]
-        if name not in (keypoints or {}):
+        if name not in (keypoints or {}) and name not in skip:
             return name
     return None
 
@@ -372,14 +379,14 @@ def coco_add_instance_keypoints(coco_ann, ann, config):
     return coco_ann
 
 
-def summary_text(keypoints, names):
-    """Short status like ``head ✓  thorax (hidden)  abdomen tip –``."""
+def summary_text(keypoints, names, skipped=()):
+    """Short status like ``head ✓  thorax (hidden)  abdomen tip –  left antenna tip skipped``."""
     parts = []
     for name in names:
         point = (keypoints or {}).get(name)
         label = name.replace('_', ' ')
         if point is None:
-            parts.append(f'{label} –')
+            parts.append(f'{label} skipped' if name in skipped else f'{label} –')
         elif point[2] == OCCLUDED:
             parts.append(f'{label} (hidden)')
         else:

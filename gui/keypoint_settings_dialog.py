@@ -33,7 +33,7 @@ class KeypointSettingsDialog(QDialog):
 
         intro = QLabel(
             'Keypoints are optional landmarks on each bee, such as the head, thorax,<br>'
-            'abdomen tip and antenna tips, saved with the bee\'s mask.<br>'
+            'abdomen tip, antenna tips and leg tips, saved with the bee\'s mask.<br>'
             'Projects that leave this off are unchanged.')
         layout.addWidget(intro)
 
@@ -48,7 +48,7 @@ class KeypointSettingsDialog(QDialog):
 
         self.names_edit = QPlainTextEdit('\n'.join(config.names))
         line = self.names_edit.fontMetrics().lineSpacing()
-        self.names_edit.setMinimumHeight(line * 7 + 12)
+        self.names_edit.setMinimumHeight(line * len(kp.DEFAULT_KEYPOINT_NAMES) + 12)
         self.names_edit.setToolTip('One keypoint per line, in the order you will usually click them')
         form.addRow('Keypoints:', self.names_edit)
         names_help = QLabel('One per line, in clicking order.<br>'
@@ -57,6 +57,7 @@ class KeypointSettingsDialog(QDialog):
         form.addRow('', names_help)
 
         self.edges_edit = QLineEdit(kp.format_edges(config.edges))
+        self.edges_edit.setCursorPosition(0)  # long lists: show the start, not the end
         self.edges_edit.setToolTip('Lines drawn between keypoints, e.g. head-thorax, thorax-abdomen_tip')
         form.addRow('Skeleton lines:', self.edges_edit)
 
@@ -89,6 +90,7 @@ class KeypointSettingsDialog(QDialog):
         default = kp.default_config()
         self.names_edit.setPlainText('\n'.join(default.names))
         self.edges_edit.setText(kp.format_edges(default.edges))
+        self.edges_edit.setCursorPosition(0)
         self._refresh_marker_choices(selected=default.marker_keypoint)
 
     def _refresh_marker_choices(self, selected=None):

@@ -1,6 +1,6 @@
 # Keypoints (optional)
 
-Keypoints are landmarks on each bee, such as head, thorax, abdomen tip and antenna tips.
+Keypoints are landmarks on each bee, such as head, thorax, abdomen tip, antenna tips and leg tips.
 They are saved with the bee's mask and exported to COCO. They are **off by default**. A project
 that never turns them on looks and behaves exactly as before.
 
@@ -13,15 +13,21 @@ the app, come later.
 **Project > Keypoints...** opens the settings:
 
 - **Use keypoints in this project:** the on/off switch.
-- **Keypoints (in order):** one name per line, in clicking order. The default is `head`,
-  `thorax`, `abdomen_tip`, `left_antenna_tip`, `right_antenna_tip`: the body axis first, then
-  the antennae, which are often hidden. Use letters, digits and underscores.
+- **Keypoints (in order):** one name per line, in clicking order. The default has 11 points:
+  the body axis first (`head`, `thorax`, `abdomen_tip`), then once around the bee:
+  `left_antenna_tip`, `left_front_leg_tip`, `left_mid_leg_tip`, `left_hind_leg_tip`,
+  `right_hind_leg_tip`, `right_mid_leg_tip`, `right_front_leg_tip`, `right_antenna_tip`.
+  Antennae and legs are often hidden; skip those (right-click). A leg tip is the end of the
+  leg, where it meets the surface. Use letters, digits and underscores.
   **Left and right are the bee's own left and right**, not the image's. Names that start
   with `left_` and `right_` are recorded as mirror pairs (`symmetries`), which pose tools
   such as SLEAP use to swap the two sides when they flip images during training.
-  **Restore Bee Defaults** puts the default list back.
+  **Restore Bee Defaults** puts the default list back. A project keeps the list it was
+  saved with, so a project set up with the earlier five-point default (no legs) gets the
+  leg tips only when you press this and save.
 - **Skeleton lines:** pairs to connect on screen and in the COCO skeleton, for example
-  `head-thorax, thorax-abdomen_tip, head-left_antenna_tip, head-right_antenna_tip`.
+  `head-thorax, thorax-abdomen_tip, head-left_antenna_tip, thorax-left_front_leg_tip`. The
+  default joins the head to each antenna tip and the thorax to each leg tip.
 - **Fill from ArUco tag:** the keypoint that **Thorax from ArUco Tags** sets to each tag's
   centre. The default is `thorax`.
 
@@ -47,25 +53,32 @@ under the tool row.
 3. Keep clicking. Each click places the next keypoint, shown in **Next:**, for that same bee,
    even when the click lands on a neighbouring bee (for example an antenna tip). When the bee
    is complete, a click on another bee starts that one.
-4. Change **Next:** at any time to redo a particular point.
-5. When an antenna tip isn't visible, press N to skip it, or Esc to finish the bee. Leave it
-   unlabelled rather than guessing. Use **hidden** only for a point whose position you can
-   still tell, for example a tip just under a neighbour's wing.
+4. When the next point isn't visible, **right-click anywhere** (or press N) to skip it. It is
+   left unlabelled, and it isn't offered again for this bee. Right-clicking a bee you haven't
+   started starts it and skips its first point. Leave a point unlabelled rather
+   than guessing. Use **hidden** only for a point whose position you can still tell, for
+   example a tip just under a neighbour's wing.
+5. The bee is done once every point is placed or skipped, so the next click starts another
+   bee. Esc finishes a bee early.
+6. Change **Next:** at any time to redo a particular point, including a skipped one. Coming
+   back to a bee later offers its skipped points again.
 
 | Action | How |
 |---|---|
 | Move a point | Drag it (any visible bee) |
 | Place one point as hidden (occluded) | Shift+click where it goes |
-| Switch an existing point between hidden and visible | Shift+click it, or right-click it |
+| Switch an existing point between hidden and visible | Shift+click it, or right-click it > **Mark Hidden/Visible** |
 | Place every following point as hidden | Tick **Place as hidden** (H); untick to stop |
-| Delete a point | Right-click it, or hover and press Backspace/Delete |
-| Remove the last point placed | Backspace |
-| Skip to the next keypoint name | N |
-| Finish the bee | Esc, or right-click > **Finish Bee** |
+| Skip the next point (leave it unlabelled) | Right-click anywhere that isn't a point, or N |
+| Point menu: hidden/visible, delete, finish or clear the bee | Right-click a point, or Shift+right-click anywhere |
+| Delete a point | Hover and press Backspace/Delete, or right-click it > **Delete** |
+| Undo the last point placed, or the last skip | Backspace |
+| Finish the bee early | Esc, or right-click a point > **Finish Bee** |
 | Undo/redo keypoint edits on this frame | Ctrl+Z / Ctrl+Shift+Z while the Keypoints tool is active |
 | Thorax from every tag on the frame | **Thorax from ArUco Tags** (only fills missing points; one undo step) |
 
-Points are drawn at a fixed screen size. Hidden points are drawn as dashed rings, and
+Points are drawn at a fixed screen size. Every `left_` point is green and every `right_`
+point pink, so a left/right swap stands out. Hidden points are drawn as dashed rings, and
 the bee being labelled is outlined in white. Keypoints follow the bee's visibility: they
 hide with the bee class switch, with an individual bee switch, and with Space.
 
