@@ -6,7 +6,7 @@ from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (QComboBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
                             QPushButton, QStyle, QToolButton, QVBoxLayout, QWidget)
 
-from core.annotation_work import (TASKS, local_index, mark_finished, matches, summarize,
+from core.annotation_work import (KEYPOINT_TASKS, TASKS, local_index, mark_finished, matches, summarize,
                                   task_categories, task_label)
 from core.assigned_work import workspace
 from gui.assigned_review import AssignedReviewViews
@@ -14,7 +14,7 @@ from gui.project_sync_dialog import OperationWorker, SyncProgressDialog
 from gui.video_browsing import SORT_ROLE, STATE_NAMES, STATUS_ROLE, status_count, status_icon
 
 
-def task_combo(parent=None):
+def task_combo(parent=None, *, keypoints=False):
     combo = QComboBox(parent)
     combo.addItem('All mask types', None)
     for task in ('hive', 'bee', 'bee_hive', 'pollen', 'nectar', 'chamber', 'brood', 'queen_brood'):
@@ -25,7 +25,28 @@ def task_combo(parent=None):
     combo.setMinimumWidth(0)
     combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
     combo.setMinimumContentsLength(12)
+    set_keypoint_tasks(combo, keypoints)
     return combo
+
+
+def set_keypoint_tasks(combo, available):
+    """List the keypoint tasks, right after Bees + Hive, only in projects that use keypoints."""
+    present = combo.findData(KEYPOINT_TASKS[0]) >= 0
+    if bool(available) == present:
+        return
+    current = combo.currentData()
+    combo.blockSignals(True)
+    if available:
+        position = combo.findData('bee_hive') + 1
+        for offset, task in enumerate(KEYPOINT_TASKS):
+            combo.insertItem(position + offset, task_label(task), task)
+    else:
+        for task in KEYPOINT_TASKS:
+            combo.removeItem(combo.findData(task))
+    combo.setCurrentIndex(max(combo.findData(current), 0))  # a removed task falls back to All mask types
+    combo.blockSignals(False)
+    if combo.currentData() != current:
+        combo.currentIndexChanged.emit(combo.currentIndex())
 
 
 class WorkFilters(QWidget):
@@ -46,8 +67,8 @@ class WorkFilters(QWidget):
         form = QFormLayout()
         self.task = task_combo(self)
         if sidebar:
-            self.task.setToolTip('The mask type you are working on. Status marks, counts and '
-                                 'Mark Finished follow it.')
+            self.task.setToolTip('The kind of work you are doing: a mask type, keypoints, or both. '
+                                 'Status marks, counts and Mark Finished follow it.')
         self.show = QComboBox()
         for title, value in (('All Work', 'all'), ('Not Started', 'not_started'),
                              ('Not Checked', 'not_checked'), ('Finished', 'finished')):
@@ -341,8 +362,12 @@ class AnnotationWorkBrowser(QObject):
             browser = self.window.video_browser
             if not state and browser.only_mine.isChecked():
                 task = browser.my_work.get(video, {}).get('task')
-            if task:
+            if task in KEYPOINT_TASKS:
+                # The first video can open before the project's keypoint settings are applied.
+                set_keypoint_tasks(self.filters.task, True)
+            if task and self.filters.task.findData(task) >= 0:
                 self.filters.task.setCurrentIndex(self.filters.task.findData(task))
+            self.window.update_keypoint_tool_availability()  # follows the video's assignment
         self.apply()
 
     def summary(self, entry, task, frames=None):
@@ -533,6 +558,7 @@ class AnnotationWorkBrowser(QObject):
             summary = summarize(entry, task, [frame])
             text = (f'Mark {task_label(task)} work unfinished?' if reopen else
                     f'Mark {task_label(task)} work finished?' if summary['presence'] != 'none' else
+                    'Confirm that you checked and no keypoints can be placed here?' if task == 'keypoints' else
                     f'Confirm that you checked and no {task_label(task).lower()} is present?')
             if summary.get('shared'):
                 text += '\n\nThis records the shared mask for the whole video, not just this frame.'

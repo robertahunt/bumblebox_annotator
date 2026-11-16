@@ -131,6 +131,7 @@ class AnnotationToolbar(QWidget):
     clear_all_aruco_requested = pyqtSignal()
     show_segmentations_changed = pyqtSignal(bool)
     show_bboxes_changed = pyqtSignal(bool)
+    show_keypoints_changed = pyqtSignal(bool)
     annotation_type_changed = pyqtSignal(str)  # Annotation type selection (bee/hive/chamber)
     annotation_type_visibility_changed = pyqtSignal(str, bool)  # annotation_type, visible
     annotation_group_visibility_changed = pyqtSignal(object, bool)  # categories, visible
@@ -299,6 +300,16 @@ class AnnotationToolbar(QWidget):
         self.bbox_checkbox.setToolTip("Show/hide bounding boxes (Ctrl+Shift+B)")
         self.bbox_checkbox.stateChanged.connect(self.on_show_bboxes_changed)
         visibility_layout.addWidget(self.bbox_checkbox)
+
+        # Only in projects that use keypoints (set_keypoints_available).
+        self.keypoints_checkbox = QCheckBox("Keypoints")
+        self.keypoints_checkbox.setChecked(True)
+        self.keypoints_checkbox.setToolTip(
+            "Show/hide keypoints, independently of masks and boxes (Ctrl+Shift+K). "
+            "Hide Segmentations to see legs and antennae while placing keypoints.")
+        self.keypoints_checkbox.toggled.connect(self.show_keypoints_changed)
+        self.keypoints_checkbox.hide()
+        visibility_layout.addWidget(self.keypoints_checkbox)
         
         main_layout.addLayout(row1)
         main_layout.addWidget(self.visibility_panel)
@@ -599,9 +610,10 @@ class AnnotationToolbar(QWidget):
         self._calibration_allowed = bool(allowed)
         self.show_tool_options(self.current_tool_name)
 
-    def set_keypoints_available(self, available):
-        """Show the Keypoints tool only in projects that use keypoints."""
-        self.keypoint_btn.setVisible(bool(available))
+    def set_keypoints_available(self, available, editable=True):
+        """Keypoints display switch in projects that use keypoints; the tool where they may be edited."""
+        self.keypoint_btn.setVisible(bool(available and editable))
+        self.keypoints_checkbox.setVisible(bool(available))
         self.tools_row.invalidate()
         self.updateGeometry()
 

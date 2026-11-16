@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QDockWidget, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QStyle, QToolButton,
     QVBoxLayout, QWidget)
 
-from core.annotation_work import task_categories, task_label
+from core.annotation_work import task_label, task_mask_categories, task_uses_keypoints
 from core.project_sync import require_no_update, update_journal_path
 from core.submission_review import PreparedSubmissionReview, approve_review, review_queue
 from gui.project_sync_dialog import SyncProgressDialog, setting_json
@@ -308,8 +308,10 @@ class SubmissionReviewDock(QDockWidget):
                 checks = {'bee': w.toolbar.show_bees_checkbox, 'hive': w.toolbar.show_hives_checkbox,
                           'chamber': w.toolbar.show_chambers_checkbox, 'pollen': w.toolbar.show_pollen_checkbox,
                           'nectar': w.toolbar.show_nectar_checkbox, **w.toolbar.brood_visibility_actions}
-                for category in task_categories(row.get('task')):
+                for category in task_mask_categories(row.get('task')):
                     checks[category].setChecked(True)
+                if task_uses_keypoints(row.get('task')):
+                    w.on_show_keypoints_changed(True)
                 w.coco_export_dirty = True
                 w.invalidate_backup_estimate()
                 self._describe_active()

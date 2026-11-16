@@ -16,23 +16,50 @@ from core.contributors import utc_now
 
 
 VERSION = 1
+# Keypoints are a kind of work alongside the mask categories, never a mask category:
+# they have their own finished marks, so masks and keypoints can be assigned and
+# completed together or separately.
+KEYPOINTS = 'keypoints'
 TASKS = {c: (c,) for c in CATEGORIES}
 TASKS.update(brood=STANDARD_BROOD_CATEGORIES, queen_brood=QUEEN_BROOD_CATEGORIES)
 TASKS['bee_hive'] = ('bee', 'hive')
+TASKS.update(keypoints=(KEYPOINTS,), bee_keypoints=('bee', KEYPOINTS),
+             bee_hive_keypoints=('bee', 'hive', KEYPOINTS))
+KEYPOINT_TASKS = tuple(task for task, kinds in TASKS.items() if KEYPOINTS in kinds)
 
 
 def task_label(task):
     return {'brood': 'Brood (all stages)', 'queen_brood': 'Queen brood (all stages)',
             'bee_hive': 'Bees + Hive (nest)',
+            'keypoints': 'Bee keypoints', 'bee_keypoints': 'Bees + keypoints',
+            'bee_hive_keypoints': 'Bees + Hive (nest) + keypoints',
             None: 'All mask types'}.get(task, category_label(task))
 
 
 def task_categories(task):
+    """The kinds of work in a task: mask categories and, for keypoint tasks, KEYPOINTS."""
     if task is None:
         return CATEGORIES
     if task not in TASKS:
         raise ValueError('Unknown annotation task: ' + str(task))
     return TASKS[task]
+
+
+def task_mask_categories(task):
+    return tuple(c for c in task_categories(task) if c != KEYPOINTS)
+
+
+def task_uses_keypoints(task):
+    return task in KEYPOINT_TASKS
+
+
+def keypoint_policy(info):
+    """What finished keypoint work was checked against, or None when keypoints are off."""
+    from core import keypoints as kp
+    config = kp.config_from_project_info(info.get('project_info', info) if isinstance(info, dict) else None)
+    if config is None:
+        return None
+    return {'scope': 'frame', 'meaning': 'keypoints', 'category': config.category, 'names': list(config.names)}
 
 
 def _hash(value):
@@ -87,8 +114,13 @@ class Sources:
 
 
 def _mask_evidence(source, name, category, *, shared=False):
+    """(mask geometry, the same with each row's keypoints folded in, or None if identical).
+
+    Finished marks made before keypoints had their own marks used the second form;
+    both are accepted, so those frames stay finished until something actually changes.
+    """
     rows = _records(source.json(name, []))
-    geometry = []
+    geometry, with_keypoints = [], []
     for row in rows:
         if row.get('category', 'chamber' if shared else 'bee') != category or row.get('bbox_only', False):
             continue
@@ -120,34 +152,60 @@ def _mask_evidence(source, name, category, *, shared=False):
             area = int(np.count_nonzero(binary))
             digest = hashlib.sha256(binary.tobytes()).hexdigest()
         if area:
-            # Keypoint edits also change a finished frame; rows without keypoints
-            # keep their existing evidence (and so their completion signature).
-            if row.get('keypoints'):
-                digest += ':keypoints:' + _hash(row['keypoints'])
             geometry.append(digest)
-    return sorted(geometry)
+            with_keypoints.append(digest + ':keypoints:' + _hash(row['keypoints'])
+                                  if row.get('keypoints') else digest)
+    geometry, with_keypoints = sorted(geometry), sorted(with_keypoints)
+    return geometry, (with_keypoints if with_keypoints != geometry else None)
+
+
+def _keypoint_evidence(source, name, policy):
+    """(one entry per bee that can carry keypoints, how many of them have any).
+
+    Every bee counts, labelled or not: a bee added after the frame's keypoints were
+    marked finished makes that mark stale.
+    """
+    names = set(policy['names'])
+    evidence, labelled = [], 0
+    for row in _records(source.json(name, [])):
+        if row.get('category', 'bee') != policy['category'] or row.get('bbox_only', False):
+            continue
+        identity = row.get('mask_id', row.get('instance_id', 0))
+        if not isinstance(identity, int) or identity <= 0:
+            raise ValueError('Invalid mask instance ID in ' + name)
+        points = row.get('keypoints') if isinstance(row.get('keypoints'), dict) else {}
+        points = {key: value for key, value in points.items() if key in names}
+        evidence.append(_hash([identity, points]))
+        labelled += bool(points)
+    return sorted(evidence), labelled
 
 
 def _unit(source, video, frame, category, policy):
     stem = 'video_annotations' if frame is None else f'frame_{frame:06d}'
     name = f'annotations/json/{video}/{stem}.json'
     try:
-        geometry = _mask_evidence(source, name, category, shared=frame is None)
+        earlier = None
+        if category == KEYPOINTS:
+            geometry, count = _keypoint_evidence(source, name, policy)
+        else:
+            geometry, earlier = _mask_evidence(source, name, category, shared=frame is None)
+            count = len(geometry)
         # A raster without its category/instance metadata cannot establish absence.
         if name not in source.files and (name.removesuffix('.json') in source.rasters or
                 name.removesuffix('.json') + '_' + category in source.rasters):
             raise ValueError('Mask metadata unavailable')
         signature = _hash([policy, geometry])
+        accepted = {signature} if earlier is None else {signature, _hash([policy, earlier])}
         record_name = 'video_work' if frame is None else f'frame_{frame:06d}'
         completed = source.json(f'annotations/work/{video}/{record_name}.json', {})
         if completed and (not isinstance(completed, dict) or completed.get('version') != VERSION or
                           not isinstance(completed.get('categories'), dict)):
             raise ValueError('Unsupported annotation completion record')
         completion = completed.get('categories', {}).get(category)
-        status = 'not_checked' if geometry else 'not_started'
+        status = 'not_checked' if count else 'not_started'
         if completion:
-            status = 'finished' if completion.get('signature') == signature else 'changed'
-        return {'count': len(geometry), 'signature': signature, 'status': status}
+            status = 'finished' if completion.get('signature') in accepted else 'changed'
+        return {'count': count, 'signature': signature, 'status': status}
     except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError) as exc:
         return {'count': None, 'signature': None, 'status': 'unknown', 'error': str(exc)}
 
@@ -182,13 +240,22 @@ def _pending_imports(source, video, frames, policies):
 
 
 def build_index(files, resolve, *, previous=None, cancelled=lambda: False,
-                cached_only=False, progress=lambda message: None, task=None):
-    """Build sparse summaries, reusing videos whose saved source records match."""
+                cached_only=False, progress=lambda message: None, task=None, keypoint_videos=()):
+    """Build sparse summaries, reusing videos whose saved source records match.
+
+    Keypoint work is summarized for a keypoint task, for `keypoint_videos`, and, in a
+    full (task=None) build, for videos that are rescanned anyway or already had it.
+    Unchanged videos are never rescanned just to add it.
+    """
     if cancelled():
         raise InterruptedError('Annotation summary cancelled')
     source = Sources(files, resolve)
-    policies = category_policies(source.json('annotations/project.json', {}))
-    requested = task_categories(task)
+    info = source.json('annotations/project.json', {})
+    policies = category_policies(info)
+    keypoints = keypoint_policy(info)
+    requested = [c for c in task_categories(task) if c != KEYPOINTS]
+    keypoints_requested = keypoints is not None and task_uses_keypoints(task)
+    all_policies = dict(policies, **({KEYPOINTS: keypoints} if keypoints is not None else {}))
     videos = {}
     video_files = {}
     for name in files:
@@ -211,19 +278,29 @@ def build_index(files, resolve, *, previous=None, cancelled=lambda: False,
             relevant['annotations/import_review.json'] = files['annotations/import_review.json']
         fingerprint = _hash([policies, relevant])
         unchanged = old.get(video, {}).get('fingerprint') == fingerprint
-        if unchanged and set(requested) <= set(old[video].get('categories', {})):
-            result['videos'][video] = old[video]
+        # A local task scan is partial. Never let it stand in for unchecked
+        # categories in a full publication or completion check.
+        retained = dict(old[video].get('categories', {})) if unchanged else {}
+        had_keypoints = KEYPOINTS in retained
+        if had_keypoints and retained[KEYPOINTS].get('policy') != keypoints:
+            del retained[KEYPOINTS]  # keypoints turned off, or their list changed
+        required = requested + ([KEYPOINTS] if keypoints_requested or
+                                (keypoints is not None and video in keypoint_videos) else [])
+        wanted = list(required)
+        if keypoints is not None and task is None and KEYPOINTS not in wanted and (not unchanged or had_keypoints):
+            wanted.append(KEYPOINTS)
+        if unchanged and set(required if cached_only else wanted) <= set(retained):
+            result['videos'][video] = (old[video] if retained.keys() == old[video].get('categories', {}).keys()
+                                       else dict(old[video], categories=retained))
             continue
         if cached_only:
             result['videos'][video] = {'scan_state': 'not_scanned',
                                       'error': 'Mask status has not been scanned for this published version'}
             continue
         progress(f'Scanning mask status: video {position}/{len(videos)} | {video}')
-        # A local task scan is partial. Never let it stand in for unchecked
-        # categories in a full publication or completion check.
-        retained = dict(old[video].get('categories', {})) if unchanged else {}
         entry = {'fingerprint': fingerprint, 'frames': indices, 'categories': retained}
-        scan_policies = {c: policies[c] for c in requested if c not in retained}
+        scan_policies = {c: all_policies[c] for c in wanted if c not in retained}
+        nothing = {c: _hash([p, []]) for c, p in scan_policies.items()}
         try:
             entry['import_pending'] = _pending_imports(source, video, indices, policies)
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
@@ -254,7 +331,9 @@ def build_index(files, resolve, *, previous=None, cancelled=lambda: False,
                          f'Frame {frame_position}/{len(indices)} (source frame {i})')
             for category, policy in frame_policies.items():
                 unit = _unit(source, video, i, category, policy)
-                if unit['status'] != 'not_started':
+                # Unstarted frames are left out, unless their signature is not the empty one
+                # (bees waiting for keypoints), which a later finished mark must match.
+                if unit['status'] != 'not_started' or unit['signature'] != nothing[category]:
                     entry['categories'][category]['units'][str(i)] = unit
             frame_json = f'annotations/json/{video}/frame_{i:06d}.json'
             try:
@@ -391,8 +470,11 @@ def summarize(entry, task, frames=None):
                 'work_text': 'Unknown', 'detail': (entry or {}).get('error', 'Summary unavailable')}
     categories = task_categories(task)
     if not set(categories) <= set(entry.get('categories', {})):
+        detail = ('Keypoints have not been checked yet, or are turned off for this project.'
+                  if KEYPOINTS in categories and KEYPOINTS not in entry.get('categories', {})
+                  else 'This mask type has not been checked yet.')
         return {'presence': 'unknown', 'state': 'not_scanned', 'mask_text': 'Not scanned',
-                'work_text': 'Not scanned', 'detail': 'This mask type has not been checked yet.'}
+                'work_text': 'Not scanned', 'detail': detail}
     frames = list(entry['frames'] if frames is None else frames)
     if not frames or not set(frames) <= set(entry['frames']):
         return summarize(None, task)
@@ -416,8 +498,10 @@ def summarize(entry, task, frames=None):
              else 'changed' if any(u['status'] == 'changed' for row in units for u in row)
              else 'not_checked' if present or finished else 'not_started')
     presence = 'unknown' if unknown else 'none' if not present else 'all' if present == total else 'some'
-    mask_text = ('Unknown' if unknown else 'Shared mask' if shared and present else 'No masks' if not present
-                 else f'Masks on {present}/{total} frames')
+    noun, nouns = (('keypoints', 'Keypoints') if categories == (KEYPOINTS,) else
+                   ('masks or keypoints', 'Masks or keypoints') if KEYPOINTS in categories else ('masks', 'Masks'))
+    mask_text = ('Unknown' if unknown else 'Shared mask' if shared and present else f'No {noun}' if not present
+                 else f'{nouns} on {present}/{total} frames')
     work_text = {'unknown': 'Unknown', 'needs_review': f'Import review: {pending} frames',
                  'finished': 'Finished' if present else 'Checked: none present', 'changed': 'Changed; recheck',
                  'not_started': 'Not started', 'not_checked': 'Not checked' if not finished else f'{finished}/{total} finished'}[state]
@@ -425,6 +509,8 @@ def summarize(entry, task, frames=None):
     if mixed_scope:
         detail = ('Frame-specific: ' + ', '.join(category_label(c) for c in frame_categories) +
                   '; shared across video: ' + ', '.join(category_label(c) for c in shared_categories))
+    if categories == (KEYPOINTS,):
+        detail = 'Bee keypoints, frame-specific'
     if unknown:
         detail = '; '.join(sorted({u['error'] for row in units for u in row if u.get('error')})) or 'Mask data unavailable'
     return dict(presence=presence, state=state, mask_text=mask_text, work_text=work_text,
@@ -459,6 +545,10 @@ def mark_finished(project, video, frame, task, contributor, *, complete=True, ca
         raise ValueError(entry['error'])
     updates = {}
     for category in task_categories(task):
+        if category not in entry['categories']:
+            raise ValueError('Turn on keypoints for this project (Project > Keypoints...) before marking '
+                             'keypoint work finished' if category == KEYPOINTS else
+                             'Saved mask status is unavailable for ' + category_label(category))
         data = entry['categories'][category]
         unit = unit_for(entry, category, frame)
         if complete and (not unit['signature'] or data['policy']['meaning'] == 'unconfirmed'):
@@ -472,7 +562,7 @@ def mark_finished(project, video, frame, task, contributor, *, complete=True, ca
         if complete:
             updates[path]['categories'][category] = {'signature': unit['signature'], 'at': utc_now(),
                 'by': {k: contributor[k] for k in ('id', 'name')} if contributor else None,
-                'outcome': 'masks' if unit['count'] else 'none_present'}
+                'outcome': ('keypoints' if category == KEYPOINTS else 'masks') if unit['count'] else 'none_present'}
         else:
             updates[path]['categories'].pop(category, None)
     if cancelled():

@@ -48,6 +48,18 @@ bring bees at the edge of the image toward the center of the screen. Brush and
 eraser strokes cannot start in the margin, and image/mask dimensions stay
 unchanged. **Fit to Window** (F) recenters and fits the image, not the margin.
 
+A **magnifier** in the top-left corner of the canvas shows a close-up of whatever is
+under the cursor (image, masks, boxes, keypoints), with a mark at the exact cursor
+position. It starts as a 100-pixel frame at three times the main view's zoom, so it
+zooms with the view. Change either under **View > Magnifier Size and Zoom**, or turn
+it off with **View > Show Magnifier** (Ctrl+Shift+M); the choices are remembered on
+that computer. Clicks pass through the magnifier, and it moves to the bottom-left
+corner while the cursor is under the top-left.
+
+**Play** steps through the frames in view, at up to ten frames a second, and stops
+on the last one. Pressing **Play** on the last frame starts again from the first.
+While playing, the Instances panel waits; it refreshes when you pause.
+
 Assignments can use **Bees + Hive (nest)** to request both mask types together.
 **Mark Finished** checks off both, using the project's saved scope for each:
 for example, frame-specific bees and a video-wide hive mask. Automatic review

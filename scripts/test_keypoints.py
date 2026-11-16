@@ -228,34 +228,84 @@ class KeypointCanvasTests(unittest.TestCase):
         self.assertAlmostEqual(thorax[0], 60, delta=1)
         self.assertNotIn('abdomen_tip', layer.keypoints_for(1))
 
-    def right_click(self, canvas, x, y, modifier=Qt.KeyboardModifier.NoModifier):
-        """Right-click at (x, y); returns the text of each menu that opened."""
+    def right_click(self, canvas, x, y, choose=None, modifier=Qt.KeyboardModifier.NoModifier):
+        """Right-click at (x, y); returns each opened menu as (entry texts, entry under the cursor).
+
+        ``choose`` picks the entry whose text starts with it, as a click on it would.
+        """
         from unittest.mock import patch
         menus = []
-        with patch('gui.keypoint_layer.QMenu.exec',
-                   lambda menu, *a: menus.append([a.text() for a in menu.actions() if a.text()])):
+        def opened(menu, pos, at=None):
+            entries = [a for a in menu.actions() if a.text()]
+            menus.append(([a.text() for a in entries], at.text() if at else None))
+            if choose is not None:
+                next(a for a in entries if a.text().startswith(choose)).trigger()
+        with patch('gui.keypoint_layer.QMenu.exec', opened):
             QTest.mouseClick(canvas.viewport(), Qt.MouseButton.RightButton, modifier,
                              canvas.mapFromScene(QPointF(x, y)), 5)
             self.app.processEvents()
         return menus
 
-    def test_right_click_skips_without_a_menu_and_finishes_the_bee(self):
+    def test_right_click_lists_keypoints_to_place_next(self):
         canvas = self.make_canvas()
         layer = canvas.keypoint_layer
         layer.set_config(kp.KeypointConfig(names=('head', 'thorax', 'abdomen_tip', 'left_antenna_tip', 'right_antenna_tip')))
         canvas.set_tool('keypoint')
-        self.assertEqual(self.right_click(canvas, 30, 40), [])  # starts bee 1, skips its head
+        self.assertEqual(self.right_click(canvas, 250, 20),  # no bee here, none chosen yet
+                         [(['Click a bee to start its keypoints'], None)])
+        (entries, under_cursor), = self.right_click(canvas, 30, 40)  # on bee 1: starts it
+        self.assertEqual(layer.target_id, 1)
+        self.assertEqual(under_cursor, 'Skip head')  # skipping is right-click, click, no travel
+        self.assertEqual(entries, ['Bee 1: place next', 'Skip head', 'head', 'thorax', 'abdomen tip',
+                                   'left antenna tip', 'right antenna tip', 'Finish Bee 1',
+                                   'Clear All Keypoints of Bee 1'])
+        self.assertEqual(layer.active_name, 'head')  # closing the list changes nothing
+        self.assertEqual(layer.skipped, set())
+
+        self.right_click(canvas, 250, 20, choose='left antenna tip')  # anywhere: still bee 1's list
+        self.assertEqual(layer.active_name, 'left_antenna_tip')
+        self.assertEqual(layer.skipped, set())  # choosing a later point skips nothing
+        self.click(canvas, 40, 30)
+        self.assertEqual(layer.active_name, 'right_antenna_tip')  # carries on from there
+        (entries, _), = self.right_click(canvas, 200, 150, choose='thorax')  # over bee 2: offers it too
+        self.assertIn('left antenna tip  \u2713', entries)
+        self.assertEqual(entries[-2:], ['Label Bee 2', 'Clear All Keypoints of Bee 2'])
+        self.click(canvas, 60, 50)
+        self.assertEqual(sorted(layer.keypoints_for(1)), ['left_antenna_tip', 'thorax'])
+        self.assertEqual(sorted(layer.keypoints_for(2)), ['head'])  # bee 2 only has the head it started with
+
+        # A placed point can be chosen again; the next click moves it.
+        self.right_click(canvas, 250, 20, choose='thorax')
+        self.click(canvas, 80, 56)  # away from the old spot (a click on a point drags it instead)
+        self.assertAlmostEqual(layer.keypoints_for(1)['thorax'][0], 80, delta=1)
+        self.right_click(canvas, 250, 20, choose='Finish Bee 1')
+        self.assertEqual(layer.target_id, 0)
+
+    def test_skip_from_the_list_finishes_the_bee_and_skipped_points_can_be_chosen(self):
+        canvas = self.make_canvas()
+        layer = canvas.keypoint_layer
+        layer.set_config(kp.KeypointConfig(names=('head', 'thorax', 'abdomen_tip', 'left_antenna_tip', 'right_antenna_tip')))
+        canvas.set_tool('keypoint')
+        self.right_click(canvas, 30, 40, choose='Skip')  # starts bee 1, skips its head
         self.assertEqual((layer.target_id, layer.active_name), (1, 'thorax'))
         self.click(canvas, 60, 50)
-        self.assertEqual(self.right_click(canvas, 250, 20), [])  # off any bee: still skips
+        self.right_click(canvas, 250, 20, choose='Skip')  # off any bee: still bee 1's
         self.assertEqual(layer.active_name, 'left_antenna_tip')
         self.click(canvas, 40, 30)
-        self.assertEqual(self.right_click(canvas, 200, 150), [])  # over bee 2: still bee 1's
+        (entries, _), = self.right_click(canvas, 200, 150, choose='Skip')  # over bee 2: still bee 1's
+        self.assertIn('abdomen tip  (skipped)', entries)
         # Skipped points don't come back round, so the bee is done without Esc.
         self.assertIsNone(layer.active_name)
         self.assertEqual(layer.target_id, 1)
         self.assertEqual(sorted(layer.keypoints_for(1)), ['left_antenna_tip', 'thorax'])
         self.assertEqual(layer.skipped, {'head', 'abdomen_tip', 'right_antenna_tip'})
+        (entries, under_cursor), = self.right_click(canvas, 250, 20, choose='abdomen tip')
+        self.assertIsNone(under_cursor)  # nothing left to skip
+        self.assertNotIn('Skip', ' '.join(entries))
+        self.assertEqual(layer.active_name, 'abdomen_tip')  # a skipped point, picked after all
+        self.assertEqual(layer.skipped, {'head', 'right_antenna_tip'})
+        self.click(canvas, 110, 60)
+        self.assertIsNone(layer.active_name)
         self.click(canvas, 200, 150)  # so the next click starts bee 2 (head already placed)
         self.assertEqual(layer.target_id, 2)
         self.assertEqual(sorted(layer.keypoints_for(2)), ['head', 'thorax'])
@@ -264,22 +314,21 @@ class KeypointCanvasTests(unittest.TestCase):
         layer.set_target(1)
         self.assertEqual(layer.active_name, 'head')
 
-    def test_point_menu_shift_right_click_and_backspace_undoes_a_skip(self):
+    def test_point_menu_and_keys_skip_and_undo_a_skip(self):
         from gui.keypoint_toolbar import KeypointToolbar
         canvas = self.make_canvas()
         layer = canvas.keypoint_layer
         layer.set_config(BODY)
         toolbar = KeypointToolbar(layer)
         canvas.set_tool('keypoint')
-        self.assertEqual(len(self.right_click(canvas, 250, 20)), 1)  # nothing to skip: menu
         self.click(canvas, 30, 40)
-        menus = self.right_click(canvas, 30, 40)  # on the head point: its menu, no skip
-        self.assertEqual(len(menus), 1)
-        self.assertTrue(any(t.startswith('Delete head') for t in menus[0]))
-        self.assertEqual(len(self.right_click(canvas, 60, 50, Qt.KeyboardModifier.ShiftModifier)), 1)
+        (entries, under_cursor), = self.right_click(canvas, 30, 40)  # on the head point: its own menu
+        self.assertIsNone(under_cursor)
+        self.assertTrue(any(t.startswith('Delete head') for t in entries))
+        self.assertFalse(any(t.startswith('Skip') for t in entries))
         self.assertEqual(layer.active_name, 'thorax')
 
-        self.right_click(canvas, 60, 50)
+        self.right_click(canvas, 60, 50, choose='Skip thorax')
         self.assertEqual(layer.active_name, 'abdomen_tip')
         self.assertIn('thorax skipped', toolbar.status_label.text())
         backspace = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Backspace, Qt.KeyboardModifier.NoModifier)
@@ -289,13 +338,48 @@ class KeypointCanvasTests(unittest.TestCase):
         self.assertNotIn('skipped', toolbar.status_label.text())
 
         n_key = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_N, Qt.KeyboardModifier.NoModifier)
-        canvas.keyPressEvent(n_key)  # N skips the same way
+        canvas.keyPressEvent(n_key)  # N skips without the list
         self.assertEqual(layer.active_name, 'abdomen_tip')
         self.click(canvas, 110, 60)
         self.assertIsNone(layer.active_name)
         self.assertIn('bee done', toolbar.status_label.text())
         canvas.keyPressEvent(backspace)  # after a placement, Backspace removes that point
         self.assertEqual(sorted(layer.keypoints_for(1)), ['head'])
+
+    def test_keypoints_show_and_hide_independently_of_masks(self):
+        canvas = self.make_canvas()
+        layer = canvas.keypoint_layer
+        layer.set_config(BODY)
+        canvas.set_tool('keypoint')
+        self.click(canvas, 30, 40)
+        shown = lambda: bool(layer.items) and layer.hit(QPointF(30, 40)) == (1, 'head')
+        self.assertTrue(shown())
+
+        canvas.set_annotation_overlay_visibility(False, False)  # masks and boxes off
+        self.assertTrue(shown())                                 # keypoints stay
+        self.click(canvas, 60, 50)                               # and bees can still be labelled
+        self.assertEqual(sorted(layer.keypoints_for(1)), ['head', 'thorax'])
+        canvas.set_annotation_overlay_visibility(True, False)
+        seen = []
+        layer.visibility_changed.connect(seen.append)
+        layer.set_visible(False)                                 # keypoints off, masks stay
+        self.assertEqual((shown(), canvas.show_segmentations, seen), (False, True, [False]))
+        self.click(canvas, 110, 60)                              # placing a point shows them again
+        self.assertEqual((shown(), seen), (True, [False, True]))
+
+        # Space shows the bare frame and puts back exactly what was showing.
+        canvas.toggle_annotation_overlays()
+        self.assertEqual((shown(), canvas.show_segmentations, layer.visible), (False, False, True))
+        canvas.toggle_annotation_overlays()
+        self.assertEqual((shown(), canvas.show_segmentations), (True, True))
+        canvas.set_annotation_overlay_visibility(False, False)   # keypoints only, e.g. to see the legs
+        canvas.toggle_annotation_overlays()
+        self.assertFalse(shown())
+        canvas.toggle_annotation_overlays()
+        self.assertEqual((shown(), canvas.show_segmentations, canvas.show_bboxes), (True, False, False))
+        canvas.toggle_annotation_overlays()
+        canvas.set_show_segmentations(True)                      # turning masks on ends the peek
+        self.assertTrue(shown())
 
     def test_drag_moves_point_and_is_one_undo_step(self):
         canvas = self.make_canvas()
@@ -498,17 +582,73 @@ class KeypointProjectTests(unittest.TestCase):
         bee = next(a for a in loaded if a.get('category', 'bee') == 'bee')
         self.assertEqual(kp.get_keypoints(bee), points)
 
-    def test_finished_frame_changes_when_only_keypoints_change(self):
-        from core.annotation_work import local_index, mark_finished, summarize
-        self.manager.save_frame_annotations(self.project, 'video', 2, [self.bee()], contributor=None)
+    def test_keypoints_and_masks_are_finished_separately(self):
+        from core.annotation_work import local_index, mark_finished, summarize, task_label
+        def state(task):
+            entry = local_index(self.project, task=task)['videos']['video']
+            return summarize(entry, task, [2])['state']
+        save = lambda *bees: self.manager.save_frame_annotations(self.project, 'video', 2, list(bees), contributor=None)
+        save(self.bee())
+        with self.assertRaisesRegex(ValueError, 'Turn on keypoints'):  # off for this project so far
+            mark_finished(self.project, 'video', 2, 'keypoints', self.actor)
+        self.assertEqual(state('keypoints'), 'not_scanned')
+        kp.save_project_config(self.project, BODY)
         mark_finished(self.project, 'video', 2, 'bee', self.actor)
-        entry = lambda: local_index(self.project)['videos']['video']
-        self.assertEqual(summarize(entry(), 'bee', [2])['state'], 'finished')
-        self.manager.save_frame_annotations(self.project, 'video', 2, [self.bee()], contributor=None)
-        self.assertEqual(summarize(entry(), 'bee', [2])['state'], 'finished')  # no false change
-        self.manager.save_frame_annotations(self.project, 'video', 2,
-                                            [self.bee({'head': [20, 12, 2]})], contributor=None)
-        self.assertEqual(summarize(entry(), 'bee', [2])['state'], 'changed')
+        self.assertEqual((state('bee'), state('keypoints'), state('bee_keypoints')),
+                         ('finished', 'not_started', 'not_checked'))  # together: masks done, keypoints not
+
+        save(self.bee({'head': [20, 12, 2]}))  # keypoint work does not disturb the finished mask
+        self.assertEqual((state('bee'), state('keypoints')), ('finished', 'not_checked'))
+        mark_finished(self.project, 'video', 2, 'keypoints', self.actor)
+        self.assertEqual((state('bee'), state('keypoints'), state('bee_keypoints')),
+                         ('finished', 'finished', 'finished'))
+        save(self.bee({'head': [21, 12, 2]}))  # moving a point reopens keypoints only
+        self.assertEqual((state('bee'), state('keypoints'), state('bee_keypoints')),
+                         ('finished', 'changed', 'changed'))
+        mark_finished(self.project, 'video', 2, 'bee_keypoints', self.actor)  # one mark for both kinds
+        self.assertEqual((state('bee'), state('keypoints')), ('finished', 'finished'))
+
+        other = self.bee()
+        other['mask_id'] = other['instance_id'] = 9
+        other['mask'] = np.roll(other['mask'], 20, axis=1)
+        save(self.bee({'head': [21, 12, 2]}), other)  # a new bee has no keypoints yet
+        self.assertEqual((state('bee'), state('keypoints')), ('changed', 'changed'))
+
+        # "No keypoints visible on any bee" can be recorded, and stays recorded.
+        mark_finished(self.project, 'video', 2, 'keypoints', self.actor, complete=False)
+        save(self.bee(), other)
+        self.assertEqual(state('keypoints'), 'not_started')
+        mark_finished(self.project, 'video', 2, 'keypoints', self.actor)
+        self.assertEqual(state('keypoints'), 'finished')
+        # Changing the keypoint list means finished keypoint work needs another look.
+        kp.save_project_config(self.project, kp.default_config())
+        self.assertEqual(state('keypoints'), 'changed')
+        self.assertEqual(task_label('bee_hive_keypoints'), 'Bees + Hive (nest) + keypoints')
+
+    def test_mask_marks_made_before_keypoints_had_their_own_stay_finished(self):
+        from core.annotation_policy import category_policies
+        from core.annotation_scope import read_project_info
+        from core.annotation_work import _hash, _mask_evidence, Sources, local_index, mark_finished, summarize
+        from core.project_sync import _read_json, _write_json
+        self.manager.save_frame_annotations(self.project, 'video', 2, [self.bee({'head': [20, 12, 2]})],
+                                            contributor=None)
+        mark_finished(self.project, 'video', 2, 'bee', self.actor)
+        # Rewrite the mark the way earlier versions made it: keypoints folded into the mask signature.
+        name = 'annotations/json/video/frame_000002.json'
+        files = {n: None for n in (name, 'annotations/png/video/frame_000002.png')}
+        geometry, earlier = _mask_evidence(Sources(files, lambda n: self.project / n), name, 'bee')
+        self.assertIsNotNone(earlier)
+        record = self.project / 'annotations/work/video/frame_000002.json'
+        data = _read_json(record)
+        policy = category_policies(read_project_info(self.project))['bee']
+        self.assertEqual(data['categories']['bee']['signature'], _hash([policy, geometry]))
+        data['categories']['bee']['signature'] = _hash([policy, earlier])
+        _write_json(record, data)
+        state = lambda: summarize(local_index(self.project)['videos']['video'], 'bee', [2])['state']
+        self.assertEqual(state(), 'finished')
+        self.manager.save_frame_annotations(self.project, 'video', 2, [self.bee({'head': [25, 12, 2]})],
+                                            contributor=None)
+        self.assertEqual(state(), 'changed')  # as it would have before; re-marking makes it independent
 
     def test_provenance_digest_sees_keypoint_edits(self):
         from core.contributors import annotation_digest

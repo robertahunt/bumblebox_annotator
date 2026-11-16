@@ -262,7 +262,8 @@ class CanvasColorTests(unittest.TestCase):
         toolbar = AnnotationToolbar()
         self.addCleanup(toolbar.close)
         toolbar.distinct_bee_colors_changed.connect(c.set_distinct_bee_colors)
-        window = SimpleNamespace(toolbar=toolbar, update_recent_projects_menu=lambda: None)
+        window = SimpleNamespace(toolbar=toolbar, update_recent_projects_menu=lambda: None,
+                                 _load_magnifier_settings=lambda settings: None)
         with tempfile.TemporaryDirectory() as directory:
             settings = QSettings(directory + '/display.ini', QSettings.Format.IniFormat)
             settings.setValue('display/distinct_bee_colors', False)

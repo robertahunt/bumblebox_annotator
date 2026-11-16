@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QPlainTextEdit,
     QRadioButton, QSlider, QStyle, QToolButton, QVBoxLayout, QWidget)
 
-from core.annotation_work import task_categories
+from core.annotation_work import task_mask_categories
 from core.categories import CATEGORIES, category_label
 from core.submission_comparison import comparison_preview
 from gui.project_sync_dialog import SyncProgressDialog
@@ -82,7 +82,8 @@ class SubmissionComparisonDialog(QDialog):
         controls.addWidget(self.frames)
         controls.addWidget(QLabel('Show:'))
         self.categories = QComboBox()
-        self.categories.addItem('Assigned task', tuple(task_categories(plan.entry.get('task'))))
+        # Keypoints are not drawn here; a keypoint-only task shows the bees they belong to.
+        self.categories.addItem('Assigned task', task_mask_categories(plan.entry.get('task')) or ('bee',))
         self.categories.addItem('All mask types', None)
         for category in CATEGORIES:
             self.categories.addItem(category_label(category), (category,))

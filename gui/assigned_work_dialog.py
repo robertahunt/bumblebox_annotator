@@ -19,7 +19,7 @@ from gui.project_sync_dialog import (SyncProgressDialog, TransferConfirmationDia
                                      setting_json, save_setting, load_contributor_profiles,
                                      remember_contributor_profile)
 from gui.workflow_help import help_button
-from gui.annotation_work import WorkFilters, task_combo
+from gui.annotation_work import WorkFilters, set_keypoint_tasks, task_combo
 from gui.assigned_review import AssignedReviewViews
 from gui.video_browsing import VideoBrowserControls, ModifiedTableItem, SORT_ROLE, VideoRowColors
 from core.annotation_work import published_index, summarize, task_label
@@ -73,6 +73,10 @@ class AssignmentManagerDialog(QDialog):
         self.video_browser.changed.connect(self.filter_videos)
         self.finished.connect(self.video_browser.cancel)
         self.work_filters = WorkFilters()
+        # Keypoint tasks are offered when this project uses keypoints. Saving an assignment
+        # checks that the setting has also been published.
+        self.keypoint_tasks = self._project_uses_keypoints()
+        set_keypoint_tasks(self.work_filters.task, self.keypoint_tasks)
         layout.addWidget(self.work_filters)
         self.work_filters.changed.connect(self.filter_videos)
         mask_status_row = QHBoxLayout()
@@ -152,6 +156,13 @@ class AssignmentManagerDialog(QDialog):
             buttons.button(QDialogButtonBox.StandardButton.Close).hide()
         layout.addWidget(buttons)
         self.refresh(initial)
+
+    def _project_uses_keypoints(self):
+        from core import keypoints
+        try:
+            return keypoints.read_project_config(self.project) is not None
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
 
     def refresh(self, initial=None):
         def load(progress, cancelled):
@@ -369,7 +380,8 @@ class AssignmentManagerDialog(QDialog):
             if self.choices() != old:
                 raise ValueError('Save or refresh your table edits before making a bulk assignment.')
             dialog = BulkAssignmentDialog(selected, self.available, self.profiles, self,
-                                          task=self.work_filters.task.currentData())
+                                          task=self.work_filters.task.currentData(),
+                                          keypoint_tasks=self.keypoint_tasks)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             choices = dict(old, **dialog.choices)
@@ -522,7 +534,7 @@ class AssignmentManagerDialog(QDialog):
 
 
 class BulkAssignmentDialog(QDialog):
-    def __init__(self, videos, available, profiles, parent=None, *, task=None):
+    def __init__(self, videos, available, profiles, parent=None, *, task=None, keypoint_tasks=False):
         super().__init__(parent)
         self.videos, self.available, self.profiles = videos, available, profiles
         self.choices = None
@@ -535,8 +547,8 @@ class BulkAssignmentDialog(QDialog):
         for identity, profile in sorted(profiles.items(), key=lambda pair: pair[1]['name'].casefold()):
             self.contributor.addItem(profile['name'] + ' (' + identity[:8] + ')', identity)
         self.contributor.setCurrentIndex(-1)
-        self.task = task_combo(self)
-        self.task.setCurrentIndex(self.task.findData(task))
+        self.task = task_combo(self, keypoints=keypoint_tasks)
+        self.task.setCurrentIndex(max(self.task.findData(task), 0))
         self.scope = QComboBox()
         self.scope.addItems(['All extracted frames', 'Specific frames'])
         self.frames = QLineEdit()

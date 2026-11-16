@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from core.assigned_work import (ASSIGNMENTS, SHARED_METADATA, _check_owned, _global_files, _policy_files,
+from core.assigned_work import (ASSIGNMENTS, REFRESHED_SETTINGS, _check_owned, _global_files, _policy_changed,
     _video_files, assignment_review_snapshot, download_plan, download_work, read_assignments, require_contributor)
 from core.contributors import utc_now
 from core.project_delta import apply_delta, bytes_record, file_record
@@ -175,7 +175,7 @@ class PreparedAssignedDownload:
         if not view.descends_from(current['reference'], self.base['reference']):
             raise SyncConflictError('Shared history differs from this working copy. Keep it for director review.')
         before, incoming = self.base['manifest']['files'], current['manifest']['files']
-        if _policy_files(before) != _policy_files(incoming):
+        if _policy_changed(self.base, current):
             raise SyncConflictError('Project policy or shared settings changed. Keep this copy for director review before updating.')
         baseline = self.state['local_files']
         dirty = {name for name in baseline.keys() | self.local.keys()
@@ -229,8 +229,9 @@ class PreparedAssignedDownload:
                 if self.local.get(name) != record:
                     self.before[name], self.after[name], self.sources[name] = self.local.get(name), record, source
 
-        # Local copies of shared metadata are never edited (checked above), so take the latest.
-        for name in SHARED_METADATA:
+        # Local copies of these are never edited (checked above), so take the latest. This is
+        # how settings that are not annotation policy, such as keypoints, reach a working copy.
+        for name in REFRESHED_SETTINGS:
             record = incoming.get(name)
             if record:
                 new_state['local_files'][name] = record

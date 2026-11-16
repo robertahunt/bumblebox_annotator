@@ -15,6 +15,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QSettings, QThread, QTimer, QEvent, QSi
 from PyQt6.QtGui import QAction, QKeySequence, QActionGroup
 from pathlib import Path
 from datetime import datetime
+import gc
 import queue
 import time
 import json
@@ -263,10 +264,14 @@ class MainWindow(QMainWindow):
         self._instance_list_update_timer.timeout.connect(self._do_update_instance_list)
         self._instance_list_update_pending = False
         
-        # Play timer for automatic frame playback
+        # Play timer for automatic frame playback. Single-shot: the next frame is
+        # scheduled only after the current one has loaded (see _play_next_frame).
         self.play_timer = QTimer()
+        self.play_timer.setSingleShot(True)
         self.play_timer.timeout.connect(self._play_next_frame)
         self.is_playing = False
+        self._play_from_start = False
+        self._play_video_annotations = None  # (video_id, video-wide annotations) while playing
         
         # Initialize instance tracker for ID matching across frames
         self.tracker = InstanceTracker()
@@ -383,6 +388,8 @@ class MainWindow(QMainWindow):
         self.toolbar.delete_all_requested.connect(self.delete_all_instances)
         self.toolbar.show_segmentations_changed.connect(self.on_show_segmentations_changed)
         self.toolbar.show_bboxes_changed.connect(self.on_show_bboxes_changed)
+        self.toolbar.show_keypoints_changed.connect(self.on_show_keypoints_changed)
+        self.canvas.keypoint_layer.visibility_changed.connect(self._sync_keypoint_visibility_controls)
         self.toolbar.annotation_type_changed.connect(self.on_annotation_type_changed)
         self.toolbar.annotation_type_visibility_changed.connect(self.on_annotation_type_visibility_changed)
         self.toolbar.annotation_group_visibility_changed.connect(self.on_annotation_group_visibility_changed)
@@ -482,7 +489,8 @@ class MainWindow(QMainWindow):
         self.play_button = QPushButton("▶ Play")
         self.play_button.setMaximumWidth(100)
         self.play_button.clicked.connect(self.toggle_play)
-        self.play_button.setToolTip("Play through frames automatically")
+        self.play_button.setToolTip(
+            "Play through the frames in view; from the last frame, play starts again from the first")
         nav_layout.addWidget(self.play_button)
 
         self.next_frame_button = QPushButton("Next ▶")
@@ -1137,7 +1145,36 @@ class MainWindow(QMainWindow):
         self.bbox_mode_action.setToolTip("Show/hide bounding box annotations")
         self.bbox_mode_action.triggered.connect(self.on_menu_show_bboxes_changed)
         view_menu.addAction(self.bbox_mode_action)
-        
+
+        # Shown only in projects that use keypoints (_apply_project_keypoint_config).
+        self.keypoint_mode_action = QAction("Show &Keypoints", self)
+        self.keypoint_mode_action.setCheckable(True)
+        self.keypoint_mode_action.setChecked(True)
+        self.keypoint_mode_action.setShortcut("Ctrl+Shift+K")
+        self.keypoint_mode_action.setToolTip("Show/hide keypoints, independently of masks and boxes")
+        self.keypoint_mode_action.triggered.connect(self.on_show_keypoints_changed)
+        self.keypoint_mode_action.setVisible(False)
+        view_menu.addAction(self.keypoint_mode_action)
+
+        view_menu.addSeparator()
+
+        # Close-up of the image under the cursor, in the corner of the canvas.
+        from gui import magnifier
+        self.magnifier_action = QAction("Show &Magnifier", self)
+        self.magnifier_action.setCheckable(True)
+        self.magnifier_action.setChecked(True)
+        self.magnifier_action.setShortcut("Ctrl+Shift+M")
+        self.magnifier_action.setToolTip(
+            "Show a close-up of the image under the cursor in the top-left corner of the canvas")
+        self.magnifier_action.triggered.connect(self.on_show_magnifier_changed)
+        view_menu.addAction(self.magnifier_action)
+        options = view_menu.addMenu("Magnifier Si&ze and Zoom")
+        self.magnifier_size_actions = self._add_magnifier_choices(
+            options, "Frame {} px", magnifier.SIZES, magnifier.DEFAULT_SIZE, self.set_magnifier_size)
+        options.addSeparator()
+        self.magnifier_zoom_actions = self._add_magnifier_choices(
+            options, "Zoom {}\u00d7", magnifier.ZOOMS, magnifier.DEFAULT_ZOOM, self.set_magnifier_zoom)
+
         view_menu.addSeparator()
         
         zoom_in_action = QAction("Zoom &In", self)
@@ -1973,10 +2010,30 @@ class MainWindow(QMainWindow):
         info = getattr(self.annotation_manager, 'project_info', None) or {}
         config = keypoints_module.config_from_project_info(info.get('project_info', info))
         self.canvas.keypoint_layer.set_config(config)
-        self.toolbar.set_keypoints_available(config is not None)
-        if config is None and self.canvas.current_tool == 'keypoint':
+        self.keypoint_mode_action.setVisible(config is not None)
+        self.keypoint_mode_action.setEnabled(config is not None)
+        if hasattr(self, 'annotation_work'):
+            from gui.annotation_work import set_keypoint_tasks
+            set_keypoint_tasks(self.annotation_work.filters.task, config is not None)
+        self.update_keypoint_tool_availability()
+
+    def update_keypoint_tool_availability(self):
+        """Keypoints tool: projects that use keypoints, and in an assigned copy only on
+        videos whose assignment includes keypoints. Keypoints still display everywhere."""
+        enabled = self.canvas.keypoint_layer.enabled
+        editable = enabled
+        if enabled and self.project_path and self.current_video_id:
+            from core.annotation_work import task_uses_keypoints
+            try:
+                state = workspace(self.project_path)
+            except (OSError, ValueError, KeyError):
+                state = None
+            task = (state or {}).get('assignments', {}).get(self.current_video_id, {}).get('task')
+            editable = state is None or task is None or task_uses_keypoints(task)
+        self.toolbar.set_keypoints_available(enabled, editable)
+        if not editable and self.canvas.current_tool == 'keypoint':
             self.toolbar.set_tool('pan')
-        self.keypoint_toolbar.setVisible(config is not None and self.canvas.current_tool == 'keypoint')
+        self.keypoint_toolbar.setVisible(editable and self.canvas.current_tool == 'keypoint')
 
     def show_keypoint_settings(self, checked=False):
         """Project > Keypoints...: turn keypoints on/off and choose their names."""
@@ -5592,6 +5649,7 @@ class MainWindow(QMainWindow):
 
             # Auto-save current frame annotations before loading new frame (only if modified)
             if self.current_frame_idx != idx and self.project_path and self.current_frame_modified:
+                self._play_video_annotations = None  # this save may change the video-wide masks
                 try:
                     if old_video_id:  # Only save if we know the video
                         # Update video next_mask_id tracking
@@ -5733,9 +5791,7 @@ class MainWindow(QMainWindow):
 
                 # Load video-level chamber/hive/pollen annotations and merge
                 if self.project_path and self.current_video_id:
-                    video_level_anns, aruco_tracking = self.annotation_manager.load_video_annotations(
-                        self.project_path, self.current_video_id
-                    )
+                    video_level_anns, aruco_tracking = self._video_level_annotations(self.current_video_id)
                     if video_level_anns:
                         annotations = merge_annotations(
                             annotations or [], video_level_anns,
@@ -5834,28 +5890,82 @@ class MainWindow(QMainWindow):
             if actual_frame_idx != self.current_frame_idx:
                 self.load_frame(actual_frame_idx)
     
+    PLAY_INTERVAL_MS = 100  # ten frames a second, when frames load that fast
+    PLAY_MIN_GAP_MS = 15    # time between frames that is always left for clicks and redraws
+
     def toggle_play(self):
         """Toggle automatic playback through frames"""
         if self.is_playing:
-            # Stop playing
-            self.play_timer.stop()
-            self.is_playing = False
-            self.play_button.setText("\u25b6 Play")
+            self.stop_playback()
         else:
-            # Start playing
-            self.is_playing = True
-            self.play_button.setText("\u23f8 Pause")
-            # Default playback speed: 10 FPS (100ms per frame)
-            self.play_timer.start(100)
-    
+            self.start_playback()
+
+    def start_playback(self):
+        if self.is_playing:
+            return
+        if not self.frame_list_to_frames_map:
+            self.status_label.setText("No frames to play in the current view")
+            return
+        self.is_playing = True
+        self.play_button.setText("\u23f8 Pause")
+        # On the last frame there is nothing left to play, so start again from the first.
+        self._play_from_start = self._get_next_frame_index() is None
+        self._play_video_annotations = None
+        # The instance list is not kept up while playing (update_instance_list_from_canvas).
+        self.instance_list.setEnabled(False)
+        # Every frame load forces garbage collections that walk all objects in the
+        # program. Set aside what exists now so they stay quick until playback stops.
+        gc.freeze()
+        self.play_timer.start(self.PLAY_MIN_GAP_MS)
+
+    def stop_playback(self):
+        if not self.is_playing:
+            return
+        self.play_timer.stop()
+        self.is_playing = False
+        self.play_button.setText("\u25b6 Play")
+        self._play_from_start = False
+        self._play_video_annotations = None
+        gc.unfreeze()
+        self.instance_list.setEnabled(True)
+        self.update_instance_list_from_canvas()
+
     def _play_next_frame(self):
-        """Advance to next frame during playback"""
-        next_idx = self._get_next_frame_index()
+        """Show the next frame, then schedule the one after it.
+
+        The timer is re-armed only after a frame has loaded, with a gap left over,
+        so a click on Pause is handled between frames however slow the frames are.
+        A repeating timer faster than the loads left the window busy all the time.
+        """
+        if not self.is_playing:
+            return
+        started = time.perf_counter()
+        if self._play_from_start:
+            self._play_from_start = False
+            next_idx = self.frame_list_to_frames_map[0] if self.frame_list_to_frames_map else None
+        else:
+            next_idx = self._get_next_frame_index()
         if next_idx is not None:
             self.load_frame(next_idx)
-        else:
-            # Reached end of frames, stop playing
-            self.toggle_play()
+        if next_idx is None or self.current_frame_idx != next_idx:
+            # Reached the last frame, or the frame could not be shown.
+            self.stop_playback()
+        elif self.is_playing:
+            elapsed = int((time.perf_counter() - started) * 1000)
+            self.play_timer.start(max(self.PLAY_MIN_GAP_MS, self.PLAY_INTERVAL_MS - elapsed))
+
+    def _video_level_annotations(self, video_id):
+        """Video-wide annotations for a frame load.
+
+        They are the same on every frame, so playback reads them from disk once
+        per video instead of once per frame. Any edit drops the copy (load_frame).
+        """
+        kept = self._play_video_annotations
+        if self.is_playing and kept is not None and kept[0] == video_id:
+            return kept[1]
+        loaded = self.annotation_manager.load_video_annotations(self.project_path, video_id)
+        self._play_video_annotations = (video_id, loaded) if self.is_playing else None
+        return loaded
             
     def on_tool_changed(self, tool_name):
         """Handle tool change"""
@@ -5893,6 +6003,7 @@ class MainWindow(QMainWindow):
         keypoints = tool_name == 'keypoint' and self.canvas.keypoint_layer.enabled
         self.keypoint_toolbar.setVisible(keypoints)
         if keypoints:
+            self.canvas.keypoint_layer.set_visible(True)  # the tool is no use with them hidden
             self.toolbar.check_tool_button('keypoint')
             self.status_label.setText(
                 "Keypoints: click a bee, then its keypoints in order; Shift+click = hidden; "
@@ -5980,6 +6091,20 @@ class MainWindow(QMainWindow):
         self._sync_segmentation_visibility_controls(show)
         self.canvas.setFocus()
     
+    def on_show_keypoints_changed(self, show):
+        """The Keypoints display switch (toolbar, View menu or keypoint options)."""
+        self.canvas.keypoint_layer.set_visible(show)
+        self._sync_keypoint_visibility_controls(self.canvas.keypoint_layer.visible)
+        self.canvas.setFocus()
+
+    def _sync_keypoint_visibility_controls(self, visible):
+        controls = [getattr(self, 'keypoint_mode_action', None),
+                    getattr(getattr(self, 'toolbar', None), 'keypoints_checkbox', None)]
+        for control in filter(None, controls):
+            control.blockSignals(True)
+            control.setChecked(bool(visible))
+            control.blockSignals(False)
+
     def on_show_bboxes_changed(self, show):
         """Handle show bboxes checkbox change from toolbar"""
         self.canvas.set_show_bboxes(show)
@@ -6491,6 +6616,10 @@ class MainWindow(QMainWindow):
         import weakref
 
         self._instance_list_update_timer.stop()
+        if self.is_playing:
+            # Measuring every mask for the list is the slowest part of showing a
+            # frame. The list catches up when playback stops (stop_playback).
+            return
         instance_entries = self.canvas.get_instance_entries()
         instance_to_aruco = self._get_instance_to_aruco_map()
         if instance_to_aruco != self.canvas.aruco_instance_labels:
@@ -10726,11 +10855,52 @@ class MainWindow(QMainWindow):
         if self.frames:
             self.load_frame(0)
                 
+    def _add_magnifier_choices(self, menu, label, values, current, chosen):
+        """Add one-of-many menu entries; returns them by value."""
+        group = QActionGroup(self)
+        actions = {}
+        for value in values:
+            action = QAction(label.format(value), self)
+            action.setCheckable(True)
+            action.setChecked(value == current)
+            action.triggered.connect(lambda checked=False, v=value: chosen(v))
+            group.addAction(action)
+            menu.addAction(action)
+            actions[value] = action
+        return actions
+
+    def on_show_magnifier_changed(self, show):
+        self.canvas.magnifier.set_active(show)
+        QSettings().setValue('display/magnifier', bool(show))
+
+    def set_magnifier_size(self, size):
+        self.canvas.magnifier.set_frame_size(size)
+        QSettings().setValue('display/magnifier_size', int(size))
+
+    def set_magnifier_zoom(self, zoom):
+        self.canvas.magnifier.set_zoom(zoom)
+        QSettings().setValue('display/magnifier_zoom', int(zoom))
+
+    def _load_magnifier_settings(self, settings):
+        from gui import magnifier
+        shown = settings.value('display/magnifier', True, type=bool)
+        self.magnifier_action.setChecked(shown)
+        self.canvas.magnifier.set_active(shown)
+        size = settings.value('display/magnifier_size', magnifier.DEFAULT_SIZE, type=int)
+        if size in self.magnifier_size_actions:
+            self.magnifier_size_actions[size].setChecked(True)
+            self.canvas.magnifier.set_frame_size(size)
+        zoom = settings.value('display/magnifier_zoom', magnifier.DEFAULT_ZOOM, type=int)
+        if zoom in self.magnifier_zoom_actions:
+            self.magnifier_zoom_actions[zoom].setChecked(True)
+            self.canvas.magnifier.set_zoom(zoom)
+
     def load_settings(self):
         """Load application settings"""
         settings = QSettings()
         self.toolbar.distinct_bee_colors_checkbox.setChecked(
             settings.value('display/distinct_bee_colors', True, type=bool))
+        self._load_magnifier_settings(settings)
         geometry = settings.value('geometry')
         if geometry:
             self.restoreGeometry(geometry)
@@ -13405,6 +13575,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
+        if self.is_playing:
+            self.stop_playback()
         if hasattr(self, 'annotation_work'):
             self.annotation_work.stop()
         self._count_scan_stopping = True

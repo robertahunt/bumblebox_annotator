@@ -23,6 +23,7 @@ from core.mask_editing import enclosed_mask_region
 from core.mask_geometry import MaskGeometryCache, measure_mask
 from core.instance_colors import contrasting_instance_colors, random_vivid_color, vivid_color
 from gui.keypoint_layer import KeypointLayer
+from gui.magnifier import CursorMagnifier
 from core import keypoints as keypoints_module
 
 
@@ -247,6 +248,9 @@ class ImageCanvas(QGraphicsView):
         
         # Optional keypoints: inactive until a project keypoint config is set.
         self.keypoint_layer = KeypointLayer(self)
+
+        # Close-up of the image under the cursor, in the top-left corner.
+        self.magnifier = CursorMagnifier(self)
 
     def keyPressEvent(self, event):
         """Handle key press events"""
@@ -691,13 +695,20 @@ class ImageCanvas(QGraphicsView):
 
     def toggle_annotation_overlays(self):
         """Toggle segmentation and bbox layers without changing class/instance switches."""
-        if self.show_segmentations or self.show_bboxes:
+        layer = getattr(self, 'keypoint_layer', None)
+        keypoints_showing = bool(layer is not None and layer.enabled and layer.visible and not layer.peeking)
+        if self.show_segmentations or self.show_bboxes or keypoints_showing:
+            # Space shows the bare frame: masks, boxes and keypoints all go, and all come back.
             self._space_restore_visibility = (self.show_segmentations, self.show_bboxes)
+            if layer is not None:
+                layer.set_peeking(True)
             self.set_annotation_overlay_visibility(False, False)
             return False
 
         show_segmentations, show_bboxes = self._space_restore_visibility or (True, True)
         self._space_restore_visibility = None
+        if layer is not None:
+            layer.set_peeking(False)
         self.set_annotation_overlay_visibility(show_segmentations, show_bboxes)
         return bool(show_segmentations or show_bboxes)
 
@@ -1141,6 +1152,7 @@ class ImageCanvas(QGraphicsView):
         self._clear_temporary_dimension_graphics()
         self._clear_brush_cursor_preview()
         self._last_brush_cursor_pos = None
+        self.magnifier.clear()
         self._set_default_cursor_for_current_tool()
         self.scene.clear()
         self.keypoint_layer.forget_items()
@@ -1240,6 +1252,7 @@ class ImageCanvas(QGraphicsView):
             view_state['viewport_size'] = (old_size.width(), old_size.height())
         super().resizeEvent(event)
         self._position_brush_size_overlay()
+        self.magnifier.place()
         if self.image_item:
             self._update_pan_extent()
             if view_state is not None:
@@ -1247,6 +1260,19 @@ class ImageCanvas(QGraphicsView):
             else:
                 self.fit_to_window()
             
+    def scrollContentsBy(self, dx, dy):
+        # Qt scrolls the viewport's child widgets along with the image, so the
+        # overlays (magnifier, brush size buttons, counters) would wander off.
+        overlays = [(widget, widget.pos()) for widget in self.viewport().findChildren(
+            QWidget, options=Qt.FindChildOption.FindDirectChildrenOnly)]
+        super().scrollContentsBy(dx, dy)
+        for widget, pos in overlays:
+            widget.move(pos)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        self.magnifier.view_painted(event.region())
+
     def zoom_in(self):
         """Zoom in"""
         self.scale(1.1, 1.1)
@@ -2032,8 +2058,10 @@ class ImageCanvas(QGraphicsView):
         """Handle mouse move"""
         if self.current_image is None:
             self._clear_brush_cursor_preview()
+            self.magnifier.clear()
             return
-            
+
+        self.magnifier.track(event.pos())
         scene_pos = self.mapToScene(event.pos())
         self._queue_brush_cursor_preview(scene_pos)
 
@@ -2185,6 +2213,7 @@ class ImageCanvas(QGraphicsView):
         """Hide brush footprint cursor when the mouse leaves the canvas."""
         self._clear_brush_cursor_preview()
         self._last_brush_cursor_pos = None
+        self.magnifier.clear()
         self._set_default_cursor_for_current_tool()
         super().leaveEvent(event)
             
@@ -5457,6 +5486,11 @@ class ImageCanvas(QGraphicsView):
 
         if not show_segmentations and self.show_segmentations:
             self.labels_visible_before_hiding = self.labels_visible
+        if show_segmentations or show_bboxes:
+            # Turning a layer back on ends a Space peek, so keypoints follow their own switch.
+            layer = getattr(self, 'keypoint_layer', None)
+            if layer is not None:
+                layer.peeking = False
 
         self.show_segmentations = show_segmentations
         # Keep the old quick-mask state as an alias for the real segmentation

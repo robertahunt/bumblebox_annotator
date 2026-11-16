@@ -11,18 +11,19 @@ Mouse, with the canvas tool set to ``'keypoint'``:
   * shift+click           place the next keypoint as hidden (occluded); on an existing
                           point, switch it between hidden and visible
   * drag a keypoint       move it (any visible bee)
-  * right-click           skip the keypoint a left-click would place (leave it unlabelled);
-                          the bee is finished once every keypoint is placed or skipped
-  * right-click a point,  menu: hidden/visible, delete point, clear bee, finish bee
-    or shift+right-click
+  * right-click           list of the bee's keypoints at the cursor: choose which one the
+                          next click places. Its first entry, under the cursor, skips the
+                          current keypoint (leaves it unlabelled); the bee is finished once
+                          every keypoint is placed or skipped. Also: finish bee, clear bee
+  * right-click a point   menu: hidden/visible, delete point, clear bee, finish bee
   * double-click          same as a click (quick successive placements)
 Keys: Esc finishes the bee, Backspace/Delete removes the hovered point or undoes the last
-placement or skip, N skips like a right-click, H toggles "place as hidden".
+placement or skip, N skips the current keypoint, H toggles "place as hidden".
 Undo/redo (``undo()``/``redo()``) cover keypoint edits on the current frame.
 """
 
 from PyQt6.QtCore import QObject, QPointF, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QBrush, QColor, QPen
+from PyQt6.QtGui import QAction, QBrush, QColor, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QMenu
 
 from core import keypoints as kp
@@ -51,10 +52,27 @@ def keypoint_color(name, index):
     return _PALETTE[index % len(_PALETTE)]
 
 
+def _dot_icon(color, filled, dashed=False):
+    """Menu icon matching the canvas: filled dot = placed, dashed ring = hidden, ring = not placed."""
+    pixmap = QPixmap(14, 14)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(*color), 2)
+    if dashed:
+        pen.setDashPattern([1.5, 1.5])
+    painter.setPen(pen)
+    painter.setBrush(QBrush(QColor(*color)) if filled else Qt.BrushStyle.NoBrush)
+    painter.drawEllipse(QRectF(2, 2, 10, 10))
+    painter.end()
+    return QIcon(pixmap)
+
+
 class KeypointLayer(QObject):
     """Keypoint display and editing for an ``ImageCanvas``."""
 
     state_changed = pyqtSignal()  # target bee, next keypoint, or its points changed
+    visibility_changed = pyqtSignal(bool)  # the Keypoints display switch, independent of masks
 
     RADIUS_PX = 5.5      # drawn radius in screen pixels (constant under zoom)
     HIT_PX = 11.0        # pick radius in screen pixels
@@ -65,6 +83,7 @@ class KeypointLayer(QObject):
         self.canvas = canvas
         self.config = None
         self.visible = True
+        self.peeking = False  # hidden by Space (a look at the bare frame), not by the switch
         self.place_occluded = False
         self.target_id = 0
         self.active_name = None
@@ -103,8 +122,21 @@ class KeypointLayer(QObject):
         self.state_changed.emit()
 
     def set_visible(self, visible):
-        self.visible = bool(visible)
+        """The Keypoints display switch. Independent of the mask and box switches."""
+        visible = bool(visible)
+        changed = visible != self.visible
+        self.visible = visible
+        if visible:
+            self.peeking = False
         self.redraw()
+        if changed:
+            self.visibility_changed.emit(visible)
+
+    def set_peeking(self, peeking):
+        """Hide keypoints with the other overlays while Space shows the bare frame."""
+        if self.peeking != bool(peeking):
+            self.peeking = bool(peeking)
+            self.redraw()
 
     def set_place_occluded(self, occluded):
         self.place_occluded = bool(occluded)
@@ -163,7 +195,7 @@ class KeypointLayer(QObject):
         return out
 
     def _overlays_shown(self):
-        return self.visible and (self.canvas.show_segmentations or self.canvas.show_bboxes)
+        return self.visible and not self.peeking
 
     def _store(self, changes, record=True):
         """Apply ``{instance_id: new keypoints}``; one undo step for the whole change."""
@@ -398,10 +430,11 @@ class KeypointLayer(QObject):
         shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
         picked = self.hit(scene_pos)
         if button == Qt.MouseButton.RightButton:
-            # Skip the point a left-click would place; the menu is for existing points,
-            # Shift+right-click, or when there is nothing to skip.
-            if shift or picked is not None or not (self._click_target(x, y) and self.skip_active_name()):
-                self._show_context_menu(event, scene_pos)
+            if picked is not None:
+                self._show_point_menu(event, *picked)
+            else:
+                self._click_target(x, y)  # a right-click on a new bee starts it, like a click
+                self._show_keypoint_picker(event, self._instance_at(x, y))
             return True
         if picked is not None:
             instance_id, name = picked
@@ -416,6 +449,7 @@ class KeypointLayer(QObject):
 
         if not self._click_target(x, y):
             return True
+        self.set_visible(True)  # never place a point that cannot be seen
         hidden = self.place_occluded or shift
         self.place(self.target_id, self.active_name, x, y, kp.OCCLUDED if hidden else kp.VISIBLE)
         return True
@@ -509,41 +543,86 @@ class KeypointLayer(QObject):
             return True
         return False
 
-    def _show_context_menu(self, event, scene_pos):
-        menu = QMenu(self.canvas)
-        picked = self.hit(scene_pos)
-        if picked is not None:
-            instance_id, name = picked
-            point = self.keypoints_for(instance_id).get(name)
-            label = 'Mark Visible' if point and point[2] == kp.OCCLUDED else 'Mark Hidden (occluded)'
-            a = QAction(f'{label}: {name} (bee {instance_id})', menu)
-            a.triggered.connect(lambda _=False, i=instance_id, n=name: self.toggle_visibility(i, n))
-            menu.addAction(a)
-            a = QAction(f'Delete {name} (bee {instance_id})', menu)
-            a.triggered.connect(lambda _=False, i=instance_id, n=name: self.delete_point(i, n))
-            menu.addAction(a)
-            menu.addSeparator()
-            context_id = instance_id
+    def _bee_actions(self, menu, bee):
+        if bee == self.target_id:
+            a = QAction(f'Finish Bee {bee}', menu)
+            a.setToolTip('Leave the remaining keypoints unlabelled')
+            a.triggered.connect(lambda _=False: self.set_target(0, select=False))
         else:
-            context_id = self.target_id or self._instance_at(scene_pos.x(), scene_pos.y())
-        if context_id:
-            if context_id == self.target_id:
-                a = QAction(f'Finish Bee {context_id}', menu)
-                a.triggered.connect(lambda _=False: self.set_target(0, select=False))
-            else:
-                a = QAction(f'Label Bee {context_id}', menu)
-                a.triggered.connect(lambda _=False, i=context_id: self.set_target(i))
-            menu.addAction(a)
-            a = QAction(f'Clear All Keypoints of Bee {context_id}', menu)
-            a.setEnabled(bool(self.keypoints_for(context_id)))
-            a.triggered.connect(lambda _=False, i=context_id: self.clear_instance(i))
-            menu.addAction(a)
-        if menu.isEmpty():
+            a = QAction(f'Label Bee {bee}', menu)
+            a.triggered.connect(lambda _=False, i=bee: self.set_target(i))
+        menu.addAction(a)
+        a = QAction(f'Clear All Keypoints of Bee {bee}', menu)
+        a.setEnabled(bool(self.keypoints_for(bee)))
+        a.triggered.connect(lambda _=False, i=bee: self.clear_instance(i))
+        menu.addAction(a)
+
+    @staticmethod
+    def _popup(menu, event, at_action=None):
+        pos = event.globalPosition().toPoint() if hasattr(event, 'globalPosition') else event.globalPos()
+        if at_action is not None:
+            menu.exec(pos, at_action)  # opens with that entry under the cursor
+        else:
+            menu.exec(pos)
+
+    def _show_point_menu(self, event, instance_id, name):
+        """Right-click on an existing keypoint."""
+        menu = QMenu(self.canvas)
+        point = self.keypoints_for(instance_id).get(name)
+        label = 'Mark Visible' if point and point[2] == kp.OCCLUDED else 'Mark Hidden (occluded)'
+        a = QAction(f'{label}: {name} (bee {instance_id})', menu)
+        a.triggered.connect(lambda _=False, i=instance_id, n=name: self.toggle_visibility(i, n))
+        menu.addAction(a)
+        a = QAction(f'Delete {name} (bee {instance_id})', menu)
+        a.triggered.connect(lambda _=False, i=instance_id, n=name: self.delete_point(i, n))
+        menu.addAction(a)
+        menu.addSeparator()
+        self._bee_actions(menu, instance_id)
+        self._popup(menu, event)
+
+    def _show_keypoint_picker(self, event, bee_under_cursor=0):
+        """Right-click off any keypoint: choose which keypoint the next click places."""
+        menu = QMenu(self.canvas)
+        menu.setToolTipsVisible(True)
+        bee, skip = self.target_id, None
+        if not bee:
             a = QAction('Click a bee to start its keypoints', menu)
             a.setEnabled(False)
             menu.addAction(a)
-        pos = event.globalPosition().toPoint() if hasattr(event, 'globalPosition') else event.globalPos()
-        menu.exec(pos)
+            self._popup(menu, event)
+            return
+        points = self.keypoints_for(bee)
+        a = QAction(f'Bee {bee}: place next', menu)
+        a.setEnabled(False)
+        menu.addAction(a)
+        if self.active_name is not None:
+            skip = QAction(f"Skip {self.active_name.replace('_', ' ')}", menu)
+            skip.setToolTip('Leave it unlabelled and move on to the next keypoint')
+            skip.triggered.connect(lambda _=False: self.skip_active_name())
+            menu.addAction(skip)
+        menu.addSeparator()
+        for index, name in enumerate(self.names):
+            point = points.get(name)
+            text = name.replace('_', ' ')
+            if point is not None:
+                text += '  (hidden)' if point[2] == kp.OCCLUDED else '  \u2713'
+            elif name in self.skipped:
+                text += '  (skipped)'
+            hidden = point is not None and point[2] == kp.OCCLUDED
+            a = QAction(_dot_icon(keypoint_color(name, index), point is not None and not hidden, hidden),
+                        text, menu)
+            if name == self.active_name:
+                font = a.font()
+                font.setBold(True)
+                a.setFont(font)
+            a.setToolTip('Click where it goes to move it' if point is not None else 'The next click places it')
+            a.triggered.connect(lambda _=False, n=name: self.set_active_name(n))
+            menu.addAction(a)
+        menu.addSeparator()
+        self._bee_actions(menu, bee)
+        if bee_under_cursor and bee_under_cursor != bee:
+            self._bee_actions(menu, bee_under_cursor)
+        self._popup(menu, event, skip)
 
     def _on_instance_selected(self, instance_id, category):
         if (self.enabled and self.canvas.current_tool == 'keypoint' and

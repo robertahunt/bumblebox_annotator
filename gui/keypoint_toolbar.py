@@ -15,14 +15,20 @@ class KeypointToolbar(QWidget):
 
     HELP = (
         "Place Keypoints: click a bee, then click its keypoints in order (the next one is "
-        "shown here and advances automatically). Right-click anywhere (or press N) to skip a "
-        "keypoint you can't see; the bee is finished once every keypoint is placed or skipped. "
-        "Drag a point to move it. Shift+click places a point as hidden, or switches an existing "
+        "shown here and advances automatically). Right-click anywhere for the list of keypoints: "
+        "choose which one to place next, or take its first entry (already under the cursor) to "
+        "skip a keypoint you can't see. N also skips. The bee is finished once every keypoint is "
+        "placed or skipped. Drag a point to move it. Shift+click places a point as hidden, or switches an existing "
         "point between hidden and visible; right-click a point for the same and to delete it. "
         "Esc finishes the bee early, Backspace removes the hovered point or undoes the last "
         "placement or skip, H toggles 'place as hidden'. "
         "Ctrl+Z / Ctrl+Shift+Z undo and redo keypoint edits on this frame."
     )
+
+    def _sync_show_checkbox(self, visible):
+        self.show_checkbox.blockSignals(True)
+        self.show_checkbox.setChecked(visible)
+        self.show_checkbox.blockSignals(False)
 
     def __init__(self, layer, parent=None, show_place_button=True):
         """``show_place_button=False`` when the main tool row has a Keypoints tool button
@@ -58,8 +64,11 @@ class KeypointToolbar(QWidget):
         layout.addWidget(self.hidden_checkbox)
 
         self.show_checkbox = QCheckBox("Show keypoints")
-        self.show_checkbox.setChecked(True)
+        self.show_checkbox.setChecked(layer.visible)
+        self.show_checkbox.setToolTip("Show or hide keypoints; masks and boxes have their own switches. "
+                                      "Shortcut: Ctrl+Shift+K")
         self.show_checkbox.toggled.connect(self.layer.set_visible)
+        layer.visibility_changed.connect(self._sync_show_checkbox)
         layout.addWidget(self.show_checkbox)
 
         self.marker_btn = QPushButton("Thorax from ArUco Tags")

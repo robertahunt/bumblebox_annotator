@@ -212,11 +212,38 @@ def _global_files(files):
 # coordinator changes this whenever videos are added, and no assigned annotation
 # depends on it, so contributor copies take the latest version instead of stopping.
 SHARED_METADATA = frozenset({'annotations/imaging_setups.json'})
+PROJECT_SETTINGS = 'annotations/project.json'
+# What a working copy with no local changes to them takes from the latest version.
+REFRESHED_SETTINGS = SHARED_METADATA | {PROJECT_SETTINGS}
 
 
 def _policy_files(files):
     """Project-wide files whose change means outstanding assigned work needs review."""
     return {name: record for name, record in _global_files(files).items() if name not in SHARED_METADATA}
+
+
+def _policy_changed(base, current):
+    """Must outstanding assigned work be reviewed before it syncs with `current`?
+
+    Saved annotations are read through the annotation policy (each category's scope and
+    meaning), so a change to it, or to any other project-wide file, stops assigned work
+    for coordinator review. Other project settings, such as keypoints, do not change what
+    existing annotations mean: a working copy takes them with its next download.
+    """
+    before, incoming = base['manifest']['files'], current['manifest']['files']
+    strict = lambda files: {n: r for n, r in _policy_files(files).items() if n != PROJECT_SETTINGS}
+    if strict(before) != strict(incoming):
+        return True
+    if before.get(PROJECT_SETTINGS) == incoming.get(PROJECT_SETTINGS):
+        return False
+    if PROJECT_SETTINGS not in before or PROJECT_SETTINGS not in incoming:
+        return True
+    from core.annotation_policy import policy_signature
+    try:
+        return (policy_signature(_verified_json(base, PROJECT_SETTINGS)) !=
+                policy_signature(_verified_json(current, PROJECT_SETTINGS)))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return True  # A policy this app cannot read is not known to be unchanged.
 
 
 def _verified_json(snapshot, name):
@@ -563,6 +590,8 @@ def save_assignments(project, configuration, contributor, videos, expected_revis
         available = catalog(snapshot)
         if assignment_requirements(snapshot, available=available):
             raise ValueError('Complete and publish the annotation policy and frame images in a deduplicated backup before assigning work.')
+        from core.annotation_work import keypoint_policy, task_uses_keypoints
+        keypoints_published = keypoint_policy(_verified_json(snapshot, PROJECT_SETTINGS)) is not None
         updated = {}
         for video, choice in videos.items():
             if video not in available:
@@ -578,6 +607,9 @@ def save_assignments(project, configuration, contributor, videos, expected_revis
             from core.annotation_work import task_categories
             task = choice.get('task', (old or {}).get('task'))
             task_categories(task)
+            if task_uses_keypoints(task) and (not old or old.get('task') != task) and not keypoints_published:
+                raise ValueError('Turn on keypoints (Project > Keypoints...) and publish the project '
+                                 'before assigning keypoint work.')
             if old and old['contributor']['id'] == actor['id'] and old['frames'] == frames and old.get('task') == task:
                 updated[video] = dict(old, contributor=actor)
             else:
@@ -896,7 +928,7 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
         current, heads = latest_snapshot(view)
         base = view.snapshot(tuple(state['base_reference']))
         before, incoming = base['manifest']['files'], current['manifest']['files']
-        if _policy_files(before) != _policy_files(incoming):
+        if _policy_changed(base, current):
             raise SyncConflictError('Project policy or shared metadata changed. Keep this work for coordinator review.')
         for video in assignments:
             if _video_files(before, video) != _video_files(incoming, video):
@@ -1004,8 +1036,10 @@ def publish_work(project, configuration, contributor, ready=(), progress=None, c
         stage = _safe_child(revisions, '.pending-' + revision, mkdir=True)
         try:
             from core.annotation_work import build_index
+            from core.annotation_work import task_uses_keypoints
             annotation_work = build_index(files, lambda name: object_path(view.home, files[name]['sha256']),
-                previous=current['manifest'].get('annotation_work'), cancelled=cancelled)
+                previous=current['manifest'].get('annotation_work'), cancelled=cancelled,
+                keypoint_videos={v for v, a in assignments.items() if task_uses_keypoints(a.get('task'))})
             if auto_ready:
                 from core.annotation_work import summarize
                 # Evaluate the exact outgoing, verified masks, not a checkbox or

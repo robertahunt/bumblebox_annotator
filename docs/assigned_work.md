@@ -240,7 +240,8 @@ Project Home offers **Open Selected Project** and **Download Assigned Work**. Se
 
 - Only selected frame images from assigned videos are downloaded. No original
   videos, models, training outputs, or tracking sequences are downloaded.
-- The annotation policy and other project settings are copied unchanged.
+- The annotation policy and other project settings are copied unchanged. Settings other
+  than the annotation policy (for example keypoints) are refreshed by later downloads.
   Existing annotations for the selected videos are included, even for their
   undownloaded frames, so shared masks and instance-ID allocation remain intact.
   Their size is included in the estimate; selecting very long, densely annotated
@@ -433,17 +434,19 @@ Incremental downloads include existing active assignments as well as the new
 selection. They preserve local edits when the published video is unchanged, and
 update clean videos when shared annotations change. If both sides changed any
 part of the same video, the whole update stops: mask PNGs and annotation JSONs
-are not merged file by file. Changed project-wide policy/settings also require
-director review. The exception is `annotations/imaging_setups.json` (each video's
-imaging setup and scale calibration): it changes whenever the director adds
-videos, so a working copy simply takes the latest version, and changing it never
-blocks uploads or downloads. A simultaneous change after the preview requires a fresh check.
+are not merged file by file. A changed **annotation policy** (a category's scope or
+meaning) also requires director review, because saved annotations are read through it.
+Other project-wide settings do not: keypoint settings and the rest of
+`annotations/project.json`, and `annotations/imaging_setups.json` (each video's
+imaging setup and scale calibration, which changes whenever the director adds
+videos). Outstanding work keeps uploading, and a working copy takes the latest
+version of those files with its next download. A simultaneous change after the preview requires a fresh check.
 Reassigned videos are retained on disk, removed from active work, and excluded
 from uploads when downloading other current assignments. They are never deleted
 automatically; unpublished retained work still needs director review.
 
 Publishing also stops if someone else changed any part of the assigned video, or
-changed project-wide settings (other than imaging setups) after the download. This includes two computers
+changed the annotation policy after the download. This includes two computers
 using the same contributor profile on the same video. It does not choose a winner
 or merge masks automatically. Keep both working copies and ask the coordinator to
 compare/import the intended annotations into the full project, then issue fresh

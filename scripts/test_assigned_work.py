@@ -183,7 +183,7 @@ class AssignedWorkTests(unittest.TestCase):
             publish_work(local, self.configuration, self.alex)
         newer = self.download(name='newer')
         info = _read_json(self.source / 'annotations/project.json')
-        info['description'] = 'Changed intent'
+        info['annotation_policy']['categories']['bee']['meaning'] = 'full_extent'
         _write_json(self.source / 'annotations/project.json', info)
         sync_project(self.source, self.configuration, self.coordinator)
         with self.assertRaisesRegex(SyncConflictError, 'metadata changed'):

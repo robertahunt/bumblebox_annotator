@@ -139,10 +139,44 @@ class AssignedWorkspaceTests(unittest.TestCase):
         local = self.download()
         path = self.source / 'annotations/project.json'
         data = _read_json(path)
-        data['name'] = 'Changed settings'
+        data['annotation_policy']['categories']['bee']['meaning'] = 'full_extent'
         _write_json(path, data)
         sync_project(self.source, self.configuration, self.coordinator)
         with self.assertRaisesRegex(SyncConflictError, 'policy'):
+            self.prepare(local)
+        self.assertEqual(project_activity(local, self.configuration)['status'], 'attention')
+
+    def test_keypoint_settings_reach_an_existing_copy_without_review(self):
+        """Settings that are not annotation policy must not strand outstanding work."""
+        from core import keypoints as kp
+        name = 'annotations/project.json'
+        local = self.download()
+        self.change(local)  # Unsent edits made before the settings change.
+        self.assertIsNone(kp.read_project_config(local))
+        kp.save_project_config(self.source, kp.default_config())
+        sync_project(self.source, self.configuration, self.coordinator)
+
+        activity = project_activity(local, self.configuration)
+        self.assertEqual(activity['status'], 'current')
+        self.assertIn('settings', activity['message'])
+        published = publish_work(local, self.configuration, self.alex)  # upload is not blocked
+        files = _read_json(Path(published['path']) / 'manifest.json')['files']
+        self.assertEqual(files[name], file_record(self.source / name))  # and keeps the new settings
+
+        plan = self.prepare(local)
+        self.assertEqual((plan.new_videos, plan.updated_videos), ([], []))
+        plan.apply()
+        self.assertEqual((local / name).read_bytes(), (self.source / name).read_bytes())
+        self.assertEqual(kp.read_project_config(local).names, kp.DEFAULT_KEYPOINT_NAMES)
+        self.assertEqual(workspace(local)['local_files'][name], file_record(local / name))
+        self.assertFalse(self.prepare(local).apply()['updated'])
+        self.assertNotIn('settings', project_activity(local, self.configuration)['message'])
+
+        # Contributors still may not change project settings themselves.
+        data = _read_json(local / name)
+        data['keypoints']['enabled'] = False
+        _write_json(local / name, data)
+        with self.assertRaisesRegex(SyncConflictError, 'Local project settings'):
             self.prepare(local)
 
     def test_new_imaging_setup_entries_do_not_block_upload_or_download(self):
