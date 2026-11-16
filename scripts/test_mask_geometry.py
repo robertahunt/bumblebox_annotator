@@ -15,7 +15,8 @@ from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtWidgets import QApplication, QGraphicsPathItem, QMessageBox
 
 from core.categories import BROOD_CATEGORIES
-from core.mask_geometry import MaskGeometry, MaskGeometryCache, measure_mask
+from core.mask_geometry import (MAX_LOCATED_ID, MaskGeometry, MaskGeometryCache, locate_instances,
+                                measure_mask)
 from gui.canvas import ImageCanvas
 from gui.main_window import MainWindow
 
@@ -75,6 +76,107 @@ class MaskGeometryTests(unittest.TestCase):
         cache.invalidate('hive')
         self.assertEqual(cache.instance_ids('hive', empty), (2,))
         self.assertEqual(cache.geometry('hive', empty, 2).bbox, (0, 0, 1, 1))
+
+    def assert_matches_pixels(self, geometry, mask):
+        """Against an independent calculation; its centre can differ in the last decimal place."""
+        expected = reference_geometry(mask)
+        self.assertEqual((geometry.area, geometry.bbox), (expected.area, expected.bbox))
+        if expected.centroid is None:
+            self.assertIsNone(geometry.centroid)
+        else:
+            np.testing.assert_allclose(geometry.centroid, expected.centroid, rtol=0, atol=1e-10)
+
+    def awkward_arrays(self):
+        def blank(dtype=np.int32):
+            return np.zeros((60, 80), dtype)
+        cases = {}
+        m = blank(); m[10:30, 10:20] = 1; m[10:30, 24:40] = 1
+        cases['one mask in two pieces'] = m
+        m = blank(); m[5:9, 5:9] = 2; m[40:44, 60:70] = 2; m[20:22, 30:31] = 2
+        cases['three pieces far apart'] = m
+        m = blank(); m[0:5, 0:7] = 1; m[55:60, 70:80] = 2; m[0:3, 70:80] = 3; m[57:60, 0:4] = 4
+        cases['touching every corner'] = m
+        m = blank(); m[:, 0] = 1; m[0, 5:20] = 2; m[:, 79] = 3; m[59, 5:20] = 4
+        cases['thin lines on each edge'] = m
+        m = blank(); m[:] = 7
+        cases['one mask filling the image'] = m
+        m = blank(); m[30, 40] = 5
+        cases['single pixel'] = m
+        m = blank(); m[0, 0] = 1; m[59, 79] = 1
+        cases['two pixels in opposite corners'] = m
+        m = blank(); m[10:50, 10:70] = 1; m[20:40, 20:60] = 2; m[28:32, 35:45] = 3
+        cases['nested masks'] = m
+        m = blank(); m[::2, ::2] = 1; m[1::2, 1::2] = 2
+        cases['checkerboard of two masks'] = m
+        m = blank(); m[5:10, 5:10] = 250; m[20:25, 20:25] = 3; m[40:45, 40:45] = 1000
+        cases['ids with gaps'] = m
+        m = blank(); m[5:10, 5:10] = 3; m[20:25, 20:25] = -4
+        cases['a negative value'] = m
+        cases['empty'] = blank()
+        for dtype in (np.uint8, np.uint16, np.int64):
+            m = blank(dtype); m[3:20, 3:9] = 4; m[30:50, 60:80] = 9; m[3:20, 12:15] = 4
+            cases[np.dtype(dtype).name] = m
+        rng = np.random.default_rng(7)
+        for n in range(40):
+            h, w = int(rng.integers(1, 90)), int(rng.integers(1, 90))
+            m = np.zeros((h, w), np.int32)
+            for label in rng.permutation(np.arange(1, int(rng.integers(1, 12)) + 1)):
+                for _ in range(int(rng.integers(1, 4))):
+                    y, x = int(rng.integers(0, h)), int(rng.integers(0, w))
+                    m[y:y + int(rng.integers(1, 25)), x:x + int(rng.integers(1, 25))] = label
+            cases[f'random {n}'] = m
+        return cases
+
+    def test_one_pass_gives_the_same_ids_and_measurements_as_one_at_a_time(self):
+        for name, source in self.awkward_arrays().items():
+            with self.subTest(name):
+                ids = tuple(int(value) for value in np.unique(source) if value > 0)
+                expected = {instance_id: measure_mask(source == instance_id) for instance_id in ids}
+                self.assertEqual(set(locate_instances(source)), set(ids))
+                cache = MaskGeometryCache()
+                self.assertEqual(cache.instance_ids('bee', source), ids)
+                # A newly seen array is measured without scanning it once per instance.
+                with patch('core.mask_geometry.measure_mask', side_effect=AssertionError('Full scan')):
+                    measured = {instance_id: cache.geometry('bee', source, instance_id) for instance_id in ids}
+                self.assertEqual(measured, expected)  # exactly, to the last decimal place
+                for instance_id in ids:
+                    self.assert_matches_pixels(measured[instance_id], source == instance_id)
+                # Asking for measurements before the IDs gives the same answers.
+                other = MaskGeometryCache()
+                self.assertEqual({i: other.geometry('bee', source, i) for i in ids}, expected)
+                self.assertEqual(other.instance_ids('bee', source), ids)
+
+    def test_arrays_the_one_pass_cannot_use_are_measured_one_at_a_time(self):
+        shape = sample_mask() > 0
+        large = np.zeros((64, 64), np.int64)
+        large[shape] = MAX_LOCATED_ID + 1
+        for source, instance_id in ((large, MAX_LOCATED_ID + 1), (shape, 1), (shape.astype(np.float32), 1)):
+            with self.subTest(dtype=source.dtype):
+                self.assertIsNone(locate_instances(source))
+                cache = MaskGeometryCache()
+                self.assertEqual(cache.instance_ids('bee', source), (instance_id,))
+                self.assert_matches_pixels(cache.geometry('bee', source, instance_id), shape)
+        at_limit = np.zeros((64, 64), np.int32)
+        at_limit[shape] = MAX_LOCATED_ID
+        self.assertEqual(list(locate_instances(at_limit)), [MAX_LOCATED_ID])
+        self.assert_matches_pixels(MaskGeometryCache().geometry('bee', at_limit, MAX_LOCATED_ID), shape)
+
+    def test_in_place_edits_are_measured_from_live_pixels(self):
+        cache = MaskGeometryCache()
+        source = np.zeros((60, 80), np.int32)
+        source[10:20, 10:20] = 1
+        source[30:40, 30:40] = 2
+        source[50:55, 60:70] = 3
+        untouched = cache.geometry('bee', source, 3)
+        self.assertEqual(cache.geometry('bee', source, 1).bbox, (10, 10, 10, 10))
+        source[5:25, 5:45] = 1        # 1 grows past its old box and over part of 2
+        source[30:40, 30:40][source[30:40, 30:40] == 2] = 0   # the rest of 2 is erased
+        source[0:3, 70:80] = 9        # and a new instance appears
+        cache.invalidate_instances('bee', (1, 2, 9))
+        self.assertEqual(cache.instance_ids('bee', source), (1, 3, 9))
+        for instance_id in (1, 2, 9):
+            self.assert_matches_pixels(cache.geometry('bee', source, instance_id), source == instance_id)
+        self.assertIs(cache.geometry('bee', source, 3), untouched)
 
 
 class CanvasGeometryTests(unittest.TestCase):
