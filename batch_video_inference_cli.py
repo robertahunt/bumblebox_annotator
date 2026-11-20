@@ -8,6 +8,10 @@ import os
 import sys
 from pathlib import Path
 
+# An Apple GPU lacks a few operations; let those run on the CPU instead of failing.
+# This must be in place before PyTorch is imported.
+os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
+
 from PyQt6.QtCore import QCoreApplication, QSettings
 
 from gui.batch_video_inference_worker import BatchVideoInferenceWorker

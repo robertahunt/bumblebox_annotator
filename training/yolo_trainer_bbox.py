@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
-from training.gpu import require_cuda_device
+from training.gpu import require_training_device
 from .carbon_tracking import CarbonTrainingRun
 
 try:
@@ -224,7 +224,7 @@ class YOLOTrainingWorkerBBox(QThread):
     
     def _train_model(self, dataset_yaml):
         """Train YOLO bbox detection model"""
-        device, device_label = require_cuda_device()
+        device, device_label = require_training_device()
         self.stage_update.emit(f"Using GPU: {device_label}")
         print(f"YOLO bbox training using GPU: {device_label}")
 

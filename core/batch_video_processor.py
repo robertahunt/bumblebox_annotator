@@ -20,6 +20,7 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 from core.brood_inference import BroodVideoWriter, brood_model_classes, brood_evidence
+from core.gpu import gpu_memory_in_use, release_gpu_memory, synchronize_gpu
 from core.categories import BROOD_CATEGORIES
 from core.instance_tracker import Detection
 from core.marker_detector import MarkerDetector
@@ -440,18 +441,19 @@ class BatchVideoProcessor:
         frame_timings[name] = frame_timings.get(name, 0.0) + elapsed
 
     def _gpu_memory_text(self) -> str:
-        """Return a compact CUDA memory string for logs."""
-        if TORCH_AVAILABLE and torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1e9
-            reserved = torch.cuda.memory_reserved() / 1e9
-            peak = torch.cuda.max_memory_allocated() / 1e9
-            return f", GPU {allocated:.2f} GB allocated/{reserved:.2f} GB reserved, peak {peak:.2f} GB"
-        return ""
+        """Return a compact GPU memory string for logs."""
+        memory = gpu_memory_in_use() if TORCH_AVAILABLE else None
+        if memory is None:
+            return ""
+        text = f", GPU {memory[0] / 1e9:.2f} GB allocated/{memory[1] / 1e9:.2f} GB reserved"
+        if torch.cuda.is_available():  # An Apple GPU keeps no peak figure.
+            text += f", peak {torch.cuda.max_memory_allocated() / 1e9:.2f} GB"
+        return text
 
     def _sync_cuda(self):
-        """Synchronize CUDA so per-step timings are attributed accurately."""
-        if TORCH_AVAILABLE and torch.cuda.is_available():
-            torch.cuda.synchronize()
+        """Synchronize the GPU so per-step timings are attributed accurately."""
+        if TORCH_AVAILABLE:
+            synchronize_gpu()
 
     def _streaming_visualization_enabled_for_frame(self, frame_number: int) -> bool:
         if self.streaming_visualization_path is None or self._streaming_video_failed:
@@ -574,14 +576,15 @@ class BatchVideoProcessor:
             )
 
     def _cleanup_memory(self):
-        """Run periodic Python and CUDA memory cleanup."""
+        """Run periodic Python and GPU memory cleanup."""
         gc.collect()
-        if TORCH_AVAILABLE and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            try:
-                torch.cuda.ipc_collect()
-            except Exception:
-                pass
+        if TORCH_AVAILABLE:
+            release_gpu_memory()
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
     
     def process(self) -> bool:
         """Process video and finalize the history cache even after a stop or error."""
@@ -666,8 +669,8 @@ class BatchVideoProcessor:
             try:
                 self._process_frame(frame, frame_number)
             except RuntimeError as e:
-                if "out of memory" in str(e).lower() and TORCH_AVAILABLE and torch.cuda.is_available():
-                    self._log(f"  ❌ CUDA out of memory at frame {frame_number}{self._gpu_memory_text()}")
+                if "out of memory" in str(e).lower() and TORCH_AVAILABLE:
+                    self._log(f"  ❌ Out of memory at frame {frame_number}{self._gpu_memory_text()}")
                     self._cleanup_memory()
                 raise
 
@@ -955,11 +958,9 @@ class BatchVideoProcessor:
                     del self.bee_masks_by_frame[f]
             
             self._cleanup_memory()
-            if TORCH_AVAILABLE and torch.cuda.is_available():
-                if frame_number % 1000 == 0:  # Log every 1000 frames
-                    mem_allocated = torch.cuda.memory_allocated() / 1e9
-                    mem_reserved = torch.cuda.memory_reserved() / 1e9
-                    self._log_verbose(f"    GPU: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
+            memory = gpu_memory_in_use() if TORCH_AVAILABLE and frame_number % 1000 == 0 else None
+            if memory is not None:  # Log every 1000 frames
+                self._log_verbose(f"    GPU: {memory[0] / 1e9:.2f} GB allocated, {memory[1] / 1e9:.2f} GB reserved")
     
     def _detect_chambers(self, frame: np.ndarray) -> Dict[int, Dict]:
         """
@@ -2992,8 +2993,8 @@ class BatchVideoProcessor:
         
         # Force garbage collection and GPU cache clearing
         gc.collect()
-        if TORCH_AVAILABLE and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if TORCH_AVAILABLE and gpu_memory_in_use() is not None:
+            release_gpu_memory()
             self._log_verbose(f"✓ GPU cache cleared")
     
     def _print_timing_stats(self, frame_number: int, final: bool = False):

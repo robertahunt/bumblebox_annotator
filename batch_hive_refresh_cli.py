@@ -11,6 +11,7 @@ import argparse
 import csv
 import gc
 import json
+import os
 import re
 import sys
 import time
@@ -20,6 +21,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+# An Apple GPU lacks a few operations; let those run on the CPU instead of failing.
+# This must be in place before PyTorch is imported.
+os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
 
 import cv2
 import numpy as np
@@ -35,6 +40,7 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 from core.batch_video_processor import BatchVideoProcessor
+from core.gpu import place_model, release_gpu_memory
 from core.temporal_hive_prior import TemporalHivePrior
 from core.temporal_hive_visualization import TemporalHiveOverlayWriter
 from core.video_inference_exporter import VideoInferenceExporter
@@ -556,14 +562,14 @@ def run_hive_model(processor: BatchVideoProcessor, hive_model, frame: np.ndarray
 
 def load_models(args: argparse.Namespace):
     print("Loading refresh models...")
-    hive_model = YOLO(str(args.hive_model))
+    hive_model = place_model(YOLO(str(args.hive_model)))
     print(f"✓ Loaded hive model: {args.hive_model}")
-    chamber_model = YOLO(str(args.chamber_model)) if args.chamber_model else None
+    chamber_model = place_model(YOLO(str(args.chamber_model))) if args.chamber_model else None
     if chamber_model is not None:
         print(f"✓ Loaded chamber model: {args.chamber_model}")
     pollen_model = None
     if not args.no_pollen_model and args.pollen_model:
-        pollen_model = YOLO(str(args.pollen_model))
+        pollen_model = place_model(YOLO(str(args.pollen_model)))
         print(f"✓ Loaded pollen model: {args.pollen_model}")
     return hive_model, chamber_model, pollen_model
 
@@ -794,8 +800,8 @@ def refresh_video(
         del frame
         if frame_number % 25 == 0:
             gc.collect()
-            if TORCH_AVAILABLE and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if TORCH_AVAILABLE:
+                release_gpu_memory()
 
     cap.release()
 

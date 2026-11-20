@@ -18,6 +18,7 @@ from utils.validation_metrics import (
     bbox_from_mask, mask_centroid, mask_to_polygons_string,
     extract_instance_masks, closest_points_between_masks
 )
+from core.gpu import place_model
 from core.predicted_masks import instance_pieces
 
 
@@ -93,16 +94,16 @@ class FrameLevelValidationWorker(QThread):
             
             # Load models
             self.status_updated.emit("Loading models...")
-            bbox_model = YOLO(self.config['bbox_model_path'])
+            bbox_model = place_model(YOLO(self.config['bbox_model_path']))
             second_stage_model = None
             if bee_model_type == 'bbox_sam2':
                 from core.sam2_integrator import SAM2Integrator
                 second_stage_model = SAM2Integrator(self.config['sam2_checkpoint_path'])
             elif bee_model_type == 'bbox_instance_focused':
-                second_stage_model = YOLO(self.config['instance_focused_model_path'])
-            hive_model = YOLO(self.config['hive_model_path']) if self.config['hive_model_path'] else None
-            pollen_model = YOLO(self.config['pollen_model_path']) if self.config.get('pollen_model_path') else None
-            chamber_model = YOLO(self.config['chamber_model_path']) if self.config['chamber_model_path'] else None
+                second_stage_model = place_model(YOLO(self.config['instance_focused_model_path']))
+            hive_model = place_model(YOLO(self.config['hive_model_path'])) if self.config['hive_model_path'] else None
+            pollen_model = place_model(YOLO(self.config['pollen_model_path'])) if self.config.get('pollen_model_path') else None
+            chamber_model = place_model(YOLO(self.config['chamber_model_path'])) if self.config['chamber_model_path'] else None
             
             # Create results folder in frame_level_validation subfolder
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

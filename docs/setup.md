@@ -7,7 +7,9 @@ branch, not `master`. No worktree is necessary on the new computer.
 
 Use a new environment; do not alter a collaborator's existing environment.
 Windows/macOS and other architectures need separate dependency and GPU checks;
-the Linux constraints are not a validated cross-platform lockfile. The old
+the Linux constraints are not a validated cross-platform lockfile. An Apple
+Silicon Mac has its own recipe under [Apple Silicon Mac](#apple-silicon-mac-untested),
+which nobody has run yet. The old
 `install.sh` and `install.ps1` are legacy installers, not this setup procedure.
 
 ## Reference Versions
@@ -101,9 +103,95 @@ python -m pip install torch==2.10.0 torchvision==0.25.0 \
   -c constraints-linux-py310.txt
 ```
 
-CPU annotation does not require a GPU. This application's YOLO training workflow
-requires CUDA; CPU-only setup is not a workaround for that requirement. CPU
+CPU annotation does not require a GPU. This application's training workflows
+require an NVIDIA card or an Apple GPU; CPU-only setup is not a workaround for
+that requirement. CPU
 inference is slower, and some model-specific workflows still require a GPU.
+
+### Apple Silicon Mac (Untested)
+
+**Nothing in this section has been run on a Mac.** It was written on the Linux
+reference computer. What was checked from there: every pinned package has an
+Apple Silicon build for Python 3.10, except the NVIDIA-only packages (never
+installed on a Mac) and two small pure-Python SAM2 dependencies that build from
+source; and the code that does not depend on CUDA was exercised on the CPU.
+Treat the first session on a Mac as a test, not as production work.
+
+Requirements: an Apple Silicon Mac (M1 or later), macOS 13 or newer, and the
+**arm64** Miniconda or Miniforge installer. An Intel Python running under
+Rosetta cannot see the Apple GPU. Ultralytics carries workarounds for an Apple
+GPU bug in macOS 14, so prefer a newer macOS if you can choose.
+
+Follow steps 1 and 2 above, then use this **instead of** the NVIDIA or CPU
+installation. The ordinary package index already holds the Apple GPU build:
+
+```bash
+python -c "import platform; print(platform.machine())"   # must print arm64
+python -m pip install torch==2.10.0 torchvision==0.25.0 \
+  -c constraints-linux-py310.txt
+```
+
+Continue with step 4 unchanged. The constraints file is named for Linux, but
+its NVIDIA lines only apply to packages that something asks for, and nothing
+does on a Mac. Once an installation works, save `python -m pip freeze` as the
+Mac's own record; the Linux file does not prove a Mac resolves the same way.
+
+In step 5, replace the CUDA check with this one:
+
+```bash
+python - <<'PY'
+import platform
+import torch
+from torchvision.ops import nms
+assert platform.machine() == 'arm64', 'Intel Python under Rosetta cannot use the Apple GPU'
+assert torch.backends.mps.is_available(), 'Apple GPU unavailable'
+x = torch.ones((128, 128), device='mps')
+assert (x @ x).mean().item() == 128
+boxes = torch.tensor([[0., 0., 10., 10.], [1., 1., 9., 9.]], device='mps')
+scores = torch.tensor([0.9, 0.8], device='mps')
+assert nms(boxes, scores, 0.5).numel() == 1
+torch.mps.synchronize()
+print('Apple GPU operations passed')
+PY
+QT_QPA_PLATFORM=offscreen NO_ALBUMENTATIONS_UPDATE=1 python -m unittest scripts.test_gpu
+```
+
+The application picks its device by itself: an NVIDIA card if PyTorch can reach
+one, otherwise the Apple GPU, otherwise the CPU ([core/gpu.py](../core/gpu.py)).
+Training needs one of the two GPUs and never falls back to the CPU. If the
+Apple GPU fails or gives odd masks, keep everything on the CPU while you
+investigate:
+
+```bash
+BUMBLEBOX_FORCE_CPU=1 python main.py
+```
+
+Operations the Apple GPU lacks run on the CPU instead of failing
+(`PYTORCH_ENABLE_MPS_FALLBACK`, set at startup); PyTorch prints a warning naming
+each one. On an Apple GPU, Ultralytics turns mixed precision off, so training
+runs at full precision: expect more memory per image and longer epochs than on
+an NVIDIA card. SAM2 training also runs at full precision there.
+
+Check these on the Mac, in this order, before relying on it:
+
+1. Load a YOLO checkpoint and predict one frame; compare the masks with the same
+   frame and checkpoint on the Linux computer.
+2. With SAM2 loaded, draw a box prompt, then propagate masks to the next frame.
+   SAM2's video model stores its memory as `bfloat16`, which an Apple GPU may not
+   accept; SAM2's own authors call their Apple GPU support preliminary.
+3. Train a few epochs on a small dataset and compare losses and validation
+   numbers with the same short run on the NVIDIA computer. They will not match
+   digit for digit; they should be close. Train and score all models that a
+   paper compares on one computer.
+4. Run batch video inference on a long video and watch the `GPU ... allocated`
+   lines in the log for steady growth.
+5. Open one video on both computers and confirm the frame count and a few
+   numbered frames are identical, since annotations are stored by frame number.
+
+Not available on a Mac: the desktop launcher below (start the app with
+`python main.py`), the terminal sign-in for the research drive (sign in with
+macOS, then use Test Connection), and `scripts/recover_segmentation_training.py`,
+which still accepts only an NVIDIA card. Energy tracking is unverified there.
 
 ## 4. Install Application Dependencies
 

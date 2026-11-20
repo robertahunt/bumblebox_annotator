@@ -16,8 +16,8 @@ Written using Claude Sonnet 4.5
 ## Installation
 
 Follow the [new-computer setup guide](docs/setup.md) for the pinned Linux/NVIDIA
-environment, CPU-only alternative, CUDA verification, optional SAM2, and project
-transfer steps. Clone `integration/annotation-batch` to use this integration
+environment, CPU-only alternative, an untested Apple Silicon Mac recipe, CUDA
+verification, optional SAM2, and project transfer steps. Clone `integration/annotation-batch` to use this integration
 version; the upstream default branch is still `master`.
 
 Use a fresh environment and the supplied `constraints-linux-py310.txt`. Install

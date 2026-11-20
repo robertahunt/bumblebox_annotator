@@ -273,7 +273,7 @@ class VisibleNestTests(unittest.TestCase):
             ('training.yolo_trainer', YOLOTrainingWorker),
             ('training.yolo_trainer_instance_focused', YOLOTrainingWorkerInstanceFocused),
         ):
-            with patch(f'{module}.require_cuda_device', return_value=(0, 'test GPU')), \
+            with patch(f'{module}.require_training_device', return_value=(0, 'test GPU')), \
                     patch(f'{module}.YOLO') as yolo:
                 worker_class(self.root, {})._train_model(self.root / 'dataset.yaml')
                 options = yolo.return_value.train.call_args.kwargs
@@ -283,7 +283,7 @@ class VisibleNestTests(unittest.TestCase):
                     self.assertEqual(options[key], value)
 
     def test_no_cpu_fallback_was_added_to_gui_training(self):
-        with patch('training.yolo_trainer.require_cuda_device', side_effect=RuntimeError('CUDA unavailable')), \
+        with patch('training.yolo_trainer.require_training_device', side_effect=RuntimeError('CUDA unavailable')), \
                 patch('training.yolo_trainer.YOLO') as yolo:
             with self.assertRaisesRegex(RuntimeError, 'CUDA unavailable'):
                 YOLOTrainingWorker(self.root, {})._train_model(self.root / 'dataset.yaml')

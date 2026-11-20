@@ -9,6 +9,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction
 from pathlib import Path
 
+from core.gpu import place_model
 from .toolbar import FlowLayout
 
 
@@ -157,7 +158,7 @@ class YOLOInstanceFocusedToolbar(QWidget):
             from ultralytics import YOLO
             
             # Load the model
-            model = YOLO(file_path)
+            model = place_model(YOLO(file_path))
             
             # Verify it's a segmentation model
             if not hasattr(model, 'predictor') or 'segment' not in str(model.task):

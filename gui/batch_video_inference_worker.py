@@ -12,7 +12,6 @@ import random
 import re
 import time
 import traceback
-import torch
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Set
@@ -27,6 +26,7 @@ from core.aruco_parameter_optimizer import (
 from core.batch_video_processor import BatchVideoProcessor
 from core.temporal_brood import TemporalBroodMap
 from core.brood_inference import brood_model_classes
+from core.gpu import gpu_memory_in_use, place_model, release_gpu_memory, synchronize_gpu
 from core.temporal_hive_prior import TemporalHivePrior
 from core.temporal_hive_visualization import resolve_hive_overlay_mode
 from core.video_inference_exporter import VideoInferenceExporter
@@ -539,25 +539,25 @@ class BatchVideoInferenceWorker(QThread):
             self.status_updated.emit("Loading models...")
             self.log_message.emit("Loading detection models...")
             
-            bee_model = YOLO(self.config['bee_model_path'])
+            bee_model = place_model(YOLO(self.config['bee_model_path']))
             self.log_message.emit(f"✓ Loaded bee model: {Path(self.config['bee_model_path']).name}")
             
             hive_model = None
             if self.config.get('hive_model_path'):
-                hive_model = YOLO(self.config['hive_model_path'])
+                hive_model = place_model(YOLO(self.config['hive_model_path']))
                 self.log_message.emit(f"✓ Loaded hive model: {Path(self.config['hive_model_path']).name}")
             else:
                 self.log_message.emit("  (No hive model - hive distance metrics will be blank)")
 
             pollen_model = None
             if self.config.get('pollen_model_path'):
-                pollen_model = YOLO(self.config['pollen_model_path'])
+                pollen_model = place_model(YOLO(self.config['pollen_model_path']))
                 self.log_message.emit(f"✓ Loaded pollen model: {Path(self.config['pollen_model_path']).name}")
             else:
                 self.log_message.emit("  (No pollen model - pollen metrics will be blank)")
 
             if self.config.get('brood_model_path'):
-                self.brood_model = YOLO(self.config['brood_model_path'])
+                self.brood_model = place_model(YOLO(self.config['brood_model_path']))
                 brood_model_classes(self.brood_model)
                 self.temporal_brood_map = TemporalBroodMap(
                     resolution=self._temporal_hive_resolution(),
@@ -585,7 +585,7 @@ class BatchVideoInferenceWorker(QThread):
             # Chamber model is optional
             chamber_model = None
             if self.config.get('chamber_model_path'):
-                chamber_model = YOLO(self.config['chamber_model_path'])
+                chamber_model = place_model(YOLO(self.config['chamber_model_path']))
                 self.log_message.emit(f"✓ Loaded chamber model: {Path(self.config['chamber_model_path']).name}")
             else:
                 self.log_message.emit("  (No chamber model - treating video as single chamber)")
@@ -719,12 +719,11 @@ class BatchVideoInferenceWorker(QThread):
                     # Aggressive GPU memory cleanup at checkpoint
                     self._log_verbose(f"  Running aggressive GPU memory cleanup at checkpoint...")
                     gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()  # Wait for all operations to complete
-                        mem_allocated = torch.cuda.memory_allocated() / 1e9
-                        mem_reserved = torch.cuda.memory_reserved() / 1e9
-                        self._log_verbose(f"    GPU memory after checkpoint cleanup: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
+                    release_gpu_memory()
+                    synchronize_gpu()  # Wait for all operations to complete
+                    memory = gpu_memory_in_use()
+                    if memory is not None:
+                        self._log_verbose(f"    GPU memory after checkpoint cleanup: {memory[0] / 1e9:.2f} GB allocated, {memory[1] / 1e9:.2f} GB reserved")
                     
                     self.log_message.emit("")
                 
@@ -1515,8 +1514,8 @@ class BatchVideoInferenceWorker(QThread):
             pct = (other_time / wall_elapsed * 100) if wall_elapsed > 0 else 0.0
             self.log_message.emit(f"    - other/frame IO/finalization: {other_time:.2f}s ({pct:.1f}%)")
 
-        if torch.cuda.is_available():
-            self.log_message.emit("    Note: GPU timings can shift a little because CUDA work may be asynchronous.")
+        if gpu_memory_in_use() is not None:
+            self.log_message.emit("    Note: GPU timings can shift a little because GPU work may be asynchronous.")
 
     def _visualization_interval(self) -> int:
         try:
@@ -1622,8 +1621,7 @@ class BatchVideoInferenceWorker(QThread):
 
         del processor
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        release_gpu_memory()
         return success
     
     def _process_video(self, video_path, bee_model, hive_model, pollen_model, chamber_model, tracker, video_idx, aruco_runtime_config=None):
@@ -1774,8 +1772,7 @@ class BatchVideoInferenceWorker(QThread):
                     )
                 del processor
                 gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                release_gpu_memory()
                 return None
 
             self.log_message.emit(f"  ❌ Failed to process video: {video_path}")
@@ -1849,17 +1846,16 @@ class BatchVideoInferenceWorker(QThread):
         self._log_verbose(f"  Cleaning up GPU memory...")
         gc.collect()
         
-        if torch.cuda.is_available():
+        memory = gpu_memory_in_use()
+        if memory is not None:
             # Log GPU memory before cleanup
-            mem_allocated = torch.cuda.memory_allocated() / 1e9  # GB
-            mem_reserved = torch.cuda.memory_reserved() / 1e9  # GB
+            mem_allocated, mem_reserved = (value / 1e9 for value in memory)  # GB
             self._log_verbose(f"    Before cleanup: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
             
-            torch.cuda.empty_cache()
+            release_gpu_memory()
             
             # Log GPU memory after cleanup
-            mem_allocated_after = torch.cuda.memory_allocated() / 1e9  # GB
-            mem_reserved_after = torch.cuda.memory_reserved() / 1e9  # GB
+            mem_allocated_after, mem_reserved_after = (value / 1e9 for value in gpu_memory_in_use())  # GB
             freed = mem_reserved - mem_reserved_after
             self._log_verbose(f"    After cleanup: {mem_allocated_after:.2f} GB allocated, {mem_reserved_after:.2f} GB reserved (freed {freed:.2f} GB)")
 

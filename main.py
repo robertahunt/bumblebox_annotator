@@ -11,6 +11,9 @@ import argparse
 # Set PyTorch CUDA memory allocator config BEFORE any CUDA/PyTorch imports
 # This prevents memory fragmentation during training
 os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
+# An Apple GPU lacks a few operations; let those run on the CPU instead of failing.
+# Like the setting above, this must be in place before PyTorch is imported.
+os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt

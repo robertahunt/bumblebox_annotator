@@ -17,6 +17,7 @@ from collections import defaultdict
 import copy
 
 from core.aruco_tracking_identity import ArucoTrackingIdentityManager
+from core.gpu import place_model
 from core.instance_tracker import InstanceTracker, Detection, Track
 from utils.validation_metrics import mask_to_simplified_polygon, polygon_to_string
 
@@ -270,7 +271,7 @@ class TrackingValidationWorker(QThread):
             model = None
             if not use_ground_truth:
                 self.status_updated.emit("Loading detection model...")
-                model = YOLO(self.config['model_path'])
+                model = place_model(YOLO(self.config['model_path']))
             
             # Create results folder with subfolder for detection source
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

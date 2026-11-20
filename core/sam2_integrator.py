@@ -2,9 +2,16 @@
 SAM2 integration for interactive segmentation
 """
 
-import torch
 import numpy as np
 from pathlib import Path
+
+from core.gpu import device_name, gpu_memory_in_use, release_gpu_memory
+
+
+def allocated_text():
+    """GPU memory in use, as the end of a progress message; empty without a GPU."""
+    memory = gpu_memory_in_use()
+    return "" if memory is None else f" Memory allocated: {memory[0] / 1024**3:.2f} GB"
 
 
 class SAM2Integrator:
@@ -17,13 +24,13 @@ class SAM2Integrator:
         Args:
             checkpoint_path: Path to SAM2 checkpoint
             config_name: Model configuration name
-            device: Device to run on (cuda/cpu)
+            device: Device to run on (cuda/mps/cpu); the best one available when omitted
         """
         self.checkpoint_path = Path(checkpoint_path)
         self.config_name = config_name
         
         if device is None:
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.device = device_name()
         else:
             self.device = device
             
@@ -34,11 +41,12 @@ class SAM2Integrator:
             from sam2.sam2_image_predictor import SAM2ImagePredictor
             
             # Build model for image prediction
-            sam2_model = build_sam2(self.config_name, str(self.checkpoint_path))
+            sam2_model = build_sam2(self.config_name, str(self.checkpoint_path), device=self.device)
             self.predictor = SAM2ImagePredictor(sam2_model)
             
             # Build video predictor separately
-            self.video_predictor = build_sam2_video_predictor(self.config_name, str(self.checkpoint_path))
+            self.video_predictor = build_sam2_video_predictor(self.config_name, str(self.checkpoint_path),
+                                                              device=self.device)
             
             print("SAM2 loaded successfully")
             
@@ -364,8 +372,6 @@ class SAM2Integrator:
         Returns:
             Dictionary mapping original_index to propagated mask (or None for failures)
         """
-        import torch
-        
         results = {}
         
         # Create mapping from original_idx to mask for comparison later
@@ -442,9 +448,8 @@ class SAM2Integrator:
                 
                 video_segments[frame_idx] = processed_masks
                 
-                # Clear CUDA cache after processing each frame
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Clear the GPU cache after processing each frame
+                release_gpu_memory()
             
             if DEBUG:
                 print(f"  Total frames in video_segments: {list(video_segments.keys())}")
@@ -501,10 +506,9 @@ class SAM2Integrator:
             import gc
             gc.collect()
             
-            # Clear CUDA cache after cleanup
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                print(f"Chunk cleanup complete. Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+            # Clear the GPU cache after cleanup
+            release_gpu_memory()
+            print(f"Chunk cleanup complete.{allocated_text()}")
         
         except Exception as e:
             print(f"Error in chunk propagation: {e}")
@@ -874,12 +878,10 @@ class SAM2Integrator:
         """
         import tempfile
         import os
-        import torch
         
-        # Clear CUDA cache before starting to free up memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            print(f"Cleared CUDA cache. Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        # Clear the GPU cache before starting to free up memory
+        release_gpu_memory()
+        print(f"Cleared GPU cache.{allocated_text()}")
         
         # Report threshold if non-default
         if mask_threshold != 0.0:
@@ -927,7 +929,7 @@ class SAM2Integrator:
                         # Merge into all results
                         all_results.update(chunk_results)
                         
-                        print(f"Chunk {chunk_num} complete. Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                        print(f"Chunk {chunk_num} complete.{allocated_text()}")
                     
                     # Build final result list in original order
                     propagated_masks = [all_results.get(i) for i in range(num_masks)]
@@ -1025,9 +1027,8 @@ class SAM2Integrator:
                 import gc
                 gc.collect()
                 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    print(f"Final cleanup. Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                release_gpu_memory()
+                print(f"Final cleanup.{allocated_text()}")
             
             # Temp directory and files are automatically cleaned up here
             

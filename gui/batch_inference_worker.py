@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from core.gpu import place_model
 from utils.validation_metrics import (
     distance_to_mask, point_in_chamber, bbox_from_mask,
     mask_centroid, mask_to_polygons_string,
@@ -107,22 +108,22 @@ class BatchInferenceWorker(QThread):
             
             from ultralytics import YOLO
             
-            bbox_model = YOLO(str(self.config['bbox_model']))
+            bbox_model = place_model(YOLO(str(self.config['bbox_model'])))
             self.log_message.emit(f"✓ Loaded bee detection model: {self.config['bbox_model'].name}")
             
             hive_model = None
             if self.config['hive_model']:
-                hive_model = YOLO(str(self.config['hive_model']))
+                hive_model = place_model(YOLO(str(self.config['hive_model'])))
                 self.log_message.emit(f"✓ Loaded hive segmentation model: {self.config['hive_model'].name}")
 
             pollen_model = None
             if self.config.get('pollen_model'):
-                pollen_model = YOLO(str(self.config['pollen_model']))
+                pollen_model = place_model(YOLO(str(self.config['pollen_model'])))
                 self.log_message.emit(f"✓ Loaded pollen segmentation model: {self.config['pollen_model'].name}")
             
             chamber_model = None
             if self.config['chamber_model']:
-                chamber_model = YOLO(str(self.config['chamber_model']))
+                chamber_model = place_model(YOLO(str(self.config['chamber_model'])))
                 self.log_message.emit(f"✓ Loaded chamber segmentation model: {self.config['chamber_model'].name}")
             
             # Open CSV files

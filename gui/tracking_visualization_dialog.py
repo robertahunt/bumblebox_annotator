@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 from typing import Dict
 
-import torch
 from PyQt6.QtCore import QThread, pyqtSignal, QSettings
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -32,6 +31,7 @@ from PyQt6.QtWidgets import (
 from ultralytics import YOLO
 
 from core.batch_video_processor import BatchVideoProcessor
+from core.gpu import place_model, release_gpu_memory
 from core.visualization_generator import VisualizationGenerator
 
 
@@ -477,9 +477,9 @@ class TrackingVisualizationWorker(QThread):
             self.log_message.emit(f"ArUco detection: {'Enabled' if self.config['enable_aruco'] else 'Disabled'}")
 
             self.status_updated.emit("Loading models...")
-            bee_model = YOLO(self.config['bee_model_path'])
-            hive_model = YOLO(self.config['hive_model_path']) if self.config.get('hive_model_path') else None
-            chamber_model = YOLO(self.config['chamber_model_path']) if self.config.get('chamber_model_path') else None
+            bee_model = place_model(YOLO(self.config['bee_model_path']))
+            hive_model = place_model(YOLO(self.config['hive_model_path'])) if self.config.get('hive_model_path') else None
+            chamber_model = place_model(YOLO(self.config['chamber_model_path'])) if self.config.get('chamber_model_path') else None
 
             for model in (bee_model, hive_model, chamber_model):
                 if model and hasattr(model, 'model') and hasattr(model.model, 'eval'):
@@ -556,8 +556,7 @@ class TrackingVisualizationWorker(QThread):
 
             del viz_gen, processor
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            release_gpu_memory()
 
         except Exception as e:
             import traceback

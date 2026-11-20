@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (QWidget, QToolButton, QPushButton,
 from PyQt6.QtCore import Qt, pyqtSignal
 from pathlib import Path
 
+from core.gpu import place_model
 from .toolbar import FlowLayout
 
 
@@ -107,7 +108,7 @@ class YOLOBBoxToolbar(QWidget):
             from ultralytics import YOLO
             
             # Load the model
-            model = YOLO(file_path)
+            model = place_model(YOLO(file_path))
             
             # Verify it's a detection model (not segmentation or other tasks)
             if not hasattr(model, 'predictor'):

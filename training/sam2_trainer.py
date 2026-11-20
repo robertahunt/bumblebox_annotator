@@ -4,12 +4,13 @@ Based on: https://towardsdatascience.com/train-fine-tune-segment-anything-2-sam-
 """
 
 import json
+from contextlib import nullcontext
 import cv2
 import numpy as np
 import torch
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
-from training.gpu import require_cuda_device
+from training.gpu import require_training_device
 from .carbon_tracking import CarbonTrainingRun
 
 try:
@@ -26,6 +27,11 @@ try:
 except ImportError:
     ALBUMENTATIONS_AVAILABLE = False
     print("Warning: albumentations not available. Install with: pip install albumentations")
+
+
+def mixed_precision(device):
+    """Mixed precision on an NVIDIA card; full precision on an Apple GPU, where it is unproven for SAM2."""
+    return torch.autocast('cuda') if device.type == 'cuda' else nullcontext()
 
 
 class SAM2TrainingWorker(QThread):
@@ -290,7 +296,7 @@ class SAM2TrainingWorker(QThread):
     
     def _load_sam2_model(self):
         """Load SAM2 model"""
-        _device, device_label = require_cuda_device()
+        device, device_label = require_training_device()
         self.stage_update.emit(f"Using GPU: {device_label}")
         print(f"SAM2 training using GPU: {device_label}")
 
@@ -298,7 +304,7 @@ class SAM2TrainingWorker(QThread):
         config_name = self.config.get('config_name', 'sam2_hiera_l.yaml')
         
         # Build SAM2 model
-        sam2_model = build_sam2(config_name, checkpoint_path, device="cuda")
+        sam2_model = build_sam2(config_name, checkpoint_path, device='mps' if device == 'mps' else 'cuda')
         predictor = SAM2ImagePredictor(sam2_model)
         
         return predictor
@@ -348,7 +354,7 @@ class SAM2TrainingWorker(QThread):
         )
         
         # Setup mixed precision scaler
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler('cuda', enabled=predictor.device.type == 'cuda')
         
         # Setup learning rate scheduler with warmup and cosine annealing
         num_steps = self.config.get('num_steps', 25000)
@@ -670,7 +676,7 @@ class SAM2TrainingWorker(QThread):
             if self.should_stop:
                 break
             
-            with torch.cuda.amp.autocast():  # Mixed precision
+            with mixed_precision(predictor.device):
                 # Load data batch
                 image, mask, input_box, _ = self._read_batch()
                 
@@ -731,7 +737,7 @@ class SAM2TrainingWorker(QThread):
                     prd_mask = prd_mask.unsqueeze(0)  # Add batch dimension: [1, H, W]
                 
                 # Ensure gt_mask has batch dimension to match prd_mask
-                gt_mask = torch.tensor(mask.astype(np.float32)).cuda()
+                gt_mask = torch.tensor(mask.astype(np.float32)).to(predictor.device)
                 if gt_mask.ndim == 2:
                     gt_mask = gt_mask.unsqueeze(0)  # Add batch dimension: [1, H, W]
                 
@@ -1018,7 +1024,7 @@ class SAM2TrainingWorker(QThread):
                     # Use box prompt - already in correct shape [1, 4] from _generate_random_crop_around_annotation
                     input_box = crop_box.astype(np.float32)  # Already shape [1, 4]
                     
-                    with torch.cuda.amp.autocast():
+                    with mixed_precision(predictor.device):
                         # Set image and predict
                         predictor.set_image(crop_image)
                         
@@ -1062,7 +1068,7 @@ class SAM2TrainingWorker(QThread):
                         prd_mask = torch.sigmoid(prd_masks[:, 0])  # Shape: [batch, H, W]
                         
                         # Ensure gt_mask has batch dimension to match prd_mask
-                        gt_mask = torch.tensor(crop_mask.astype(np.float32)).cuda()
+                        gt_mask = torch.tensor(crop_mask.astype(np.float32)).to(predictor.device)
                         if gt_mask.ndim == 2:
                             gt_mask = gt_mask.unsqueeze(0)  # Add batch dimension: [1, H, W]
                         

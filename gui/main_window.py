@@ -52,6 +52,7 @@ from .keypoint_settings_dialog import KeypointSettingsDialog
 from core import keypoints as keypoints_module
 from .project_import_dialog import ProjectImportDialog
 from .annotation_policy_dialog import AnnotationPolicyDialog, ImportedFrameReviewDialog
+from core.gpu import gpu_memory_in_use, release_gpu_memory
 from core.annotation_policy import (category_policies, policy_needs_confirmation,
                                     policy_signature, policy_text, guidance)
 from core.annotation_scope import read_project_info
@@ -6283,7 +6284,6 @@ class MainWindow(QMainWindow):
     def on_sam2_unload(self):
         """Called when SAM2 model is unloaded via the SAM2Toolbar"""
         import gc
-        import torch
         
         print(f"on_sam2_unload called. self.sam2 before unload: {type(self.sam2) if self.sam2 else 'None'}")
         
@@ -6295,10 +6295,9 @@ class MainWindow(QMainWindow):
         # Force garbage collection
         gc.collect()
         
-        # Clear CUDA cache if available
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            print("CUDA cache cleared")
+        # Clear the GPU cache if there is one
+        release_gpu_memory()
+        print("GPU cache cleared")
         
         print("SAM2 unloaded and memory freed")
         
@@ -9071,9 +9070,7 @@ class MainWindow(QMainWindow):
                 
                 # Clear CUDA cache if available
                 try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    release_gpu_memory()
                 except:
                     pass
                 
@@ -9117,9 +9114,7 @@ class MainWindow(QMainWindow):
                     pass
                 gc.collect()
                 try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    release_gpu_memory()
                 except:
                     pass
                 QMessageBox.warning(self, "Propagation Error", 
@@ -9234,10 +9229,9 @@ class MainWindow(QMainWindow):
         
         # Report memory usage if available
         try:
-            import torch
-            if torch.cuda.is_available():
-                memory_gb = torch.cuda.memory_allocated() / 1024**3
-                print(f"Post-propagation GPU memory: {memory_gb:.2f} GB")
+            memory = gpu_memory_in_use()
+            if memory is not None:
+                print(f"Post-propagation GPU memory: {memory[0] / 1024**3:.2f} GB")
         except:
             pass
         
@@ -12163,9 +12157,7 @@ class MainWindow(QMainWindow):
                     
                     # Clear GPU cache periodically
                     if step % 20 == 0:
-                        import torch
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        release_gpu_memory()
                     
                     # Check if there are detections
                     if not result or result.boxes is None or len(result.boxes) == 0:
@@ -12415,9 +12407,7 @@ class MainWindow(QMainWindow):
                     
                     # Clear GPU cache periodically to prevent memory buildup
                     if step % 20 == 0:
-                        import torch
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        release_gpu_memory()
                     
                     # Check if there are detections
                     if not result or result.masks is None or len(result.masks) == 0:
@@ -12769,9 +12759,7 @@ class MainWindow(QMainWindow):
                     
                     # Clear GPU cache periodically to prevent memory buildup
                     if step % 20 == 0:
-                        import torch
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        release_gpu_memory()
                     
                     # Check if there are detections
                     if not result or result.masks is None or len(result.masks) == 0:

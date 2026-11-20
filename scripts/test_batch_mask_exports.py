@@ -42,7 +42,7 @@ class BatchMaskExportTests(unittest.TestCase):
 
         for target, options in (
             ('core.batch_video_processor.TORCH_AVAILABLE', {'new': False}),
-            ('gui.batch_video_inference_worker.torch.cuda.is_available', {'return_value': False}),
+            ('torch.cuda.is_available', {'return_value': False}),
             ('core.batch_video_processor.cv2.VideoCapture', {'side_effect': self.make_capture}),
             ('core.batch_video_processor.cv2.VideoWriter', {'return_value': Mock(isOpened=Mock(return_value=True))}),
         ):
