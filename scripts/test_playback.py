@@ -99,6 +99,17 @@ class PlaybackTests(unittest.TestCase):
             QTest.qWait(10)
         self.assertFalse(self.window.is_playing, 'playback did not stop')
 
+    def show_window(self):
+        """On screen and active, so keyboard focus moves as it does in use."""
+        self.window.show()
+        self.assertTrue(QTest.qWaitForWindowActive(self.window))
+
+    def wait_for_frames(self, count, seconds=5):
+        deadline = time.monotonic() + seconds
+        while len(self.shown) < count and time.monotonic() < deadline:
+            QTest.qWait(5)
+        self.assertGreaterEqual(len(self.shown), count, 'no frame was played')
+
     def assert_stopped(self):
         w = self.window
         self.assertFalse(w.is_playing)
@@ -148,6 +159,41 @@ class PlaybackTests(unittest.TestCase):
         w.play_button.click()
         self.wait_until_stopped()
         self.assertEqual(self.row(), FRAMES - 1)
+
+    def test_pause_works_when_a_frame_loads_between_press_and_release(self):
+        # A click by hand is a press, a pause, and a release; frames load in between.
+        w = self.window
+        self.show_window()
+        focused = QApplication.focusWidget()
+        self.assertIsNotNone(focused)
+        self.shown.clear()
+        w.play_button.click()
+        QTest.mousePress(w.play_button, Qt.MouseButton.LeftButton)
+        self.wait_for_frames(1)
+        self.assertTrue(w.is_playing)
+        self.assertTrue(w.play_button.isDown())
+        QTest.mouseRelease(w.play_button, Qt.MouseButton.LeftButton)
+        self.assert_stopped()
+        self.assertLess(self.row(), FRAMES - 1)
+        # The keyboard stays where it was, so the canvas shortcuts carry on working.
+        self.assertIs(QApplication.focusWidget(), focused)
+
+    def test_playing_leaves_the_keyboard_where_it_is(self):
+        # Taking the keyboard on every frame cancelled clicks held on any button.
+        w = self.window
+        self.show_window()
+        w.next_frame_button.setFocus()
+        self.assertIs(QApplication.focusWidget(), w.next_frame_button)
+        self.shown.clear()
+        w.play_button.click()
+        QTest.mousePress(w.next_frame_button, Qt.MouseButton.LeftButton)
+        self.wait_for_frames(1)
+        self.assertIs(QApplication.focusWidget(), w.next_frame_button)
+        self.assertTrue(w.next_frame_button.isDown())
+        w.stop_playback()
+        QTest.mouseRelease(w.next_frame_button, Qt.MouseButton.LeftButton)
+        # Going to a frame by hand still hands the keyboard to the canvas.
+        self.assertIs(QApplication.focusWidget(), w.canvas)
 
     def test_instance_list_waits_for_the_end_and_video_wide_masks_are_read_once(self):
         w = self.window

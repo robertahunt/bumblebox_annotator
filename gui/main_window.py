@@ -491,6 +491,10 @@ class MainWindow(QMainWindow):
         self.play_button.clicked.connect(self.toggle_play)
         self.play_button.setToolTip(
             "Play through the frames in view; from the last frame, play starts again from the first")
+        # A click must not move the keyboard to this button. A button that loses the
+        # keyboard between press and release drops the click, and frames load in
+        # between while playing. It also keeps the canvas shortcuts working.
+        self.play_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         nav_layout.addWidget(self.play_button)
 
         self.next_frame_button = QPushButton("Next ▶")
@@ -5736,8 +5740,11 @@ class MainWindow(QMainWindow):
                 if cached_image is None and self.canvas.current_image is not None:
                     self.frame_cache.put(idx, self.canvas.current_image.copy())
                 
-                # Give focus to canvas for keyboard shortcuts (spacebar toggles masks)
-                self.canvas.setFocus()
+                # Give focus to canvas for keyboard shortcuts (spacebar toggles masks).
+                # Not while playing: taking the keyboard on every frame cancels any
+                # click still held down on a button, and interrupts typing elsewhere.
+                if not self.is_playing:
+                    self.canvas.setFocus()
                 
                 # Store image dimensions in annotation manager (for COCO export)
                 if self.canvas.current_image is not None:
