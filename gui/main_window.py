@@ -13028,19 +13028,14 @@ class MainWindow(QMainWindow):
                     interpolation=cv2.INTER_LINEAR  # Use LINEAR for probabilities
                 )
                 
-                # Extract largest contour at 0.5 threshold for cleaning
+                # Drop stray fragments at the 0.5 threshold, keeping every piece that
+                # belongs to the bee (it may be cut in two by something crossing it).
+                from core.predicted_masks import instance_pieces
                 pred_mask_binary = (pred_mask_probs_resized > 0.5).astype('uint8') * 255
-                contours, _ = cv2.findContours(pred_mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                if len(contours) > 0:
-                    # Find the largest contour
-                    largest_contour = max(contours, key=cv2.contourArea)
-                    
-                    # Create mask of largest contour
-                    contour_mask = np.zeros_like(pred_mask_binary)
-                    cv2.drawContours(contour_mask, [largest_contour], 0, 255, -1)
-                    
-                    # Apply contour mask to probabilities (zero out probabilities outside largest contour)
+                if np.any(pred_mask_binary):
+                    contour_mask = instance_pieces(
+                        pred_mask_binary, original_mask[crop_y1:crop_y2, crop_x1:crop_x2])
+                    # Zero out probabilities outside the kept pieces
                     pred_mask_probs_clean = pred_mask_probs_resized * (contour_mask > 0)
                 else:
                     pred_mask_probs_clean = pred_mask_probs_resized
@@ -13247,18 +13242,12 @@ class MainWindow(QMainWindow):
                 
                 print(f"Resized prediction from {pred_mask.shape} back to ({orig_crop_h}, {orig_crop_w})")
                 
-                # Extract only the largest contour to clean up the mask
-                contours, _ = cv2.findContours(pred_mask_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if len(contours) > 0:
-                    # Find the largest contour
-                    largest_contour = max(contours, key=cv2.contourArea)
-                    largest_area = cv2.contourArea(largest_contour)
-                    
-                    print(f"Found {len(contours)} contour(s), keeping largest (area: {largest_area:.0f}px)")
-                    
-                    # Create clean mask with only the largest contour
-                    pred_mask_clean = np.zeros_like(pred_mask_resized)
-                    cv2.drawContours(pred_mask_clean, [largest_contour], 0, 255, -1)
+                # Drop stray fragments, keeping every piece that belongs to the bee
+                # (it may be cut in two by something crossing it).
+                from core.predicted_masks import instance_pieces
+                if np.any(pred_mask_resized):
+                    pred_mask_clean = instance_pieces(
+                        pred_mask_resized, original_mask[crop_y1:crop_y2, crop_x1:crop_x2])
                 else:
                     print("Warning: No contours found in predicted mask")
                     pred_mask_clean = pred_mask_resized

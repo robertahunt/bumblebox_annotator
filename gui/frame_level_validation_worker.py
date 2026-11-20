@@ -18,6 +18,7 @@ from utils.validation_metrics import (
     bbox_from_mask, mask_centroid, mask_to_polygons_string,
     extract_instance_masks, closest_points_between_masks
 )
+from core.predicted_masks import instance_pieces
 
 
 class FrameLevelValidationWorker(QThread):
@@ -939,13 +940,9 @@ class FrameLevelValidationWorker(QThread):
                 interpolation=cv2.INTER_NEAREST
             )
 
-            contours, _ = cv2.findContours(pred_mask_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                largest_contour = max(contours, key=cv2.contourArea)
-                pred_mask_clean = np.zeros_like(pred_mask_resized)
-                cv2.drawContours(pred_mask_clean, [largest_contour], 0, 255, -1)
-            else:
-                pred_mask_clean = pred_mask_resized
+            # The same clean-up as refining from a box in the app: stray fragments
+            # go, and a bee in several pieces keeps them.
+            pred_mask_clean = instance_pieces(pred_mask_resized)
 
             full_mask = np.zeros((h, w), dtype=np.uint8)
             full_mask[crop_y1:crop_y2, crop_x1:crop_x2] = pred_mask_clean
