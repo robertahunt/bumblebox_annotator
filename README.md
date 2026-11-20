@@ -48,13 +48,32 @@ bring bees at the edge of the image toward the center of the screen. Brush and
 eraser strokes cannot start in the margin, and image/mask dimensions stay
 unchanged. **Fit to Window** (F) recenters and fits the image, not the margin.
 
+The mouse wheel zooms in and out around the point under the cursor. Zooming out goes
+on past the fitted size, to half of it, where the whole image is in view wherever you
+were working. Point at any other part of the reduced image and scroll to zoom in there.
+
 A **magnifier** in the top-left corner of the canvas shows a close-up of whatever is
 under the cursor (image, masks, boxes, keypoints), with a mark at the exact cursor
 position. It starts as a 100-pixel frame at three times the main view's zoom, so it
-zooms with the view. Change either under **View > Magnifier Size and Zoom**, or turn
-it off with **View > Show Magnifier** (Ctrl+Shift+M); the choices are remembered on
-that computer. Clicks pass through the magnifier, and it moves to the bottom-left
-corner while the cursor is under the top-left.
+zooms with the view. Change either under **View > Magnifier Size and Zoom** (frames
+up to 600 pixels), or turn it off with **View > Show Magnifier** (Ctrl+Shift+M).
+
+Below it, a **zoomed-out view** shows the surroundings of the cursor, so the close-up,
+the main view and the wider picture are on screen together. It outlines the part the
+main view shows and marks the cursor. It starts as a 200-pixel frame reaching twice
+as far across as the main view; **View > Zoomed-Out View Size and Reach** sets the
+frame size and how far it reaches, from 1.05 to 2 times the main view or the whole
+frame, and **View > Show Zoomed-Out View** (Ctrl+Shift+O) turns it off. Number labels
+and keypoint markers are left out of it, because they keep their size on screen and
+would cover a small picture.
+
+Both size menus end with **Half the canvas height**, which also says how many pixels
+that is for the window as it stands. With both frames set to it they are equal squares
+that fill the left side of the canvas, and they resize with the window.
+
+Both remember their settings on that computer and let clicks pass through. They move
+to another corner while the cursor is under them, and sit side by side when the canvas
+is too short to stack them.
 
 **Play** steps through the frames in view, at up to ten frames a second, and stops
 on the last one. Pressing **Play** on the last frame starts again from the first.

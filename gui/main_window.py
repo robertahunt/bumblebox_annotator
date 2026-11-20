@@ -1173,11 +1173,30 @@ class MainWindow(QMainWindow):
         self.magnifier_action.triggered.connect(self.on_show_magnifier_changed)
         view_menu.addAction(self.magnifier_action)
         options = view_menu.addMenu("Magnifier Si&ze and Zoom")
+        options.aboutToShow.connect(self._label_half_height_sizes)
         self.magnifier_size_actions = self._add_magnifier_choices(
-            options, "Frame {} px", magnifier.SIZES, magnifier.DEFAULT_SIZE, self.set_magnifier_size)
+            options, self._frame_size_label, magnifier.SIZES, magnifier.DEFAULT_SIZE, self.set_magnifier_size)
         options.addSeparator()
         self.magnifier_zoom_actions = self._add_magnifier_choices(
             options, "Zoom {}\u00d7", magnifier.ZOOMS, magnifier.DEFAULT_ZOOM, self.set_magnifier_zoom)
+
+        # The surroundings of the cursor, zoomed out, below the close-up.
+        self.overview_action = QAction("Show Zoomed-&Out View", self)
+        self.overview_action.setCheckable(True)
+        self.overview_action.setChecked(True)
+        self.overview_action.setShortcut("Ctrl+Shift+O")
+        self.overview_action.setToolTip(
+            "Show the surroundings of the cursor, zoomed out, below the magnifier")
+        self.overview_action.triggered.connect(self.on_show_overview_changed)
+        view_menu.addAction(self.overview_action)
+        options = view_menu.addMenu("Zoomed-Out View Size and &Reach")
+        options.aboutToShow.connect(self._label_half_height_sizes)
+        self.overview_size_actions = self._add_magnifier_choices(
+            options, self._frame_size_label, magnifier.SIZES, magnifier.DEFAULT_OVERVIEW_SIZE, self.set_overview_size)
+        options.addSeparator()
+        self.overview_reach_actions = self._add_magnifier_choices(
+            options, lambda reach: "Whole frame" if reach == magnifier.WHOLE_FRAME else f"{reach:g}\u00d7 the main view",
+            magnifier.REACHES, magnifier.DEFAULT_REACH, self.set_overview_reach)
 
         view_menu.addSeparator()
         
@@ -10863,11 +10882,14 @@ class MainWindow(QMainWindow):
             self.load_frame(0)
                 
     def _add_magnifier_choices(self, menu, label, values, current, chosen):
-        """Add one-of-many menu entries; returns them by value."""
+        """Add one-of-many menu entries; returns them by value.
+
+        ``label`` is a format string for the value, or a function of it.
+        """
         group = QActionGroup(self)
         actions = {}
         for value in values:
-            action = QAction(label.format(value), self)
+            action = QAction(label(value) if callable(label) else label.format(value), self)
             action.setCheckable(True)
             action.setChecked(value == current)
             action.triggered.connect(lambda checked=False, v=value: chosen(v))
@@ -10875,6 +10897,19 @@ class MainWindow(QMainWindow):
             menu.addAction(action)
             actions[value] = action
         return actions
+
+    def _frame_size_label(self, size):
+        from gui import magnifier
+        if size != magnifier.HALF_HEIGHT:
+            return f"Frame {size} px"
+        # Two frames of this size, one above the other, fill the left side of the canvas.
+        return f"Half the canvas height ({self.canvas.cursor_views.half_height_side()} px now)"
+
+    def _label_half_height_sizes(self):
+        """The half-height size in pixels follows the window, so name it as the menu opens."""
+        from gui import magnifier
+        for actions in (self.magnifier_size_actions, self.overview_size_actions):
+            actions[magnifier.HALF_HEIGHT].setText(self._frame_size_label(magnifier.HALF_HEIGHT))
 
     def on_show_magnifier_changed(self, show):
         self.canvas.magnifier.set_active(show)
@@ -10888,7 +10923,20 @@ class MainWindow(QMainWindow):
         self.canvas.magnifier.set_zoom(zoom)
         QSettings().setValue('display/magnifier_zoom', int(zoom))
 
+    def on_show_overview_changed(self, show):
+        self.canvas.overview.set_active(show)
+        QSettings().setValue('display/overview', bool(show))
+
+    def set_overview_size(self, size):
+        self.canvas.overview.set_frame_size(size)
+        QSettings().setValue('display/overview_size', int(size))
+
+    def set_overview_reach(self, reach):
+        self.canvas.overview.set_reach(reach)
+        QSettings().setValue('display/overview_reach', float(reach))
+
     def _load_magnifier_settings(self, settings):
+        """The remembered choices for the close-up and the zoomed-out view."""
         from gui import magnifier
         shown = settings.value('display/magnifier', True, type=bool)
         self.magnifier_action.setChecked(shown)
@@ -10901,6 +10949,17 @@ class MainWindow(QMainWindow):
         if zoom in self.magnifier_zoom_actions:
             self.magnifier_zoom_actions[zoom].setChecked(True)
             self.canvas.magnifier.set_zoom(zoom)
+        shown = settings.value('display/overview', True, type=bool)
+        self.overview_action.setChecked(shown)
+        self.canvas.overview.set_active(shown)
+        size = settings.value('display/overview_size', magnifier.DEFAULT_OVERVIEW_SIZE, type=int)
+        if size in self.overview_size_actions:
+            self.overview_size_actions[size].setChecked(True)
+            self.canvas.overview.set_frame_size(size)
+        reach = settings.value('display/overview_reach', magnifier.DEFAULT_REACH, type=float)
+        if reach in self.overview_reach_actions:
+            self.overview_reach_actions[reach].setChecked(True)
+            self.canvas.overview.set_reach(reach)
 
     def load_settings(self):
         """Load application settings"""

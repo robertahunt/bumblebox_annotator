@@ -23,7 +23,7 @@ from core.mask_editing import enclosed_mask_region
 from core.mask_geometry import MaskGeometryCache, measure_mask
 from core.instance_colors import contrasting_instance_colors, random_vivid_color, vivid_color
 from gui.keypoint_layer import KeypointLayer
-from gui.magnifier import CursorMagnifier
+from gui.magnifier import CursorViews
 from core import keypoints as keypoints_module
 
 
@@ -249,8 +249,10 @@ class ImageCanvas(QGraphicsView):
         # Optional keypoints: inactive until a project keypoint config is set.
         self.keypoint_layer = KeypointLayer(self)
 
-        # Close-up of the image under the cursor, in the top-left corner.
-        self.magnifier = CursorMagnifier(self)
+        # A close-up and a zoomed-out view of the image around the cursor, in the top-left corner.
+        self.cursor_views = CursorViews(self)
+        self.magnifier = self.cursor_views.magnifier
+        self.overview = self.cursor_views.overview
 
     def keyPressEvent(self, event):
         """Handle key press events"""
@@ -1152,7 +1154,7 @@ class ImageCanvas(QGraphicsView):
         self._clear_temporary_dimension_graphics()
         self._clear_brush_cursor_preview()
         self._last_brush_cursor_pos = None
-        self.magnifier.clear()
+        self.cursor_views.clear()
         self._set_default_cursor_for_current_tool()
         self.scene.clear()
         self.keypoint_layer.forget_items()
@@ -1190,6 +1192,13 @@ class ImageCanvas(QGraphicsView):
             self.fitInView(self.image_item, Qt.AspectRatioMode.KeepAspectRatio)
             self.zoom_factor = 1.0
 
+    # The display-only margin around the image, in fitted viewports per side.
+    PAN_PAD = 0.75
+    # How far out the view zooms, as a fraction of the fit-to-window scale. From
+    # 1 / (1 + PAN_PAD) down, the whole image is in view wherever the view has
+    # been scrolled to.
+    ZOOM_OUT_LIMIT = 0.5
+
     def _update_pan_extent(self):
         """Add display-only room to center edge pixels, even at fit-to-window."""
         if self.image_item is None:
@@ -1199,8 +1208,8 @@ class ImageCanvas(QGraphicsView):
         aspect = max(1, viewport.width()) / max(1, viewport.height())
         # Reserve most of a fitted viewport on each side. Derive this from the
         # image and viewport, never annotation items, so overlays cannot move it.
-        pad_x = 0.75 * max(rect.width(), rect.height() * aspect)
-        pad_y = 0.75 * max(rect.height(), rect.width() / aspect)
+        pad_x = self.PAN_PAD * max(rect.width(), rect.height() * aspect)
+        pad_y = self.PAN_PAD * max(rect.height(), rect.width() / aspect)
         self.scene.setSceneRect(rect.adjusted(-pad_x, -pad_y, pad_x, pad_y))
 
     def _apply_initial_view(self, token, view_state):
@@ -1252,7 +1261,7 @@ class ImageCanvas(QGraphicsView):
             view_state['viewport_size'] = (old_size.width(), old_size.height())
         super().resizeEvent(event)
         self._position_brush_size_overlay()
-        self.magnifier.place()
+        self.cursor_views.place()
         if self.image_item:
             self._update_pan_extent()
             if view_state is not None:
@@ -1262,7 +1271,7 @@ class ImageCanvas(QGraphicsView):
             
     def scrollContentsBy(self, dx, dy):
         # Qt scrolls the viewport's child widgets along with the image, so the
-        # overlays (magnifier, brush size buttons, counters) would wander off.
+        # overlays (cursor views, brush size buttons, counters) would wander off.
         overlays = [(widget, widget.pos()) for widget in self.viewport().findChildren(
             QWidget, options=Qt.FindChildOption.FindDirectChildrenOnly)]
         super().scrollContentsBy(dx, dy)
@@ -1271,7 +1280,7 @@ class ImageCanvas(QGraphicsView):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        self.magnifier.view_painted(event.region())
+        self.cursor_views.view_painted(event.region())
 
     def zoom_in(self):
         """Zoom in"""
@@ -1279,27 +1288,24 @@ class ImageCanvas(QGraphicsView):
         self.zoom_factor *= 1.1
         
     def zoom_out(self):
-        """Zoom out with limit to prevent zooming smaller than fit-to-window"""
+        """Zoom out, as far as half the fit-to-window size.
+
+        Zooming keeps the point under the mouse where it is, so at fit-to-window
+        size part of the image can still be out of view. Going on to half that
+        size brings all of it in, wherever the view was, so any other part can
+        be pointed at and zoomed in on.
+        """
         if not self.image_item:
             return
-        
-        # Get current transform scale
-        current_transform = self.transform()
-        current_scale = current_transform.m11()
-        
-        # Calculate what scale we'd need to fit the whole image
         viewport_rect = self.viewport().rect()
         image_rect = self.image_item.boundingRect()
-        
-        scale_x = viewport_rect.width() / image_rect.width()
-        scale_y = viewport_rect.height() / image_rect.height()
-        min_scale = min(scale_x, scale_y)
-        
-        # Only zoom out if we're more zoomed in than fit-to-window
-        if current_scale > min_scale * 0.95:  # 0.95 adds small tolerance
-            self.scale(1/1.1, 1/1.1)
-            self.zoom_factor /= 1.1
-        
+        fit_scale = min(viewport_rect.width() / image_rect.width(),
+                        viewport_rect.height() / image_rect.height())
+        step = max(1 / 1.1, self.ZOOM_OUT_LIMIT * fit_scale / self.transform().m11())
+        if step < 1:
+            self.scale(step, step)
+            self.zoom_factor *= step
+
     def wheelEvent(self, event):
         """Handle mouse wheel for zooming"""
         delta = event.angleDelta().y() or event.pixelDelta().y()
@@ -2058,10 +2064,10 @@ class ImageCanvas(QGraphicsView):
         """Handle mouse move"""
         if self.current_image is None:
             self._clear_brush_cursor_preview()
-            self.magnifier.clear()
+            self.cursor_views.clear()
             return
 
-        self.magnifier.track(event.pos())
+        self.cursor_views.track(event.pos())
         scene_pos = self.mapToScene(event.pos())
         self._queue_brush_cursor_preview(scene_pos)
 
@@ -2213,7 +2219,7 @@ class ImageCanvas(QGraphicsView):
         """Hide brush footprint cursor when the mouse leaves the canvas."""
         self._clear_brush_cursor_preview()
         self._last_brush_cursor_pos = None
-        self.magnifier.clear()
+        self.cursor_views.clear()
         self._set_default_cursor_for_current_tool()
         super().leaveEvent(event)
             

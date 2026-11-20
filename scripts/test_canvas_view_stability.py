@@ -326,6 +326,71 @@ class CanvasViewStabilityTests(unittest.TestCase):
         canvas.wheelEvent(self.wheel(QPoint(0, -120)))
         self.assertLess(canvas.transform().m11(), before)
 
+    def fit_scale(self, canvas):
+        image = canvas.image_item.boundingRect()
+        return min(canvas.viewport().width() / image.width(), canvas.viewport().height() / image.height())
+
+    def test_wheel_zooms_out_to_half_the_fitted_size_and_no_further(self):
+        canvas = self.canvas()
+        fit = self.fit_scale(canvas)
+        self.assertAlmostEqual(canvas.transform().m11() / fit, 1, delta=.02)
+        for _ in range(40):
+            canvas.wheelEvent(self.wheel(QPoint(0, -120)))
+        self.assertAlmostEqual(canvas.transform().m11(), canvas.ZOOM_OUT_LIMIT * fit)
+        self.assertAlmostEqual(canvas.zoom_factor, canvas.ZOOM_OUT_LIMIT, delta=.02)
+        canvas.zoom_out()  # the menu entry shares the limit
+        self.assertAlmostEqual(canvas.transform().m11(), canvas.ZOOM_OUT_LIMIT * fit)
+        # The whole image is certain to be in view from there (see ImageCanvas.ZOOM_OUT_LIMIT).
+        self.assertLessEqual(canvas.ZOOM_OUT_LIMIT, 1 / (1 + canvas.PAN_PAD))
+
+    def test_zooming_out_brings_the_whole_image_into_view_from_anywhere(self):
+        # Zooming keeps the point under the mouse in place, so from a corner the
+        # image is still partly out of view at the fitted size.
+        for shape, size in (((1000, 1000), (800, 600)), ((300, 400), (1200, 500)), ((900, 300), (500, 800))):
+            canvas = self.canvas()
+            canvas.resize(*size)
+            canvas.load_image(np.zeros(shape, np.uint8))
+            self.app.processEvents()
+            self.app.processEvents()
+            fit = self.fit_scale(canvas)
+            image = canvas.image_item.sceneBoundingRect()
+            view = canvas.viewport().rect()
+            for corner in (image.topLeft(), image.bottomRight(), image.topRight(), image.bottomLeft()):
+                for mouse in (view.topLeft() + QPoint(5, 5), view.bottomRight() - QPoint(5, 5), view.center()):
+                    with self.subTest(shape=shape, corner=corner, mouse=mouse):
+                        canvas.fit_to_window()
+                        for _ in range(25):
+                            canvas.zoom_in()
+                        canvas.centerOn(corner)
+                        QTest.mouseMove(canvas.viewport(), mouse + QPoint(1, 1))
+                        QTest.mouseMove(canvas.viewport(), mouse)
+                        self.app.processEvents()
+                        for _ in range(60):
+                            canvas.wheelEvent(self.wheel(QPoint(0, -120)))
+                        self.app.processEvents()
+                        self.assertAlmostEqual(canvas.transform().m11(), canvas.ZOOM_OUT_LIMIT * fit)
+                        shown = canvas.mapToScene(canvas.viewport().rect()).boundingRect()
+                        self.assertTrue(shown.adjusted(-1, -1, 1, 1).contains(image), (shown, image))
+
+    def test_zooming_in_from_the_reduced_image_goes_to_the_point_under_the_mouse(self):
+        canvas = self.canvas()
+        for _ in range(40):
+            canvas.wheelEvent(self.wheel(QPoint(0, -120)))
+        self.app.processEvents()
+        target = QPointF(820, 240)  # a spot on the reduced image, away from its middle
+        mouse = canvas.mapFromScene(target)
+        QTest.mouseMove(canvas.viewport(), mouse + QPoint(1, 1))
+        QTest.mouseMove(canvas.viewport(), mouse)
+        self.app.processEvents()
+        for _ in range(30):
+            canvas.wheelEvent(self.wheel(QPoint(0, 120)))
+        self.app.processEvents()
+        self.assertGreater(canvas.transform().m11(), 5 * self.fit_scale(canvas))
+        # Each wheel step lands on a whole scroll position, so the spot drifts by a few pixels.
+        on_screen = canvas.mapFromScene(target)
+        self.assertLessEqual(abs(on_screen.x() - mouse.x()), 15)
+        self.assertLessEqual(abs(on_screen.y() - mouse.y()), 15)
+
 
 if __name__ == '__main__':
     unittest.main()

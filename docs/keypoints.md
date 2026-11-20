@@ -110,6 +110,10 @@ exactly where a click will land. That helps with small targets such as leg and a
 tips. Set its size and zoom under **View > Magnifier Size and Zoom**, or turn it off with
 **View > Show Magnifier** (Ctrl+Shift+M).
 
+The zoomed-out view below it shows where on the frame the cursor is, with the main view
+outlined. It leaves keypoint markers out; set it up under **View > Zoomed-Out View Size
+and Reach**, or turn it off with **View > Show Zoomed-Out View** (Ctrl+Shift+O).
+
 ## Assigning keypoint work
 
 Keypoints are a kind of work beside the mask types, so they can be assigned with masks or
