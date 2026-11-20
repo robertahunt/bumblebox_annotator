@@ -6,8 +6,9 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from core.assigned_work import (ASSIGNMENTS, REFRESHED_SETTINGS, _check_owned, _global_files, _policy_changed,
-    _video_files, assignment_review_snapshot, download_plan, download_work, read_assignments, require_contributor)
+from core.assigned_work import (ASSIGNMENTS, REFRESHED_SETTINGS, _check_owned, _editable, _frame, _global_files,
+    _policy_changed, _video_files, assignment_review_snapshot, download_plan, download_work, read_assignments,
+    require_contributor)
 from core.contributors import utc_now
 from core.project_delta import apply_delta, bytes_record, file_record
 from core.project_sync import (WORK_STATE, SyncConflictError, _digest, _inventory,
@@ -49,11 +50,14 @@ def existing_copies(paths, configuration, project_id, contributor):
     return found
 
 
-DOWNLOAD_NEEDED = frozenset(('not_downloaded', 'missing_frames', 'assignment_changed', 'shared_updates'))
+DOWNLOAD_NEEDED = frozenset(('not_downloaded', 'missing_frames', 'more_frames', 'assignment_changed',
+                             'shared_updates'))
 DOWNLOAD_LABELS = {
     'not_downloaded': 'Not downloaded',
     'downloaded': 'Downloaded',
     'missing_frames': 'Missing frames',
+    # The assigned frames are here, but not the rest of the video, which is for viewing only.
+    'more_frames': 'More frames to view',
     'assignment_changed': 'Assignment changed',
     'shared_updates': 'Shared updates available',
     'unknown': 'Not checked',
@@ -89,6 +93,10 @@ def assigned_download_overview(configuration, project_id, contributor, assignmen
         result['local_path'] = str(destination)
         baseline = view.snapshot(tuple(state['base_reference']))['manifest']['files']
         current = review['snapshot']['manifest']['files']
+        published_frames = {}
+        for name in current:
+            if name.startswith('frames/') and _frame(name) is not None:
+                published_frames.setdefault(name.split('/')[1], []).append(name)
         for position, (video, expected) in enumerate(assignments.items(), 1):
             if cancelled():
                 raise InterruptedError('Assignment check cancelled')
@@ -107,7 +115,9 @@ def assigned_download_overview(configuration, project_id, contributor, assignmen
                         present = False
                         break
                 result['local'][video] = ('missing_frames' if not present else
-                    'shared_updates' if _video_files(baseline, video) != _video_files(current, video) else 'downloaded')
+                    'shared_updates' if _video_files(baseline, video) != _video_files(current, video) else
+                    'more_frames' if not all(_safe_child(destination, name).is_file()
+                                             for name in published_frames.get(video, ())) else 'downloaded')
     except InterruptedError:
         raise
     except (OSError, ValueError, KeyError) as exc:
@@ -117,6 +127,33 @@ def assigned_download_overview(configuration, project_id, contributor, assignmen
 
 def _payload(value):
     return json.dumps(value, indent=2).encode()
+
+
+def _without_counter(metadata):
+    return {key: value for key, value in metadata.items() if key != 'max_mask_id'}
+
+
+def _require_edits_keep_their_place(video, old, entry, unpublished):
+    """Refuse a changed assignment that would strand unpublished edits.
+
+    Adding frames is always safe. A frame with unpublished edits must stay
+    assigned, and the mask task must stay the same, because those edits could
+    no longer be uploaded or would be judged against a different task.
+    """
+    if old.get('task') != entry.get('task'):
+        raise SyncConflictError('The mask task for ' + video + ' changed while this copy has unpublished work on '
+            'it. Nothing was overwritten. Keep this copy and ask the director to restore the earlier task until '
+            'this work is uploaded.')
+    stranded = [name for name in unpublished
+                if not name.endswith('/video_metadata.json') and not _editable(name, {video: entry})]
+    frames = sorted({_frame(name) for name in stranded} - {None})
+    if frames:
+        raise SyncConflictError('The new assignment for ' + video + ' no longer includes frame ' +
+            ', '.join(str(frame) for frame in frames) + ', which has unpublished work in this copy. Nothing was '
+            'overwritten. Keep this copy and ask the director to keep that frame assigned until the work is uploaded.')
+    if stranded:
+        raise SyncConflictError('Both the local work and the published work or assignment changed for ' + video +
+            '. Nothing was overwritten. Keep this copy and ask the director to reconcile the annotations.')
 
 
 class PreparedAssignedDownload:
@@ -192,14 +229,18 @@ class PreparedAssignedDownload:
 
         for video, entry in self.plan['assignments'].items():
             old = self.state['assignments'].get(video)
-            video_dirty = bool(_video_files({name: None for name in dirty}, video))
+            unpublished = sorted(_video_files({name: None for name in dirty}, video))
+            video_dirty = bool(unpublished)
             if video in new_state['retained_assignments']:
                 raise SyncConflictError('Previously retained work exists for ' + video +
                     '. Ask the director to reconcile it before downloading a new assignment for that video.')
-            if video_dirty and (not old or old['id'] != entry['id'] or
-                               _video_files(before, video) != _video_files(incoming, video)):
+            if video_dirty and (not old or _video_files(before, video) != _video_files(incoming, video)):
                 raise SyncConflictError('Both the local work and the published work or assignment changed for ' + video +
                     '. Nothing was overwritten. Keep this copy and ask the director to reconcile the annotations.')
+            if video_dirty and old['id'] != entry['id']:
+                # Only the assignment changed; the published video did not. The local
+                # work is then the only work there is, so nothing needs merging.
+                _require_edits_keep_their_place(video, old, entry, unpublished)
             if video_dirty:
                 self.kept_edits.append(video)
             if old is None:
@@ -211,9 +252,32 @@ class PreparedAssignedDownload:
             # Retain old frame images, but remove obsolete annotations only when the video is clean.
             old_annotations = {n for n in _video_files(baseline, video) if n.startswith('annotations/')}
             for name in names | old_annotations:
+                record = incoming.get(name) if name in names else None
+                if name in dirty and name.endswith('/video_metadata.json') and record:
+                    # The student's copy differs from the published one only by its instance
+                    # counter, which their unpublished masks raised. Keep that counter and
+                    # take everything else, including the assigned frames, from the director.
+                    kept = _read_json(self.destination / name)
+                    if _without_counter(kept) != _without_counter(self.state['metadata'][video]):
+                        if old and old['id'] != entry['id']:
+                            raise SyncConflictError('Local video settings changed for ' + video + ' and so did its '
+                                'assignment. Nothing was overwritten. Keep this copy for director review.')
+                        continue
+                    meta = dict(self.plan['catalog'][video]['metadata'], project_import=True,
+                                split=self.plan['catalog'][video]['split'], selected_frames=entry['frames'])
+                    new_state['metadata'][video] = meta
+                    # What the published project says is the baseline; the file itself keeps
+                    # the local counter, so it still counts as unpublished work.
+                    new_state['local_files'][name] = bytes_record(_payload(meta))
+                    if 'max_mask_id' in kept:
+                        meta = dict(meta, max_mask_id=kept['max_mask_id'])
+                    source = _payload(meta)
+                    if self.local.get(name) != bytes_record(source):
+                        self.before[name], self.after[name], self.sources[name] = (
+                            self.local.get(name), bytes_record(source), source)
+                    continue
                 if name in dirty:
                     continue
-                record = incoming.get(name) if name in names else None
                 if name.endswith('/video_metadata.json'):
                     meta = dict(self.plan['catalog'][video]['metadata'], project_import=True,
                                 split=self.plan['catalog'][video]['split'], selected_frames=entry['frames'])

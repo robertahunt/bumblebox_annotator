@@ -11,7 +11,7 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QMessageBox, QDialog
 
 from core.annotation_work import local_index, mark_finished, summarize, _local_video_files
-from core.assigned_work import catalog, latest_snapshot, read_assignments, save_assignments
+from core.assigned_work import catalog, latest_snapshot, read_assignments, save_assignments, workspace
 from gui.assigned_work_dialog import AssignmentManagerDialog, BulkAssignmentDialog
 from gui.annotation_work import WorkFilters
 from gui.project_sync_dialog import SyncProgressDialog
@@ -339,7 +339,9 @@ class AnnotationWorkGuiTests(unittest.TestCase):
         self.assertEqual(browser.filters.task.currentData(), 'hive')
         self.assertTrue(window.video_list.alternatingRowColors())
         self.assertIn('Shared mask', window.video_list.item(0).text())
-        self.assertEqual(browser.index['videos']['alpha']['frames'], [0])
+        # The whole video is on disk for viewing; progress still counts only the assigned frame.
+        self.assertEqual(browser.index['videos']['alpha']['frames'], [0, 1, 2])
+        self.assertEqual(workspace(window.project_path)['assignments']['alpha']['frames'], [0])
         transform = window.canvas.transform()
         annotations = window.canvas.get_annotations()
         browser.filters.show.setCurrentIndex(browser.filters.show.findData('finished'))

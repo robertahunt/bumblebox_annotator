@@ -81,9 +81,12 @@ class AssignedWorkTests(unittest.TestCase):
         self.assertEqual(my_projects(self.configuration, self.alex)[0]['name'], 'full-project')
         self.assertEqual(my_projects(self.configuration, new_session('Alex')), [])
         plan = download_plan(self.configuration, self.project_id, self.alex, ['alpha'])
-        self.assertNotIn('frames/alpha/frame_000001.jpg', plan['names'])
+        # The whole video is downloaded for viewing; the assignment still says which frame is the work.
+        self.assertIn('frames/alpha/frame_000001.jpg', plan['names'])
         local = self.download()
-        self.assertEqual([p.name for p in (local / 'frames/alpha').glob('*.jpg')], ['frame_000000.jpg'])
+        self.assertEqual(sorted(p.name for p in (local / 'frames/alpha').glob('*.jpg')),
+                         ['frame_000000.jpg', 'frame_000001.jpg', 'frame_000002.jpg'])
+        self.assertEqual(workspace(local)['assignments']['alpha']['frames'], [0])
         self.assertFalse((local / 'input_data').exists())
         self.assertFalse((local / 'frames/beta').exists())
         self.assertTrue((local / 'annotations/json/alpha/frame_000002.json').exists())

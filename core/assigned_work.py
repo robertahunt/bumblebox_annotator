@@ -769,7 +769,9 @@ def download_plan(configuration, project_id, contributor, videos):
         elif _annotation_video(name) in selected:
             names.add(name)
         elif len(parts) == 3 and parts[0] == 'frames' and parts[1] in selected:
-            if parts[2] == 'video_metadata.json' or _frame(name) in selected[parts[1]]['frames']:
+            # The whole video comes along, so the assigned frames can be judged in
+            # context. Only the assigned frames can be edited or uploaded.
+            if parts[2] == 'video_metadata.json' or _frame(name) is not None:
                 names.add(name)
     for video, entry in selected.items():
         if video not in available or not set(entry['frames']) <= set(available[video]['frames']):

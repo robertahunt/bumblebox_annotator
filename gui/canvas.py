@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
                              QGraphicsTextItem, QMenu, QGraphicsRectItem,
                              QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
                              QGraphicsPolygonItem, QGraphicsPathItem,
-                             QWidget, QHBoxLayout, QPushButton)
+                             QWidget, QHBoxLayout, QPushButton, QLabel)
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF, QTimer
 from PyQt6.QtGui import (QPixmap, QImage, QPen, QBrush, QColor, QPainter,
                         QTransform, QCursor, QPolygonF, QPainterPath, QFont, QAction)
@@ -59,6 +59,7 @@ class ImageCanvas(QGraphicsView):
     point_clicked = pyqtSignal(int, int, bool)  # x, y, is_positive
     box_drawn = pyqtSignal(int, int, int, int)  # x1, y1, x2, y2
     annotation_changed = pyqtSignal()
+    view_only_blocked = pyqtSignal()  # input that would change a frame which may only be viewed
     masks_visibility_changed = pyqtSignal(bool)  # Signal when mask visibility changes
     bboxes_visibility_changed = pyqtSignal(bool)  # Signal when bbox visibility changes
     instance_visibility_changed = pyqtSignal(int, str, bool)  # instance_id, category, visible
@@ -251,15 +252,37 @@ class ImageCanvas(QGraphicsView):
 
         # A close-up and a zoomed-out view of the image around the cursor, in the top-left corner.
         self.cursor_views = CursorViews(self)
+        # A frame outside an assignment can be looked at but not changed.
+        self.view_only = False
+        self._view_only_label = QLabel('View only: not one of your assigned frames', self.viewport())
+        self._view_only_label.setStyleSheet(
+            'background: rgba(40, 40, 40, 215); color: #ffd966; padding: 4px 10px;'
+            ' border-radius: 4px; font-weight: bold;')
+        self._view_only_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._view_only_label.hide()
         self.magnifier = self.cursor_views.magnifier
         self.overview = self.cursor_views.overview
 
+    VIEWING_TOOLS = frozenset({'pan', 'measure'})
+
+    def set_view_only(self, view_only):
+        """Let the frame be looked at but not changed: editing tools ignore the mouse and keys."""
+        self.view_only = bool(view_only)
+        self._view_only_label.setVisible(self.view_only)
+        self._place_view_only_label()
+
+    def _place_view_only_label(self):
+        label = self._view_only_label
+        label.adjustSize()
+        label.move(max(0, (self.viewport().width() - label.width()) // 2), 8)
+        label.raise_()
+
     def keyPressEvent(self, event):
         """Handle key press events"""
-        if self.current_tool == 'keypoint' and self.keypoint_layer.handle_key(event):
+        if not self.view_only and self.current_tool == 'keypoint' and self.keypoint_layer.handle_key(event):
             event.accept()
             return
-        if self.current_tool == 'no_draw_zone':
+        if not self.view_only and self.current_tool == 'no_draw_zone':
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self._finish_no_draw_polygon()
                 event.accept()
@@ -1262,6 +1285,7 @@ class ImageCanvas(QGraphicsView):
         super().resizeEvent(event)
         self._position_brush_size_overlay()
         self.cursor_views.place()
+        self._place_view_only_label()
         if self.image_item:
             self._update_pan_extent()
             if view_state is not None:
@@ -1372,6 +1396,9 @@ class ImageCanvas(QGraphicsView):
 
     def mouseDoubleClickEvent(self, event):
         """Treat brush/eraser double-clicks as regular taps for switch counting."""
+        if self.view_only and self.current_tool not in self.VIEWING_TOOLS:
+            self.mousePressEvent(event)  # refused there, with the same notice
+            return
         if self.current_tool == 'keypoint' and self.keypoint_layer.enabled:
             self.mousePressEvent(event)  # quick successive keypoint clicks
             return
@@ -1407,6 +1434,12 @@ class ImageCanvas(QGraphicsView):
     def mousePressEvent(self, event):
         """Handle mouse press"""
         if self.current_image is None:
+            return
+
+        if self.view_only and self.current_tool not in self.VIEWING_TOOLS:
+            # No tool starts, so nothing on this frame can change. Pan and measure still work.
+            self.view_only_blocked.emit()
+            event.accept()
             return
 
         if self.current_tool == 'keypoint' and self.keypoint_layer.handle_mouse_press(

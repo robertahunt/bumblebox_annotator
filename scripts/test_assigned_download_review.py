@@ -7,7 +7,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QDialog
 
 from core.assigned_work import accept_submission, publish_work, read_assignments, save_assignments
-from core.assigned_workspace import assigned_download_overview
+from core.assigned_workspace import DOWNLOAD_NEEDED, assigned_download_overview
 from core.project_sync import sync_project
 from core.project_update import PreparedUpdate
 from gui.assigned_work_dialog import AssignedDownloadDialog, managed_copy_key
@@ -41,6 +41,13 @@ class DownloadOverviewTests(unittest.TestCase):
         save_assignments(self.source, self.configuration, self.coordinator, self.choices,
                          read_assignments(self.view())['revision'])
         self.assertEqual(self.overview(saved_path=local)['local'], {'alpha': 'assignment_changed'})
+
+    def test_a_copy_without_the_rest_of_the_video_is_offered_it(self):
+        # Copies made before whole videos were downloaded hold only the assigned frame images.
+        local = self.download()
+        (local / 'frames/alpha/frame_000002.jpg').unlink()
+        self.assertEqual(self.overview(saved_path=local)['local'], {'alpha': 'more_frames'})
+        self.assertIn('more_frames', DOWNLOAD_NEEDED)
 
     def test_new_publication_detected_from_metadata_without_reading_annotation_payloads(self):
         local = self.download()

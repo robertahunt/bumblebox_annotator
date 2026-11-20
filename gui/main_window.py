@@ -252,6 +252,8 @@ class MainWindow(QMainWindow):
         
         # Track unsaved changes to avoid unnecessary saves
         self.current_frame_modified = False
+        # In an assigned copy: each video's assigned frames. Its other frames are for viewing only.
+        self._assigned_frame_sets = None
         self._annotation_revision = 0
         self.dirty_frame_annotation_keys = set()
         self.dirty_video_annotation_ids = set()
@@ -351,6 +353,7 @@ class MainWindow(QMainWindow):
         self.canvas.new_instance_requested.connect(self.new_instance)
         self.canvas.measurement_line_completed.connect(self.on_measurement_line_completed)
         self.canvas.annotation_changed.connect(self.on_annotation_changed)
+        self.canvas.view_only_blocked.connect(self._explain_view_only)
         self.canvas.annotation_changed.connect(self._schedule_instance_list_update)
         self.canvas.setToolTip(
             "Space toggles masks and boxes | "
@@ -4586,6 +4589,9 @@ class MainWindow(QMainWindow):
 
     def _mark_current_annotations_dirty(self, include_frame=True, include_video=True):
         """Mark the current annotation source files as needing a save."""
+        if self._list_frame_view_only(self.current_frame_idx):
+            self._explain_view_only()
+            return
         self.current_frame_modified = True
         self._annotation_revision += 1
         self.coco_export_dirty = True
@@ -4636,6 +4642,12 @@ class MainWindow(QMainWindow):
         target_list_idx = self.current_frame_idx if list_idx is None else list_idx
         frame_key = self._frame_annotation_key(target_video_id, target_list_idx)
         frame_idx_in_video = frame_key[1] if frame_key is not None else target_list_idx
+        if self._is_view_only_frame(target_video_id, frame_idx_in_video):
+            # Nothing on a view-only frame is ever written; forget any change held in memory.
+            self.dirty_frame_annotation_keys.discard(frame_key)
+            if target_video_id == self.current_video_id and target_list_idx == self.current_frame_idx:
+                self.current_frame_modified = False
+            return {'saved_any': False, 'reason': 'view_only'}
         require_assigned_frame(self.project_path, self.contributor_session, target_video_id, frame_idx_in_video)
 
         if use_background and annotations is None:
@@ -5375,6 +5387,32 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
     
+    def _remember_assigned_frames(self, assigned):
+        """Note which frames an assigned copy may edit. A full project may edit every frame."""
+        self._assigned_frame_sets = None if not assigned else {
+            video: frozenset(entry['frames']) for video, entry in assigned['assignments'].items()}
+
+    def _is_view_only_frame(self, video_id, frame_idx_in_video):
+        """In an assigned copy, a frame outside the assignment can be looked at but not changed."""
+        return (self._assigned_frame_sets is not None and
+                frame_idx_in_video not in self._assigned_frame_sets.get(video_id, ()))
+
+    def _list_frame_view_only(self, list_idx):
+        if self._assigned_frame_sets is None or not 0 <= list_idx < len(self.frames):
+            return False
+        video_id = (self.frame_video_ids[list_idx] if list_idx < len(self.frame_video_ids)
+                    else self.current_video_id)
+        return self._is_view_only_frame(video_id, self._get_frame_idx_in_video(list_idx))
+
+    def _first_workable_frame(self):
+        """The first listed frame that can be edited, or the first listed frame if none can."""
+        listed = self.frame_list_to_frames_map or list(range(len(self.frames)))
+        return next((i for i in listed if not self._list_frame_view_only(i)), listed[0])
+
+    def _explain_view_only(self):
+        self.status_label.setText('View only: this frame is not one of your assigned frames. '
+                                  'Choose an assigned frame to make changes.')
+
     def load_video_frames(self, video_id):
         """Load frames from a specific video for annotation"""
         if not self.project_path:
@@ -5440,9 +5478,10 @@ class MainWindow(QMainWindow):
                 return
             
             # Load all frame paths
+            # An assigned copy lists the whole video: the frames outside the assignment
+            # show what happens around the assigned ones, and are view only.
             frame_files = sorted(frames_dir.glob('frame_*.jpg'))
-            if assigned:
-                frame_files = [p for p in frame_files if int(p.stem.split('_')[1]) in assigned['assignments'][video_id]['frames']]
+            self._remember_assigned_frames(assigned)
             review = getattr(self, 'submission_review_dock', None)
             review_entry = review.review_assignment(video_id) if review else None
             if review_entry:
@@ -5500,7 +5539,8 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             
             if self.frame_list_to_frames_map:
-                self.load_frame(self.frame_list_to_frames_map[0])
+                # Start on a frame that can be worked on, not on one that is only for viewing.
+                self.load_frame(self._first_workable_frame())
             elif self.frames:
                 self.load_frame(0)
             
@@ -5598,13 +5638,17 @@ class MainWindow(QMainWindow):
             if multiple_videos and i < len(self.frame_video_ids):
                 item.setData(Qt.ItemDataRole.UserRole + 44, self.frame_video_ids[i])
                 item.setText(f"{label} · {self.frame_video_ids[i]}")
-            if not (is_selected and split != 'unknown'):
+            view_only = self._list_frame_view_only(i)
+            if view_only or not (is_selected and split != 'unknown'):
                 # Frames outside the selected set are not exported for training.
                 font = item.font()
                 font.setItalic(True)
                 item.setFont(font)
                 item.setData(Qt.ItemDataRole.UserRole + 43,
+                             'View only: not one of your assigned frames' if view_only else
                              'Not a selected frame: training exports skip it')
+            if view_only:
+                item.setData(Qt.ItemDataRole.UserRole + 45, True)
             self.frame_list.addItem(item)
             
             # Store mapping from list row to actual frame index
@@ -5690,6 +5734,7 @@ class MainWindow(QMainWindow):
                     print(f"Warning: Failed to queue save: {e}")
             
             self.current_frame_idx = idx
+            self.canvas.set_view_only(self._list_frame_view_only(idx))
             
             # Update current video ID from frame_video_ids list
             if idx < len(self.frame_video_ids):
@@ -10815,6 +10860,7 @@ class MainWindow(QMainWindow):
         # Get all video subdirectories
         video_dirs = [d for d in frames_dir.iterdir() if d.is_dir()]
         assigned = workspace(self.project_path)
+        self._remember_assigned_frames(assigned)
         if assigned:
             video_dirs = [d for d in video_dirs if d.name in assigned['assignments']]
         
@@ -10824,8 +10870,6 @@ class MainWindow(QMainWindow):
             
             # Get frames for this video
             frame_files = sorted(video_dir.glob('frame_*.jpg'))
-            if assigned:
-                frame_files = [p for p in frame_files if int(p.stem.split('_')[1]) in assigned['assignments'][video_id]['frames']]
             
             # Load metadata to see which frames are selected
             import json
@@ -10875,11 +10919,11 @@ class MainWindow(QMainWindow):
                                 return
                     # Fallback to first frame if we couldn't find the exact frame
                     if self.frames:
-                        self.load_frame(0)
+                        self.load_frame(self._first_workable_frame())
                     return
         # No saved state or video not found - just load first frame
         if self.frames:
-            self.load_frame(0)
+            self.load_frame(self._first_workable_frame())
                 
     def _add_magnifier_choices(self, menu, label, values, current, chosen):
         """Add one-of-many menu entries; returns them by value.

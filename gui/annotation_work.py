@@ -3,6 +3,7 @@
 from collections import OrderedDict
 
 from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (QComboBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
                             QPushButton, QStyle, QToolButton, QVBoxLayout, QWidget)
 
@@ -463,7 +464,9 @@ class AnnotationWorkBrowser(QObject):
         video, frame, entry = self.current()
         summary = self.summary(entry, task, [frame])
         dirty = bool(getattr(w, 'current_frame_modified', False))
-        self.frame_note.setText('This frame: unsaved edits; showing saved status' if dirty else
+        view_only = bool(video) and w._list_frame_view_only(w.current_frame_idx)
+        self.frame_note.setText('This frame: view only, not one of your assigned frames' if view_only else
+                                'This frame: unsaved edits; showing saved status' if dirty else
                                 'Choose a video to see its saved work' if not video else
                                 self.frame_text(summary))
         notes = []
@@ -475,17 +478,19 @@ class AnnotationWorkBrowser(QObject):
         if video and not (w.video_browser.accepts(video) and w.video_browser.matches_search(video)
                           and self.review.accepts(video)):
             notes.append('Current video is outside the video filters')
-        elif video and summary['state'] != 'loading' and not self.filters.accepts(self.summary(entry, task)):
+        elif video and summary['state'] != 'loading' and not self.filters.accepts(
+                self.summary(entry, task, assignments.get(video, {}).get('frames'))):
             notes.append('Current video kept visible outside these filters')
         self.note.setText('\n'.join(notes))
         self.note.setVisible(bool(notes))
         self.filters.update_filter_label()
         available = summary['state'] not in ('unknown', 'loading', 'not_scanned')
-        self.finish.setEnabled(bool(video and entry and task and available))
+        self.finish.setEnabled(bool(video and entry and task and available and not view_only))
         self.finish.setText('Reopen Work' if not dirty and summary.get('finished', 0) == summary.get('total', -1)
                             else 'Mark Finished')
         self._finish_tip = self.completion_tip(summary, state, task, video)
-        self.finish.setToolTip(self.completion_tip(summary, state, task, video, reopening=True)
+        self.finish.setToolTip('This frame is for viewing only. Choose one of your assigned frames.' if view_only
+                               else self.completion_tip(summary, state, task, video, reopening=True)
                                if self.finish.text() == 'Reopen Work' else self._finish_tip)
         self.next.setEnabled(bool(video and entry and task and available))
         if hasattr(w, 'frame_list'):
@@ -497,6 +502,12 @@ class AnnotationWorkBrowser(QObject):
                 if base is None:
                     base = item.text()
                     item.setData(Qt.ItemDataRole.UserRole + 40, base)
+                if item.data(Qt.ItemDataRole.UserRole + 45):
+                    # Outside the assignment: there for context, with no work to track.
+                    item.setText(base + ' · View only')
+                    item.setIcon(QIcon())
+                    item.setToolTip(item.data(Qt.ItemDataRole.UserRole + 43))
+                    continue
                 number = w._get_frame_idx_in_video(index)
                 # Before a video is chosen the list holds frames from every video.
                 frame_video = w.frame_video_ids[index] if index < len(w.frame_video_ids) else video
@@ -587,6 +598,8 @@ class AnnotationWorkBrowser(QObject):
         indices = w.frame_list_to_frames_map
         ordered = [i for i in indices if i > w.current_frame_idx] + [i for i in indices if i < w.current_frame_idx]
         for index in ordered:
+            if w._list_frame_view_only(index):
+                continue  # not this person's work
             summary = summarize(entry, task, [w._get_frame_idx_in_video(index)])
             if summary['state'] != 'finished':
                 w.frame_list.setCurrentRow(indices.index(index))

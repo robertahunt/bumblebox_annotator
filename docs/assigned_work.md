@@ -188,8 +188,10 @@ review status and its local availability. Mark Finished is local until an upload
 is verified. Only the director can move a submitted video to Accepted.
 
 Active videos that are not downloaded, have missing assigned frame images, have
-changed assignments, or have newer published video data are preselected. Already
-downloaded videos are unchecked. Hidden checkbox selections are cleared and never
+changed assignments, or have newer published video data are preselected. So are
+videos shown as **More frames to view**: working copies made before whole videos
+were downloaded, which hold only the assigned frame images. Already downloaded
+videos are unchecked. Hidden checkbox selections are cleared and never
 requested as new downloads. Use **Open Working Copy** to resume the existing copy
 without transferring files, or explicitly select downloaded videos to check for
 updates. The refresh icon rechecks review and local-copy status.
@@ -238,17 +240,24 @@ Project Home offers **Open Selected Project** and **Download Assigned Work**. Se
 
 ## Storage and Scope
 
-- Only selected frame images from assigned videos are downloaded. No original
-  videos, models, training outputs, or tracking sequences are downloaded.
+- Every published frame image of an assigned video is downloaded, whichever frames
+  are assigned, so the assigned frames can be judged in context: play the video or
+  step to neighbouring frames to see what moves. Frames outside the assignment are
+  **view only**. They are listed in italics as *View only*, the canvas shows a
+  *View only* label on them, editing tools do nothing there, and nothing on them is
+  saved or uploaded. Opening a video starts on an assigned frame, and **Next
+  unfinished** skips view-only frames. No original videos, models, training
+  outputs, or tracking sequences are downloaded.
 - The annotation policy and other project settings are copied unchanged. Settings other
   than the annotation policy (for example keypoints) are refreshed by later downloads.
-  Existing annotations for the selected videos are included, even for their
-  undownloaded frames, so shared masks and instance-ID allocation remain intact.
+  Existing annotations for the selected videos are included for every frame, so
+  shared masks and instance-ID allocation remain intact and the view-only frames
+  show their published masks.
   Their size is included in the estimate; selecting very long, densely annotated
   videos can still consume substantial space.
 - Only assigned frame annotations and the selected videos' shared masks can be
   published. **A shared-video mask still applies to the entire video**, including
-  undownloaded frames. The normal category policy guidance remains visible.
+  its view-only frames. The normal category policy guidance remains visible.
 - Setup, imports, calibration, split changes, and training/export are coordinator
   tasks. Policy can be reviewed but not edited in an assigned copy.
 - Publishing uploads new/changed annotation objects and a complete manifest
@@ -425,10 +434,19 @@ One contributor owns each video assignment, even if only some frames are assigne
 Two people should not edit the same video's shared masks concurrently.
 
 Reassigning a video or changing its assigned frame range or mask task retires the old assignment.
-Its local files remain intact. Downloading can refresh a changed assignment if
-the local video has no unpublished changes. If that video has edits, review is
-required before refreshing its task/range. Finish/publish current work before
-expanding an assignment when possible.
+Its local files remain intact. Until the working copy downloads the new assignment,
+its uploads are refused and the changed videos are left out of My Work.
+
+Downloading takes a changed assignment when the local video has no unpublished
+changes. When it does have them, the download still goes through if the published
+video itself is unchanged, the mask task is the same, and **every frame with
+unpublished work is still assigned**. Adding frames therefore never needs the
+student to upload first; their unpublished work is kept and uploads resume. Taking
+away a frame that has unpublished work, or changing the mask task over unpublished
+work, is refused with a message naming the frame or the task; nothing is
+overwritten. Assign that frame again, or restore the task, and the download goes
+through. Because the whole video is always downloaded for viewing, an assignment
+does not need to grow just so that someone can see the other frames.
 
 Incremental downloads include existing active assignments as well as the new
 selection. They preserve local edits when the published video is unchanged, and

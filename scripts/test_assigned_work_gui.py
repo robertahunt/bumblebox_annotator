@@ -6,11 +6,14 @@ import os
 import unittest
 from unittest.mock import patch
 
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QPoint, QSettings, Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QMessageBox, QDialog
 
 from core.assigned_work import read_assignments, save_assignments, workspace
 from core.contributors import new_session
+from core.project_delta import file_record
+from core.project_sync import _inventory
 from gui.assigned_work_dialog import (AssignmentManagerDialog, AssignedDownloadDialog,
                                       assigned_local_path, managed_copy_key)
 from gui.annotation_policy_dialog import AnnotationPolicyDialog
@@ -192,7 +195,9 @@ class AssignedWorkGuiTests(unittest.TestCase):
         local = self.download()
         window = self.make_window(local)
         self.assertEqual(window.video_list.count(), 1)
-        self.assertEqual(len(window.frames), 1)
+        self.assertEqual(len(window.frames), 3)  # the whole video; only frame 0 is assigned
+        self.assertEqual(window.current_frame_idx, 0)
+        self.assertFalse(window.canvas.view_only)
         self.assertEqual(window.current_video_id, 'alpha')
         self.assertTrue(all(not action.isEnabled() for action in window.full_project_actions))
         self.assertEqual(window.sync_project_action.text(), 'Upload Assigned Annotations')
@@ -234,9 +239,9 @@ class AssignedWorkGuiTests(unittest.TestCase):
         save_assignments(self.source, self.configuration, self.coordinator, self.choices, data['revision'])
         local = self.download()
         window = self.make_window(local)
-        self.assertEqual([p.stem for p in window.frames], ['frame_000000', 'frame_000002'])
+        self.assertEqual([window._list_frame_view_only(i) for i in range(len(window.frames))], [False, True, False])
         untouched = (local / 'annotations/json/alpha/frame_000001.json').read_bytes()
-        window.load_frame(1)
+        window.load_frame(2)
         self.assertEqual(window._get_frame_idx_in_video(window.current_frame_idx), 2)
         window.canvas.set_annotations([])
         window._mark_current_annotations_dirty()
@@ -244,6 +249,74 @@ class AssignedWorkGuiTests(unittest.TestCase):
         self.warnings.assert_not_called()
         self.assertEqual((local / 'annotations/json/alpha/frame_000001.json').read_bytes(), untouched)
         self.assertEqual(window.annotation_manager.load_frame_annotations(local, 'alpha', 2), [])
+
+    def records(self, local):
+        return {name: file_record(local / name) for name in _inventory(local, True)}
+
+    def test_whole_video_is_listed_and_unassigned_frames_are_view_only(self):
+        local = self.download()  # alpha: frame 0 of three is assigned
+        window = self.make_window(local)
+        self.assertEqual([p.stem for p in window.frames], ['frame_000000', 'frame_000001', 'frame_000002'])
+        self.assertEqual([window._list_frame_view_only(i) for i in range(3)], [False, True, True])
+        window.show()
+        self.app.processEvents()
+        blocked = []
+        window.canvas.view_only_blocked.connect(lambda: blocked.append(True))
+        window.canvas.set_tool('brush')
+        centre = window.canvas.viewport().rect().center()
+        saved = self.records(local)
+
+        window.load_frame(1)
+        self.assertTrue(window.canvas.view_only)
+        self.assertFalse(window.canvas._view_only_label.isHidden())
+        shown = [a['mask'].copy() for a in window.canvas.get_annotations()]
+        # The brush does nothing there, with either a click or a double click...
+        QTest.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=centre)
+        QTest.mouseDClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=centre + QPoint(3, 3))
+        self.assertGreaterEqual(len(blocked), 2)
+        self.assertFalse(window.canvas.is_drawing)
+        self.assertTrue(all((a['mask'] == b).all() for a, b in zip(window.canvas.get_annotations(), shown)))
+        self.assertIn('View only', window.status_label.text())
+        # ...and a change that reaches the canvas some other way is neither marked nor written.
+        annotations = window.canvas.get_annotations()
+        annotations[0]['mask'][0, 0] = 255
+        window.canvas.set_annotations(annotations)
+        window._mark_current_annotations_dirty()
+        self.assertFalse(window.current_frame_modified)
+        self.assertEqual(window._save_annotation_sources(force=True)['reason'], 'view_only')
+        window.annotation_work.apply()
+        self.assertTrue(window.frame_list.item(1).text().endswith('View only'))
+        self.assertFalse(window.frame_list.item(0).text().endswith('View only'))
+        self.assertFalse(window.annotation_work.finish.isEnabled())
+
+        window.load_frame(2)
+        window.load_frame(0)
+        window.save_worker.wait_until_idle()
+        self.assertFalse(window.canvas.view_only)
+        self.assertTrue(window.canvas._view_only_label.isHidden())
+        self.assertEqual(saved, self.records(local))  # looking at frames wrote nothing
+        before = len(blocked)
+        QTest.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=centre)
+        self.assertEqual(len(blocked), before)  # the assigned frame takes the brush as usual
+        self.warnings.assert_not_called()
+
+    def test_a_video_opens_on_a_frame_that_can_be_worked_on(self):
+        data = read_assignments(self.view())
+        self.choices['alpha']['frames'] = [2]
+        save_assignments(self.source, self.configuration, self.coordinator, self.choices, data['revision'])
+        window = self.make_window(self.download())
+        self.assertEqual(len(window.frames), 3)
+        self.assertEqual(window._get_frame_idx_in_video(window.current_frame_idx), 2)
+        self.assertFalse(window.canvas.view_only)
+
+    def test_a_full_project_has_no_view_only_frames(self):
+        with patch.object(MainWindow, 'load_settings'):
+            self.window = MainWindow()
+        self.window.set_contributor(self.coordinator)
+        self.window.load_project(self.source)
+        self.window.load_video_frames('alpha')
+        self.assertFalse(any(self.window._list_frame_view_only(i) for i in range(len(self.window.frames))))
+        self.assertFalse(self.window.canvas.view_only)
 
     def test_wrong_contributor_is_blocked_and_normal_project_restores_controls(self):
         local = self.download()
