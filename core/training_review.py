@@ -1,4 +1,8 @@
-"""A resumable, explicit opt-in queue for previously unselected bee frames."""
+"""A resumable, explicit opt-in queue for previously unselected bee frames.
+
+The queue is made once and its decisions are never reset. Frames that become
+candidates afterwards join it as pending each time the queue is opened.
+"""
 
 from copy import deepcopy
 from pathlib import Path
@@ -105,6 +109,30 @@ def create_queue(project, candidates=None, *, title='Unselected bee frames'):
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_json(path, queue)
     return queue
+
+
+def add_new_candidates(project):
+    """Add frames that became candidates since the queue was made, as pending.
+
+    Returns the queue and how many frames it gained. Earlier decisions are
+    never touched, nothing is selected for training, and the file is written
+    only when there is a frame to add. Without a queue yet, one is created.
+    """
+    project = Path(project)
+    require_full_project(project)
+    require_no_update(project)
+    queue = read_queue(project)
+    if queue is None:
+        return create_queue(project), 0
+    known = {_key(item) for item in queue['items']}
+    now = utc_now()
+    new = [{'video': candidate['video'], 'frame': candidate['frame'], 'status': 'pending', 'added_at': now}
+           for candidate in discover_candidates(project) if _key(candidate) not in known]
+    if not new:
+        return queue, 0
+    queue['items'] = sorted(queue['items'] + new, key=lambda x: (x['video'], x['frame']))
+    _write_json(project / QUEUE_FILE, queue)
+    return queue, len(new)
 
 
 def _nonempty_bees(project, video, frame):

@@ -6,7 +6,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (QComboBox, QDockWidget, QHBoxLayout, QLabel,
                             QMessageBox, QPushButton, QVBoxLayout, QWidget)
 
-from core.training_review import create_queue, record_decision
+from core.training_review import add_new_candidates, create_queue, record_decision
 from core.validation_review import selected_frame_indices
 
 
@@ -18,6 +18,7 @@ class TrainingReviewDock(QDockWidget):
         self.project = None
         self.queue = None
         self.position = None
+        self.notice = ''
         self.busy = False
         body = QWidget()
         layout = QVBoxLayout(body)
@@ -32,13 +33,13 @@ class TrainingReviewDock(QDockWidget):
         layout.addWidget(note)
         row = QHBoxLayout()
         self.filter = QComboBox()
-        for label, key in [('Pending', 'pending'), ('Incomplete', 'incomplete'),
-                           ('Complete', 'complete'), ('All frames', 'all')]:
+        for label, key in [('Pending', 'pending'), ('Pending, added later', 'added'),
+                           ('Incomplete', 'incomplete'), ('Complete', 'complete'), ('All frames', 'all')]:
             self.filter.addItem(label, key)
         row.addWidget(self.filter)
         self.previous = QPushButton('Previous')
-        self.complete = QPushButton('Complete — add & next')
-        self.incomplete = QPushButton('Incomplete — exclude & next')
+        self.complete = QPushButton('Complete — add && next')
+        self.incomplete = QPushButton('Incomplete — exclude && next')
         self.skip = QPushButton('Skip / next')
         self.reopen = QPushButton('Open review frame')
         for button in (self.previous, self.complete, self.incomplete, self.skip, self.reopen):
@@ -58,7 +59,21 @@ class TrainingReviewDock(QDockWidget):
 
     def start(self):
         self.project = Path(self.window.project_path)
-        self.queue = create_queue(self.project)
+        self.notice = ''
+        try:
+            # Frames that gained bee masks since the queue was made join it as pending.
+            self.queue, added = add_new_candidates(self.project)
+        except (OSError, ValueError) as exc:
+            # An existing queue still opens; a problem with the queue itself is raised again here.
+            self.queue, added = create_queue(self.project), 0
+            self.notice = 'New frames could not be checked: ' + str(exc)
+        if added:
+            self.notice = (('1 frame with bee masks has' if added == 1 else f'{added} frames with bee masks have') +
+                           ' been added to this queue since it was made. Added frames that are still '
+                           'pending are listed under "Pending, added later".')
+            self.filter.blockSignals(True)
+            self.filter.setCurrentIndex(self.filter.findData('added'))
+            self.filter.blockSignals(False)
         self.position = None
         if hasattr(self.window, 'workflow'):
             self.window.workflow.activate('Annotate')
@@ -67,8 +82,11 @@ class TrainingReviewDock(QDockWidget):
         self.navigate(reset=True)
 
     def matching(self):
-        return [i for i, item in enumerate(self.queue['items'])
-                if self.filter.currentData() in ('all', item['status'])]
+        view = self.filter.currentData()
+        if view == 'added':
+            return [i for i, item in enumerate(self.queue['items'])
+                    if item['status'] == 'pending' and item.get('added_at')]
+        return [i for i, item in enumerate(self.queue['items']) if view in ('all', item['status'])]
 
     def same_project(self):
         return self.project is not None and self.window.project_path is not None and (
@@ -118,11 +136,16 @@ class TrainingReviewDock(QDockWidget):
         counts = {status: sum(i['status'] == status for i in self.queue['items'])
                   for status in ('pending', 'complete', 'incomplete')}
         text = f"{counts['complete']} complete · {counts['incomplete']} incomplete · {counts['pending']} pending"
+        later = sum(item['status'] == 'pending' and bool(item.get('added_at')) for item in self.queue['items'])
+        if later:
+            text += f' ({later} added later)'
         if self.position is not None:
             item = self.queue['items'][self.position]
             text += f"\n{self.position + 1}/{len(self.queue['items'])} · {item['video']} · frame {item['frame']} · {item['status']}"
         else:
             text += '\nNo frames in this view. Choose another view to revisit decisions.'
+        if self.notice:
+            text += '\n' + self.notice
         self.label.setText(text)
 
     def open_current(self):

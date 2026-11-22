@@ -126,6 +126,8 @@ gaps separately before marking the annotation finished.
 See [importing between projects](docs/project_import.md) to copy selected frames and annotations, including converting frame-specific hive masks into an editable video-wide mask.
 Import previews disclose scope/meaning conflicts. **Project > Imported Frame Review...** opens the review queue; correct each affected frame and check **Imported labels reviewed for this frame** before training/export.
 
+Training and export use only the frames selected for a video's split. **Project > Review Bee Training Candidates...** lists training-split frames that have saved bee masks but are not selected: **Complete** adds a frame to training and **Incomplete** leaves it out. The queue is made once and keeps every decision. Each time it is opened, frames that have gained bee masks since then join it as pending, and the **Pending, added later** view shows only those.
+
 See [ArUco tag size measurement](docs/aruco_tag_measurement.md) to measure minimum and maximum tag sizes before batch optimization.
 
 Batch ArUco **Detection workers** runs the parameter bank concurrently within each

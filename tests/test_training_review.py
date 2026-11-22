@@ -134,6 +134,55 @@ def test_queue_validates_paths_and_never_auto_selects(project):
     assert _read_json(project / 'frames/video-a/video_metadata.json')['selected_frames'] == [0]
 
 
+def test_frames_that_become_candidates_later_join_as_pending(project, monkeypatch):
+    bees = project / 'annotations/json/video-a/frame_000002.json'
+    saved = bees.read_text()
+    bees.unlink()
+    review.create_queue(project)
+    person = new_session('Reviewer')
+    decided = review.record_decision(project, 'video-a', 1, True, person)['items'][0]
+
+    bees.write_text(saved)  # frame 2 gets its bee masks after the queue was made
+    queue, added = review.add_new_candidates(project)
+
+    assert added == 1
+    assert queue == review.read_queue(project)
+    assert queue['items'][0] == decided
+    later = queue['items'][1]
+    assert (later['video'], later['frame'], later['status']) == ('video-a', 2, 'pending')
+    assert later['added_at']
+    # Joining the queue selects nothing; the held-out video stays out of it.
+    assert _read_json(project / 'frames/video-a/video_metadata.json')['selected_frames'] == [0, 1]
+    assert {item['video'] for item in queue['items']} == {'video-a'}
+
+    # With nothing new, the file is left alone.
+    monkeypatch.setattr(review, '_write_json', Mock(side_effect=AssertionError('queue rewritten')))
+    assert review.add_new_candidates(project) == (queue, 0)
+
+
+def test_decided_frames_are_never_added_again(project):
+    review.create_queue(project)
+    review.record_decision(project, 'video-a', 1, False)
+    review.record_decision(project, 'video-a', 2, True)
+    before = review.read_queue(project)
+    assert review.add_new_candidates(project) == (before, 0)
+    assert [item['status'] for item in review.read_queue(project)['items']] == ['incomplete', 'complete']
+
+
+def test_a_hand_picked_queue_takes_in_the_other_candidates(project):
+    review.create_queue(project, [{'video': 'video-a', 'frame': 2}], title='Chosen frames')
+    queue, added = review.add_new_candidates(project)
+    assert added == 1 and queue['title'] == 'Chosen frames'
+    assert [(i['frame'], 'added_at' in i) for i in queue['items']] == [(1, True), (2, False)]
+
+
+def test_adding_without_a_queue_creates_one(project):
+    queue, added = review.add_new_candidates(project)
+    assert added == 0
+    assert [(i['frame'], i['status'], 'added_at' in i) for i in queue['items']] == [
+        (1, 'pending', False), (2, 'pending', False)]
+
+
 def test_higher_resolution_reaches_actual_current_frame_predict(app, monkeypatch):
     from gui.main_window import MainWindow
     toolbar = YOLOToolbar()
@@ -155,7 +204,9 @@ def test_higher_resolution_reaches_actual_current_frame_predict(app, monkeypatch
     toolbar.close()
 
 
-def test_navigation_goes_to_exact_frame_and_saves_then_adds(app, project, monkeypatch):
+@pytest.fixture
+def review_window(app, project, monkeypatch):
+    """A main window on the project, with frame loading replaced by bookkeeping, and its review dock."""
     from gui.main_window import MainWindow
     monkeypatch.setattr(MainWindow, 'load_settings', lambda self: None)
     window = MainWindow()
@@ -178,28 +229,7 @@ def test_navigation_goes_to_exact_frame_and_saves_then_adds(app, project, monkey
     monkeypatch.setattr(window, 'load_video_frames', load_video)
     monkeypatch.setattr(window, 'load_frame', load_frame)
     try:
-        dock.start()
-        assert window.current_frame_idx == 1
-        assert dock.current_matches()
-        dock.decide(True)
-        assert _read_json(project / 'frames/video-a/video_metadata.json')['selected_frames'] == [0, 1]
-        assert window.current_frame_idx == 2
-        dock.decide(False)
-        assert dock.position is None
-        assert [r['status'] for r in review.read_queue(project)['items']] == ['complete', 'incomplete']
-        dock.filter.setCurrentIndex(dock.filter.findData('incomplete'))
-        assert window.current_frame_idx == 2
-        # Navigating elsewhere cannot accidentally approve the queued frame.
-        window.current_frame_idx = 0
-        dock.decide(True)
-        assert _read_json(project / 'frames/video-a/video_metadata.json')['selected_frames'] == [0, 1]
-        # A failed source save must leave the review and selection untouched.
-        window.current_frame_idx = 2
-        monkeypatch.setattr(window, '_save_annotation_sources', Mock(side_effect=OSError('save failed')))
-        monkeypatch.setattr(QMessageBox, 'warning', Mock())
-        dock.decide(True)
-        assert dock.position == 1
-        assert _read_json(project / 'frames/video-a/video_metadata.json')['selected_frames'] == [0, 1]
+        yield window, dock
     finally:
         dock.timer.stop()
         dock.close()
@@ -208,3 +238,68 @@ def test_navigation_goes_to_exact_frame_and_saves_then_adds(app, project, monkey
         monkeypatch.setattr('gui.main_window.QSettings', Mock())
         window.close()
         app.processEvents()
+
+
+def test_navigation_goes_to_exact_frame_and_saves_then_adds(project, monkeypatch, review_window):
+    window, dock = review_window
+    dock.start()
+    assert window.current_frame_idx == 1
+    assert dock.current_matches()
+    assert dock.filter.currentData() == 'pending' and 'added' not in dock.label.text()
+    dock.decide(True)
+    assert _read_json(project / 'frames/video-a/video_metadata.json')['selected_frames'] == [0, 1]
+    assert window.current_frame_idx == 2
+    dock.decide(False)
+    assert dock.position is None
+    assert [r['status'] for r in review.read_queue(project)['items']] == ['complete', 'incomplete']
+    dock.filter.setCurrentIndex(dock.filter.findData('incomplete'))
+    assert window.current_frame_idx == 2
+    # Navigating elsewhere cannot accidentally approve the queued frame.
+    window.current_frame_idx = 0
+    dock.decide(True)
+    assert _read_json(project / 'frames/video-a/video_metadata.json')['selected_frames'] == [0, 1]
+    # A failed source save must leave the review and selection untouched.
+    window.current_frame_idx = 2
+    monkeypatch.setattr(window, '_save_annotation_sources', Mock(side_effect=OSError('save failed')))
+    monkeypatch.setattr(QMessageBox, 'warning', Mock())
+    dock.decide(True)
+    assert dock.position == 1
+    assert _read_json(project / 'frames/video-a/video_metadata.json')['selected_frames'] == [0, 1]
+
+
+def test_opening_the_review_brings_in_new_frames_and_shows_them(project, review_window):
+    window, dock = review_window
+    review.create_queue(project, [{'video': 'video-a', 'frame': 1}])  # made before frame 2 had masks
+
+    dock.start()
+
+    assert [(i['frame'], i['status']) for i in review.read_queue(project)['items']] == [(1, 'pending'), (2, 'pending')]
+    assert dock.filter.currentData() == 'added'
+    assert '1 frame with bee masks has been added' in dock.label.text()
+    assert '2 pending (1 added later)' in dock.label.text()
+    assert window.current_frame_idx == 2 and dock.current_matches()
+    assert dock.matching() == [1]
+    dock.filter.setCurrentIndex(dock.filter.findData('pending'))
+    assert dock.matching() == [0, 1]
+    dock.filter.setCurrentIndex(dock.filter.findData('added'))
+    dock.decide(True)
+    assert _read_json(project / 'frames/video-a/video_metadata.json')['selected_frames'] == [0, 2]
+    assert dock.matching() == [] and dock.position is None
+
+    # Opening again adds nothing, keeps the decision and says nothing about new frames.
+    dock.start()
+    assert [(i['frame'], i['status']) for i in review.read_queue(project)['items']] == [(1, 'pending'), (2, 'complete')]
+    assert 'added to this queue' not in dock.label.text() and 'added later' not in dock.label.text()
+
+
+def test_review_still_opens_when_new_frames_cannot_be_checked(project, review_window):
+    window, dock = review_window
+    review.create_queue(project)
+    before = review.read_queue(project)
+    (project / 'frames/video-a/video_metadata.json').write_text('{not json')  # unreadable video settings
+
+    dock.start()
+
+    assert review.read_queue(project) == before
+    assert 'New frames could not be checked' in dock.label.text()
+    assert dock.filter.currentData() == 'pending' and window.current_frame_idx == 1
