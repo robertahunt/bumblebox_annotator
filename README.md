@@ -128,6 +128,8 @@ Import previews disclose scope/meaning conflicts. **Project > Imported Frame Rev
 
 Training and export use only the frames selected for a video's split. **Project > Review Bee Training Candidates...** lists training-split frames that have saved bee masks but are not selected: **Complete** adds a frame to training and **Incomplete** leaves it out. The queue is made once and keeps every decision. Each time it is opened, frames that have gained bee masks since then join it as pending, and the **Pending, added later** view shows only those.
 
+In the training dialog, **Image Size** is the model input: every image is scaled so that its longer side equals it. **Full resolution**, offered for whole-frame mask and box training, uses the longest image side found in the training and validation images, rounded up to a multiple of 32, so no image is reduced. Images with a shorter long side are enlarged to match, and the training log lists the size and each enlargement. It needs the most memory, so choosing it sets **Batch Size** to 1; raise that only after a run at 1 has worked. Measured on four crowded 4096-pixel frames with an NVIDIA RTX A5000 at batch size 1: about 19 GB of graphics memory at full resolution, against 12 GB at 3072. Preparing a frame also takes ordinary memory: 5.4 GB at 3072 for a frame with 107 bees, which scales to about 9 GB at 4096. An Apple GPU trains at full precision and needs more graphics memory (about 26 GB, estimated from the same frames on the NVIDIA card); full resolution has not been run on a Mac.
+
 See [ArUco tag size measurement](docs/aruco_tag_measurement.md) to measure minimum and maximum tag sizes before batch optimization.
 
 Batch ArUco **Detection workers** runs the parameter bank concurrently within each

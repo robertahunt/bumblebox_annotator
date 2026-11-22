@@ -11,6 +11,7 @@ from pathlib import Path
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
 from training.gpu import require_training_device
+from training.image_size import resolve_image_size
 from .carbon_tracking import CarbonTrainingRun
 
 try:
@@ -225,6 +226,12 @@ class YOLOTrainingWorkerBBox(QThread):
     def _train_model(self, dataset_yaml):
         """Train YOLO bbox detection model"""
         device, device_label = require_training_device()
+        data_dir = Path(dataset_yaml).parent
+        image_size, size_note = resolve_image_size(
+            self.config.get('imgsz', 1024), [data_dir / 'train' / 'images', data_dir / 'val' / 'images'])
+        if size_note:
+            self.stage_update.emit(size_note)
+            print(size_note)
         self.stage_update.emit(f"Using GPU: {device_label}")
         print(f"YOLO bbox training using GPU: {device_label}")
 
@@ -239,7 +246,7 @@ class YOLOTrainingWorkerBBox(QThread):
         training_params = {
             'data': str(dataset_yaml),
             'epochs': self.config.get('epochs', 1000),
-            'imgsz': self.config.get('imgsz', 1024),
+            'imgsz': image_size,
             'batch': self.config.get('batch', 8),
             'name': self.config.get('name', 'bee_bbox_detection'),
             'project': str(output_dir.absolute()),

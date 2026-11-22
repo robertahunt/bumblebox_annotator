@@ -3,6 +3,7 @@ Training progress dialog for YOLO model training
 """
 
 from core.categories import BROOD_MODEL_LABEL
+from training.image_size import FULL_RESOLUTION, FULL_RESOLUTION_LABEL
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QProgressBar, QTextEdit, QGroupBox,
@@ -459,11 +460,14 @@ class TrainingConfigDialog(QDialog):
             self.imgsz_combo.setCurrentText('640')
         if not (self.stage2 or self.sahi or self.beehavesque or self.instance_focused):
             self.imgsz_combo.addItems(['2560', '3072'])
+            self.imgsz_combo.addItem(FULL_RESOLUTION_LABEL, FULL_RESOLUTION)
         self.imgsz_combo.setToolTip(
             'Model input size in pixels, not the display size. Aspect ratio is preserved with padding. '
             'Higher sizes retain more detail but need more GPU memory. '
-            'For 2560 or 3072, start with batch size 1 and compare held-out masks at the same input size.')
+            'For 2560, 3072 or full resolution, start with batch size 1 and compare held-out masks '
+            'at the same input size.')
         params_layout.addRow("Image Size:", self.imgsz_combo)
+        self.imgsz_combo.currentIndexChanged.connect(self.on_image_size_changed)
         
         # Learning rate
         self.lr_combo = QComboBox()
@@ -486,6 +490,15 @@ class TrainingConfigDialog(QDialog):
         
         params_group.setLayout(params_layout)
         layout.addWidget(params_group)
+
+        # Below the group, not inside the form: a wrapped label in a form row is cut short.
+        self.full_resolution_note = QLabel(
+            'Full resolution uses the longest image side in the training data, so no image is '
+            'reduced. The training log shows the size in pixels. It needs the most memory, so '
+            'Batch Size has been set to 1. Raise it only after a run at 1 has worked.')
+        self.full_resolution_note.setWordWrap(True)
+        self.full_resolution_note.hide()
+        layout.addWidget(self.full_resolution_note)
         
         # Data Export Options
         export_group = QGroupBox("Data Export")
@@ -826,6 +839,17 @@ class TrainingConfigDialog(QDialog):
         
         layout.addLayout(button_layout)
 
+    def on_image_size_changed(self):
+        full = self.imgsz_combo.currentData() == FULL_RESOLUTION
+        if full:
+            self.batch_spin.setValue(1)
+        if full != self.full_resolution_note.isHidden():
+            return  # the note already matches the choice; leave the window's size alone
+        self.full_resolution_note.setVisible(full)
+        # A wrapped label does not make the window grow by itself; without this the rows above are squeezed.
+        self.layout().activate()
+        self.adjustSize()
+
     def on_model_type_changed(self, type_text):
         """Keep the default experiment name aligned with the selected model type."""
         if self.stage2 or self.sahi or self.beehavesque or self.instance_focused:
@@ -860,7 +884,8 @@ class TrainingConfigDialog(QDialog):
         config = {
             'epochs': self.epochs_spin.value(),
             'batch': self.batch_spin.value(),
-            'imgsz': int(self.imgsz_combo.currentText()),
+            # A number, or FULL_RESOLUTION for the trainer to work out from the prepared images.
+            'imgsz': self.imgsz_combo.currentData() or int(self.imgsz_combo.currentText()),
             'lr0': float(self.lr_combo.currentText()),
             'patience': self.patience_spin.value(),
             'name': self.name_combo.currentText(),

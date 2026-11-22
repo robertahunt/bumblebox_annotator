@@ -11,6 +11,7 @@ from pathlib import Path
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
 from training.gpu import require_training_device
+from training.image_size import resolve_image_size
 from core.coco_masks import decode_segmentation
 from .carbon_tracking import CarbonTrainingRun
 
@@ -288,6 +289,11 @@ class YOLOTrainingWorker(QThread):
     def _train_model(self, dataset_yaml):
         """Train YOLO model"""
         device, device_label = require_training_device()
+        images = Path(dataset_yaml).parent / 'images'
+        image_size, size_note = resolve_image_size(self.config.get('imgsz', 640), [images / 'train', images / 'val'])
+        if size_note:
+            self.stage_update.emit(size_note)
+            print(size_note)
         self.stage_update.emit(f"Using GPU: {device_label}")
         print(f"YOLO training using GPU: {device_label}")
 
@@ -299,7 +305,7 @@ class YOLOTrainingWorker(QThread):
         training_params = {
             'data': str(dataset_yaml),
             'epochs': self.config.get('epochs', 50),
-            'imgsz': self.config.get('imgsz', 640),
+            'imgsz': image_size,
             'batch': self.config.get('batch', 8),
             'name': self.config.get('name', 'bee_segmentation'),
             'project': str(output_dir.absolute()),
