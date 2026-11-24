@@ -167,6 +167,8 @@ def validate_coco_reviews(project, paths):
     require_full_project(project)
     policies = category_policies(read_project_info(project))
     records = read_reviews(project)
+    from core.intake import held_categories, held_work, is_held
+    held = held_work(project)
     for path in paths:
         coco = _read_json(path)
         images = coco.get('images', [])
@@ -188,6 +190,13 @@ def validate_coco_reviews(project, paths):
         for im, video, index in references:
             selections.setdefault(video, set()).add(index)
         require_reviewed(project, selections)
+        names = {category['id']: category['name'] for category in coco.get('categories', [])}
+        videos = {im.get('id'): video for im, video, _ in references}
+        if (any(is_held(held, video, index) for _, video, index in references) or
+                any(names.get(ann.get('category_id')) in held_categories(held, videos.get(ann.get('image_id')))
+                    for ann in coco.get('annotations', []))):
+            raise ValueError('The cached COCO export includes contributor work that has not been accepted yet. '
+                             'Re-export COCO before training.')
         exported_policy = coco.get('info', {}).get('annotation_policy')
         if exported_policy is not None and exported_policy != policies:
             raise ValueError('Annotation policy changed. Re-export COCO before training.')

@@ -159,13 +159,16 @@ class PreparedSubmissionReview:
         baseline = base['manifest']['files']
         if state.get('approved') and state.get('project_id') == view.project_id:
             baseline = state['local_baseline']
+        from core.intake import read_state
+        # A version that automatic intake brought in is their work, not a change made here.
+        taken_in = (read_state(self.project)['videos'].get(video) or {}).get('files')
         for name in self.local.keys() | incoming.keys():
             if cancelled():
                 raise InterruptedError('Review opening cancelled.')
             local, remote = self.local.get(name), incoming.get(name)
             if local == remote:
                 continue
-            if unfinished or local != baseline.get(name):
+            if unfinished or (local != baseline.get(name) and (taken_in is None or local != taken_in.get(name))):
                 self.conflicts.append(name)
             self.before[name], self.after[name] = local, remote
             if remote:
@@ -244,6 +247,15 @@ class PreparedSubmissionReview:
         return dict(result, entry=self.entry)
 
 
+def _record_acceptance(project, entry, revision, original, result):
+    """Accepted work is no longer held out of export and training by automatic intake."""
+    from core.intake import _assignment_files, mark_accepted
+    try:
+        mark_accepted(project, entry, revision, _assignment_files(original['manifest']['files'], entry))
+    except (OSError, ValueError) as exc:
+        result.setdefault('warning', 'Approval was published; the local intake record could not be updated: ' + str(exc))
+
+
 def approve_review(project, configuration, contributor, video, revision, assignment_id,
                    progress=lambda text: None, cancelled=lambda: False):
     project = Path(project).resolve()
@@ -261,6 +273,7 @@ def approve_review(project, configuration, contributor, video, revision, assignm
                     _write_json(project / _state_name(video), dict(state, approved=True, local_baseline=local))
                 except OSError as exc:
                     result['warning'] = 'Approval was published; local review receipt could not be updated: ' + str(exc)
+                _record_acceptance(project, entry, revision, original, result)
                 return result
             raise ValueError('This submission was already accepted. Refresh the review queue.')
         if not _same_session(state, view, entry, contributor, revision):
@@ -357,4 +370,5 @@ def approve_review(project, configuration, contributor, video, revision, assignm
             _write_json(project / _state_name(video), dict(state, approved=True, local_baseline=local))
         except OSError as exc:
             result['warning'] = 'Approval was published; local review receipt could not be updated: ' + str(exc)
+        _record_acceptance(project, entry, revision, original, result)
         return result

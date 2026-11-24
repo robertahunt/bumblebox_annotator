@@ -149,7 +149,8 @@ one minute apart. Transfers briefly pause editing in a cancellable progress dial
 to protect the saved snapshot. They never start during a stroke or while saves
 are outstanding. Only changed annotation content is transferred, with existing
 conflict checks and upload verification. No automatic merging or downloading is
-introduced. Full-project/director backups still use the explicit backup workflow.
+introduced in a contributor's copy; the director's project takes uploaded work in by
+itself ([Automatic Intake](assigned_work.md#automatic-intake)). Full-project/director backups still use the explicit backup workflow.
 
 After verification, all required assigned frames must have matching completion
 records for the assigned task before the video is made ready for review. A

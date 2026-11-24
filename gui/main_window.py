@@ -1297,6 +1297,9 @@ class MainWindow(QMainWindow):
         submission_review_action = QAction('Review Submitted Work...', self)
         submission_review_action.triggered.connect(self.review_submissions)
         project_menu.addAction(submission_review_action)
+        intake_action = QAction('Shared Work Intake...', self)
+        intake_action.triggered.connect(self.show_intake)
+        project_menu.addAction(intake_action)
         self.ready_work_action = QAction('Submit Current Video for Review...', self)
         self.ready_work_action.triggered.connect(lambda: self.publish_assigned_work(ready=True))
         self.ready_work_action.setVisible(False)
@@ -1422,6 +1425,19 @@ class MainWindow(QMainWindow):
             self.submission_review_dock.start()
         except Exception as exc:
             QMessageBox.warning(self, 'Review Queue Unavailable', str(exc))
+
+    def show_intake(self):
+        """What automatic intake has taken in from contributors, holds back, or left alone."""
+        if not self.project_path or workspace(self.project_path):
+            QMessageBox.information(self, 'Open a Project',
+                                    "Open the director's local project to see the work taken in from contributors.")
+            return
+        from gui.automatic_intake import IntakeDialog
+        if getattr(self, 'intake_dialog', None) is None:
+            self.intake_dialog = IntakeDialog(self)
+        self.intake_dialog.refresh()
+        self.intake_dialog.show()
+        self.intake_dialog.raise_()
 
     def manage_assignments(self):
         if not self.project_path or not self.contributor_session:
@@ -10101,6 +10117,7 @@ class MainWindow(QMainWindow):
                 return progress.wasCanceled()
             
             coco_files_generated = []
+            held_out = []  # contributor work taken in but not accepted yet
             
             # Export train split if videos exist
             if train_videos:
@@ -10112,7 +10129,8 @@ class MainWindow(QMainWindow):
                     image_width=self.annotation_manager.image_width,
                     image_height=self.annotation_manager.image_height,
                     progress_callback=update_progress,
-                    cancel_check=check_cancelled
+                    cancel_check=check_cancelled,
+                    held_out=held_out
                 )
                 if train_paths is None:  # Cancelled
                     self.status_label.setText("Export cancelled")
@@ -10129,7 +10147,8 @@ class MainWindow(QMainWindow):
                     image_width=self.annotation_manager.image_width,
                     image_height=self.annotation_manager.image_height,
                     progress_callback=update_progress,
-                    cancel_check=check_cancelled
+                    cancel_check=check_cancelled,
+                    held_out=held_out
                 )
                 if val_paths is None:  # Cancelled
                     self.status_label.setText("Export cancelled")
@@ -10146,7 +10165,8 @@ class MainWindow(QMainWindow):
                     image_width=self.annotation_manager.image_width,
                     image_height=self.annotation_manager.image_height,
                     progress_callback=update_progress,
-                    cancel_check=check_cancelled
+                    cancel_check=check_cancelled,
+                    held_out=held_out
                 )
                 if test_paths is None:  # Cancelled
                     self.status_label.setText("Export cancelled")
@@ -10158,12 +10178,20 @@ class MainWindow(QMainWindow):
             
             # Show success message
             files_list = '\n'.join(coco_files_generated)
+            held_note = ''
+            if held_out:
+                frames = sum(1 for kind, _, _ in held_out if kind == 'frame')
+                masks = sum(1 for kind, _, _ in held_out if kind == 'shared')
+                parts = ([f"{frames} frame{'s' if frames != 1 else ''}"] if frames else []) + (
+                    [f"{masks} video-wide mask{'s' if masks != 1 else ''}"] if masks else [])
+                held_note = (f"\n\nLeft out: {' and '.join(parts)} with contributor work that was taken in but is "
+                             "not accepted yet. Accept it under Project > Shared Work Intake... to include it.")
             QMessageBox.information(
                 self,
                 "Export Successful",
                 f"COCO format annotations exported successfully!\n\n"
                 f"{files_list}\n\n"
-                f"Location: {self.project_path / 'annotations/coco'}"
+                f"Location: {self.project_path / 'annotations/coco'}" + held_note
             )
             self.coco_export_dirty = False
             self.status_label.setText(f"✓ Exported COCO format ({files_list})")

@@ -14,13 +14,14 @@ from core.annotation_scope import frame_categories, read_project_info, merge_ann
 from core.coco_masks import encode_mask, decode_segmentation
 from core.annotation_policy import category_policies
 from core.import_review import require_reviewed, selected_frames, export_review_metadata
+from core.intake import held_categories, held_work, is_held
 from core import keypoints as keypoints_module
 
 
 def export_coco_per_video(project_path: Path, video_ids: List[str], 
                           split_name: str, class_names: List[str] = None,
                           image_width: int = 1920, image_height: int = 1080,
-                          progress_callback=None, cancel_check=None):
+                          progress_callback=None, cancel_check=None, held_out=None):
     """
     Export annotations as separate COCO JSON files per video
     
@@ -56,6 +57,8 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
     keypoint_config = keypoints_module.config_from_project_info(
         project_info.get('project_info', project_info))  # None unless the project uses keypoints
     require_reviewed(project_path, selected_frames(project_path, video_ids))
+    # Contributor work that automatic intake brought in stays out until the director accepts it.
+    held = held_work(project_path)
     
     # Create category name to ID mapping
     category_name_to_id = {name: i + 1 for i, name in enumerate(class_names)}
@@ -185,6 +188,11 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
                     category = ann_meta.get('category', 'chamber')
                     if category in per_frame_categories:
                         continue
+                    if category in held_categories(held, video_name):
+                        # A video-wide mask a contributor changed, not accepted yet: the frames go out without it.
+                        if held_out is not None and ('shared', video_name, category) not in held_out:
+                            held_out.append(('shared', video_name, category))
+                        continue
                     
                     # Ensure category_id is correctly set based on category name
                     # This overrides any incorrect category_id that might be in the metadata
@@ -222,6 +230,10 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
             
             # Skip frames not selected for this split
             if frame_idx not in selected_frame_indices:
+                continue
+            if is_held(held, video_name, frame_idx):
+                if held_out is not None:
+                    held_out.append(('frame', video_name, frame_idx))
                 continue
             
             # Load annotations from PNG+JSON and bbox folder
@@ -411,7 +423,7 @@ def export_coco_per_video(project_path: Path, video_ids: List[str],
 
 def export_coco_with_tracking(project_path: Path, video_ids: List[str], 
                                split_name: str, class_names: List[str] = None,
-                               image_width: int = 1920, image_height: int = 1080):
+                               image_width: int = 1920, image_height: int = 1080, held_out=None):
     """
     Export annotations in enhanced COCO format with video tracking support
     
@@ -442,6 +454,8 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
     keypoint_config = keypoints_module.config_from_project_info(
         project_info.get('project_info', project_info))  # None unless the project uses keypoints
     require_reviewed(project_path, selected_frames(project_path, video_ids))
+    # Contributor work that automatic intake brought in stays out until the director accepts it.
+    held = held_work(project_path)
 
     # Create category name to ID mapping
     category_name_to_id = {name: i + 1 for i, name in enumerate(class_names)}
@@ -564,6 +578,11 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
                     category = ann_meta.get('category', 'chamber')
                     if category in per_frame_categories:
                         continue
+                    if category in held_categories(held, video_name):
+                        # A video-wide mask a contributor changed, not accepted yet: the frames go out without it.
+                        if held_out is not None and ('shared', video_name, category) not in held_out:
+                            held_out.append(('shared', video_name, category))
+                        continue
 
                     # Ensure category_id is correctly set based on category name
                     # This overrides any incorrect category_id that might be in the metadata
@@ -594,6 +613,10 @@ def export_coco_with_tracking(project_path: Path, video_ids: List[str],
             
             # Skip frames that are not selected for this split
             if frame_idx not in selected_frame_indices:
+                continue
+            if is_held(held, video_name, frame_idx):
+                if held_out is not None:
+                    held_out.append(('frame', video_name, frame_idx))
                 continue
             
             # Load annotations from PNG+JSON and bbox folder

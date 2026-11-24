@@ -304,6 +304,46 @@ still blocks publication until repaired and rechecked. Full-project backup
 publication retains its separate presence/size checks; this change applies to
 assigned-work uploads.
 
+## Automatic Intake
+
+On the director's computer, work that contributors upload on their assigned videos
+is copied into the full project by itself, finished or not. Nothing has to be
+submitted first and there is nothing to click.
+
+- **When.** About every two minutes while the project is open and the shared folder
+  is reachable, the app checks whether anyone has published. Only then does it
+  compare files, in the background. Copying waits until nothing is being drawn or
+  saved and no review is open, and shows a short progress dialog while it runs.
+- **What.** Each contributor's latest publication, for the frames and video-wide
+  masks of their assignments: the same files a review loads. Other videos,
+  unassigned frames and project settings are not touched. An assigned frame image
+  this project lacks is copied; an image that differs stops that video.
+- **Never over your own changes.** If a video's assigned annotations were changed
+  here since their last version arrived, the video is skipped and listed under
+  **Project > Shared Work Intake...**, with two choices. **Use Their Version**
+  replaces yours, which goes to Local Rollback History. **Keep Mine** leaves it,
+  and asks again only when they upload again. An open, unapproved review is left
+  alone as well. A version you accepted, including corrections you published with
+  the approval, is replaced only by work they did after downloading it.
+- **Reversible.** Every copy goes through the same verified, journalled update as a
+  review and leaves a rollback bundle. Only the newest 30 intake bundles are kept;
+  an older one holds a superseded published version, which stays in the shared folder.
+- **Held until accepted.** Frames a contributor really changed, and video-wide masks
+  they changed, are held: COCO export leaves them out and says how many, and
+  training refuses an older cached export that contains them. A frame they only
+  opened is not held (opening re-saves files without changing an annotation), and
+  a held nest mask does not hold the video's bee frames. Accepting the work
+  releases it.
+- **Accepting.** **Review Submitted Work** works as before, and usually opens
+  without a comparison step because the submitted version is already here. For
+  submitted videos you have not changed, **Accept Selected** in the intake window
+  accepts several at once. **Stop Holding** releases work without accepting it.
+- **Off switch.** The checkbox at the top of the intake window, for that computer.
+
+Intake does not submit anything for a contributor and does not merge two people's
+edits. It does not advance this copy's shared history either: a full-project backup
+still follows the usual update workflow.
+
 ## Review
 
 The coordinator opens the **Assignments** workspace (also reachable through

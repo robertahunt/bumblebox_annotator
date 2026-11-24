@@ -368,6 +368,8 @@ class WorkspaceController(QObject):
         self.save_timer.timeout.connect(self.autosave)
         from gui.automatic_work import AutomaticWork
         self.automatic_work = AutomaticWork(self)
+        from gui.automatic_intake import AutomaticIntake
+        self.automatic_intake = AutomaticIntake(self)  # the director's side: take uploaded work in
         self.update_button.hide()
         self.update_help.hide()
         self.show_home()
@@ -838,6 +840,7 @@ class WorkspaceController(QObject):
     def stop_check(self):
         self.save_timer.stop()
         stopped = self.automatic_work.stop()
+        stopped = self.automatic_intake.stop() and stopped
         stopped = self.home.inbox.stop() and stopped
         stopped = self.assignments_page.stop() and stopped
         stopped = self.window.video_browser.stop() and stopped

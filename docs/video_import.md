@@ -40,6 +40,10 @@ objects of the target class on frames used for training or validation. Hive,
 chamber, and pollen masks stored at video level are reused on included frames;
 check that those masks remain accurate across the video.
 
+Contributor work that [automatic intake](assigned_work.md#automatic-intake) copied into the
+director's project is the exception: the frames and video-wide masks a contributor
+changed are left out of export, with a count, until the director accepts them.
+
 Re-export COCO after annotation changes before training. These rules describe
 the current GUI export and segmentation trainer, not every external COCO
 consumer or the separate bbox-training path.

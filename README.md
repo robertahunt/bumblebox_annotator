@@ -161,7 +161,9 @@ updates, local rollback history, and collaboration safeguards.
 
 For smaller contributor laptops, [Assigned Work](docs/assigned_work.md) lets a
 coordinator assign videos, download only selected frame images, and publish
-annotation changes without copying the whole project.
+annotation changes without copying the whole project. On the coordinator's computer, uploaded work is
+[taken in automatically](docs/assigned_work.md#automatic-intake), never over local changes, and stays out of
+export and training until accepted.
 
 Contributor identities can be [shared between computers](docs/shared_profiles.md)
 through an optional shared-folder profile directory, without exchanging files manually.
