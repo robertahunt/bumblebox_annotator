@@ -76,6 +76,20 @@ def test_dialog_offers_full_resolution_for_whole_frame_training_only(app):
     crops.close()
 
 
+def test_dialog_offers_3584_between_3072_and_full_resolution_for_whole_frames_only(app):
+    dialog = TrainingConfigDialog()
+    sizes = [dialog.imgsz_combo.itemText(index) for index in range(dialog.imgsz_combo.count())]
+    assert sizes[-3:] == ['3072', '3584', FULL_RESOLUTION_LABEL]
+    dialog.imgsz_combo.setCurrentText('3584')
+    config = dialog.get_config()
+    assert config['imgsz'] == 3584 and config['imgsz'] % 32 == 0  # the model needs a multiple of 32
+    assert dialog.full_resolution_note.isHidden()
+    dialog.close()
+    crops = TrainingConfigDialog(instance_focused=True)
+    assert crops.imgsz_combo.findText('3584') == -1
+    crops.close()
+
+
 def test_mask_training_passes_the_full_resolution_size_and_says_what_it_is(app, tmp_path):
     write_images(tmp_path / 'images' / 'train', [(128, 96), (104, 95)])
     write_images(tmp_path / 'images' / 'val', [(126, 95)])
