@@ -24,7 +24,8 @@ or a security role. Use the same updated app version on every computer.
    changing your active person; new profiles appear automatically on connected
    computers. **Import Profile...** inside People remains a fallback.
 5. Search/filter the video table and check several videos, or **Select Visible**.
-   Choose **Assign Selected Videos...**, choose a contributor, and choose **All
+   Choose **Assign Selected Videos...**, choose a contributor and what to work on
+   (a mask task is required), and choose **All
    extracted frames** or **Specific frames**, such as `0,5-10`. Review the list and
    confirm **Assign Work**. Frame ranges must exist in every selected video.
 Assignments are saved immediately; no downloads are started on another computer.
@@ -343,6 +344,11 @@ submitted first and there is nothing to click.
 Intake does not submit anything for a contributor and does not merge two people's
 edits. It does not advance this copy's shared history either: a full-project backup
 still follows the usual update workflow.
+
+Automatic submission needs a mask task, so every new assignment must name one.
+**Select Without Task (N)** in Assignments checks the older assignments that have
+none; assign them again with a task. That retires the old assignment, so the
+contributor downloads the new one before their uploads resume.
 
 ## Review
 

@@ -202,6 +202,24 @@ class AssignmentOnboardingGuiTests(unittest.TestCase):
         self.app.processEvents()
         page.grab().save('/tmp/bumblebox-assignment-workspace.png')
 
+    def test_assignments_without_a_task_are_counted_and_selected_in_one_step(self):
+        # The fixture's two assignments have no task; give beta one, so only alpha lacks it.
+        data = read_assignments(self.view())
+        choices = {video: {'contributor': entry['contributor'], 'frames': entry['frames']}
+                   for video, entry in data['videos'].items()}
+        choices['beta']['task'] = 'bee'
+        save_assignments(self.source, self.configuration, self.coordinator, choices, data['revision'])
+        flow = self.load()
+        self.settle()
+        flow.activate('Assignments')
+        self.settle_assignments()
+        panel = flow.assignments_page.panel
+        self.assertFalse(panel.select_taskless.isHidden())
+        self.assertEqual(panel.select_taskless.text(), 'Select Without Task (1)')
+        panel.check_visible()
+        panel.select_taskless.click()
+        self.assertEqual(panel.checked_videos(), ['alpha'])
+
     def test_bulk_review_validates_ranges_and_never_assigns_on_cancel(self):
         dialog = BulkAssignmentDialog(['alpha', 'beta'], {'alpha': {'frames': [0, 1]},
             'beta': {'frames': [0]}}, {self.alex['id']: self.alex})
@@ -216,8 +234,13 @@ class AssignmentOnboardingGuiTests(unittest.TestCase):
         with patch('gui.assigned_work_dialog.TransferConfirmationDialog.exec', return_value=QDialog.DialogCode.Rejected):
             dialog.review()
         self.assertIsNone(dialog.choices)
-        with patch('gui.assigned_work_dialog.TransferConfirmationDialog.exec', return_value=QDialog.DialogCode.Accepted):
+        with patch('gui.assigned_work_dialog.TransferConfirmationDialog.exec', return_value=QDialog.DialogCode.Accepted) as review:
+            dialog.review()  # no mask task chosen yet
+            review.assert_not_called()
+            self.assertIsNone(dialog.choices)
+            dialog.task.setCurrentIndex(dialog.task.findData('bee'))
             dialog.review()
+        self.assertEqual(dialog.choices['alpha']['task'], 'bee')
         self.assertEqual(dialog.choices['alpha']['frames'], [0, 1])
         self.assertEqual(dialog.choices['beta']['frames'], [0])
         dialog.close()

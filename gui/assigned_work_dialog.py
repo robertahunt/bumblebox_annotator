@@ -98,7 +98,14 @@ class AssignmentManagerDialog(QDialog):
         self.assign_selected = QPushButton('Assign Selected Videos...')
         self.assign_selected.setEnabled(False)
         self.assign_selected.clicked.connect(self.bulk_assign)
+        self.select_taskless = QPushButton('Select Without Task')
+        self.select_taskless.setToolTip(
+            'Check the assignments that have no mask task. They can never be submitted for review. '
+            'Assign them again with a task; the contributor then downloads the new assignment.')
+        self.select_taskless.clicked.connect(self.check_taskless)
+        self.select_taskless.hide()
         bulk.addWidget(self.select_visible)
+        bulk.addWidget(self.select_taskless)
         bulk.addWidget(clear)
         bulk.addStretch()
         bulk.addWidget(self.assign_selected)
@@ -361,11 +368,24 @@ class AssignmentManagerDialog(QDialog):
         count = len(self.checked_videos())
         self.assign_selected.setEnabled(bool(count))
         self.assign_selected.setText(f'Assign Selected Videos ({count})...' if count else 'Assign Selected Videos...')
+        missing = len(self.taskless()) if getattr(self, 'data', None) else 0
+        self.select_taskless.setVisible(bool(missing))
+        self.select_taskless.setText(f'Select Without Task ({missing})')
 
     def check_visible(self):
         for row in range(self.table.rowCount()):
             if not self.table.isRowHidden(row):
                 self.table.item(row, 0).setCheckState(Qt.CheckState.Checked)
+
+    def taskless(self):
+        return {video for video, entry in self.data['videos'].items() if not entry.get('task')}
+
+    def check_taskless(self):
+        missing = self.taskless()
+        for row, video in enumerate(self.videos):
+            if not self.table.isRowHidden(row):
+                self.table.item(row, 0).setCheckState(
+                    Qt.CheckState.Checked if video in missing else Qt.CheckState.Unchecked)
 
     def clear_checked(self):
         for row in range(self.table.rowCount()):
@@ -548,6 +568,8 @@ class BulkAssignmentDialog(QDialog):
             self.contributor.addItem(profile['name'] + ' (' + identity[:8] + ')', identity)
         self.contributor.setCurrentIndex(-1)
         self.task = task_combo(self, keypoints=keypoint_tasks)
+        # Every assignment names its work: without a task nothing can be marked finished or submitted.
+        self.task.setItemText(self.task.findData(None), 'Choose what to work on...')
         self.task.setCurrentIndex(max(self.task.findData(task), 0))
         self.scope = QComboBox()
         self.scope.addItems(['All extracted frames', 'Specific frames'])
@@ -574,6 +596,9 @@ class BulkAssignmentDialog(QDialog):
             ranges = self.frames.text() if self.scope.currentIndex() else 'All'
             choices = {v: {'contributor': actor, 'frames': parse_frames(ranges, self.available[v]['frames'])}
                        for v in self.videos}
+            if self.task.currentData() is None:
+                raise ValueError('Choose what to work on. Work assigned without a mask task cannot be marked '
+                                 'finished, so it is never submitted for review.')
             for choice in choices.values():
                 choice['task'] = self.task.currentData()
             details = '\n'.join(f'{v}: {len(c["frames"])} frames' for v, c in choices.items())

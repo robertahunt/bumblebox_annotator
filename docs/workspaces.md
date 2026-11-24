@@ -157,7 +157,7 @@ records for the assigned task before the video is made ready for review. A
 shared-video task needs one video-level completion, not bee masks on every frame.
 Unknown tasks, missing evidence, changed masks, or pending import reviews cannot
 be auto-submitted. A director must set a specific task on older "All mask types"
-assignments. Editing completed geometry invalidates completion; the next upload
+assignments (**Select Without Task** in Assignments finds them; new assignments require one). Editing completed geometry invalidates completion; the next upload
 withdraws the old ready state until the task is finished again. Manual submission
 remains available in File for exceptional workflows, including older clients.
 
