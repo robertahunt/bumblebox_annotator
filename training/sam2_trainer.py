@@ -3,6 +3,7 @@ SAM2 Fine-tuning Training Worker
 Based on: https://towardsdatascience.com/train-fine-tune-segment-anything-2-sam-2-in-60-lines-of-code-928dd29a63b3/
 """
 
+import sys
 import json
 from contextlib import nullcontext
 import cv2
@@ -196,6 +197,8 @@ class SAM2TrainingWorker(QThread):
         except Exception as e:
             import traceback
             error_msg = f"Training failed: {str(e)}\n{traceback.format_exc()}"
+            # Also in the terminal: the window may be closed or stuck when this arrives.
+            print(error_msg, file=sys.stderr, flush=True)
             self.training_failed.emit(error_msg)
     
     def _load_training_data(self):

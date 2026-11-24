@@ -15,6 +15,10 @@ os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 # Like the setting above, this must be in place before PyTorch is imported.
 os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
 
+from core.gpu import limit_apple_gpu_memory
+
+limit_apple_gpu_memory()  # also before PyTorch is imported
+
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QIcon

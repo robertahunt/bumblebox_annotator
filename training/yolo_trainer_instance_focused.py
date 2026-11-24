@@ -4,6 +4,7 @@ Generates cropped, resized regions around individual bees with ONLY the primary 
 This differs from Stage2 which includes all visible bees in each crop.
 """
 
+import sys
 import json
 import shutil
 import yaml
@@ -14,6 +15,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 import torch
 from ultralytics import YOLO
 from training.gpu import require_training_device
+from training.apple_gpu import assign_targets_on_cpu
 from core.coco_masks import decode_segmentation
 from .carbon_tracking import CarbonTrainingRun
 
@@ -89,6 +91,8 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
         except Exception as e:
             import traceback
             error_msg = f"Training failed: {str(e)}\n{traceback.format_exc()}"
+            # Also in the terminal: the window may be closed or stuck when this arrives.
+            print(error_msg, file=sys.stderr, flush=True)
             self.training_failed.emit(error_msg)
             
     def _generate_instance_focused_crops(self, train_jsons, val_jsons):
@@ -487,7 +491,8 @@ class YOLOTrainingWorkerInstanceFocused(QThread):
         carbon_run.start()
         try:
             # Train
-            results = model.train(trainer=RasterSegmentationTrainer, **training_params)
+            with assign_targets_on_cpu():
+                results = model.train(trainer=RasterSegmentationTrainer, **training_params)
 
             # Return best model path
             best_model_path = output_dir / training_name / 'weights' / 'best.pt'

@@ -4,17 +4,40 @@ An NVIDIA card (CUDA) is used when PyTorch can reach one, otherwise an Apple
 GPU (MPS), otherwise the CPU. Set BUMBLEBOX_FORCE_CPU=1 before starting the
 app to stay on the CPU, for example if an Apple GPU fails or gives odd masks.
 
-The Apple GPU path is written from PyTorch's documented interface and has not
-been run on a Mac; docs/setup.md lists what to check there first.
+The Apple GPU path is written from PyTorch's documented interface on a Linux
+computer; docs/setup.md says what has and has not been seen to work on a Mac.
 """
 
 import os
 
 FORCE_CPU_VARIABLE = 'BUMBLEBOX_FORCE_CPU'
 
+# PyTorch's own names. Both are fractions of the GPU memory macOS recommends for one program.
+APPLE_GPU_MEMORY_LIMITS = {
+    'PYTORCH_MPS_HIGH_WATERMARK_RATIO': '1.0',  # never hold more than this
+    'PYTORCH_MPS_LOW_WATERMARK_RATIO': '0.8',   # from here on, hand unused memory back
+}
+
 
 def cpu_forced():
     return os.environ.get(FORCE_CPU_VARIABLE, '').strip().lower() in ('1', 'true', 'yes')
+
+
+def limit_apple_gpu_memory(environment=os.environ):
+    """Keep PyTorch within the GPU memory macOS recommends. Call before PyTorch is imported.
+
+    Left alone, PyTorch lets an Apple GPU hold 1.7 times the recommended amount,
+    which is more memory than the Mac has: the first full-resolution training run
+    on a 96 GB Mac held 108 GB and spent its time swapping. At the limit PyTorch
+    first frees memory it is only keeping for reuse, and fails with an
+    out-of-memory error only if that is not enough.
+
+    PyTorch refuses to start its Apple GPU support when the lower value exceeds
+    the upper one, so if either is already set, both are left as they are. The
+    settings do nothing on a computer without an Apple GPU.
+    """
+    if not any(name in environment for name in APPLE_GPU_MEMORY_LIMITS):
+        environment.update(APPLE_GPU_MEMORY_LIMITS)
 
 
 def apple_gpu_available():

@@ -9,6 +9,8 @@ import copy
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 import traceback
 from contextlib import AbstractContextManager
@@ -115,6 +117,17 @@ def _recompute_totals(ledger: Dict[str, Any]) -> None:
     }
 
 
+def _powermetrics_runs_unattended() -> bool:
+    """Whether carbontracker's power reading would run without a password prompt ("-n": fail, never ask)."""
+    command = ['sudo', '-n', 'powermetrics', '-n', '1', '-i', '100', '--samplers', 'all']
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 class CarbonTrainingRun(AbstractContextManager):
     """Best-effort carbontracker wrapper with a persistent project ledger."""
 
@@ -167,6 +180,15 @@ class CarbonTrainingRun(AbstractContextManager):
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self._write_run(status="running")
+
+        if sys.platform == 'darwin' and not _powermetrics_runs_unattended():
+            # carbontracker reads a Mac's power draw with "sudo powermetrics". When sudo needs a password it asks
+            # in the terminal and waits there for the whole run, and nothing is measured.
+            self._error = ('Energy use not tracked: on a Mac that needs "sudo powermetrics" '
+                           'to run without asking for a password.')
+            print(self._error, flush=True)
+            self._write_run(status="running")
+            return
 
         try:
             from carbontracker.tracker import CarbonTracker

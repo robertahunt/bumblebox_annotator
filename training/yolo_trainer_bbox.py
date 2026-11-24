@@ -2,6 +2,7 @@
 YOLO bbox training worker for GUI integration
 """
 
+import sys
 import json
 import shutil
 import yaml
@@ -12,6 +13,7 @@ from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
 from training.gpu import require_training_device
 from training.image_size import resolve_image_size
+from training.apple_gpu import assign_targets_on_cpu
 from .carbon_tracking import CarbonTrainingRun
 
 try:
@@ -92,6 +94,8 @@ class YOLOTrainingWorkerBBox(QThread):
         except Exception as e:
             import traceback
             error_msg = f"Training failed: {str(e)}\n{traceback.format_exc()}"
+            # Also in the terminal: the window may be closed or stuck when this arrives.
+            print(error_msg, file=sys.stderr, flush=True)
             self.training_failed.emit(error_msg)
             
     def _prepare_yolo_dataset(self):
@@ -376,7 +380,8 @@ class YOLOTrainingWorkerBBox(QThread):
         try:
             # Train
             print(f"Starting training with params: {training_params}")
-            results = model.train(**training_params)
+            with assign_targets_on_cpu():
+                results = model.train(**training_params)
 
             # Find best model - get actual save directory from results
             # YOLO appends numbers to avoid overwriting, so use the actual save_dir

@@ -96,8 +96,8 @@ augmentation remain enabled. Polygon-only mosaic, mixup, cutmix, copy-paste, per
 multi-scale mixing are disabled explicitly. Separate masks use
 `overlap_mask=False`; this preserves overlapping instances but can use more
 host/GPU memory than a combined ID map. Start conservatively with batch size.
-The GUI still requires a GPU for training (an NVIDIA card, or an Apple GPU, which is
-untested; see [setup](setup.md#apple-silicon-mac-untested)); there is no CPU fallback.
+The GUI still requires a GPU for training (an NVIDIA card, or an Apple GPU, which is only
+partly tested; see [setup](setup.md#apple-silicon-mac-untested)); there is no CPU fallback.
 
 Standalone validation of these dataset sidecars must also use the adapter:
 

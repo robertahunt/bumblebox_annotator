@@ -9,7 +9,7 @@ Use a new environment; do not alter a collaborator's existing environment.
 Windows/macOS and other architectures need separate dependency and GPU checks;
 the Linux constraints are not a validated cross-platform lockfile. An Apple
 Silicon Mac has its own recipe under [Apple Silicon Mac](#apple-silicon-mac-untested),
-which nobody has run yet. The old
+which has only partly been tried on a Mac. The old
 `install.sh` and `install.ps1` are legacy installers, not this setup procedure.
 
 ## Reference Versions
@@ -110,12 +110,16 @@ inference is slower, and some model-specific workflows still require a GPU.
 
 ### Apple Silicon Mac (Untested)
 
-**Nothing in this section has been run on a Mac.** It was written on the Linux
-reference computer. What was checked from there: every pinned package has an
+**This section was written on the Linux reference computer, and only part of it
+has been seen to work on a Mac.** On one Mac Studio (M5 Ultra, 96 GB) the app
+started in an environment with the reference versions, found the Apple GPU and
+trained on it; see [what the first training run on a Mac showed](#what-the-first-training-run-on-a-mac-showed).
+The numbered checks further down have not been reported back.
+What was checked from Linux: every pinned package has an
 Apple Silicon build for Python 3.10, except the NVIDIA-only packages (never
 installed on a Mac) and two small pure-Python SAM2 dependencies that build from
 source; and the code that does not depend on CUDA was exercised on the CPU.
-Treat the first session on a Mac as a test, not as production work.
+Treat work on a Mac as a test, not as production work, until those checks pass.
 
 Requirements: an Apple Silicon Mac (M1 or later), macOS 13 or newer, and the
 **arm64** Miniconda or Miniforge installer. An Intel Python running under
@@ -191,7 +195,45 @@ Check these on the Mac, in this order, before relying on it:
 Not available on a Mac: the desktop launcher below (start the app with
 `python main.py`), the terminal sign-in for the research drive (sign in with
 macOS, then use Test Connection), and `scripts/recover_segmentation_training.py`,
-which still accepts only an NVIDIA card. Energy tracking is unverified there.
+which still accepts only an NVIDIA card.
+
+#### What the first training run on a Mac showed
+
+In November 2026 a whole-frame bee mask run at **Full resolution** (4096 pixels,
+batch size 1, 224 training frames) on the Mac Studio took 4 to 6.6 seconds a
+step. PyTorch held 108 GB of GPU memory on a 96 GB computer, so macOS was
+swapping to disk. The run stopped in its fourth epoch with `shape mismatch: value
+tensor of shape [16133] cannot be broadcast to indexing result of shape [23132]`.
+That error comes from the step where Ultralytics matches each labelled bee to
+the model's predictions: the Apple GPU counted one mask two ways. What sets it
+off is not known; the same crowded frames had passed in the three epochs before.
+Run on its own on that Mac afterwards, selecting and writing back through a mask
+at the same table sizes (up to 107 bees) gave correct results every time, so
+table size alone does not cause it.
+
+The app now does four things differently. **None of them has been run on a Mac.**
+
+- **Matching on the CPU.** When training on an Apple GPU, the matching step is
+  computed on the CPU ([training/apple_gpu.py](../training/apple_gpu.py)). On the
+  NVIDIA computer the CPU route gives the same matches as the GPU, checked at
+  4096 pixels with up to 107 bees, and takes at most 0.44 seconds a step.
+- **A memory ceiling.** PyTorch is kept to the GPU memory macOS recommends for
+  one program, and starts handing unused memory back at 80% of it. PyTorch's own
+  default is 1.7 times the recommended amount, which is more than the Mac has.
+  If a run now stops with `MPS backend out of memory`, it needs more than the
+  ceiling allows. To raise it, start the app with both values set, the lower one
+  no higher than the upper one:
+
+  ```bash
+  PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.2 PYTORCH_MPS_LOW_WATERMARK_RATIO=1.0 python main.py
+  ```
+
+- **Errors in the terminal.** A training failure is printed in the terminal as
+  well as shown in the training window. Before, it reached only the window.
+- **No password prompt.** Energy tracking reads a Mac's power draw with
+  `sudo powermetrics`. It is now skipped, with one line saying so, unless that
+  command runs without asking for a password. Before, the prompt sat unanswered
+  in the terminal for the whole run and nothing was measured.
 
 ## 4. Install Application Dependencies
 
