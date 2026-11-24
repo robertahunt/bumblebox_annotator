@@ -12,12 +12,14 @@ import albumentations as A
 import cv2
 import numpy as np
 import torch
+from pycocotools import mask as mask_utils
+from scipy import ndimage
 from ultralytics.data.augment import RandomHSV
 from ultralytics.data.base import BaseDataset
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.utils.torch_utils import unwrap_model
 
-from core.coco_masks import decode_segmentation, encode_mask
+from core.coco_masks import encode_mask, segmentation_rle
 from training.precision import PrecisionSegmentationTrainer, PrecisionSegmentationValidator
 
 
@@ -86,11 +88,50 @@ class RasterMaskDataset(BaseDataset):
                      cval=114, cval_mask=0, mode=cv2.BORDER_CONSTANT, p=1.0),
             A.HorizontalFlip(p=hyp.fliplr), A.VerticalFlip(p=hyp.flipud),
         ]) if self.augment else None
+        if self.geometry is not None and self.geometry.transforms[0].mask_interpolation != cv2.INTER_NEAREST:
+            raise ValueError('Instance label images need nearest-neighbour sampling')
         self.hsv = RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v)
         self.blur = A.Compose([
             A.Blur(blur_limit=(3, 15), p=0.15), A.MedianBlur(blur_limit=15, p=0.15),
         ]) if self.augment and hyp.augment else None
         return self._format_sample
+
+    @staticmethod
+    def _instance_layers(record):
+        """Draw every instance mask into a few label images at the label file's size.
+
+        One label image holds instances that share no pixel, numbered 1, 2, ...;
+        overlapping instances go into different images, so no pixel is lost. Each
+        image is then resized, padded and augmented once, rather than every instance
+        on a full-size canvas of its own. Nearest-neighbour sampling takes the same
+        source pixel for every output pixel whatever it holds, so each instance comes
+        out exactly as it would have on its own.
+
+        Returns (label images, how many labels each holds, and per instance its
+        (image, label), or None for an empty mask).
+        """
+        height, width = record['shape']
+        layers, counts, places = [], [], []
+        for instance in record['instances']:
+            rle = segmentation_rle(instance['segmentation'], height, width)
+            x, y, box_w, box_h = (int(v) for v in mask_utils.toBbox(rle)) if rle is not None else (0, 0, 0, 0)
+            if not box_w or not box_h:
+                places.append(None)
+                continue
+            # The box from the RLE always contains the mask, so only that part is touched.
+            mask = mask_utils.decode(rle)[y:y + box_h, x:x + box_w] > 0
+            for index, layer in enumerate(layers):
+                region = layer[y:y + box_h, x:x + box_w]
+                if counts[index] < 255 and not region[mask].any():
+                    break
+            else:
+                layers.append(np.zeros((height, width), np.uint8))
+                counts.append(0)
+                index, region = len(layers) - 1, layers[-1][y:y + box_h, x:x + box_w]
+            counts[index] += 1
+            region[mask] = counts[index]
+            places.append((index, counts[index]))
+        return layers, counts, places
 
     def _format_sample(self, label):
         image = label['img']
@@ -99,12 +140,9 @@ class RasterMaskDataset(BaseDataset):
             record = json.load(stream)
         if tuple(record['shape']) != tuple(label['ori_shape']):
             raise ValueError(f"Raster label/image shape mismatch: {label['im_file']}")
-        masks = []
-        classes = []
-        for instance in record['instances']:
-            mask = decode_segmentation(instance['segmentation'], *record['shape'])
-            masks.append(cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST))
-            classes.append(0 if self.single_cls else instance['cls'])
+        layers, counts, places = self._instance_layers(record)
+        layers = [cv2.resize(layer, (w, h), interpolation=cv2.INTER_NEAREST) for layer in layers]
+        classes = [0 if self.single_cls else instance['cls'] for instance in record['instances']]
 
         target_h, target_w = label.get('rect_shape', (self.imgsz, self.imgsz))
         top, left = (int(target_h) - h) // 2, (int(target_w) - w) // 2
@@ -112,19 +150,19 @@ class RasterMaskDataset(BaseDataset):
         if min(top, left, bottom, right) < 0:
             raise ValueError('Raster letterbox target is smaller than the resized image')
         image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
-        masks = [cv2.copyMakeBorder(m, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0) for m in masks]
+        layers = [cv2.copyMakeBorder(m, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0) for m in layers]
         if self.geometry is not None:
             # Albumentations 1.4.24's Affine.apply_to_masks delegates to the
             # image path (linear interpolation, image fill). A multi-channel
             # `mask` uses apply_to_mask and preserves nearest/zero-fill semantics.
-            stacked = np.stack(masks, axis=-1) if masks else np.zeros(image.shape[:2], np.uint8)
+            stacked = np.stack(layers, axis=-1) if layers else np.zeros(image.shape[:2], np.uint8)
             transformed = self.geometry(image=image, mask=stacked)
             image = transformed['image']
-            if masks:
-                transformed_masks = transformed['mask']
-                if transformed_masks.ndim == 2:
-                    transformed_masks = transformed_masks[..., None]
-                masks = list(np.moveaxis(transformed_masks, -1, 0))
+            if layers:
+                moved = transformed['mask']
+                if moved.ndim == 2:
+                    moved = moved[..., None]
+                layers = list(np.moveaxis(moved, -1, 0))
             image = self.hsv({'img': image})['img']
             if self.blur is not None:
                 image = self.blur(image=image)['image']
@@ -132,18 +170,22 @@ class RasterMaskDataset(BaseDataset):
         # Recompute boxes after paired geometry. Keep one target per original
         # instance, irrespective of how many disconnected regions it contains.
         h, w = image.shape[:2]
-        boxes, kept_classes, targets = [], [], []
         mh, mw = h // self.mask_ratio, w // self.mask_ratio
-        for class_id, mask in zip(classes, masks):
-            if np.any((mask != 0) & (mask != 1)):
+        extents, reduced = [], []
+        for layer, count in zip(layers, counts):
+            if layer.max(initial=0) > count:
                 raise ValueError('Raster augmentation produced non-binary instance labels')
-            ys, xs = np.nonzero(mask)
-            if not len(xs):
-                continue
-            x1, y1, x2, y2 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
+            extents.append(ndimage.find_objects(layer, max_label=count))  # each label's exact box
+            reduced.append(cv2.resize(layer, (mw, mh), interpolation=cv2.INTER_NEAREST))
+        boxes, kept_classes, targets = [], [], []
+        for class_id, place in zip(classes, places):
+            found = extents[place[0]][place[1] - 1] if place else None
+            if found is None:
+                continue  # an empty mask, or one moved out of the frame
+            (y1, y2), (x1, x2) = ((part.start, part.stop) for part in found)
             boxes.append([(x1 + x2) / (2 * w), (y1 + y2) / (2 * h), (x2 - x1) / w, (y2 - y1) / h])
             kept_classes.append(class_id)
-            targets.append(cv2.resize(mask, (mw, mh), interpolation=cv2.INTER_NEAREST))
+            targets.append((reduced[place[0]] == place[1]).astype(np.uint8))
         mask_array = np.stack(targets) if targets else np.zeros((0, mh, mw), dtype=np.uint8)
         sem_mask = np.zeros((mh, mw), dtype=np.int64)
         for class_id, mask in zip(kept_classes, mask_array):

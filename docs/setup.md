@@ -211,7 +211,8 @@ Run on its own on that Mac afterwards, selecting and writing back through a mask
 at the same table sizes (up to 107 bees) gave correct results every time, so
 table size alone does not cause it.
 
-The app now does four things differently. **None of them has been run on a Mac.**
+The app now does four things differently. With them, the next full-resolution run on
+the Mac Studio was reported to run well at about 60 GB of memory.
 
 - **Matching on the CPU.** When training on an Apple GPU, the matching step is
   computed on the CPU ([training/apple_gpu.py](../training/apple_gpu.py)). On the
