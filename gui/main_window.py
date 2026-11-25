@@ -6361,7 +6361,8 @@ class MainWindow(QMainWindow):
             )
             
             if reply == QMessageBox.StandardButton.Yes:
-                self.export_coco_format()
+                if self.export_coco_format(confirm=False) is None:
+                    return
                 # Check again after export
                 if not train_dir.exists() or not list(train_dir.glob('*.json')):
                     QMessageBox.warning(self, "Export Failed", "Failed to export annotations.")
@@ -6383,9 +6384,12 @@ class MainWindow(QMainWindow):
         if config_dialog.exec():
             config = config_dialog.get_config()
             
-            # Export COCO annotations if requested
+            # Export COCO annotations if requested; training then starts without waiting for OK
+            export_note = None
             if config.get('export_coco', True):
-                self.export_coco_format()
+                export_note = self.export_coco_format(confirm=False)
+                if export_note is None:
+                    return  # failed or cancelled: the reason was shown; never train on an older export
                 # Check annotations exist after export
                 train_jsons = list(train_dir.glob('*.json')) if train_dir.exists() else []
                 if not train_jsons:
@@ -6394,6 +6398,8 @@ class MainWindow(QMainWindow):
             
             # Create progress dialog
             progress_dialog = TrainingProgressDialog(self)
+            if export_note:
+                progress_dialog.log(export_note)
             progress_dialog.setWindowTitle("SAM2 Fine-tuning Progress")
             
             # Create training worker
@@ -9372,7 +9378,8 @@ class MainWindow(QMainWindow):
             )
             
             if reply == QMessageBox.StandardButton.Yes:
-                self.export_coco_format()
+                if self.export_coco_format(confirm=False) is None:
+                    return
                 # Check again
                 train_jsons = list(train_dir.glob('*.json')) if train_dir.exists() else []
                 val_jsons = list(val_dir.glob('*.json')) if val_dir.exists() else []
@@ -9392,9 +9399,12 @@ class MainWindow(QMainWindow):
         if config_dialog.exec():
             config = config_dialog.get_config()
             
-            # Export COCO annotations if requested
+            # Export COCO annotations if requested; training then starts without waiting for OK
+            export_note = None
             if config.get('export_coco', True):
-                self.export_coco_format()
+                export_note = self.export_coco_format(confirm=False)
+                if export_note is None:
+                    return  # failed or cancelled: the reason was shown; never train on an older export
                 # Check annotations exist after export
                 train_jsons = list(train_dir.glob('*.json')) if train_dir.exists() else []
                 val_jsons = list(val_dir.glob('*.json')) if val_dir.exists() else []
@@ -9411,6 +9421,8 @@ class MainWindow(QMainWindow):
             
             # Create progress dialog
             progress_dialog = TrainingProgressDialog(self)
+            if export_note:
+                progress_dialog.log(export_note)
             
             # Create training worker
             worker = YOLOTrainingWorker(self.project_path, config)
@@ -9520,7 +9532,8 @@ class MainWindow(QMainWindow):
             )
             
             if reply == QMessageBox.StandardButton.Yes:
-                self.export_coco_format()
+                if self.export_coco_format(confirm=False) is None:
+                    return
                 # Check again
                 train_jsons = list(train_dir.glob('*.json')) if train_dir.exists() else []
                 val_jsons = list(val_dir.glob('*.json')) if val_dir.exists() else []
@@ -9540,9 +9553,12 @@ class MainWindow(QMainWindow):
         if config_dialog.exec():
             config = config_dialog.get_config()
             
-            # Export COCO annotations if requested
+            # Export COCO annotations if requested; training then starts without waiting for OK
+            export_note = None
             if config.get('export_coco', True):
-                self.export_coco_format()
+                export_note = self.export_coco_format(confirm=False)
+                if export_note is None:
+                    return  # failed or cancelled: the reason was shown; never train on an older export
                 # Check annotations exist after export
                 train_jsons = list(train_dir.glob('*.json')) if train_dir.exists() else []
                 val_jsons = list(val_dir.glob('*.json')) if val_dir.exists() else []
@@ -9552,6 +9568,8 @@ class MainWindow(QMainWindow):
             
             # Create progress dialog for instance-focused training (uses IoU metrics)
             progress_dialog = TrainingProgressDialog(self, instance_focused=True)
+            if export_note:
+                progress_dialog.log(export_note)
             
             # Create training worker for instance-focused
             worker = YOLOTrainingWorkerInstanceFocused(self.project_path, config)
@@ -9690,7 +9708,8 @@ class MainWindow(QMainWindow):
             )
             
             if reply == QMessageBox.StandardButton.Yes:
-                self.export_coco_format()
+                if self.export_coco_format(confirm=False) is None:
+                    return
                 # Check again
                 train_jsons = list(train_dir.glob('*.json')) if train_dir.exists() else []
                 val_jsons = list(val_dir.glob('*.json')) if val_dir.exists() else []
@@ -9714,9 +9733,12 @@ class MainWindow(QMainWindow):
         if config_dialog.exec():
             config = config_dialog.get_config()
             
-            # Export COCO annotations if requested
+            # Export COCO annotations if requested; training then starts without waiting for OK
+            export_note = None
             if config.get('export_coco', True):
-                self.export_coco_format()
+                export_note = self.export_coco_format(confirm=False)
+                if export_note is None:
+                    return  # failed or cancelled: the reason was shown; never train on an older export
                 # Check annotations exist after export
                 train_jsons = list(train_dir.glob('*.json')) if train_dir.exists() else []
                 val_jsons = list(val_dir.glob('*.json')) if val_dir.exists() else []
@@ -9726,6 +9748,8 @@ class MainWindow(QMainWindow):
             
             # Create progress dialog
             progress_dialog = TrainingProgressDialog(self)
+            if export_note:
+                progress_dialog.log(export_note)
             
             # Create training worker (bbox specific)
             worker = YOLOTrainingWorkerBBox(self.project_path, config)
@@ -9810,8 +9834,9 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
-            # Export COCO annotations
-            self.export_coco_format()
+            # Export COCO annotations; the configuration dialog follows without an OK box
+            if self.export_coco_format(confirm=False) is None:
+                return
         
         # Show configuration dialog
         config_dialog = FrameLevelValidationConfigDialog(self)
@@ -10057,8 +10082,13 @@ class MainWindow(QMainWindow):
                 worker.stop()
                 worker.wait(5000)
     
-    def export_coco_format(self):
-        """Export annotations in COCO format (train, val, and test splits only - inference split is excluded)"""
+    def export_coco_format(self, confirm=True):
+        """Export annotations in COCO format (train, val, and test splits only - inference split is excluded).
+
+        Returns a summary of what was exported, or None when nothing was (no project or videos,
+        cancelled, or failed; problems are shown in a dialog). With confirm=False, as when training
+        follows, success goes to the status line instead of a dialog that waits for OK.
+        """
         if not self.project_path:
             QMessageBox.warning(self, "No Project", "Please create or open a project first")
             return
@@ -10186,15 +10216,14 @@ class MainWindow(QMainWindow):
                     [f"{masks} video-wide mask{'s' if masks != 1 else ''}"] if masks else [])
                 held_note = (f"\n\nLeft out: {' and '.join(parts)} with contributor work that was taken in but is "
                              "not accepted yet. Accept it under Project > Shared Work Intake... to include it.")
-            QMessageBox.information(
-                self,
-                "Export Successful",
-                f"COCO format annotations exported successfully!\n\n"
-                f"{files_list}\n\n"
-                f"Location: {self.project_path / 'annotations/coco'}" + held_note
-            )
+            summary = (f"COCO format annotations exported successfully!\n\n{files_list}\n\n"
+                       f"Location: {self.project_path / 'annotations/coco'}" + held_note)
+            if confirm:
+                QMessageBox.information(self, "Export Successful", summary)
             self.coco_export_dirty = False
-            self.status_label.setText(f"✓ Exported COCO format ({files_list})")
+            self.status_label.setText(f"✓ Exported COCO format ({files_list.replace(chr(10), ', ')})" +
+                                      (' (some contributor work left out until accepted)' if held_note else ''))
+            return summary
             
         except Exception as e:
             error_msg = f"Failed to export COCO format:\n\n{str(e)}"
