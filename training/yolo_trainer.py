@@ -16,6 +16,10 @@ from training.image_size import resolve_image_size
 from training.apple_gpu import assign_targets_on_cpu
 from core.coco_masks import decode_segmentation
 from .carbon_tracking import CarbonTrainingRun
+from collections import namedtuple
+
+# A trained model to continue from: its file, run folder name, training image size and epoch (1-based).
+StartWeights = namedtuple('StartWeights', 'path run image_size epoch')
 
 try:
     from ultralytics import YOLO
@@ -46,7 +50,37 @@ class YOLOTrainingWorker(QThread):
         self.config = training_config
         self.should_stop = False
         self._last_carbon_metrics = {}
-        
+        self.start_weights = None  # checked trained model to continue from; None: standard weights
+
+    def _check_start_weights(self):
+        """Check the trained model chosen to start from, before any data is prepared.
+
+        Returns a StartWeights, or None for the standard pretrained weights.
+        """
+        start = self.config.get('start_weights')
+        if not start:
+            return None
+        path = Path(start)
+        if not path.is_file():
+            raise FileNotFoundError(f'The model to start from is missing: {path}')
+        from ultralytics.nn.tasks import guess_model_task
+        from training.precision import checkpoint_model, load_checked_checkpoint
+        checkpoint = load_checked_checkpoint(path)
+        model = checkpoint_model(checkpoint)
+        task = guess_model_task(model)
+        if task != 'segment':
+            raise ValueError(f'{path.name} is a {task} model. Whole-frame training needs a segmentation model.')
+        names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
+        expected = dict(enumerate(training_categories(self.config.get('model_type', 'bee'))))
+        if dict(names) != expected:
+            raise ValueError(
+                f'{path.name} predicts {", ".join(map(str, names.values()))}, but this training is for '
+                f'{", ".join(expected.values())}. Choose a model trained for the same annotation type.')
+        run = path.parent.parent.name if path.parent.name == 'weights' else path.parent.name
+        epoch = checkpoint.get('epoch')
+        return StartWeights(path, run, (checkpoint.get('train_args') or {}).get('imgsz'),
+                            None if epoch is None or epoch < 0 else epoch + 1)
+
     def stop(self):
         """Request training to stop"""
         self.should_stop = True
@@ -58,6 +92,9 @@ class YOLOTrainingWorker(QThread):
                 self.training_failed.emit("Ultralytics YOLO not installed. Install with: pip install ultralytics")
                 return
                 
+            # A wrong model to start from should fail now, not after the data is prepared.
+            self.start_weights = self._check_start_weights()
+
             # Step 1: Prepare data
             self.stage_update.emit("Preparing training data...")
             yolo_dir, dataset_yaml = self._prepare_yolo_dataset()
@@ -301,9 +338,10 @@ class YOLOTrainingWorker(QThread):
         self.stage_update.emit(f"Using GPU: {device_label}")
         print(f"YOLO training using GPU: {device_label}")
 
-        # Initialize model
-        model = YOLO('yolov8s-seg.pt')
-        
+        # Initialize model: the standard pretrained weights, or a trained model chosen to continue from
+        start = self.start_weights
+        model = YOLO(str(start.path) if start else 'yolov8s-seg.pt')
+
         # Training parameters
         output_dir = self.project_path / 'models' / 'yolo_runs'
         training_params = {
@@ -438,6 +476,17 @@ class YOLOTrainingWorker(QThread):
             "Paired affine/flips and color augmentation enabled; mosaic, mixup, "
             "copy-paste, cutmix and perspective disabled."
         )
+        if start:
+            # The default warm-up starts the bias learning rate at 0.1, a jolt that suits fresh
+            # weights but undoes some of what a trained model learned. Keep it at the run's rate.
+            training_params['warmup_bias_lr'] = training_params['lr0']
+            details = ([f'epoch {start.epoch}'] if start.epoch else []) + (
+                [f'trained at {start.image_size} px'] if start.image_size else [])
+            known = f" ({', '.join(details)})" if details else ''
+            note = (f"Starting from {start.run} / {start.path.name}{known}, at {image_size} px. "
+                    f"Bias warm-up kept at the learning rate ({training_params['lr0']}).")
+            self.stage_update.emit(note)
+            print(note)
 
         training_name = self.config.get('name', 'bee_segmentation')
         model_kind = f"yolo_segmentation_{self.config.get('model_type', 'bee')}"

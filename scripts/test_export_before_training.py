@@ -56,7 +56,7 @@ class ExportBeforeTrainingTests(unittest.TestCase):
         dialog.exec.return_value = True
         dialog.get_config.return_value = dict(extra, export_coco=True, epochs=1)
         progress = MagicMock(training_completed=False, training_failed=False)
-        with patch('gui.main_window.TrainingConfigDialog', return_value=dialog), \
+        with patch('gui.main_window.TrainingConfigDialog', return_value=dialog) as self.dialog_class, \
                 patch('gui.main_window.TrainingProgressDialog', return_value=progress), \
                 patch(f'gui.main_window.{worker_name}') as worker, \
                 patch.object(self.window, 'export_coco_format', return_value=export_result) as export, \
@@ -74,6 +74,14 @@ class ExportBeforeTrainingTests(unittest.TestCase):
                 progress.log.assert_any_call('Exported: Training: 2 videos')
         self.information.assert_not_called()
         self.question.assert_not_called()
+
+    def test_only_whole_frame_training_offers_a_trained_model_to_start_from(self):
+        self.window.export_coco_format(confirm=False)
+        for action, worker_name, extra in FLOWS:
+            with self.subTest(action):
+                self.run_flow(action, worker_name, extra, 'Exported')
+                offered = self.dialog_class.call_args.kwargs.get('start_from', False)
+                self.assertEqual(offered, action == 'train_yolo_model')
 
     def test_training_never_starts_after_a_failed_or_cancelled_export(self):
         self.window.export_coco_format(confirm=False)  # an older export is on disk, and must not be used

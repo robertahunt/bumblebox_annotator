@@ -9393,9 +9393,9 @@ class MainWindow(QMainWindow):
         current_model_path = None
         if hasattr(self, 'yolo_toolbar') and hasattr(self.yolo_toolbar, 'model_path'):
             current_model_path = self.yolo_toolbar.model_path
-        
+
         # Show configuration dialog
-        config_dialog = TrainingConfigDialog(self, current_model_path)
+        config_dialog = TrainingConfigDialog(self, current_model_path, start_from=True)
         if config_dialog.exec():
             config = config_dialog.get_config()
             

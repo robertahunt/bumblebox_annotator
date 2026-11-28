@@ -2,12 +2,17 @@
 Training progress dialog for YOLO model training
 """
 
+from pathlib import Path
+
 from core.categories import BROOD_MODEL_LABEL
 from training.image_size import FULL_RESOLUTION, FULL_RESOLUTION_LABEL
 
-from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
+from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QProgressBar, QTextEdit, QGroupBox,
-                             QFormLayout, QSpinBox, QComboBox, QCheckBox, QSlider, QMessageBox)
+                             QFormLayout, QSpinBox, QComboBox, QCheckBox, QSlider, QMessageBox,
+                             QFileDialog)
+
+STANDARD_WEIGHTS_LABEL = 'Standard pretrained weights (yolov8s-seg)'
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QFont
 import matplotlib.pyplot as plt
@@ -358,8 +363,10 @@ class TrainingProgressDialog(QDialog):
 class TrainingConfigDialog(QDialog):
     """Dialog for configuring YOLO training parameters"""
     
-    def __init__(self, parent=None, current_model_path=None, stage2=False, sahi=False, beehavesque=False, instance_focused=False):
+    def __init__(self, parent=None, current_model_path=None, stage2=False, sahi=False, beehavesque=False,
+                 instance_focused=False, start_from=False):
         super().__init__(parent)
+        self.start_from = start_from  # offer to continue from a trained model (whole-frame segmentation)
         self.stage2 = stage2
         self.sahi = sahi
         self.beehavesque = beehavesque
@@ -468,7 +475,21 @@ class TrainingConfigDialog(QDialog):
             'at the same input size.')
         params_layout.addRow("Image Size:", self.imgsz_combo)
         self.imgsz_combo.currentIndexChanged.connect(self.on_image_size_changed)
-        
+
+        if self.start_from:
+            self.start_combo = QComboBox()
+            self.start_combo.addItem(STANDARD_WEIGHTS_LABEL, None)
+            self.start_combo.setToolTip(
+                'Standard pretrained weights start from a general-purpose model. '
+                'A trained model of the same annotation type continues from what it learned, '
+                'for example at a larger image size. Its file is not changed.')
+            choose = QPushButton('Choose Model...')
+            choose.clicked.connect(self.choose_start_weights)
+            start_row = QHBoxLayout()
+            start_row.addWidget(self.start_combo, 1)
+            start_row.addWidget(choose)
+            params_layout.addRow("Start From:", start_row)
+
         # Learning rate
         self.lr_combo = QComboBox()
         self.lr_combo.addItems(['0.0001', '0.0005', '0.001', '0.005', '0.01'])
@@ -869,6 +890,23 @@ class TrainingConfigDialog(QDialog):
         if current_name in known_defaults:
             self.name_combo.setCurrentText(defaults.get(type_text, 'bee_segmentation'))
         
+    def choose_start_weights(self):
+        project = getattr(self.parent(), 'project_path', None)
+        folder = Path(project) / 'models' if project else None
+        if folder is None or not folder.is_dir():
+            folder = Path(self.current_model_path).parent if self.current_model_path else Path.home()
+        path, _ = QFileDialog.getOpenFileName(self, 'Choose a Trained Model', str(folder), 'Model weights (*.pt)')
+        if not path:
+            return
+        index = self.start_combo.findData(path)
+        if index < 0:
+            weights = Path(path)
+            run = weights.parent.parent.name if weights.parent.name == 'weights' else weights.parent.name
+            self.start_combo.addItem(f'{run} / {weights.name}', path)
+            index = self.start_combo.count() - 1
+            self.start_combo.setItemData(index, path, Qt.ItemDataRole.ToolTipRole)
+        self.start_combo.setCurrentIndex(index)
+
     def accept(self):
         if (hasattr(self, 'model_type_combo')
                 and self.model_type_combo.currentText() == BROOD_MODEL_LABEL
@@ -892,7 +930,9 @@ class TrainingConfigDialog(QDialog):
             'current_model_path': self.current_model_path,
             'export_coco': self.export_coco_checkbox.isChecked()
         }
-        
+        if self.start_from:
+            config['start_weights'] = self.start_combo.currentData()  # None: standard weights
+
         # Add model type for coarse YOLO training
         if not (self.stage2 or self.sahi or self.beehavesque or self.instance_focused):
             model_type_map = {'Bee': 'bee', 'Chamber': 'chamber', 'Hive': 'hive', 'Pollen': 'pollen',

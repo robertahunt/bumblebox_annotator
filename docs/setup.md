@@ -236,6 +236,26 @@ the Mac Studio was reported to run well at about 60 GB of memory.
   command runs without asking for a password. Before, the prompt sat unanswered
   in the terminal for the whole run and nothing was measured.
 
+#### What the second run showed
+
+That full-resolution run (`bee_segmentation4`) started from the standard
+pretrained weights and stopped after 226 epochs (about 54 hours, 15 minutes an
+epoch), when early stopping (patience 50) found no improvement since epoch 176.
+Scored afterwards on the NVIDIA computer against the November 3072-pixel model
+(`bee_recovery_fp32_20261106`), each at its own image size, on the same frames:
+
+| Validation frames | Model | Mask mAP50 | Mask mAP50-95 | Box mAP50-95 |
+|---|---|---|---|---|
+| 3 Nov (37 frames, 719 bees) | November, 3072 | 0.927 | 0.711 | 0.740 |
+| 3 Nov (37 frames, 719 bees) | Mac, 4096 | 0.904 | 0.663 | 0.703 |
+| 25 Nov (40 frames, 846 bees) | November, 3072 | 0.926 | 0.696 | 0.728 |
+| 25 Nov (40 frames, 846 bees) | Mac, 4096 | 0.911 | 0.650 | 0.701 |
+
+The November model had about 630 epochs of training behind it, all on frames
+that leave out the held-out colonies; the Mac run was still improving slowly
+when it stopped. To see what full resolution adds, train at 4096 with **Start
+From** set to the November model (see the README's training section).
+
 ## 4. Install Application Dependencies
 
 ```bash
